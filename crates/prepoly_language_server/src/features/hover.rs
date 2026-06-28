@@ -87,7 +87,10 @@ fn ident_hover(
         ));
     }
     if let Some(f) = full.program.resolve_function(module, &name) {
-        return Some(markup(function_signature(full, f), Some(doc.range_of(span))));
+        return Some(markup(
+            function_signature(full, f),
+            Some(doc.range_of(span)),
+        ));
     }
     if let Some(t) = full.program.resolve_type(module, &name) {
         return Some(markup(render_type_def(t), Some(doc.range_of(span))));

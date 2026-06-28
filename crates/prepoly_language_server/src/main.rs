@@ -13,12 +13,23 @@ mod features;
 mod render;
 #[cfg(test)]
 mod tests;
+#[cfg(target_family = "wasm")]
+mod wasm_serve;
+#[cfg(target_family = "wasm")]
+mod wasm_stdio;
 
 use std::io;
 
 use tower_lsp_server::{LspService, Server};
 
 use backend::Backend;
+
+// Async stdin/stdout for the transport. Native uses tokio's `io-std`; wasm,
+// where that feature is unavailable, uses the blocking WASI adapters.
+#[cfg(not(target_family = "wasm"))]
+use tokio::io::{stdin, stdout};
+#[cfg(target_family = "wasm")]
+use wasm_stdio::{stdin, stdout};
 
 /// Send the compiler/server's own logs to stderr; stdout is the LSP transport.
 /// Controlled by `PREPOLY_LOG` (the same variable the driver uses), defaulting
@@ -36,11 +47,29 @@ fn init_tracing() {
         .try_init();
 }
 
-#[tokio::main]
+// wasm has no threads, so the server runs on the current-thread runtime there;
+// native keeps the default multi-threaded runtime.
+#[cfg_attr(not(target_family = "wasm"), tokio::main)]
+#[cfg_attr(target_family = "wasm", tokio::main(flavor = "current_thread"))]
 async fn main() {
     init_tracing();
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
     let (service, socket) = LspService::new(Backend::new);
-    Server::new(stdin, stdout, socket).serve(service).await;
+    let server = Server::new(stdin(), stdout(), socket);
+
+    // The browser client feeds the whole batch (initialize, did_open, the
+    // feature request, ...) up front rather than waiting for each reply, so the
+    // lifecycle stays correct only if messages are handled strictly in order:
+    // the service is serialized and the transport runs one message at a time. A
+    // native client already serializes the handshake, so it keeps the default.
+    #[cfg(target_family = "wasm")]
+    {
+        server
+            .concurrency_level(1)
+            .serve(wasm_serve::Sequential::new(service))
+            .await;
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        server.serve(service).await;
+    }
 }

@@ -134,3 +134,12 @@ This program can be placed alongside the above `newton` example, and the output 
 ```
 AL17001 (Doctor 3): Thomas Edison
 ```
+
+We can use `Person` type if we would like to define a function which receives `Person` and its derivative:
+
+```prepoly
+fun print_name(person: Person) {
+    println(person.display())
+}
+print_name(edison)
+```

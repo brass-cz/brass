@@ -11,14 +11,11 @@
     padding: 8px;
     font-size: 1.2em;
   }
-  #program {
+  #program-container {
     width: 100%;
     height: 10em;
     margin: 8px 0;
-    padding: 4px;
     border: 1px solid #ccc;
-    font-size: 1.2em;
-    font-family: monospace;
   }
   #stdout, #stderr {
     margin: 8px 0;
@@ -37,8 +34,7 @@
 <div id="playground">
   <section>
     <h3>Program</h3>
-    <div>
-      <textarea id="program"></textarea>
+    <div id="program-container">
     </div>
     <button id="execButton">Execute</button>
   </section>

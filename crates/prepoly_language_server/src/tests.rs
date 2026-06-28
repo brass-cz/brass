@@ -225,4 +225,3 @@ fn semantic_tokens_classify_keyword() {
     // The first token is `fun`, the keyword type (index 8 in the legend).
     assert_eq!(data[0].token_type, 8);
 }
-

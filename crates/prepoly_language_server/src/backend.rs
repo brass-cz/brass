@@ -11,12 +11,18 @@ use std::path::PathBuf;
 use dashmap::DashMap;
 use tower_lsp_server::ls_types::{
     Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InitializeParams,
-    InitializeResult, InitializedParams, MessageType, OneOf, SemanticTokens,
-    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
-    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Uri, WorkDoneProgressOptions,
+    DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
+    FullDocumentDiagnosticReport, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+    InitializeParams, InitializeResult, InitializedParams, MessageType, OneOf,
+    RelatedFullDocumentDiagnosticReport, SemanticTokens, SemanticTokensFullOptions,
+    SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    TextDocumentSyncKind, Uri, WorkDoneProgressOptions,
 };
+// Advertised only on wasm, where the browser transport pulls diagnostics rather
+// than receiving server-pushed ones.
+#[cfg(target_family = "wasm")]
+use tower_lsp_server::ls_types::{DiagnosticOptions, DiagnosticServerCapabilities};
 use tower_lsp_server::{Client, LanguageServer, jsonrpc::Result};
 
 use crate::analysis::DocAnalyzer;
@@ -60,11 +66,18 @@ impl Backend {
                 .entry(uri.clone())
                 .or_insert_with(|| DocState::new(&uri, String::new(), version));
             entry.document.update(text, version);
-            let DocState { document, analyzer } = &mut *entry;
-            let raw = analyzer.diagnostics(&document.text);
-            features::diagnostics::to_lsp(&raw, document)
+            analyze(&mut entry)
         };
         self.publish(uri, diags, version).await;
+    }
+
+    /// Diagnostics for an already-open document, for the pull
+    /// (`textDocument/diagnostic`) path. Unknown documents report nothing.
+    fn compute_diagnostics(&self, uri: &Uri) -> Vec<Diagnostic> {
+        match self.docs.get_mut(uri) {
+            Some(mut entry) => analyze(&mut entry),
+            None => Vec::new(),
+        }
     }
 
     async fn publish(&self, uri: Uri, diags: Vec<Diagnostic>, version: i32) {
@@ -96,6 +109,19 @@ impl LanguageServer for Backend {
                         },
                     ),
                 ),
+                // The browser's one-shot transport cannot receive the
+                // server-pushed diagnostics that `did_open`/`did_change`
+                // produce, so the wasm build also answers pull diagnostic
+                // requests. Native clients keep using the push path.
+                #[cfg(target_family = "wasm")]
+                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
+                    DiagnosticOptions {
+                        identifier: None,
+                        inter_file_dependencies: false,
+                        workspace_diagnostics: false,
+                        work_done_progress_options: WorkDoneProgressOptions::default(),
+                    },
+                )),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -170,6 +196,25 @@ impl LanguageServer for Backend {
         )
     }
 
+    /// Pull diagnostics: the same analysis the push path runs, returned as a
+    /// full report so a client that does not get pushed diagnostics (the
+    /// browser) can request them.
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> Result<DocumentDiagnosticReportResult> {
+        let items = self.compute_diagnostics(&params.text_document.uri);
+        Ok(DocumentDiagnosticReportResult::Report(
+            DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
+                related_documents: None,
+                full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                    result_id: None,
+                    items,
+                },
+            }),
+        ))
+    }
+
     async fn semantic_tokens_full(
         &self,
         params: SemanticTokensParams,
@@ -184,6 +229,13 @@ impl LanguageServer for Backend {
             data,
         })))
     }
+}
+
+/// Run the incremental analyzer over a document's current text and lower the
+/// raw diagnostics to LSP form. Shared by the push and pull diagnostic paths.
+fn analyze(state: &mut DocState) -> Vec<Diagnostic> {
+    let raw = state.analyzer.diagnostics(&state.document.text);
+    features::diagnostics::to_lsp(&raw, &state.document)
 }
 
 /// Best-effort filesystem path for a document URI, used to resolve imports

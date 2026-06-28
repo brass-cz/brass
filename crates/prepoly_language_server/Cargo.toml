@@ -19,11 +19,24 @@ prepoly_typeck.workspace = true
 # LSP server framework (Tower-based). The default `runtime-tokio` feature pulls
 # in the tokio integration the async `LanguageServer` impl runs on.
 tower-lsp-server = "0.23"
-# Async runtime for the stdio JSON-RPC server loop. `io-std` gives async
-# stdin/stdout; `macros`/`rt-multi-thread` give `#[tokio::main]`.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync"] }
 # Concurrent document store keyed by URI; one entry per open file.
 dashmap = "6"
 
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# Async runtime for the stdio JSON-RPC server loop. tokio supports only a small
+# feature set on wasm (`sync, macros, io-util, rt, time`), so the runtime is
+# split by target the same way the driver splits its back end. Native uses the
+# threaded runtime and tokio's async `io-std` stdin/stdout; wasm uses the
+# current-thread runtime and drives the WASI stdio through a blocking adapter
+# (see `wasm_stdio`), since `io-std` and `rt-multi-thread` are unavailable there.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+tokio = { version = "1", features = ["macros", "rt", "sync", "io-util"] }
+# The wasm transport serves the whole request batch at once (the browser client
+# cannot wait for each reply), so the service is wrapped to serialize calls --
+# see `wasm_serve`. The wrapper implements tower's `Service` directly.
+tower-service = "0.3"

@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "prebuild": "(cd ../../ && ./x cargo build --release --target wasm32-wasip1) && mkdir -p public && cp ../../target/wasm32-wasip1/release/prepoly.wasm ./public",
+    "prebuild": "(cd ../../ && ./x cargo build --release --target wasm32-wasip1 && ./x cargo build --release -p prepoly_language_server --target wasm32-wasip1) && mkdir -p public && cp ../../target/wasm32-wasip1/release/prepoly.wasm ../../target/wasm32-wasip1/release/prepoly-lsp.wasm ./public",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },
@@ -14,6 +14,7 @@
     "vite": "^8.1.0"
   },
   "dependencies": {
-    "@bjorn3/browser_wasi_shim": "^0.4.2"
+    "@bjorn3/browser_wasi_shim": "^0.4.2",
+    "monaco-editor": "0.55.1"
   }
 }
