@@ -89,13 +89,14 @@ fn hover_text(h: &tower_lsp_server::ls_types::Hover) -> String {
 }
 
 /// Hovering a function whose parameter and return are unannotated shows them as
-/// numbered `unknown_N`, the contract for an inference-open function type.
+/// numbered `unknown_N`, the contract for an inference-open function type. The
+/// function is never called, so no concrete return type can be recovered.
 #[test]
 fn hover_shows_unknown_numbered_signature() {
-    let src = "fun id(x) {\n    return x\n}\n\nfun main() {\n    let v = id(5)\n}\n";
+    let src = "fun id(x) {\n    return x\n}\n";
     let full = full_analysis(src);
-    let (doc, pos) = position(src, "id(5)", true);
-    let h = hover::hover(&doc, &full, pos).expect("hover over a call");
+    let (doc, pos) = position(src, "id(x)", false);
+    let h = hover::hover(&doc, &full, pos).expect("hover over the function name");
     let text = hover_text(&h);
     assert!(text.contains("fun id("), "got: {text}");
     assert!(
@@ -169,6 +170,33 @@ fn hover_shows_pattern_bound_variable_type() {
     assert!(hover_text(&h2).contains("float64"), "use shows the type");
 }
 
+/// A function with no return annotation whose body is fallible shows its
+/// inferred return type (recovered from a call site), not `unknown_N`.
+#[test]
+fn hover_shows_inferred_return_type() {
+    let src = concat!(
+        "fun f(a: int32) {\n",
+        "    error(1)!\n",
+        "    return \"never\"\n",
+        "}\n",
+        "\n",
+        "println(f(0))\n",
+    );
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "f(0)", true);
+    let h = hover::hover(&doc, &full, pos).expect("hover over the function");
+    let text = hover_text(&h);
+    assert!(text.contains("fun f("), "got: {text}");
+    assert!(
+        text.contains("Result<string, int32>"),
+        "inferred fallible return must be shown: {text}"
+    );
+    assert!(
+        !text.contains("-> unknown"),
+        "return must not fall back to unknown: {text}"
+    );
+}
+
 /// Go-to-definition on a call jumps to the called function's declaration.
 #[test]
 fn definition_jumps_to_function() {
@@ -197,3 +225,4 @@ fn semantic_tokens_classify_keyword() {
     // The first token is `fun`, the keyword type (index 8 in the legend).
     assert_eq!(data[0].token_type, 8);
 }
+

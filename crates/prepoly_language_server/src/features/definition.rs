@@ -8,9 +8,7 @@
 
 use prepoly_hir::{Type, TypedExprKind};
 use prepoly_lexer::Span;
-use prepoly_parser::ast::{
-    Block, Expr, FieldPat, Member, Pattern, Stmt, StrSeg, TopLevel, TypeBody,
-};
+use prepoly_parser::ast::{Block, Expr, FieldPat, Pattern, Stmt, StrSeg};
 use tower_lsp_server::ls_types::{Location, Position};
 
 use crate::analysis::FullAnalysis;
@@ -245,124 +243,6 @@ fn receiver_of_field(main_ast: &prepoly_parser::ast::Module, field_span: Span) -
             result = Some(recv.span());
         }
     };
-    walk_module_exprs(main_ast, &mut visit);
+    nav::walk_exprs(main_ast, &mut visit);
     result
-}
-
-/// Visit every expression in the module (pre-order), for span-based lookups.
-fn walk_module_exprs(main_ast: &prepoly_parser::ast::Module, visit: &mut impl FnMut(&Expr)) {
-    for item in &main_ast.items {
-        match item {
-            TopLevel::Fun(func) => walk_block(&func.body, visit),
-            TopLevel::Type(t) => {
-                let members = match &t.body {
-                    TypeBody::Record(members) => members.clone(),
-                    TypeBody::Sum(variants) => {
-                        for v in variants {
-                            for m in &v.members {
-                                if let Member::Method(method) = m
-                                    && let Some(b) = &method.body
-                                {
-                                    walk_block(b, visit);
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                };
-                for m in &members {
-                    if let Member::Method(method) = m
-                        && let Some(b) = &method.body
-                    {
-                        walk_block(b, visit);
-                    }
-                }
-            }
-            TopLevel::Stmt(s) => walk_stmt(s, visit),
-        }
-    }
-}
-
-fn walk_block(b: &Block, visit: &mut impl FnMut(&Expr)) {
-    for s in &b.stmts {
-        walk_stmt(s, visit);
-    }
-}
-
-fn walk_stmt(s: &Stmt, visit: &mut impl FnMut(&Expr)) {
-    match s {
-        Stmt::Let { value, .. } => walk_expr(value, visit),
-        Stmt::Assign { target, value, .. } => {
-            walk_expr(target, visit);
-            walk_expr(value, visit);
-        }
-        Stmt::Expr(e) => walk_expr(e, visit),
-        Stmt::While { cond, body, .. } => {
-            walk_expr(cond, visit);
-            walk_block(body, visit);
-        }
-        Stmt::For { iter, body, .. } => {
-            walk_expr(iter, visit);
-            walk_block(body, visit);
-        }
-        Stmt::Return(Some(e), _) => walk_expr(e, visit),
-        Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => {}
-    }
-}
-
-fn walk_expr(e: &Expr, visit: &mut impl FnMut(&Expr)) {
-    visit(e);
-    match e {
-        Expr::Unary(_, e, _) | Expr::ErrorProp(e, _) | Expr::Field(e, _, _) => walk_expr(e, visit),
-        Expr::Binary(_, a, b, _) | Expr::Index(a, b, _) => {
-            walk_expr(a, visit);
-            walk_expr(b, visit);
-        }
-        Expr::Call(callee, args, _) => {
-            walk_expr(callee, visit);
-            for arg in args {
-                walk_expr(&arg.expr, visit);
-            }
-        }
-        Expr::Closure(_, body, _) => walk_expr(body, visit),
-        Expr::Array(elems, _) => {
-            for e in elems {
-                walk_expr(e, visit);
-            }
-        }
-        Expr::Str(segs, _) => {
-            for seg in segs {
-                if let StrSeg::Expr(e) = seg {
-                    walk_expr(e, visit);
-                }
-            }
-        }
-        Expr::If(cond, then, els, _) => {
-            walk_expr(cond, visit);
-            walk_block(then, visit);
-            if let Some(e) = els {
-                walk_expr(e, visit);
-            }
-        }
-        Expr::IfLet(_, scrut, then, els, _) => {
-            walk_expr(scrut, visit);
-            walk_block(then, visit);
-            if let Some(e) = els {
-                walk_expr(e, visit);
-            }
-        }
-        Expr::Match(scrut, arms, _) => {
-            walk_expr(scrut, visit);
-            for arm in arms {
-                walk_expr(&arm.body, visit);
-            }
-        }
-        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => {
-            for (_, v) in fields {
-                walk_expr(v, visit);
-            }
-        }
-        Expr::Block(b, _) => walk_block(b, visit),
-        _ => {}
-    }
 }

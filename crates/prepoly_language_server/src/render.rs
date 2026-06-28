@@ -104,6 +104,15 @@ fn render_nominal(n: &prepoly_hir::NominalType, namer: &mut UnknownNamer) -> Str
 /// signature tables, so it is rendered as a fresh `unknown_N` numbered by
 /// position. An explicitly annotated slot is rendered from its resolved type.
 pub fn render_signature(sig: &CallableSignature) -> String {
+    render_signature_with(sig, None)
+}
+
+/// Like [`render_signature`], but an unannotated return type is rendered from
+/// `inferred_ret` when given -- the type inference recovered for the function
+/// (see `nav::inferred_return`) -- instead of a fresh `unknown_N`. The signature
+/// tables hold only annotations, so this is how an inferred-but-unannotated
+/// return such as a fallible `string` reaches hover output.
+pub fn render_signature_with(sig: &CallableSignature, inferred_ret: Option<&Type>) -> String {
     let mut namer = UnknownNamer::default();
     let params = sig
         .params
@@ -124,9 +133,10 @@ pub fn render_signature(sig: &CallableSignature) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let ret = match &sig.ret_ty {
-        Some(t) => render_type(t, &mut namer),
-        None => namer.fresh(),
+    let ret = match (&sig.ret_ty, inferred_ret) {
+        (Some(t), _) => render_type(t, &mut namer),
+        (None, Some(t)) => render_type(t, &mut namer),
+        (None, None) => namer.fresh(),
     };
     format!("fun {}({params}) -> {ret}", sig.name)
 }

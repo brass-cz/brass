@@ -4,7 +4,9 @@
 
 use prepoly_hir::{Type, TypedExpr, TypedExprKind};
 use prepoly_lexer::{Span, TokenKind, lex};
-use prepoly_parser::ast::{Block, Expr, Member, Module, Param, Pattern, Stmt, TopLevel, TypeBody};
+use prepoly_parser::ast::{
+    Block, Expr, Member, Module, Param, Pattern, Stmt, StrSeg, TopLevel, TypeBody,
+};
 use tower_lsp_server::ls_types::{Location, Uri};
 
 use crate::analysis::FullAnalysis;
@@ -148,5 +150,160 @@ fn let_value_in_expr(e: &Expr, off: usize, name: &str) -> Option<Span> {
             .find_map(|a| let_value_in_expr(&a.body, off, name)),
         Expr::Closure(_, body, _) => let_value_in_expr(body, off, name),
         _ => None,
+    }
+}
+
+/// The inferred return type of free function `name`, recovered from its call
+/// sites. The signature table only records the syntactic return annotation, so
+/// an unannotated return reads as absent there even though inference knows it.
+/// Each `name(...)` call's typed result type *is* that return type, so this
+/// returns the type all call sites agree on, or `None` when there are no calls
+/// or they disagree (a genuinely polymorphic return that has no single type).
+pub fn inferred_return(full: &FullAnalysis, name: &str) -> Option<Type> {
+    let mut call_spans: Vec<Span> = Vec::new();
+    let mut visit = |e: &Expr| {
+        if let Expr::Call(callee, _, span) = e
+            && let Expr::Ident(n, _) = callee.as_ref()
+            && n == name
+        {
+            call_spans.push(*span);
+        }
+    };
+    walk_exprs(&full.main_ast, &mut visit);
+
+    let mut ret: Option<Type> = None;
+    for span in call_spans {
+        let Some(e) = full
+            .typed
+            .expressions
+            .iter()
+            .find(|e| e.span == span && matches!(e.kind, TypedExprKind::Call))
+        else {
+            continue;
+        };
+        match &ret {
+            None => ret = Some(e.ty.clone()),
+            Some(t) if t != &e.ty => return None,
+            _ => {}
+        }
+    }
+    ret
+}
+
+/// Visit every expression in the module (pre-order), for span-based lookups.
+pub fn walk_exprs(main_ast: &Module, visit: &mut impl FnMut(&Expr)) {
+    for item in &main_ast.items {
+        match item {
+            TopLevel::Fun(func) => walk_block(&func.body, visit),
+            TopLevel::Type(t) => {
+                let members = match &t.body {
+                    TypeBody::Record(members) => members.as_slice(),
+                    TypeBody::Sum(variants) => {
+                        for v in variants {
+                            for m in &v.members {
+                                if let Member::Method(method) = m
+                                    && let Some(b) = &method.body
+                                {
+                                    walk_block(b, visit);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                };
+                for m in members {
+                    if let Member::Method(method) = m
+                        && let Some(b) = &method.body
+                    {
+                        walk_block(b, visit);
+                    }
+                }
+            }
+            TopLevel::Stmt(s) => walk_stmt(s, visit),
+        }
+    }
+}
+
+fn walk_block(b: &Block, visit: &mut impl FnMut(&Expr)) {
+    for s in &b.stmts {
+        walk_stmt(s, visit);
+    }
+}
+
+fn walk_stmt(s: &Stmt, visit: &mut impl FnMut(&Expr)) {
+    match s {
+        Stmt::Let { value, .. } => walk_expr(value, visit),
+        Stmt::Assign { target, value, .. } => {
+            walk_expr(target, visit);
+            walk_expr(value, visit);
+        }
+        Stmt::Expr(e) => walk_expr(e, visit),
+        Stmt::While { cond, body, .. } => {
+            walk_expr(cond, visit);
+            walk_block(body, visit);
+        }
+        Stmt::For { iter, body, .. } => {
+            walk_expr(iter, visit);
+            walk_block(body, visit);
+        }
+        Stmt::Return(Some(e), _) => walk_expr(e, visit),
+        Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => {}
+    }
+}
+
+fn walk_expr(e: &Expr, visit: &mut impl FnMut(&Expr)) {
+    visit(e);
+    match e {
+        Expr::Unary(_, e, _) | Expr::ErrorProp(e, _) | Expr::Field(e, _, _) => walk_expr(e, visit),
+        Expr::Binary(_, a, b, _) | Expr::Index(a, b, _) => {
+            walk_expr(a, visit);
+            walk_expr(b, visit);
+        }
+        Expr::Call(callee, args, _) => {
+            walk_expr(callee, visit);
+            for arg in args {
+                walk_expr(&arg.expr, visit);
+            }
+        }
+        Expr::Closure(_, body, _) => walk_expr(body, visit),
+        Expr::Array(elems, _) => {
+            for e in elems {
+                walk_expr(e, visit);
+            }
+        }
+        Expr::Str(segs, _) => {
+            for seg in segs {
+                if let StrSeg::Expr(e) = seg {
+                    walk_expr(e, visit);
+                }
+            }
+        }
+        Expr::If(cond, then, els, _) => {
+            walk_expr(cond, visit);
+            walk_block(then, visit);
+            if let Some(e) = els {
+                walk_expr(e, visit);
+            }
+        }
+        Expr::IfLet(_, scrut, then, els, _) => {
+            walk_expr(scrut, visit);
+            walk_block(then, visit);
+            if let Some(e) = els {
+                walk_expr(e, visit);
+            }
+        }
+        Expr::Match(scrut, arms, _) => {
+            walk_expr(scrut, visit);
+            for arm in arms {
+                walk_expr(&arm.body, visit);
+            }
+        }
+        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => {
+            for (_, v) in fields {
+                walk_expr(v, visit);
+            }
+        }
+        Expr::Block(b, _) => walk_block(b, visit),
+        _ => {}
     }
 }
