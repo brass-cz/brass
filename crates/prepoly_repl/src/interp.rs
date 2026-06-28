@@ -753,9 +753,12 @@ impl<'p, 'm> Interp<'p, 'm> {
 /// Whether a non-bool condition is truthy: a present nullable is truthy, an absent
 /// one is not; a bool is itself.
 fn truthy(v: &Value, ty: &Type) -> bool {
+    // Truthiness is derived from the condition's type: a bool is its own value,
+    // a nullable tests non-null, and any other (non-nullable) type is true.
     match ty {
+        Type::Bool => v.as_bool(),
         Type::Nullable(_) => !v.is_null(),
-        _ => v.as_bool(),
+        _ => true,
     }
 }
 

@@ -1099,30 +1099,29 @@ mod tests {
     }
 
     #[test]
-    fn integer_literal_condition_is_rejected() {
-        let e = errs("fun main() {\n    if 1 { println(\"x\") }\n}\n");
-        assert!(
-            e.iter()
-                .any(|m| m.contains("condition must be bool or nullable")),
-            "{e:?}"
-        );
-    }
-
-    #[test]
-    fn integer_identifier_condition_is_rejected() {
-        // A bare identifier of a non-bool, non-nullable type is not a valid
-        // condition even though it was previously exempt from the check.
+    fn non_nullable_condition_is_accepted() {
+        // A condition of any type is accepted; a non-nullable, non-bool type
+        // (here an integer) is unconditionally truthy at runtime, so the type
+        // checker reports nothing.
         let e = errs("fun main() {\n    let x: int32 = 3\n    if x { println(\"x\") }\n}\n");
-        assert!(
-            e.iter()
-                .any(|m| m.contains("condition must be bool or nullable")),
-            "{e:?}"
-        );
+        assert!(e.is_empty(), "{e:?}");
     }
 
     #[test]
     fn nullable_identifier_condition_is_accepted() {
         let e = errs("fun main() {\n    let x: int32? = null\n    if x { println(\"has\") }\n}\n");
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn statically_dead_if_arm_with_bare_null_is_tolerated() {
+        // Calling an unannotated `if`-branching function with a bare `null`
+        // monomorphizes its parameter to `never?` (only ever null), making the
+        // truthy arm statically unreachable -- narrowing there yields `never`, so
+        // `a * 2` cannot type. That dead arm's errors are tolerated rather than
+        // rejecting the program; the value call exercises the opposite arm.
+        let src = "fun double(a) {\n    if a {\n        return a * 2\n    } else {\n        return error(\"null\")\n    }\n}\nfun main() {\n    let x = double(2)\n    let y = double(null)\n}\n";
+        let e = errs(src);
         assert!(e.is_empty(), "{e:?}");
     }
 

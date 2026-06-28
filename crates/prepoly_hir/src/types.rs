@@ -267,6 +267,20 @@ impl Type {
         matches!(self, Type::Sum(name) if name.is_result_type())
     }
 
+    /// The compile-time truthiness of a condition value of this (resolved) type,
+    /// when it is fixed by the type alone. A `bool` or a non-trivial nullable
+    /// depends on the runtime value, so it is `None`. A bare `null` (`never?`,
+    /// inhabited only by null) is always false; any other non-nullable value is
+    /// always true. Used to fold a statically-known `if`: the type checker
+    /// tolerates the unreachable arm and the back end skips emitting it.
+    pub fn static_truthiness(&self) -> Option<bool> {
+        match self {
+            Type::Bool | Type::Unknown(_) | Type::Never => None,
+            Type::Nullable(inner) => matches!(**inner, Type::Never).then_some(false),
+            _ => Some(true),
+        }
+    }
+
     pub fn result_payloads(&self) -> Option<(&Type, &Type)> {
         match self {
             Type::Sum(name) => name.result_payloads(),

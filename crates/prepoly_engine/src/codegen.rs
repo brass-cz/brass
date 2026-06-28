@@ -444,8 +444,20 @@ pub trait Codegen {
 
     fn codegen_function(&mut self, program: &MonoProgram, f: &MonoFunction) {
         self.begin_body(f);
-        for i in 0..f.body.blocks.len() {
-            self.codegen_block(program, f, BlockId(i as u32));
+        // A statically-folded `if` (a `never?` or non-nullable condition) leaves
+        // one arm unreachable. Such an arm may hold values the back end cannot
+        // emit -- a bare `null` narrowed to `never` -- so it is skipped, its
+        // block terminated as `unreachable` to stay well-formed. The matching
+        // `CondBranch` folds to a direct jump (see `codegen_terminator`).
+        let reachable = crate::mono::reachable_blocks(f.body, &f.local_types);
+        for (i, live) in reachable.iter().enumerate() {
+            let id = BlockId(i as u32);
+            if *live {
+                self.codegen_block(program, f, id);
+            } else {
+                self.begin_block(id);
+                self.emit_unreachable();
+            }
         }
         self.end_body();
     }
@@ -638,16 +650,24 @@ pub trait Codegen {
             }
             Terminator::Goto(b) => self.emit_goto(*b),
             Terminator::CondBranch { cond, then, els } => {
-                // A bool branches directly; a nullable (or other non-bool) cond is
-                // reduced to an i1 truthiness test (non-null).
+                // A statically-known condition folds to a direct jump, leaving the
+                // dead arm (skipped in `codegen_function`) without a predecessor.
                 let cty = operand_type_of(cond, &f.local_types);
-                let c = if matches!(cty, Type::Bool) {
-                    self.codegen_operand(program, f, cond, &Type::Bool)
-                } else {
-                    let v = self.codegen_operand(program, f, cond, &cty);
-                    self.truthy(v, &cty)
-                };
-                self.emit_cond_branch(c, *then, *els);
+                match cty.static_truthiness() {
+                    Some(true) => self.emit_goto(*then),
+                    Some(false) => self.emit_goto(*els),
+                    // A bool branches directly; any other (runtime) type is reduced
+                    // to an i1 truthiness test (a nullable tests non-null).
+                    None => {
+                        let c = if matches!(cty, Type::Bool) {
+                            self.codegen_operand(program, f, cond, &Type::Bool)
+                        } else {
+                            let v = self.codegen_operand(program, f, cond, &cty);
+                            self.truthy(v, &cty)
+                        };
+                        self.emit_cond_branch(c, *then, *els);
+                    }
+                }
             }
             Terminator::Unreachable => self.emit_unreachable(),
         }

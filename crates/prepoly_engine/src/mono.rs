@@ -1833,6 +1833,11 @@ fn variant_field_layoutable(program: &Program, ty: &Option<Type>) -> bool {
 fn is_supported_rec(ty: &Type, visiting: &mut HashSet<i32>) -> bool {
     match ty {
         Type::Bool | Type::Int(_) | Type::Float(_) | Type::Void | Type::Str => true,
+        // `Never` only types values on a statically-unreachable path -- e.g. the
+        // truthy arm of `if x` for a bare `null` (`never?`), where narrowing
+        // yields `never`. The arm is type-checked (so payloads still infer) but
+        // the back end skips emitting it, so an opaque placeholder slot suffices.
+        Type::Never => true,
         // `File` is a builtin opaque handle (a runtime file descriptor object), not
         // a user record with fields, so it is supported despite an empty field set.
         Type::Record(n) if n.is_name("File") => true,
@@ -1885,6 +1890,39 @@ pub fn operand_type_of(op: &Operand, local_types: &[Type]) -> Type {
     }
 }
 
+/// The blocks reachable from the entry once statically-known `if` conditions are
+/// folded: a `never?` condition (a bare `null`, always null) is taken as false
+/// and a non-nullable / non-bool condition (always truthy) as true, so the dead
+/// arm is never visited. The typed back end uses this to skip emitting an arm
+/// that cannot run -- and the unwrapped `never` values it would otherwise
+/// contain (e.g. `a * 2` where `a` is a bare `null`) -- while monomorphization
+/// still types both arms so a fallible callable's `Result` payloads infer from
+/// whichever arm supplies each.
+pub fn reachable_blocks(body: &MirBody, local_types: &[Type]) -> Vec<bool> {
+    let mut reached = vec![false; body.blocks.len()];
+    let mut stack = vec![body.entry];
+    while let Some(id) = stack.pop() {
+        if std::mem::replace(&mut reached[id.index()], true) {
+            continue;
+        }
+        match &body.block(id).term {
+            Terminator::Goto(b) => stack.push(*b),
+            Terminator::CondBranch { cond, then, els } => {
+                match operand_type_of(cond, local_types).static_truthiness() {
+                    Some(true) => stack.push(*then),
+                    Some(false) => stack.push(*els),
+                    None => {
+                        stack.push(*then);
+                        stack.push(*els);
+                    }
+                }
+            }
+            Terminator::Return(_) | Terminator::Unreachable => {}
+        }
+    }
+    reached
+}
+
 /// Check that a binary operator's operands have compatible, in-scope types.
 fn check_bin(op: BinOp, a: &Type, b: &Type) -> Result<(), String> {
     // `x == null` / `x != null` (or comparing nullables) is a null/identity test.
@@ -1897,6 +1935,12 @@ fn check_bin(op: BinOp, a: &Type, b: &Type) -> Result<(), String> {
     // element type (valid programs guard for null first); the back end unwraps it.
     let a = unwrap_nullable(a);
     let b = unwrap_nullable(b);
+    // `never` is the bottom type: it only reaches here on a statically-dead path
+    // (a bare `null` narrowed in an always-false `if` arm), which the back end
+    // never emits, so any operator over it is vacuously well-typed.
+    if matches!(a, Type::Never) || matches!(b, Type::Never) {
+        return Ok(());
+    }
     let same = a == b;
     let numeric = |t: &Type| matches!(t, Type::Int(_) | Type::Float(_));
     let integer = |t: &Type| matches!(t, Type::Int(_));

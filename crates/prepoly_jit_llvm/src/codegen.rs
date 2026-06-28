@@ -1920,9 +1920,10 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
         self.abi.ptr().const_null().into()
     }
     fn truthy(&mut self, v: BasicValueEnum<'ctx>, ty: &Type) -> BasicValueEnum<'ctx> {
-        // A condition is a bool (its own value) or a nullable (a null test). There
-        // is no implicit numeric truthiness: `if x` for an integer `x` must be
-        // written `if x != 0` and is rejected by the type checker (DESIGN.md 5.5).
+        // Truthiness is derived from the condition's type: a bool is its own
+        // value, a nullable is a non-null test, and any other (non-nullable)
+        // type is unconditionally true. The operand `v` is still evaluated for
+        // its side effects before being discarded in the always-true case.
         match ty {
             Type::Bool => v,
             Type::Nullable(_) => self
@@ -1930,10 +1931,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
                 .build_is_not_null(v.into_pointer_value(), "nn")
                 .unwrap()
                 .into(),
-            other => unreachable!(
-                "condition must be bool or nullable, got `{}`",
-                other.display()
-            ),
+            _ => self.const_bool(true),
         }
     }
     fn unit(&mut self) -> BasicValueEnum<'ctx> {

@@ -1514,15 +1514,27 @@ impl<'a> Checker<'a> {
                 self.check_variant_lit(t, variant, fields, *span, scopes)
             }
             Expr::If(cond, then, els, span) => {
-                self.check_condition(cond, scopes);
+                let cond_ty = self.check_condition(cond, scopes);
+                let truth = cond_ty.static_truthiness();
                 let mut then_scopes = scopes.clone();
                 self.apply_truthy_narrowing(cond, &mut then_scopes);
-                let then_ty = self.check_block_expr(then, &mut then_scopes);
-                let else_ty = els
-                    .as_ref()
-                    .map(|e| self.check_expr(e, scopes))
-                    .unwrap_or(Type::Void);
-                self.common_type_or_error("if", then_ty, else_ty, *span)
+                // A statically-known condition makes one arm unreachable. Its
+                // body is still walked (so nested call instances are recorded for
+                // monomorphization) but its type errors are discarded: a dead
+                // path may not type-check -- e.g. a bare `null` (`never?`) whose
+                // truthy arm narrows it to `never` -- yet must not reject the
+                // program. The reachable arm alone determines the `if` type.
+                let then_ty =
+                    self.check_branch(then, &mut then_scopes, truth == Some(false));
+                let else_ty = match els {
+                    Some(e) => self.check_branch_expr(e, scopes, truth == Some(true)),
+                    None => Type::Void,
+                };
+                match truth {
+                    Some(true) => then_ty,
+                    Some(false) => else_ty,
+                    None => self.common_type_or_error("if", then_ty, else_ty, *span),
+                }
             }
             Expr::IfLet(pat, scrut, then, els, span) => {
                 let scrut_ty = self.check_expr(scrut, scopes);
@@ -1604,6 +1616,30 @@ impl<'a> Checker<'a> {
         self.fresh_unknown()
     }
 
+    /// Type an `if` block arm, discarding its errors when `dead` (statically
+    /// unreachable). The arm is still walked so its nested call instances reach
+    /// monomorphization; only the type errors -- which a dead path is allowed to
+    /// have -- are rolled back.
+    fn check_branch(&mut self, b: &Block, scopes: &mut ScopeStack, dead: bool) -> Type {
+        let mark = self.errors.len();
+        let ty = self.check_block_expr(b, scopes);
+        if dead {
+            self.errors.truncate(mark);
+        }
+        ty
+    }
+
+    /// As `check_branch`, for an `else` arm (a nested expression rather than a
+    /// block; an `else if` chain or a braced block lowered to an expression).
+    fn check_branch_expr(&mut self, e: &Expr, scopes: &mut ScopeStack, dead: bool) -> Type {
+        let mark = self.errors.len();
+        let ty = self.check_expr(e, scopes);
+        if dead {
+            self.errors.truncate(mark);
+        }
+        ty
+    }
+
     fn check_block_expr(&mut self, b: &Block, scopes: &mut ScopeStack) -> Type {
         scopes.push(HashMap::new());
         self.const_scopes.push(HashSet::new());
@@ -1662,24 +1698,15 @@ impl<'a> Checker<'a> {
         ty
     }
 
-    fn check_condition(&mut self, cond: &Expr, scopes: &mut ScopeStack) {
-        // Every condition must be bool or nullable (DESIGN.md 5.5). A bare
-        // identifier is not exempt: `if x` is only valid when `x` is a bool or
-        // a nullable to be narrowed. `!expr` is typed through `check_unary`,
-        // which yields `bool` for bool/nullable operands and reports anything
-        // else, so it satisfies this check without a special case. Unresolved
-        // unknowns are deferred to the runtime.
+    /// Type a condition and return its resolved type. A condition may be of any
+    /// type; its runtime truthiness is derived from the type rather than
+    /// restricting what is accepted: a `bool` is used directly, a nullable tests
+    /// non-null (and narrows on the truthy arm), and any other (non-nullable)
+    /// type is unconditionally true. The resolved type lets callers fold a
+    /// statically-known condition (see `static_truthiness`).
+    fn check_condition(&mut self, cond: &Expr, scopes: &mut ScopeStack) -> Type {
         let ty = self.check_expr(cond, scopes);
-        match self.resolve(&ty) {
-            Type::Bool | Type::Nullable(_) | Type::Never | Type::Unknown(_) => {}
-            other => self.errors.push(TypeError {
-                message: format!(
-                    "condition must be bool or nullable, found `{}`",
-                    other.display()
-                ),
-                span: cond.span(),
-            }),
-        }
+        self.resolve(&ty)
     }
 
     fn check_record_lit(

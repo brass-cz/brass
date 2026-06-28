@@ -54,7 +54,8 @@ type Student: Person = {
 Here, we wrote the `Person` type on the left of `Student`.
 This requires that the `Student` type include all fields of the `Person` type.
 
-Using these definitions, let's write a simple program:
+Using these definitions, let's write a complete program.
+Here we enhance `display` with a `match` expression that formats each `DegreeProgram` variant:
 
 ```prepoly
 type Person = {
@@ -78,7 +79,12 @@ type Student: Person = {
     first_name,
     last_name,
     display(self) {
-        return "{self.id}: {self.first_name} {self.last_name}"
+        const program = match self.program {
+            Bachelor { year } => "Bachelor {year}",
+            Master { year } => "Master {year}",
+            Doctor { year } => "Doctor {year}",
+        }
+        return "{self.id} ({program}): {self.first_name} {self.last_name}"
     },
     id,
     program: DegreeProgram,
@@ -99,7 +105,7 @@ fun main() {
 Executing this shows the following output:
 
 ```
-1001: Isac Newton
+1001 (Master 1): Isac Newton
 Student {
     first_name: Isac,
     last_name: Newton,
@@ -126,5 +132,5 @@ println("{edison.display()}")
 This program can be placed alongside the above `newton` example, and the output is as follows:
 
 ```
-AL17001: Thomas Edison
+AL17001 (Doctor 3): Thomas Edison
 ```
