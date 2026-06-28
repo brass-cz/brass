@@ -1,10 +1,20 @@
-# Prepoly
+<div align="center">
+  <h1>
+    prepoly
+  </h1>
+  <p>
+    Statically and flexibly type-inferred programming language
+  </p>
+  <p>
+    and its interpreter implementation with JIT-compilation
+  </p>
+</div>
 
-Prepoly is a statically type-checked, structurally-typed programming language
+prepoly is a statically type-checked, structurally-typed programming language
 with Hindley-Milner-style type inference, sum and record types under a single
 `type` keyword, explicit interface contracts, nullable and `Result` error types,
 closures, a file-based module system, and a small standard library written in
-Prepoly itself. The name is a contraction of *pre-typed* and *polymorphic*: it
+prepoly itself. The name is a contraction of *pre-typed* and *polymorphic*: it
 is run like an interpreter, but every function is fully type-checked just before
 it executes, and most types are inferred rather than written.
 
@@ -98,7 +108,7 @@ tests the LLVM crates as part of the JIT.)
 
 ### WebAssembly (wasm32-wasip1)
 
-Prepoly also builds for `wasm32-wasip1`, where the LLVM JIT cannot link. The
+prepoly also builds for `wasm32-wasip1`, where the LLVM JIT cannot link. The
 driver's `build.rs` detects a wasm target and turns the default `jit` feature
 off, so the LLVM dependencies are never pulled in and the program runs through
 the pure-Rust interpreter back end (`prepoly_repl`) instead.
