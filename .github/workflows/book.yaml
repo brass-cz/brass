@@ -1,0 +1,69 @@
+name: book
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Add wasm target
+        run: rustup target add wasm32-wasip1
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: book/playground/pnpm-lock.yaml
+
+      - name: Install mdbook
+        uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: latest
+
+      - name: Install playground dependencies
+        working-directory: book/playground
+        run: pnpm install --frozen-lockfile
+
+      - name: Build playground
+        working-directory: book/playground
+        run: pnpm build
+
+      - name: Build book
+        working-directory: book
+        run: mdbook build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: book/book
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

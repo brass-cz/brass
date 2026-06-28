@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "prebuild": "(cd ../../ && ./x cargo build --release --target wasm32-wasip1) && cp ../../target/wasm32-wasip1/release/prepoly.wasm ./public",
+    "prebuild": "(cd ../../ && ./x cargo build --release --target wasm32-wasip1) && mkdir -p public && cp ../../target/wasm32-wasip1/release/prepoly.wasm ./public",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },
