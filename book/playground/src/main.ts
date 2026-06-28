@@ -1,6 +1,6 @@
 import { WASI, File, OpenFile, ConsoleStdout, PreopenDirectory } from "@bjorn3/browser_wasi_shim";
 
-const wasm = await WebAssembly.compileStreaming(fetch("prepoly.wasm"));
+const wasm = await WebAssembly.compileStreaming(fetch("/playground/prepoly.wasm"));
 
 const execute = async () => {
   const stdout = document.getElementById("stdout")!;
