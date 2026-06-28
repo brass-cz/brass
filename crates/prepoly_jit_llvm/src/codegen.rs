@@ -544,16 +544,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             .unwrap();
         self.builder.position_at_end(live);
         let i64t = self.abi.i64t();
-        let rc = self
-            .builder
-            .build_load(i64t, obj, "rc")
-            .unwrap()
-            .into_int_value();
-        let rc1 = self
-            .builder
-            .build_int_sub(rc, i64t.const_int(1, false), "rc1")
-            .unwrap();
-        self.builder.build_store(obj, rc1).unwrap();
+        let rc1 = self.atomic_rc_dec(obj);
         let dead = self
             .builder
             .build_int_compare(inkwell::IntPredicate::SLE, rc1, i64t.const_zero(), "dead")
@@ -720,16 +711,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             .unwrap();
         self.builder.position_at_end(live);
         let i64t = self.abi.i64t();
-        let rc = self
-            .builder
-            .build_load(i64t, obj, "rc")
-            .unwrap()
-            .into_int_value();
-        let rc1 = self
-            .builder
-            .build_int_sub(rc, i64t.const_int(1, false), "rc1")
-            .unwrap();
-        self.builder.build_store(obj, rc1).unwrap();
+        let rc1 = self.atomic_rc_dec(obj);
         let dead = self
             .builder
             .build_int_compare(inkwell::IntPredicate::SLE, rc1, i64t.const_zero(), "dead")
@@ -756,6 +738,29 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             self.builder.position_at_end(b);
         }
         f
+    }
+
+    /// Atomically decrement the reference count at `obj` (offset 0) and return the
+    /// new count. The decrement is always atomic because an object shared across
+    /// `spawn` threads is released from more than one thread, so a plain
+    /// load/sub/store would lose a decrement (a leak) or both observe the object
+    /// dead (a double free). A thread-exclusive object is only ever decremented on
+    /// its own thread, where the atomic op is still correct -- a small end-of-life
+    /// cost; its hot retain/release path stays non-atomic via `rc_atomic`.
+    fn atomic_rc_dec(&self, obj: PointerValue<'ctx>) -> IntValue<'ctx> {
+        let i64t = self.abi.i64t();
+        let old = self
+            .builder
+            .build_atomicrmw(
+                inkwell::AtomicRMWBinOp::Sub,
+                obj,
+                i64t.const_int(1, false),
+                inkwell::AtomicOrdering::SequentiallyConsistent,
+            )
+            .unwrap();
+        self.builder
+            .build_int_sub(old, i64t.const_int(1, false), "rc1")
+            .unwrap()
     }
 
     /// Emit a runtime panic with a static message.
@@ -2660,6 +2665,14 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
 
     fn spawn(&mut self, closure: BasicValueEnum<'ctx>) {
         self.call_rt_void("pp_spawn", closure);
+    }
+
+    fn freeze(&mut self, value: BasicValueEnum<'ctx>) {
+        self.call_rt_void("pp_freeze_deep", value);
+    }
+
+    fn make_cown(&mut self, value: BasicValueEnum<'ctx>) {
+        self.call_rt_void("pp_make_cown", value);
     }
 
     fn thread_join_all(&mut self) {

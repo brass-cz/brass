@@ -41,7 +41,7 @@ pub unsafe extern "C-unwind" fn pp_retain(h: *mut Header) {
         if h.is_null() {
             return;
         }
-        if is_shared((*h).owner) {
+        if rc_atomic((*h).owner) {
             atomic_rc(h).fetch_add(1, Ordering::Relaxed);
         } else {
             (*h).rc += 1;
@@ -61,7 +61,7 @@ pub unsafe extern "C-unwind" fn pp_release(h: *mut Header) {
         if h.is_null() {
             return;
         }
-        let dead = if is_shared((*h).owner) {
+        let dead = if rc_atomic((*h).owner) {
             let was = atomic_rc(h).fetch_sub(1, Ordering::Release);
             if was == 1 {
                 std::sync::atomic::fence(Ordering::Acquire);

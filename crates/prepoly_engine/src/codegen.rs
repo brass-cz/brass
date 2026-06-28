@@ -328,6 +328,12 @@ pub trait Codegen {
 
     /// Run a zero-argument closure on a new thread (`spawn`).
     fn spawn(&mut self, closure: Self::Value);
+    /// Promote a `spawn` capture to a shared owner before the spawn, so its
+    /// reference count is maintained atomically once it is reachable from another
+    /// thread: `freeze` deep-freezes a read-only capture to immutable; `make_cown`
+    /// makes a mutated capture a cown (still mutated under its `with` lock).
+    fn freeze(&mut self, value: Self::Value);
+    fn make_cown(&mut self, value: Self::Value);
     /// Join every thread spawned so far (`sync`), so their effects are observable
     /// before execution continues.
     fn thread_join_all(&mut self);
@@ -460,8 +466,14 @@ pub trait Codegen {
                 // Reassigning a managed local drops its previous value. Snapshot it
                 // first (the rvalue may read the old value), release it after the
                 // new value is stored. Parameters are skipped: they are borrowed
-                // from the caller, who owns the original.
-                let old = if rc_managed(&dest) && !f.body.params.contains(local) {
+                // from the caller, who owns the original. A closure moved into a
+                // `spawn` is skipped too: the thread now owns it and releases it, so
+                // the spawner must not release it here -- otherwise reassigning the
+                // local (a `spawn` in a loop) frees a closure a thread still runs.
+                let old = if rc_managed(&dest)
+                    && !f.body.params.contains(local)
+                    && !(matches!(dest, Type::Fun(..)) && spawn_moved_locals(f).contains(local))
+                {
                     Some(self.load_local(*local))
                 } else {
                     None
@@ -1020,6 +1032,20 @@ pub trait Codegen {
                 self.thread_join_all();
                 self.unit()
             }
+            // `_freeze(c)` / `_cown(c)` promote a `spawn` capture to a shared owner
+            // before the spawn, so its reference count is atomic across threads: a
+            // read-only capture is frozen (immutable), a mutated one is made a cown.
+            // The driver's auto-acquire pass inserts these; both yield no value.
+            "_freeze" | "_cown" => {
+                let ty = operand_type_of(&args[0], &f.local_types);
+                let v = self.codegen_operand(program, f, &args[0], &ty);
+                if name == "_freeze" {
+                    self.freeze(v);
+                } else {
+                    self.make_cown(v);
+                }
+                self.unit()
+            }
             // `with(obj, f)` acquires `obj`'s lock, runs `f(obj)`, releases, and
             // yields the closure's result -- the cown access made data-race-free.
             "with" => {
@@ -1032,21 +1058,25 @@ pub trait Codegen {
                 let multi = matches!(obj_ty, Type::Slice(_) | Type::Array(..));
                 // A single-cown `with` opens a region with the guarded object as
                 // its bridge (DESIGN.md 12.3); closedness is verified on release.
-                // The lock (data-race-freedom) is kept around the region.
-                let region = (!multi).then(|| self.region_open(obj));
+                // The lock (data-race-freedom) is kept around the region: acquire it
+                // first, so the region open/close and the body all run under it.
+                // Otherwise concurrent `with`s on the same cown race on the region
+                // setup -- `region_open` writes the bridge's header, and the body's
+                // write barrier mutates region metadata -- which corrupts the heap.
                 if multi {
                     self.cown_lock_all(obj);
                 } else {
                     self.cown_lock(obj);
                 }
+                let region = (!multi).then(|| self.region_open(obj));
                 let result = self.call_indirect(clo, &cty, &[obj]);
+                if let Some(region_id) = region {
+                    self.region_close(region_id);
+                }
                 if multi {
                     self.cown_unlock_all(obj);
                 } else {
                     self.cown_unlock(obj);
-                }
-                if let Some(region_id) = region {
-                    self.region_close(region_id);
                 }
                 result
             }

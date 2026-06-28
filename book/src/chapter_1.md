@@ -47,7 +47,7 @@ fun gcd(a, b) {
     }
 }
 
-println("{gcd(48, 36)}")
+println(gcd(48, 36))
 ```
 
 This outputs `12`, which is correct!
@@ -63,7 +63,7 @@ let result = elems[0]
 for elem in elems.slice(1, elems.len()) {
     result = gcd(result, elem)
 }
-println("{result}")
+println("GCD is {result}")
 ```
 
-This program outputs `4`.
+This program outputs `GCD is 4`.

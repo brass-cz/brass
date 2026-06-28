@@ -255,6 +255,12 @@ impl Codegen for TextBackend {
     fn spawn(&mut self, closure: usize) {
         self.line(format!("spawn v{closure}"));
     }
+    fn freeze(&mut self, value: usize) {
+        self.line(format!("freeze v{value}"));
+    }
+    fn make_cown(&mut self, value: usize) {
+        self.line(format!("cown v{value}"));
+    }
     fn thread_join_all(&mut self) {
         self.line("sync".into());
     }

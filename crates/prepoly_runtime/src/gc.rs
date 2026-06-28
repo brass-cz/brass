@@ -280,6 +280,16 @@ extern "C-unwind" fn freeze_child(c: *mut Header) {
 /// registry and pending-free buffer and an overlap would trace or free the same
 /// object twice. The in-flight collection already covers the current garbage.
 pub extern "C-unwind" fn pp_gc_collect() {
+    // Defer collection while any spawned thread is running. The trial-deletion
+    // pass mutates every registered object's `rc`/`color` non-atomically and frees
+    // the garbage it finds, which would race a concurrent mutator on another
+    // thread. With no spawn active the main thread is the sole mutator (and cannot
+    // start a spawn while blocked here), so the pass has exclusive access;
+    // `pp_join_all` runs a collection once all threads have joined to reclaim what
+    // was deferred.
+    if crate::conc::has_active_spawns() {
+        return;
+    }
     if COLLECTING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
         .is_err()

@@ -1,14 +1,19 @@
 //! Automatic ownership analysis for `spawn` captures (DESIGN.md 12.7-12.8).
 //!
-//! For each variable captured by a `spawn` closure the compiler chooses, from
-//! the variable's liveness after the spawn and its mutation inside the closure,
-//! whether to move, freeze, or cown it. The sequential runtime executes any of
-//! these schedules identically, so the decision here is advisory (it can drive
-//! the auto-acquire warning of DESIGN.md 12.9.2), but the analysis is the same
-//! one the JIT would use to specialize ownership.
+//! A `spawn` runs its closure on a real OS thread, so each captured value is
+//! shared between the spawner and that thread. The decision here is therefore
+//! load-bearing, not advisory: [`auto_acquire`] realizes it before the spawn so
+//! the capture has an atomic reference count from its first cross-thread
+//! reference. A capture the closure mutates is made a cown (and its access wrapped
+//! in `with`, which lock-guards it); a read-only capture is frozen (immutable).
+//! Both are `rc_atomic` owner classes, which is what makes the otherwise-racy
+//! cross-thread reference counting sound. [`decide`] additionally classifies a
+//! capture as move/freeze/cown from its liveness for the auto-acquire diagnostic
+//! (DESIGN.md 12.9.2).
 
 use std::collections::HashSet;
 
+use prepoly_lexer::Span;
 use prepoly_parser::ast::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -270,34 +275,76 @@ fn stmts_reference(stmts: &[Stmt], var: &str) -> bool {
 /// whole closure body in one `with` per cowned capture). A capture that is moved
 /// (exclusive to the thread) or frozen (read-only) needs no lock and is left
 /// alone. `params` are the names already in scope around `stmts`.
-pub fn auto_acquire(stmts: &mut [Stmt], params: &HashSet<String>) {
+pub fn auto_acquire(stmts: &mut Vec<Stmt>, params: &HashSet<String>) {
     let mut locals = params.clone();
     collect_local_bindings(stmts, &mut locals);
     auto_acquire_in(stmts, &locals);
 }
 
-fn auto_acquire_in(stmts: &mut [Stmt], locals: &HashSet<String>) {
-    for i in 0..stmts.len() {
-        // Liveness for this spawn looks at the statements that follow it; clone
-        // them so the analysis can borrow while `stmts[i]` is mutated.
-        let rest: Vec<Stmt> = stmts.get(i + 1..).map(<[Stmt]>::to_vec).unwrap_or_default();
-        let cowns = spawn_cown_captures(&stmts[i], locals, &rest);
-        if !cowns.is_empty() {
-            wrap_spawn_body(&mut stmts[i], &cowns);
-        }
+fn auto_acquire_in(stmts: &mut Vec<Stmt>, locals: &HashSet<String>) {
+    let mut i = 0;
+    while i < stmts.len() {
         // Recurse into loop bodies (which may themselves contain spawns).
         if let Stmt::While { body, .. } | Stmt::For { body, .. } = &mut stmts[i] {
             auto_acquire_in(&mut body.stmts, locals);
         }
+        let (cowns, freezes) = spawn_capture_promotions(&stmts[i], locals);
+        if cowns.is_empty() && freezes.is_empty() {
+            i += 1;
+            continue;
+        }
+        // Lock-guard each mutated capture's access inside the closure body.
+        if !cowns.is_empty() {
+            wrap_spawn_body(&mut stmts[i], &cowns);
+        }
+        // Promote every capture to an atomic-count owner *before* the spawn, so the
+        // owner is fixed before the closure captures (retains) the value and the
+        // count is atomic from the first cross-thread reference: a mutated capture
+        // becomes a cown, a read-only one is frozen.
+        let span = spawn_stmt_span(&stmts[i]);
+        let promos: Vec<Stmt> = cowns
+            .iter()
+            .map(|c| promote_stmt("_cown", c, span))
+            .chain(freezes.iter().map(|c| promote_stmt("_freeze", c, span)))
+            .collect();
+        let inserted = promos.len();
+        for (k, p) in promos.into_iter().enumerate() {
+            stmts.insert(i + k, p);
+        }
+        i += inserted + 1;
     }
 }
 
-/// The cowned captures of a `spawn` closure in `stmt`: those mutated inside the
-/// closure and still live after the spawn (so neither moved nor frozen). Sorted
+/// The span used for a spawn's synthesized promotion statements (cosmetic: these
+/// builtins do not fail, so the span only ever surfaces in internal diagnostics).
+fn spawn_stmt_span(stmt: &Stmt) -> Span {
+    match stmt {
+        Stmt::Expr(e) | Stmt::Let { value: e, .. } => e.span(),
+        _ => Span::new(0, 0),
+    }
+}
+
+/// A `builtin(var)` statement -- `_cown(var)` or `_freeze(var)` -- inserted before
+/// a spawn to promote `var` to an atomic-count owner.
+fn promote_stmt(builtin: &str, var: &str, span: Span) -> Stmt {
+    Stmt::Expr(Expr::Call(
+        Box::new(Expr::Ident(builtin.to_string(), span)),
+        vec![Arg {
+            expr: Expr::Ident(var.to_string(), span),
+        }],
+        span,
+    ))
+}
+
+/// The captures of a `spawn` closure in `stmt`, partitioned into `(cowns,
+/// freezes)`: those the closure mutates (cowned, so their access is lock-guarded)
+/// and those it only reads (frozen). Every captured local crosses to the new
+/// thread, so both groups are promoted to an atomic-count owner -- the move/freeze
+/// liveness distinction is not used for atomicity, only the mutation does. Sorted
 /// for deterministic, deadlock-free lock ordering.
-fn spawn_cown_captures(stmt: &Stmt, locals: &HashSet<String>, rest: &[Stmt]) -> Vec<String> {
+fn spawn_capture_promotions(stmt: &Stmt, locals: &HashSet<String>) -> (Vec<String>, Vec<String>) {
     let Some(closure_body) = spawn_closure_body(stmt) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let bound = closure_bound_in(stmt);
     let mut caps: Vec<String> = captured(&closure_body, &bound)
@@ -305,11 +352,8 @@ fn spawn_cown_captures(stmt: &Stmt, locals: &HashSet<String>, rest: &[Stmt]) -> 
         .filter(|name| locals.contains(name))
         .collect();
     caps.sort();
-    caps.retain(|var| {
-        let live = stmts_reference(rest, var);
-        decide(var, live, &closure_body) == Ownership::Cown
-    });
-    caps
+    caps.into_iter()
+        .partition(|var| mutates(&closure_body, var))
 }
 
 /// Rewrite the spawn closure's body in `stmt` to `with(c, (c) -> body)` nested

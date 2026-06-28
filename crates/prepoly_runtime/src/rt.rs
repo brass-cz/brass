@@ -60,13 +60,27 @@ pub const OWNER_COWN: u8 = 4;
 /// runtime historically named this class "frozen".
 pub const OWNER_FROZEN: u8 = OWNER_IMMUTABLE;
 
-/// Whether an owner class is shared across threads (so its reference count must be
-/// atomic). Only the two shared classes (Immutable, Cown) qualify; the three owned
-/// classes (Local, Contained, Bridge) are thread-exclusive. The class numbering
-/// makes this a single comparison.
+/// Whether an owner class is shared across threads, for the region write barrier
+/// (`prepoly_runtime::region`): only the deeply-shared classes (Immutable, Cown)
+/// qualify. This is the membership/borrow predicate, NOT the reference-count
+/// atomicity one -- see [`rc_atomic`].
 #[inline]
 pub fn is_shared(owner: u8) -> bool {
     owner >= OWNER_IMMUTABLE
+}
+
+/// Whether an object's reference count must be maintained atomically. A `Bridge`
+/// is a region's external entry point reachable from another thread (the
+/// `with`-acquired cown a `spawn` capture is promoted to), so its count is touched
+/// concurrently even though region *membership* (`is_shared`) excludes it. The
+/// `Bridge`/`Immutable`/`Cown` classes are the ones that cross threads; `Local`
+/// and `Contained` (region-interior, reached only under the bridge's lock) stay on
+/// the fast non-atomic path. A capture is promoted to one of these atomic classes
+/// *before* the spawn (freeze/cown), so its owner -- and thus its atomicity -- is
+/// stable from the first cross-thread reference.
+#[inline]
+pub fn rc_atomic(owner: u8) -> bool {
+    owner >= OWNER_BRIDGE
 }
 
 /// Heap object header. `owner` classifies reference-count behavior (see the owner

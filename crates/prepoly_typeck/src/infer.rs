@@ -2529,6 +2529,16 @@ impl<'a> Checker<'a> {
                 }
                 Some(Type::Void)
             }
+            // `_cown(c)` / `_freeze(c)` are inserted by the spawn auto-acquire pass
+            // to promote a capture to an atomic-count owner before the spawn; each
+            // takes the capture and yields nothing.
+            "_cown" | "_freeze" => {
+                self.check_arg_count(name, 1, args.len(), span);
+                for arg in args {
+                    self.check_expr(&arg.expr, scopes);
+                }
+                Some(Type::Void)
+            }
             _ => None,
         }
     }
@@ -2554,7 +2564,7 @@ impl<'a> Checker<'a> {
                 Some(Type::result(Type::Int(IntKind::I64), Type::Str))
             }
             "_int_widen" => Some(Type::Int(IntKind::I64)),
-            "spawn" | "sync" => Some(Type::Void),
+            "spawn" | "sync" | "_cown" | "_freeze" => Some(Type::Void),
             _ => None,
         }
     }
@@ -4174,6 +4184,8 @@ fn is_runtime_builtin_value(name: &str) -> bool {
             | "spawn"
             | "with"
             | "sync"
+            | "_cown"
+            | "_freeze"
             | "input"
             | "read_file"
             | "write_file"

@@ -9,11 +9,22 @@
 //! they reach another thread (moved when unique, frozen when read-only, or cowned
 //! when mutated), so transferring the closure pointer across threads is sound.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 
-use crate::rt::Header;
+use crate::rt::{Header, OWNER_COWN};
+
+/// Count of spawned threads that have not yet finished their heap work. The cycle
+/// collector reads this to defer collection while any spawned thread runs: it
+/// mutates object headers non-atomically, so it must run only when the main
+/// thread is the sole mutator (see `crate::gc::pp_gc_collect`).
+static ACTIVE_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether any spawned thread is currently running.
+pub fn has_active_spawns() -> bool {
+    ACTIVE_SPAWNS.load(Ordering::SeqCst) > 0
+}
 
 /// A heap pointer asserted `Send`. The compiler's ownership analysis guarantees a
 /// spawned closure's reachable mutable state is exclusive (moved), immutable
@@ -27,6 +38,25 @@ unsafe impl Send for SendPtr {}
 fn threads() -> &'static Mutex<Vec<JoinHandle<()>>> {
     static THREADS: OnceLock<Mutex<Vec<JoinHandle<()>>>> = OnceLock::new();
     THREADS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Promote `obj` to a cown so its reference count is maintained atomically (the
+/// `rc_atomic` class) and it is safe to share across threads, while it stays
+/// mutable -- reached only under its lock via `with`. The compiler calls this on a
+/// `spawn` capture the closure mutates, *before* the spawn, so the owner (and thus
+/// the count's atomicity) is fixed before the first cross-thread reference; a later
+/// `with` re-tags it as the region bridge, which is also an `rc_atomic` class, so
+/// the count stays atomic across that transition. Shallow: the region interior is
+/// governed by the `with` region barrier.
+///
+/// # Safety
+/// `obj` must be a valid object header (or null).
+pub unsafe extern "C-unwind" fn pp_make_cown(obj: *mut Header) {
+    unsafe {
+        if !obj.is_null() {
+            (*obj).owner = OWNER_COWN;
+        }
+    }
 }
 
 /// The lock byte of a heap object: the header's `flags` field (offset 11),
@@ -116,6 +146,9 @@ pub unsafe extern "C-unwind" fn pp_unlock_all(arr: *mut Header) {
 /// the function pointer with the closure object as its environment.
 pub extern "C-unwind" fn pp_spawn(closure: *mut Header) {
     let captured = SendPtr(closure);
+    // Mark a spawn active before the thread starts and clear it only after the
+    // thread's last heap operation, so the cycle collector defers while it runs.
+    ACTIVE_SPAWNS.fetch_add(1, Ordering::SeqCst);
     let handle = std::thread::spawn(move || {
         // Bind the whole `SendPtr` so the closure captures it (which is `Send`),
         // not its raw pointer field (disjoint capture would not be `Send`).
@@ -135,17 +168,22 @@ pub extern "C-unwind" fn pp_spawn(closure: *mut Header) {
                 dtor(env);
             }
         }
+        // Heap work done; allow collection again once every thread has cleared.
+        ACTIVE_SPAWNS.fetch_sub(1, Ordering::SeqCst);
     });
     threads().lock().unwrap().push(handle);
 }
 
 /// Join every spawned thread. The driver calls this in `main`'s epilogue so the
-/// program waits for spawned work before exiting.
+/// program waits for spawned work before exiting. With all threads joined the main
+/// thread is again the sole mutator, so it runs a collection to reclaim any cycle
+/// garbage whose collection was deferred while spawned threads ran.
 pub extern "C-unwind" fn pp_join_all() {
     let handles: Vec<_> = std::mem::take(&mut *threads().lock().unwrap());
     for h in handles {
         let _ = h.join();
     }
+    crate::gc::pp_gc_collect();
 }
 
 #[cfg(test)]
@@ -306,5 +344,62 @@ mod tests {
         // Both threads ran to completion (no deadlock) and every increment landed.
         assert_eq!(unsafe { *field(a) }, 2 * PER_THREAD);
         assert_eq!(unsafe { *field(b) }, 2 * PER_THREAD);
+    }
+
+    #[test]
+    fn shared_object_refcount_is_atomic_under_threads() {
+        // A `Bridge`-owned object (a `with`-acquired cown a spawn capture is
+        // promoted to) is shared across threads, so its reference count must be
+        // atomic -- a non-atomic increment/decrement loses updates under
+        // contention, which leaks or double-frees. Many threads each do balanced
+        // retain/release; with atomic counting the count returns exactly to its
+        // start. (Before the `rc_atomic` fix, `Bridge` used the non-atomic path and
+        // this lost updates.)
+        use crate::alloc::{pp_release, pp_retain};
+        use crate::mem::pp_live_blocks;
+        use crate::rt::OWNER_BRIDGE;
+
+        let _serial = serial_spawn();
+        let obj = alloc_counter();
+        unsafe {
+            (*obj).rc = 1;
+            (*obj).owner = OWNER_BRIDGE;
+        }
+        let before = pp_live_blocks();
+        let addr = obj as usize;
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 20_000;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let obj = addr as *mut Header;
+                    for _ in 0..PER_THREAD {
+                        unsafe {
+                            pp_retain(obj);
+                            pp_release(obj);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // The base reference is held throughout, so every thread's retain leads its
+        // release and the count never drops to zero mid-run; it returns to 1.
+        assert_eq!(unsafe { (*obj).rc }, 1, "no lost reference-count updates");
+        assert_eq!(
+            pp_live_blocks(),
+            before,
+            "object neither leaked nor freed early"
+        );
+        unsafe { pp_release(obj) };
+        assert_eq!(
+            pp_live_blocks(),
+            before - 1,
+            "the final release frees it exactly once"
+        );
     }
 }

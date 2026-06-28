@@ -1032,6 +1032,9 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 "spawn" => Ok(Some(Type::Void)),
                 // `sync()` joins all spawned threads (R6 value-observability).
                 "sync" => Ok(Some(Type::Void)),
+                // `_cown(c)` / `_freeze(c)` promote a spawn capture to a shared
+                // owner before the spawn; each yields nothing.
+                "_cown" | "_freeze" => Ok(Some(Type::Void)),
                 // Deferred dispatch (DESIGN.md 7.3): resolves+calls a consumer at
                 // runtime, yielding `int32`; not a user function to instantiate.
                 "__rt_dispatch" => Ok(Some(Type::Int(IntKind::I32))),

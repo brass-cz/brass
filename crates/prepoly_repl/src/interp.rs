@@ -552,6 +552,10 @@ impl<'p, 'm> Interp<'p, 'm> {
             "spawn" | "sync" | "with" => Err(
                 "concurrency (`spawn`/`sync`/`with`) is not supported by the REPL runtime".into(),
             ),
+            // Ownership promotions inserted by the spawn auto-acquire pass. The
+            // interpreter is single-threaded, so freezing/cowning a value is a
+            // no-op; a program that actually spawns still errors at `spawn` above.
+            "_cown" | "_freeze" => Ok(Value::Void),
             "__rt_dispatch" => {
                 Err("runtime type dispatch is not supported by the REPL runtime".into())
             }

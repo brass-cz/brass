@@ -199,6 +199,26 @@ fn report_spawn_ownership(modules: &[LoadedModule]) {
     }
 }
 
+/// Make any Rust panic abort the process instead of unwinding. JIT-compiled
+/// frames carry no unwind tables, so a panic in a runtime function called from
+/// JIT code that unwinds into them is undefined behavior. Aborting in the panic
+/// hook -- before unwinding begins -- keeps such a failure well-defined (a clean
+/// abort with the panic message). Installed once, only on the JIT execution path;
+/// the interpreter is pure Rust and unwinds normally, and the in-process JIT
+/// tests call `prepoly_jit_llvm::run` directly without going through here.
+#[cfg(jit_backend)]
+fn install_jit_panic_guard() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            default(info);
+            std::process::abort();
+        }));
+    });
+}
+
 /// Run a checked program through the default runtime: the LLVM JIT, used when the
 /// JIT back end is available (the `jit` feature on a non-wasm target).
 #[cfg(jit_backend)]
@@ -206,6 +226,7 @@ fn execute(
     program: &Program,
     int_lit_types: &HashMap<Span, prepoly_hir::IntKind>,
 ) -> Result<(), String> {
+    install_jit_panic_guard();
     prepoly_jit_llvm::run(program, int_lit_types)
 }
 
