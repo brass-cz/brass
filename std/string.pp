@@ -6,6 +6,13 @@
 // Split `s` on every occurrence of `sep`.
 fun split(s: string, sep: string) -> string[] {
     let result = []
+    // An empty separator has a match at every position, so `_string_find` always
+    // returns 0 and `start` never advances -- an infinite loop. Treat it as no
+    // split (the whole string), mirroring `replace`'s empty-`old` guard.
+    if len(sep) == 0 {
+        result.push(s)
+        return result
+    }
     let start: int64 = 0
     while start < len(s) {
         let rest = _string_slice(s, start, len(s))

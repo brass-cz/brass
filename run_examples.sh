@@ -30,6 +30,6 @@ examples=(
 
 for ex in "${examples[@]}"; do
     echo "===== $ex ====="
-    "$BIN" run "$ex"
+    "$BIN" "$ex"
     echo
 done
