@@ -105,14 +105,14 @@ fn hover_shows_unknown_numbered_signature() {
     assert!(!text.contains("---"), "no bindings without a call: {text}");
 }
 
-/// A generic function called with concrete types shows its generic signature and
-/// a separated section binding each `unknown_N` to the call's concrete type.
+/// Hovering a *call* of a generic function shows its generic signature and a
+/// separated section binding each `unknown_N` to that call's concrete type.
 #[test]
 fn hover_shows_call_site_bindings() {
     let src = "fun f(a, b) {\n    return a\n}\n\nf(1, \"x\")\n";
     let full = full_analysis(src);
-    let (doc, pos) = position(src, "f(a, b)", false);
-    let h = hover::hover(&doc, &full, pos).expect("hover over the function name");
+    let (doc, pos) = position(src, "f(1", false); // the call, not the declaration
+    let h = hover::hover(&doc, &full, pos).expect("hover over the call");
     let text = hover_text(&h);
     assert!(
         text.contains("fun f(a: unknown_0, b: unknown_1) -> unknown_0"),
@@ -122,6 +122,55 @@ fn hover_shows_call_site_bindings() {
     assert!(
         text.contains("unknown_0 = int32") && text.contains("unknown_1 = string"),
         "bindings: {text}"
+    );
+}
+
+/// Hovering the *declaration* (not a call) shows only the generic signature.
+#[test]
+fn hover_declaration_has_no_bindings() {
+    let src = "fun f(a, b) {\n    return a\n}\n\nf(1, \"x\")\n";
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "f(a, b)", false);
+    let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover over the declaration"));
+    assert!(text.contains("fun f("), "signature: {text}");
+    assert!(
+        !text.contains("---"),
+        "no bindings at the declaration: {text}"
+    );
+}
+
+/// With several instantiations, each call's hover binds the variables to that
+/// call's own concrete types, not an arbitrary call's.
+#[test]
+fn hover_bindings_follow_the_call_under_the_cursor() {
+    let src = concat!(
+        "fun double(a: infer) {\n",
+        "    for e in a {\n",
+        "        e *= 2\n",
+        "    }\n",
+        "}\n",
+        "\n",
+        "const arr = [1.1, 2.2, 3.3]\n",
+        "double(arr)\n",
+        "const arr2 = [1, 2, 3]\n",
+        "double(arr2)\n",
+    );
+    let full = full_analysis(src);
+
+    let (doc, pos) = position(src, "double(arr)", false);
+    let t1 = hover_text(&hover::hover(&doc, &full, pos).expect("hover first call"));
+    assert!(t1.contains("unknown_0 = float64[]"), "first call: {t1}");
+    assert!(
+        !t1.contains("int32"),
+        "first call must not show int32: {t1}"
+    );
+
+    let (doc, pos) = position(src, "double(arr2)", false);
+    let t2 = hover_text(&hover::hover(&doc, &full, pos).expect("hover second call"));
+    assert!(t2.contains("unknown_0 = int32[]"), "second call: {t2}");
+    assert!(
+        !t2.contains("float64"),
+        "second call must not show float64: {t2}"
     );
 }
 
@@ -445,5 +494,40 @@ fn for_over_non_iterable_is_an_error() {
     assert!(
         diags.iter().any(|(m, _)| m.contains("cannot iterate")),
         "expected a cannot-iterate error: {diags:?}"
+    );
+}
+
+/// A recursive call passes the function's own type variables as arguments, which
+/// is not a concrete instantiation; such variable-to-variable bindings are
+/// dropped, so hovering the recursive call shows only the generic signature,
+/// while a concrete call still shows concrete bindings.
+#[test]
+fn hover_recursive_call_has_no_variable_bindings() {
+    let src = concat!(
+        "fun gcd(a, b) {\n",
+        "    if b == 0 {\n",
+        "        return a\n",
+        "    } else {\n",
+        "        return gcd(b, a % b)\n",
+        "    }\n",
+        "}\n",
+        "\n",
+        "gcd(48, 36)\n",
+    );
+    let full = full_analysis(src);
+
+    let (doc, pos) = position(src, "gcd(b", false);
+    let recursive = hover_text(&hover::hover(&doc, &full, pos).expect("hover recursive call"));
+    assert!(recursive.contains("fun gcd("), "signature: {recursive}");
+    assert!(
+        !recursive.contains("---"),
+        "no variable-to-variable bindings on a recursive call: {recursive}"
+    );
+
+    let (doc, pos) = position(src, "gcd(48", false);
+    let concrete = hover_text(&hover::hover(&doc, &full, pos).expect("hover concrete call"));
+    assert!(
+        concrete.contains("unknown_0 = int32"),
+        "concrete call still binds: {concrete}"
     );
 }

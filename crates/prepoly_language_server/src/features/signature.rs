@@ -21,8 +21,11 @@ use crate::render::{UnknownNamer, render_signature_into, render_type};
 /// real ids. They still bind from the call site by position.
 const SYNTH_BASE: u32 = 0xFFFF_0000;
 
-/// The hover markdown for free function `f`.
-pub fn function_markdown(full: &FullAnalysis, f: &FunInfo) -> String {
+/// The hover markdown for free function `f`. When `call_args` is given (the
+/// cursor is on a call), a bindings section maps each `unknown_N` to the type
+/// that specific call instantiates it with; otherwise only the generic
+/// signature is shown.
+pub fn function_markdown(full: &FullAnalysis, f: &FunInfo, call_args: Option<&[Type]>) -> String {
     let body_span = f.decl.body.span;
 
     // For each parameter, the type rendered (`overrides[i]` overrides an
@@ -65,9 +68,10 @@ pub fn function_markdown(full: &FullAnalysis, f: &FunInfo) -> String {
     let mut namer = UnknownNamer::default();
     let sig = render_signature_into(&f.signature, &overrides, ret_override.as_ref(), &mut namer);
 
-    // Bind the signature's variables to the first call's concrete arguments.
+    // Bind the signature's variables to the concrete arguments of the call
+    // under the cursor.
     let mut bound: HashMap<u32, Type> = HashMap::new();
-    if let Some(args) = nav::call_arg_types(full, &f.signature.name) {
+    if let Some(args) = call_args {
         for (i, param) in param_types.iter().enumerate() {
             if let (Some(generic), Some(concrete)) = (param, args.get(i)) {
                 nav::collect_bindings(generic, concrete, &mut bound);
@@ -78,6 +82,14 @@ pub fn function_markdown(full: &FullAnalysis, f: &FunInfo) -> String {
     let mut lines: Vec<(usize, String)> = Vec::new();
     for (id, n) in namer.assignments() {
         if let Some(concrete) = bound.get(&id) {
+            // Only show a concrete instantiation. A binding whose value still has
+            // inference variables comes from a recursive (or otherwise generic)
+            // call -- e.g. `gcd`'s recursion maps one of its own type variables to
+            // another -- and would just restate the signature's variables, so it
+            // is dropped rather than shown as a misleading `unknown_j = unknown_i`.
+            if !nav::free_vars(concrete).is_empty() {
+                continue;
+            }
             let mut cn = UnknownNamer::default();
             lines.push((
                 n,

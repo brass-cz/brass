@@ -247,35 +247,32 @@ fn return_value_in_expr(e: &Expr) -> Option<Span> {
     }
 }
 
-/// The concrete argument types of the first call to free function `name`, for
-/// binding the function's generic type variables to a call instance.
-pub fn call_arg_types(full: &FullAnalysis, name: &str) -> Option<Vec<Type>> {
+/// The concrete argument types of the call expression whose whole span is
+/// `call_span`, for binding a function's generic type variables to the specific
+/// call instance under the cursor (rather than an arbitrary one).
+pub fn call_args_at_span(full: &FullAnalysis, call_span: Span) -> Option<Vec<Type>> {
     let mut result = None;
     let mut visit = |e: &Expr| {
         if result.is_some() {
             return;
         }
-        if let Expr::Call(callee, args, _) = e
-            && let Expr::Ident(n, _) = callee.as_ref()
-            && n == name
+        if let Expr::Call(_, args, span) = e
+            && *span == call_span
         {
-            let types = args
-                .iter()
-                .map(|a| {
-                    let span = a.expr.span();
-                    full.typed
-                        .expressions
-                        .iter()
-                        .find(|te| te.span == span)
-                        .map(|te| te.ty.clone())
-                        .unwrap_or(Type::Unknown(u32::MAX))
-                })
-                .collect();
-            result = Some(types);
+            result = Some(args.iter().map(|a| arg_type(full, a.expr.span())).collect());
         }
     };
     walk_exprs(&full.main_ast, &mut visit);
     result
+}
+
+fn arg_type(full: &FullAnalysis, span: Span) -> Type {
+    full.typed
+        .expressions
+        .iter()
+        .find(|e| e.span == span)
+        .map(|e| e.ty.clone())
+        .unwrap_or(Type::Unknown(u32::MAX))
 }
 
 /// Bind the inference variables of a `generic` type to the corresponding parts

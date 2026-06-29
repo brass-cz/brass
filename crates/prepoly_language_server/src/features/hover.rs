@@ -22,15 +22,21 @@ pub fn hover(doc: &Document, full: &FullAnalysis, pos: Position) -> Option<Hover
     let global = local + full.main_base;
     let module = vec!["main".to_string()];
 
-    // Prefer the tightest typed expression: it gives the precise inferred type
-    // of whatever subexpression the cursor sits on.
-    if let Some(expr) = nav::smallest_typed_at(full, global) {
+    // The tightest typed expression gives the precise inferred type of whatever
+    // subexpression the cursor sits on.
+    let expr = nav::smallest_typed_at(full, global);
+    if let Some(expr) = expr {
         match &expr.kind {
             TypedExprKind::Ident(name) => {
-                // A bare name that resolves to a function is best shown as its
-                // signature (with parameter names); otherwise show its type.
+                // A bare name resolving to a function (used as a value) shows its
+                // signature, with no specific call's bindings; otherwise its type.
                 if let Some(f) = full.program.resolve_function(&module, name) {
-                    return Some(function_hover(full, f, local_range(doc, full, expr.span)));
+                    return Some(function_hover(
+                        full,
+                        f,
+                        None,
+                        local_range(doc, full, expr.span),
+                    ));
                 }
                 let mut namer = UnknownNamer::default();
                 let value = format!("{name}: {}", render_type(&expr.ty, &mut namer));
@@ -41,65 +47,58 @@ pub fn hover(doc: &Document, full: &FullAnalysis, pos: Position) -> Option<Hover
                 let value = format!("{name}: {}", render_type(&expr.ty, &mut namer));
                 return Some(markup(value, local_range(doc, full, expr.span)));
             }
-            _ => {
-                // The tightest typed node is a compound expression (call, match,
-                // if-let, block, ...). If the cursor is on an identifier within
-                // it -- a callee, a constructor, or a pattern binding that has no
-                // typed node of its own -- resolve that identifier; otherwise
-                // show the whole expression's type.
-                if let Some(h) = ident_hover(doc, full, local, global, &module) {
-                    return Some(h);
-                }
-                let mut namer = UnknownNamer::default();
-                return Some(markup(
-                    render_type(&expr.ty, &mut namer),
-                    local_range(doc, full, expr.span),
-                ));
-            }
+            _ => {}
         }
     }
 
-    // No typed expression here: the cursor may be on a local binding's
-    // declaration, a type annotation, or a declaration name.
-    ident_hover(doc, full, local, global, &module)
-}
+    // An identifier under the cursor: a local variable, a function (with the
+    // bindings of the call it sits in, when any), or a type. A local shadows a
+    // same-named symbol.
+    if let Some((name, span)) = nav::ident_at(&doc.text, local) {
+        if let Some(ty) = nav::local_var_type(full, global, &name) {
+            let mut namer = UnknownNamer::default();
+            return Some(markup(
+                format!("{name}: {}", render_type(&ty, &mut namer)),
+                Some(doc.range_of(span)),
+            ));
+        }
+        if let Some(f) = full.program.resolve_function(&module, &name) {
+            // When the cursor sits in a call expression, bind the function's
+            // type variables to that specific call's argument types.
+            let call_args = expr
+                .filter(|e| matches!(e.kind, TypedExprKind::Call))
+                .and_then(|e| nav::call_args_at_span(full, e.span));
+            return Some(function_hover(full, f, call_args, Some(doc.range_of(span))));
+        }
+        if let Some(t) = full.program.resolve_type(&module, &name) {
+            return Some(markup(render_type_def(t), Some(doc.range_of(span))));
+        }
+    }
 
-/// Resolve the identifier under the cursor for hover: a local variable (its
-/// `let`/parameter/loop/pattern binding has no typed node of its own) shows its
-/// inferred type and shadows any same-named symbol; then a function shows its
-/// signature, and a type its definition.
-fn ident_hover(
-    doc: &Document,
-    full: &FullAnalysis,
-    local: usize,
-    global: usize,
-    module: &[String],
-) -> Option<Hover> {
-    let (name, span) = nav::ident_at(&doc.text, local)?;
-    if let Some(ty) = nav::local_var_type(full, global, &name) {
+    // A compound expression with nothing more specific under the cursor.
+    if let Some(expr) = expr {
         let mut namer = UnknownNamer::default();
         return Some(markup(
-            format!("{name}: {}", render_type(&ty, &mut namer)),
-            Some(doc.range_of(span)),
+            render_type(&expr.ty, &mut namer),
+            local_range(doc, full, expr.span),
         ));
-    }
-    if let Some(f) = full.program.resolve_function(module, &name) {
-        return Some(function_hover(full, f, Some(doc.range_of(span))));
-    }
-    if let Some(t) = full.program.resolve_type(module, &name) {
-        return Some(markup(render_type_def(t), Some(doc.range_of(span))));
     }
     None
 }
 
-/// Hover for a free function: its generic signature plus, when it is called with
-/// concrete types, the `unknown_N` bindings recovered from a call site (see
-/// [`crate::features::signature`]).
-fn function_hover(full: &FullAnalysis, f: &prepoly_hir::FunInfo, range: Option<Range>) -> Hover {
+/// Hover for a free function: its generic signature plus, when the cursor is on
+/// a call (`call_args` given), the `unknown_N` bindings that call instantiates
+/// (see [`crate::features::signature`]).
+fn function_hover(
+    full: &FullAnalysis,
+    f: &prepoly_hir::FunInfo,
+    call_args: Option<Vec<prepoly_hir::Type>>,
+    range: Option<Range>,
+) -> Hover {
     Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
-            value: crate::features::signature::function_markdown(full, f),
+            value: crate::features::signature::function_markdown(full, f, call_args.as_deref()),
         }),
         range,
     }
