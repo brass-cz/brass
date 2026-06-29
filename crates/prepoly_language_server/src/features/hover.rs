@@ -5,7 +5,7 @@
 //! `unknown_N` (see [`crate::render`]), which is the contract for displaying a
 //! function type that inference has left partly open.
 
-use prepoly_hir::TypedExprKind;
+use prepoly_hir::{CallableSignature, Type, TypeKind, TypedExprKind};
 use prepoly_lexer::Span;
 use tower_lsp_server::ls_types::{
     Hover, HoverContents, MarkupContent, MarkupKind, Position, Range,
@@ -14,13 +14,20 @@ use tower_lsp_server::ls_types::{
 use crate::analysis::FullAnalysis;
 use crate::document::Document;
 use crate::features::nav;
-use crate::render::{UnknownNamer, render_type, render_type_def};
+use crate::render::{UnknownNamer, render_signature_full, render_type, render_type_def};
 
 /// Build the hover response for `pos` in `doc`, using the full analysis.
 pub fn hover(doc: &Document, full: &FullAnalysis, pos: Position) -> Option<Hover> {
     let local = doc.offset_at(pos);
     let global = local + full.main_base;
     let module = vec!["main".to_string()];
+
+    // The cursor on a method name in `recv.method(...)` shows the *method's* type
+    // (its signature), not the call's result type. (A method called through UFCS is
+    // a free function and is handled by the `resolve_function` path below.)
+    if let Some(h) = method_hover(doc, full, local, global) {
+        return Some(h);
+    }
 
     // The tightest typed expression gives the precise inferred type of whatever
     // subexpression the cursor sits on.
@@ -84,6 +91,74 @@ pub fn hover(doc: &Document, full: &FullAnalysis, pos: Position) -> Option<Hover
         ));
     }
     None
+}
+
+/// Hover for the method name in `recv.method(...)`: the method's signature (its
+/// type). Returns `None` unless the cursor sits on an identifier immediately
+/// preceded by `.` whose receiver resolves to a record type declaring that method,
+/// so plain fields, UFCS free functions, and built-in methods fall through to the
+/// general hover paths. The return slot is filled from the enclosing call's
+/// inferred result type when present, so an unannotated method return shows its
+/// concrete type rather than a bare `unknown_N`.
+fn method_hover(doc: &Document, full: &FullAnalysis, local: usize, global: usize) -> Option<Hover> {
+    let (name, span) = nav::ident_at(&doc.text, local)?;
+    // A member access: a `.` immediately before the name. The receiver expression
+    // ends exactly at that `.`.
+    let bytes = doc.text.as_bytes();
+    if span.lo == 0 || bytes.get(span.lo - 1) != Some(&b'.') {
+        return None;
+    }
+    let recv_hi = full.main_base + (span.lo - 1);
+    let recv_ty = receiver_type_at(full, recv_hi)?;
+    let sig = record_method(full, &recv_ty, &name)?;
+    let ret = enclosing_call_ty(full, global);
+    let rendered = render_signature_full(sig, &[], ret.as_ref());
+    Some(markup(rendered, Some(doc.range_of(span))))
+}
+
+/// The inferred type of the receiver expression ending at global offset `hi` (the
+/// widest one, so `foo.bar.method` uses `foo.bar`). Mirrors completion's receiver
+/// lookup.
+fn receiver_type_at(full: &FullAnalysis, hi: usize) -> Option<Type> {
+    full.typed
+        .expressions
+        .iter()
+        .filter(|e| e.span.hi == hi)
+        .min_by_key(|e| e.span.lo)
+        .map(|e| e.ty.clone())
+}
+
+/// The signature of method `name` declared on the record type `recv_ty` resolves
+/// to (seeing through reference/mutability/const/nullable wrappers), or `None` if
+/// `recv_ty` is not a record or has no such method (e.g. `name` is a field).
+fn record_method<'a>(
+    full: &'a FullAnalysis,
+    recv_ty: &Type,
+    name: &str,
+) -> Option<&'a CallableSignature> {
+    let mut t = recv_ty;
+    while let Type::Ref(i) | Type::Mut(i) | Type::ConstOf(i) | Type::Nullable(i) = t {
+        t = i;
+    }
+    let id = match t {
+        Type::Record(n) | Type::Sum(n) => n.id,
+        _ => return None,
+    };
+    match &full.program.type_by_id(id)?.kind {
+        TypeKind::Record { methods, .. } => methods.get(name).map(|m| &m.signature),
+        _ => None,
+    }
+}
+
+/// The result type of the innermost call expression covering `global` (the method
+/// call the cursor sits in), used as the method's inferred return type.
+fn enclosing_call_ty(full: &FullAnalysis, global: usize) -> Option<Type> {
+    full.typed
+        .expressions
+        .iter()
+        .filter(|e| matches!(e.kind, TypedExprKind::Call) && nav::contains(e.span, global))
+        .min_by_key(|e| e.span.hi - e.span.lo)
+        .map(|e| e.ty.clone())
 }
 
 /// Hover for a free function: its generic signature plus, when the cursor is on

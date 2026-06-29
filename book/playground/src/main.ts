@@ -34,8 +34,36 @@ let result = elems[0]
 for elem in elems.slice(1, elems.len()) {
     result = gcd(result, elem)
 }
+println("GCD is {result}")
 
-println("GCD is {result}")`;
+
+// Type definition example
+type Person = {
+    first_name: string,
+    last_name: string,
+    display(self) {
+        return "{self.first_name} {self.last_name}"
+    }
+}
+fun get_display_name(obj) {
+    if let person = Person.from(obj) {
+        return person.display()
+    } else {
+        error("not a Person type")!
+    }
+}
+println(
+    get_display_name({
+        first_name: "Grace",
+        last_name: "Hopper",
+    })
+)
+println(
+    get_display_name({
+        name: "Haskell Curry",
+        age: 125,
+    })
+)`;
 
 const setupMonaco = async () => {
   monaco.languages.register({ id: "prepoly" });

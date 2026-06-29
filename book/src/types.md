@@ -262,3 +262,28 @@ println(get_name({ name: "Asimov" })) // Asimov
 println(get_name({ age: 20 }))        // no name
 println(get_name({ name: 1 }))        // no name
 ```
+
+## `anonymous` structure
+
+Anonymous structure can be written as `{ field: value, ... }`.
+You can access its fields by null checking or type conversion using `T.from()`:
+
+```prepoly
+fun get_name(obj) {
+    if let person = Person.from(obj) {
+        return person.display()
+    } else {
+        error("not a Person type!")!
+    }
+}
+
+// Ok: Hideki Yukawa
+println(
+    get_name({
+        first_name: "Hideki",
+        last_name: "Yukawa"
+    })
+)
+// error: not a Person type
+println(get_name({ last_name: "Yukawa" }))
+```

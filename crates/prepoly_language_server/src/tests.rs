@@ -262,6 +262,36 @@ fn hover_shows_inferred_return_type() {
     );
 }
 
+/// Hovering a method call shows the *method's* signature (its type), not the
+/// call's result type, with an unannotated return filled from the call site.
+#[test]
+fn hover_method_call_shows_method_signature() {
+    let src = concat!(
+        "type Person = {\n",
+        "    first_name: string,\n",
+        "    last_name: string,\n",
+        "    display(self) {\n",
+        "        return \"{self.first_name} {self.last_name}\"\n",
+        "    },\n",
+        "}\n",
+        "\n",
+        "fun main() {\n",
+        "    let p = Person { first_name: \"a\", last_name: \"b\" }\n",
+        "    println(p.display())\n",
+        "}\n",
+    );
+    let full = full_analysis(src);
+    // `display()` is the call (the declaration is `display(self)`), so this lands
+    // on the method name in `p.display()`.
+    let (doc, pos) = position(src, "display()", false);
+    let h = hover::hover(&doc, &full, pos).expect("hover over the method call");
+    let text = hover_text(&h);
+    assert!(
+        text.contains("fun display(self) -> string"),
+        "method type with inferred return must be shown, not the call result: {text}"
+    );
+}
+
 /// Go-to-definition on a call jumps to the called function's declaration.
 #[test]
 fn definition_jumps_to_function() {
