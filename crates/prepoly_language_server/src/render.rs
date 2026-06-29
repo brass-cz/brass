@@ -77,6 +77,8 @@ pub fn render_type(ty: &Type, namer: &mut UnknownNamer) -> String {
         ),
         Type::Nullable(t) => format!("{}?", render_type(t, namer)),
         Type::ConstOf(t) => format!("const {}", render_type(t, namer)),
+        Type::Mut(t) => format!("mut({})", render_type(t, namer)),
+        Type::Ref(t) => format!("ref({})", render_type(t, namer)),
         Type::Unknown(id) => namer.named(*id),
         Type::SelfType => "Self".into(),
     }

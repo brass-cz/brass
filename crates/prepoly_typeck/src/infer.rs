@@ -1028,6 +1028,8 @@ impl<'a> Checker<'a> {
                 }
                 Ok(prepoly_hir::structural_record(resolved))
             }
+            TypeExpr::Mut(inner, _) => Ok(Type::Mut(Box::new(self.resolve_type(inner)?))),
+            TypeExpr::Ref(inner, _) => Ok(Type::Ref(Box::new(self.resolve_type(inner)?))),
         }
     }
 
@@ -4551,7 +4553,9 @@ fn is_concrete_type(ty: &Type) -> bool {
         Type::Array(inner, _)
         | Type::Slice(inner)
         | Type::Nullable(inner)
-        | Type::ConstOf(inner) => is_concrete_type(inner),
+        | Type::ConstOf(inner)
+        | Type::Mut(inner)
+        | Type::Ref(inner) => is_concrete_type(inner),
         Type::Fun(params, ret) => params.iter().all(is_concrete_type) && is_concrete_type(ret),
         Type::Tuple(elems) => elems.iter().all(is_concrete_type),
         _ => true,
@@ -4727,7 +4731,9 @@ fn visit_unknowns(ty: &Type, record: &mut impl FnMut(u32)) {
         Type::Array(inner, _)
         | Type::Slice(inner)
         | Type::Nullable(inner)
-        | Type::ConstOf(inner) => visit_unknowns(inner, record),
+        | Type::ConstOf(inner)
+        | Type::Mut(inner)
+        | Type::Ref(inner) => visit_unknowns(inner, record),
         Type::Fun(params, ret) => {
             params
                 .iter()

@@ -56,6 +56,9 @@ pub(crate) fn resolve_simple_type(te: &TypeExpr) -> Option<Type> {
             }
             Some(prepoly_hir::structural_record(resolved))
         }
+        // Mutability and reference-ness are front-end concepts; the back end sees
+        // the plain `T` (a reference is a pointer, the same as the value handle).
+        TypeExpr::Mut(inner, _) | TypeExpr::Ref(inner, _) => resolve_simple_type(inner),
     }
 }
 

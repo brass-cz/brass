@@ -36,7 +36,7 @@ use crate::mono::{
 /// fields are not yet released recursively, so they leak rather than
 /// use-after-free (they were retained on store); scalar-content aggregates and all
 /// strings/records reclaim fully.
-fn rc_managed(ty: &Type) -> bool {
+pub fn rc_managed(ty: &Type) -> bool {
     matches!(
         ty,
         Type::Str
@@ -414,6 +414,11 @@ pub trait Codegen {
     /// Remove and return the last element of growable array `arr` as a nullable
     /// (`elem_ty?`): the element value, or null when `arr` is empty.
     fn pop(&mut self, arr: Self::Value, elem_ty: &Type) -> Self::Value;
+    /// A fresh, independent deep copy of `value` of type `ty` (the value-passing of
+    /// a non-reference heap argument): an aggregate (array/slice/record/sum/tuple)
+    /// is recursively copied; any other value is returned with its reference count
+    /// balanced so the caller-side temporary owns a reference.
+    fn deep_copy(&mut self, value: Self::Value, ty: &Type) -> Self::Value;
 
     // ===== closures (leaf) =====
 
@@ -1055,6 +1060,14 @@ pub trait Codegen {
                 let variant = str_const(&args[1]).unwrap_or_default();
                 self.pattern_matches(subj, &subj_ty, variant)
             }
+            // `__deep_copy(x)`: a fresh, independent copy of an aggregate argument
+            // (the default value-passing for a non-reference heap parameter). The
+            // leaf balances reference counts for non-aggregates.
+            "__deep_copy" => {
+                let ty = operand_type_of(&args[0], &f.local_types);
+                let v = self.codegen_operand(program, f, &args[0], &ty);
+                self.deep_copy(v, &ty)
+            }
             // `result_is_ok(r)` is the `Ok` tag test of the `r!` operator.
             "result_is_ok" => {
                 let subj_ty = operand_type_of(&args[0], &f.local_types);
@@ -1433,7 +1446,7 @@ fn str_const(op: &Operand) -> Option<&str> {
 
 /// The element type of an array/slice type, or `void` if not a sequence. A
 /// narrowed nullable array (`int32[]?` proven non-null) is unwrapped first.
-fn element_type(ty: &Type) -> Type {
+pub fn element_type(ty: &Type) -> Type {
     match unwrap_nullable(ty) {
         Type::Slice(e) | Type::Array(e, _) => (**e).clone(),
         _ => Type::Void,

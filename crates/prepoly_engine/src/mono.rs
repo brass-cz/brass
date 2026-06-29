@@ -387,6 +387,7 @@ pub fn monomorphize<'m>(mir: &'m MirProgram, program: &Program) -> Result<MonoPr
             &init.module,
             Vec::new(),
             Some(Type::Void),
+            None,
             &[],
             Vec::new(),
             false,
@@ -609,18 +610,22 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             .by_fn
             .get(base)
             .ok_or_else(|| format!("unknown function `{base}`"))?;
-        let ret_ann = self
+        let sig_ret = self
             .program
             .functions
             .get(base)
-            .and_then(|info| info.signature.ret_ty.clone())
-            .filter(is_supported);
+            .and_then(|info| info.signature.ret_ty.clone());
+        // A `T!` return fixes the Ok payload `T` (even if the inferred error type
+        // is left open); keep it so the body cannot redefine it.
+        let declared_ok = sig_ret.as_ref().and_then(result_concrete_ok);
+        let ret_ann = sig_ret.filter(is_supported);
         self.type_and_store(
             sym,
             &func.body,
             &func.module,
             type_args,
             ret_ann,
+            declared_ok,
             &[],
             Vec::new(),
             false,
@@ -640,6 +645,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         module: &[String],
         type_args: Vec<Type>,
         ret_ann: Option<Type>,
+        declared_ok: Option<Type>,
         capture_seed: &[(LocalId, Type)],
         captures: Vec<LocalId>,
         is_closure: bool,
@@ -713,7 +719,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             }
             if fallible
                 && ret.is_none()
-                && let Some(t) = self.infer_result_ret(body, &local_types)?
+                && let Some(t) = self.infer_result_ret(body, &local_types, declared_ok.as_ref())?
             {
                 ret = Some(t);
                 changed = true;
@@ -799,12 +805,19 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
     /// payload from bare (non-`Result`) returns or explicit `Ok` constructions,
     /// the `err` payload from `error(...)` / `Err` constructions, and either from
     /// a directly-returned `Result`. `None` until both payloads are resolvable.
+    ///
+    /// `declared_ok` is the Ok payload fixed by a `T!` return annotation; when
+    /// present it is authoritative (the body's own bare returns do not override it),
+    /// so a then-branch returning a wrong type does not redefine the Ok payload --
+    /// essential for the structural fold, which folds that branch away by comparing
+    /// the return against the *declared* Ok type.
     fn infer_result_ret(
         &self,
         body: &MirBody,
         local_types: &[Option<Type>],
+        declared_ok: Option<&Type>,
     ) -> Result<Option<Type>, String> {
-        let mut ok_t: Option<Type> = None;
+        let mut ok_t: Option<Type> = declared_ok.cloned();
         let mut err_e: Option<Type> = None;
         let note = |slot: &mut Option<Type>, t: Option<Type>| {
             if slot.is_none()
@@ -852,6 +865,14 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         }
         match (ok_t, err_e) {
             (Some(ok), Some(err)) => Ok(Some(result_type(ok, err))),
+            // A callable made fallible only by a `T!` return annotation never
+            // produces an error, so its error payload is unconstrained: default it
+            // to `string` (the conventional error type) once the Ok payload is
+            // known. Guarded by the absence of any error source, so a fallible body
+            // that does raise errors still waits for the real error type.
+            (Some(ok), None) if !body_has_error_source(body) => {
+                Ok(Some(result_type(ok, Type::Str)))
+            }
             _ => Ok(None),
         }
     }
@@ -1042,6 +1063,12 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             // other builtins are out of scope.
             Rvalue::Call(Callee::Builtin(name), args) => match name.as_str() {
                 "value_matches" => Ok(Some(Type::Bool)),
+                // `__deep_copy(x)` produces a value of the same type as `x` (a fresh
+                // copy of an aggregate; a balanced pass-through otherwise).
+                "__deep_copy" => match args.first() {
+                    Some(op) => self.operand_type(op, local_types),
+                    None => Ok(Some(Type::Void)),
+                },
                 // `r!` lowers to `result_is_ok(r)` + an Ok-payload load + Err
                 // propagation; the first is a tag test (bool).
                 "result_is_ok" => Ok(Some(Type::Bool)),
@@ -1303,12 +1330,14 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 "mutual recursion (`{cur_sym}` <-> `{target}`) is unsupported on the typed backend"
             ));
         }
+        let declared_ok = ret_ann.as_ref().and_then(result_concrete_ok);
         let sym = self.type_and_store(
             target,
             body,
             module,
             type_args,
             ret_ann,
+            declared_ok,
             &[],
             Vec::new(),
             false,
@@ -1746,6 +1775,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             &clo.module,
             param_types.to_vec(),
             None,
+            None,
             &capture_seed,
             clo.captures.clone(),
             true,
@@ -2067,6 +2097,14 @@ pub fn cond_static_truthiness(
 /// whose value's primitive kind clearly differs from `ret` (no coercion bridges
 /// `string` vs `int`, etc.). A nested branch in the then-arm is not folded.
 fn then_return_conflicts(body: &MirBody, local_types: &[Type], ret: &Type, then: BlockId) -> bool {
+    // In a fallible callable a bare `return v` is the `Ok` payload, so compare the
+    // returned value against the Ok payload type, not the whole `Result`.
+    let target = match ret {
+        Type::Sum(n) if n.id == RESULT_TYPE_ID => {
+            n.result_payloads().map(|(ok, _)| ok).unwrap_or(ret)
+        }
+        _ => ret,
+    };
     let mut id = then;
     let mut seen = HashSet::new();
     loop {
@@ -2075,12 +2113,46 @@ fn then_return_conflicts(body: &MirBody, local_types: &[Type], ret: &Type, then:
         }
         match &body.block(id).term {
             Terminator::Return(op) => {
-                return primitive_kind_conflict(&operand_type_of(op, local_types), ret);
+                let op_ty = operand_type_of(op, local_types);
+                // A returned `Result` flows whole; only a bare value is the Ok
+                // payload, so only it is compared against the Ok type.
+                if matches!(&op_ty, Type::Sum(n) if n.id == RESULT_TYPE_ID) {
+                    return false;
+                }
+                return primitive_kind_conflict(&op_ty, target);
             }
             Terminator::Goto(b) => id = *b,
             _ => return false,
         }
     }
+}
+
+/// The concrete (supported) Ok payload of a `Result` return type fixed by a `T!`
+/// annotation, or `None` if `t` is not such a `Result` or its Ok payload is not
+/// yet concrete. Authoritative for the fallible return's Ok payload.
+fn result_concrete_ok(t: &Type) -> Option<Type> {
+    match t {
+        Type::Sum(n) if n.id == RESULT_TYPE_ID => n
+            .result_payloads()
+            .map(|(ok, _)| ok.clone())
+            .filter(is_supported),
+        _ => None,
+    }
+}
+
+/// Whether a fallible body actually raises an error: an `error(...)` (an `Err`
+/// construction) or an `expr!` propagation (a `result_is_ok` test). A body with
+/// neither never produces an `Err`, so its `Result` error payload is free.
+fn body_has_error_source(body: &MirBody) -> bool {
+    body.blocks.iter().any(|b| {
+        b.stmts.iter().any(|s| match s {
+            MirStmt::Assign(_, Rvalue::Variant { ty, variant, .. }) => {
+                ty == "Result" && variant == "Err"
+            }
+            MirStmt::Assign(_, Rvalue::Call(Callee::Builtin(n), _)) => n == "result_is_ok",
+            _ => false,
+        })
+    })
 }
 
 /// Whether `a` and `b` are concrete primitives of different kinds (string/bool/

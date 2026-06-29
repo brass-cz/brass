@@ -53,21 +53,27 @@ impl ConstChecker<'_> {
         // and method bodies start from the module's global const bindings.
         let globals = self.global_consts();
         for f in self.program.functions.values() {
-            self.check_block(&f.decl.body, &mut vec![globals.clone()]);
+            // Parameters are mutable handles within their own body (mutating one is
+            // the very thing that makes the parameter mutable to callers), and they
+            // shadow any like-named global const. A `ref(T)` parameter is an
+            // immutable reference, so it binds as const instead.
+            let params = param_scope(&f.signature.params, false);
+            self.check_block(&f.decl.body, &mut vec![globals.clone(), params]);
         }
         for t in self.program.types.values() {
-            let bodies: Vec<&Block> = match &t.kind {
-                TypeKind::Record { methods, .. } => methods
-                    .values()
-                    .filter_map(|m| m.decl.body.as_ref())
-                    .collect(),
-                TypeKind::Sum { variants } => variants
-                    .iter()
-                    .flat_map(|v| v.methods.values().filter_map(|m| m.decl.body.as_ref()))
-                    .collect(),
+            let methods: Vec<&prepoly_hir::MethodInfo> = match &t.kind {
+                TypeKind::Record { methods, .. } => methods.values().collect(),
+                TypeKind::Sum { variants } => {
+                    variants.iter().flat_map(|v| v.methods.values()).collect()
+                }
             };
-            for body in bodies {
-                self.check_block(body, &mut vec![globals.clone()]);
+            for m in methods {
+                let Some(body) = m.decl.body.as_ref() else {
+                    continue;
+                };
+                // A method also binds `self` (mutable within the body).
+                let params = param_scope(&m.signature.params, true);
+                self.check_block(body, &mut vec![globals.clone(), params]);
             }
         }
         // Top-level init statements build their scope up in order, so a global
@@ -243,6 +249,21 @@ impl ConstChecker<'_> {
         let Expr::Field(receiver, method, _) = callee else {
             return;
         };
+        // A built-in growable-array mutator (`push`/`insert`/`remove`/`pop`) on a
+        // const array -- or an array reachable from a const struct/sum/tuple root --
+        // modifies a value declared immutable, so it is rejected. The receiver is a
+        // const place that is not a user nominal type (records/sums whose own
+        // methods are checked via `mutating_methods` below have a type name).
+        if matches!(method.as_str(), "push" | "insert" | "remove" | "pop")
+            && self.const_place_type(receiver, scopes).is_none()
+            && let Some(root) = self.const_root(receiver, scopes)
+        {
+            self.errors.push(TypeError {
+                message: format!("cannot call mutating method `{method}` on const value `{root}`"),
+                span,
+            });
+            return;
+        }
         // The receiver may be a nested projection of a const value
         // (e.g. `o.inner.bump()`); a mutating method on any field reachable from
         // a const root is rejected (DESIGN.md 5.4 const propagation).
@@ -261,9 +282,23 @@ impl ConstChecker<'_> {
         }
     }
 
-    /// Reject passing a const record/sum value into a parameter position that
-    /// the callee mutates. The callee taking ownership of the mutation would let
-    /// it modify a value declared immutable at the call site.
+    /// The const binding a place is rooted in (its root identifier), or `None`
+    /// when the root is not const. Unlike `const_place_type` this does not require
+    /// the place to be a user nominal type, so it also covers const arrays/tuples.
+    fn const_root<'a>(&self, place: &'a Expr, scopes: &ConstScopes) -> Option<&'a str> {
+        let root = root_ident(place)?;
+        match self.const_binding(scopes, root) {
+            Some(Binding::Const(_)) => Some(root),
+            _ => None,
+        }
+    }
+
+    /// Reject passing an immutable (`const`-rooted) value into a parameter the
+    /// callee requires to be mutable: it mutates that parameter through the shared
+    /// reference, which would modify a value declared immutable at the call site.
+    /// Any const-rooted place qualifies (records, sums, arrays, tuples) -- a
+    /// primitive parameter is never marked mutable (it cannot be mutated through a
+    /// reference), so this does not reject a copied `const` primitive argument.
     fn check_const_args_to_mutating_fn(
         &mut self,
         callee: &Expr,
@@ -277,11 +312,12 @@ impl ConstChecker<'_> {
             return;
         };
         for (i, arg) in args.iter().enumerate() {
-            if indices.contains(&i) && self.const_place_type(&arg.expr, scopes).is_some() {
-                let root = root_ident(&arg.expr).unwrap_or("");
+            if indices.contains(&i)
+                && let Some(root) = self.const_root(&arg.expr, scopes)
+            {
                 self.errors.push(TypeError {
                     message: format!(
-                        "cannot pass const value `{root}` to `{fname}`, which mutates that parameter"
+                        "cannot pass const value `{root}` to `{fname}`, which requires a mutable parameter"
                     ),
                     span: arg.expr.span(),
                 });
@@ -375,9 +411,13 @@ fn mutating_methods(program: &Program) -> HashSet<(String, String)> {
         .collect()
 }
 
-/// Parameter indices each function directly mutates (assigns a field/element of
-/// a place rooted at the parameter). Conservative: transitive mutation through
-/// nested calls is not tracked.
+/// Parameter indices each function requires to be mutable: either the body
+/// mutates the parameter through its reference (so the caller's value changes),
+/// or the parameter is annotated `mut(T)`. The mutability is thus inferred from
+/// use, and an explicit `mut(T)` annotation states the requirement directly. A
+/// caller must pass a mutable value (a `let`, not a `const`) for these positions.
+/// Conservative: mutation that propagates through a further nested call is not
+/// tracked.
 fn mutating_function_params(program: &Program) -> HashMap<String, HashSet<usize>> {
     let mut map = HashMap::new();
     for f in program.functions.values() {
@@ -386,7 +426,15 @@ fn mutating_function_params(program: &Program) -> HashMap<String, HashSet<usize>
             .params
             .iter()
             .enumerate()
-            .filter(|(_, p)| mutates_root(&f.decl.body, &p.name))
+            .filter(|(_, p)| {
+                // A `ref(mut(T))` parameter is a mutable reference: it always
+                // requires a mutable argument. A parameter the body mutates through
+                // its reference also requires one -- unless it is passed by deep copy
+                // (a non-reference array/slice), where the mutation hits only the
+                // callee's own copy.
+                param_is_mut_ref(p)
+                    || (mutates_root(&f.decl.body, &p.name) && !param_is_copied(p))
+            })
             .map(|(i, _)| i)
             .collect();
         if !indices.is_empty() {
@@ -394,6 +442,50 @@ fn mutating_function_params(program: &Program) -> HashMap<String, HashSet<usize>
         }
     }
     map
+}
+
+/// Whether a parameter is a mutable reference (`ref(mut(T))`).
+fn param_is_mut_ref(p: &prepoly_hir::ParamInfo) -> bool {
+    matches!(&p.resolved_ty, Some(Type::Ref(inner)) if matches!(**inner, Type::Mut(_)))
+}
+
+/// Whether a parameter is passed by deep copy: a non-reference array/slice (a
+/// `mut(...)` wrapper does not change that). Such a parameter's mutations are
+/// confined to the callee's copy, so a `const` argument to it is fine.
+fn param_is_copied(p: &prepoly_hir::ParamInfo) -> bool {
+    fn peel(t: &Type) -> &Type {
+        match t {
+            Type::Mut(inner) => peel(inner),
+            _ => t,
+        }
+    }
+    matches!(&p.resolved_ty, Some(t)
+        if !matches!(t, Type::Ref(_)) && matches!(peel(t), Type::Slice(_) | Type::Array(..)))
+}
+
+/// A scope binding each parameter (and `self` for a method) so it shadows a
+/// like-named global const. A `ref(T)` parameter is an immutable reference, so it
+/// binds as const (mutating through it is rejected); every other parameter binds
+/// as a mutable local (it owns its copy, or is a `ref(mut(T))` mutable reference).
+fn param_scope(params: &[prepoly_hir::ParamInfo], is_method: bool) -> HashMap<String, Binding> {
+    let mut scope = HashMap::new();
+    if is_method {
+        scope.insert("self".to_string(), Binding::Mutable);
+    }
+    for p in params {
+        let binding = if param_is_immutable_ref(p) {
+            Binding::Const(None)
+        } else {
+            Binding::Mutable
+        };
+        scope.insert(p.name.clone(), binding);
+    }
+    scope
+}
+
+/// Whether a parameter is an immutable reference (`ref(T)`, not `ref(mut(T))`).
+fn param_is_immutable_ref(p: &prepoly_hir::ParamInfo) -> bool {
+    matches!(&p.resolved_ty, Some(Type::Ref(inner)) if !matches!(**inner, Type::Mut(_)))
 }
 
 fn binding_type_name(program: &Program, ty: &Option<TypeExpr>, value: &Expr) -> Option<String> {
@@ -410,13 +502,28 @@ fn constructed_type_name(value: &Expr) -> Option<String> {
     }
 }
 
+/// The built-in growable-array mutators: a method that mutates its receiver in
+/// place rather than producing a fresh value. They make their receiver mutable.
+fn is_builtin_mutating_method(method: &str) -> bool {
+    matches!(method, "push" | "insert" | "remove" | "pop")
+}
+
+/// Whether `block` mutates the value behind `root` *through the reference* it
+/// names -- a field/element assignment (`root.f = ` / `root[i] = `) or a built-in
+/// mutating method (`root.push(..)`), including through nested projections. This
+/// is the signal that makes a parameter (or `self`) mutable: such a mutation is
+/// visible to the caller. A bare `root = ...` only rebinds the local and is *not*
+/// counted -- it does not touch the caller's value, so a `const` argument bound to
+/// a copied or rebindable parameter stays valid.
 fn mutates_root(block: &Block, root: &str) -> bool {
     block.stmts.iter().any(|stmt| stmt_mutates_root(stmt, root))
 }
 
 fn stmt_mutates_root(stmt: &Stmt, root: &str) -> bool {
     match stmt {
-        Stmt::Assign { target, .. } => root_ident(target) == Some(root),
+        Stmt::Assign { target, .. } => {
+            matches!(target, Expr::Field(..) | Expr::Index(..)) && root_ident(target) == Some(root)
+        }
         Stmt::While { body, .. } | Stmt::For { body, .. } => mutates_root(body, root),
         Stmt::Expr(expr) => expr_mutates_root(expr, root),
         Stmt::Return(Some(expr), _) => expr_mutates_root(expr, root),
@@ -433,6 +540,13 @@ fn expr_mutates_root(expr: &Expr, root: &str) -> bool {
         }
         Expr::Match(_, arms, _) => arms.iter().any(|arm| expr_mutates_root(&arm.body, root)),
         Expr::Closure(_, body, _) => expr_mutates_root(body, root),
+        // A built-in array mutator on a place rooted at `root` mutates it; a
+        // mutation may also appear inside an argument expression.
+        Expr::Call(callee, args, _) => {
+            matches!(&**callee, Expr::Field(recv, m, _)
+                if is_builtin_mutating_method(m) && root_ident(recv) == Some(root))
+                || args.iter().any(|a| expr_mutates_root(&a.expr, root))
+        }
         _ => false,
     }
 }

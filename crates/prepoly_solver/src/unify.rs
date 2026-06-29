@@ -62,6 +62,8 @@ impl Subst {
             Type::Slice(inner) => Type::Slice(Box::new(self.resolve_deep(&inner))),
             Type::Nullable(inner) => Type::Nullable(Box::new(self.resolve_deep(&inner))),
             Type::ConstOf(inner) => Type::ConstOf(Box::new(self.resolve_deep(&inner))),
+            Type::Mut(inner) => Type::Mut(Box::new(self.resolve_deep(&inner))),
+            Type::Ref(inner) => Type::Ref(Box::new(self.resolve_deep(&inner))),
             Type::Fun(params, ret) => Type::Fun(
                 params.iter().map(|p| self.resolve_deep(p)).collect(),
                 Box::new(self.resolve_deep(&ret)),
@@ -114,6 +116,17 @@ impl Subst {
             (Type::Never, Type::Nullable(_)) | (Type::Nullable(_), Type::Never) => Ok(()),
             (Type::ConstOf(x), Type::ConstOf(y)) => self.unify(x, y),
             (Type::ConstOf(x), other) | (other, Type::ConstOf(x)) => self.unify(x, other),
+            // `mut(T)` is transparent to unification: it unifies with `T` (and with
+            // `mut(T)`) on its inner type. Mutability itself is not enforced by
+            // unification but by the mutation/parameter-position checks, which
+            // inspect the declared `mut(...)` wrapper directly.
+            (Type::Mut(x), Type::Mut(y)) => self.unify(x, y),
+            (Type::Mut(x), other) | (other, Type::Mut(x)) => self.unify(x, other),
+            // A reference unifies with its referent type: the reference is created
+            // implicitly from the parameter annotation, so the argument value type
+            // matches. Whether to borrow or copy is decided separately at the call.
+            (Type::Ref(x), Type::Ref(y)) => self.unify(x, y),
+            (Type::Ref(x), other) | (other, Type::Ref(x)) => self.unify(x, other),
             (Type::Slice(x), Type::Slice(y)) => self.unify(x, y),
             (Type::Array(x, n), Type::Array(y, m)) if n == m => self.unify(x, y),
             (Type::Fun(p1, r1), Type::Fun(p2, r2)) if p1.len() == p2.len() => {
@@ -157,7 +170,9 @@ impl Subst {
             Type::Array(inner, _)
             | Type::Slice(inner)
             | Type::Nullable(inner)
-            | Type::ConstOf(inner) => self.occurs(id, &inner),
+            | Type::ConstOf(inner)
+            | Type::Mut(inner)
+            | Type::Ref(inner) => self.occurs(id, &inner),
             Type::Fun(params, ret) => {
                 params.iter().any(|p| self.occurs(id, p)) || self.occurs(id, &ret)
             }

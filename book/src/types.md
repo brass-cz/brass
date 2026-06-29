@@ -1,4 +1,4 @@
-# Chapter 2: Defining types
+# Defining types
 
 We can define new types with their fields and methods as follows:
 

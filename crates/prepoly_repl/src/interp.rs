@@ -543,6 +543,15 @@ impl<'p, 'm> Interp<'p, 'm> {
                 let variant = str_const(&args[1]).unwrap_or_default();
                 Ok(Value::Bool(matches_variant(&subj, variant)))
             }
+            // `__deep_copy(x)`: a fresh, independent copy of `x` (value-passing of a
+            // non-reference heap argument). Aggregates get new mutable storage so the
+            // callee's mutations do not reach the caller; immutable/shared values are
+            // returned as-is (the Rc share is sound -- they are never mutated).
+            "__deep_copy" => {
+                let ty = operand_type_of(&args[0], &f.local_types);
+                let v = self.eval_operand(f, frame, &args[0], &ty)?;
+                Ok(deep_copy_value(&v))
+            }
             "result_is_ok" => {
                 let sty = operand_type_of(&args[0], &f.local_types);
                 let subj = self.eval_operand(f, frame, &args[0], &sty)?;
@@ -784,6 +793,36 @@ fn truthy(v: &Value, ty: &Type) -> bool {
 
 /// Whether a value is the named sum variant. A record (single-shape) always
 /// matches; a non-aggregate never does.
+/// A fresh, independent deep copy of `v`. Aggregates (array, record, sum) are
+/// rebuilt with new mutable cells and recursively-copied children, so the copy
+/// shares no mutable storage with the original. Scalars and immutable/shared
+/// handles (string, closure) are returned as-is -- they are never mutated, so the
+/// `Rc` share is sound.
+fn deep_copy_value(v: &Value) -> Value {
+    match v {
+        Value::Array(a) => {
+            Value::Array(Rc::new(RefCell::new(a.borrow().iter().map(deep_copy_value).collect())))
+        }
+        Value::Record(r) => Value::Record(Rc::new(RefCell::new(
+            r.borrow()
+                .iter()
+                .map(|(k, val)| (k.clone(), deep_copy_value(val)))
+                .collect(),
+        ))),
+        Value::Variant(var) => Value::Variant(Rc::new(VariantObj {
+            variant: var.variant.clone(),
+            fields: RefCell::new(
+                var.fields
+                    .borrow()
+                    .iter()
+                    .map(|(k, val)| (k.clone(), deep_copy_value(val)))
+                    .collect(),
+            ),
+        })),
+        other => other.clone(),
+    }
+}
+
 fn matches_variant(v: &Value, variant: &str) -> bool {
     match v {
         Value::Variant(var) => var.variant == variant,

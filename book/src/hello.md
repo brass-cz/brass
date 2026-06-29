@@ -1,4 +1,4 @@
-# Chapter 1: Hello, world!
+# Hello, world!
 
 Let's write your first prepoly program!
 

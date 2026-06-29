@@ -30,6 +30,12 @@ pub fn types_compatible(program: &Program, have: &Type, want: &Type) -> bool {
         (Type::ConstOf(h), Type::ConstOf(w)) => types_compatible(program, h, w),
         (Type::ConstOf(h), other) => types_compatible(program, h, other),
         (other, Type::ConstOf(w)) => types_compatible(program, other, w),
+        (Type::Mut(h), Type::Mut(w)) => types_compatible(program, h, w),
+        (Type::Mut(h), other) => types_compatible(program, h, other),
+        (other, Type::Mut(w)) => types_compatible(program, other, w),
+        (Type::Ref(h), Type::Ref(w)) => types_compatible(program, h, w),
+        (Type::Ref(h), other) => types_compatible(program, h, other),
+        (other, Type::Ref(w)) => types_compatible(program, other, w),
         (Type::Never, Type::Nullable(_)) => true,
         (Type::Nullable(h), Type::Nullable(w))
             if matches!(h.as_ref(), Type::Never) || matches!(w.as_ref(), Type::Never) =>

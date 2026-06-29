@@ -137,6 +137,17 @@ pub enum Type {
     Fun(Vec<Type>, Box<Type>),
     Nullable(Box<Type>),
     ConstOf(Box<Type>),
+    /// A mutable `T` (written `mut(T)`): a place of this type may be mutated. The
+    /// wrapper is transparent to unification (`mut(T)` unifies with `T`); it is
+    /// the signal a mutation site / mutating-parameter position checks for. Plain
+    /// `T` is immutable. Erased to `T` before the back ends.
+    Mut(Box<Type>),
+    /// A reference (written `ref(T)`, or `ref(mut(T))` for a mutable reference --
+    /// the inner is then a `Mut`). A reference parameter borrows its argument; a
+    /// non-reference heap parameter is deep-copied. Transparent to unification (it
+    /// unifies with its referent type), so the reference is created implicitly from
+    /// the parameter annotation. Erased to its referent before the back ends.
+    Ref(Box<Type>),
     Unknown(u32),
     SelfType,
 }
@@ -352,6 +363,8 @@ impl Type {
             ),
             Type::Nullable(t) => format!("{}?", t.display()),
             Type::ConstOf(t) => format!("const {}", t.display()),
+            Type::Mut(t) => format!("mut({})", t.display()),
+            Type::Ref(t) => format!("ref({})", t.display()),
             Type::Unknown(_) => "?".into(),
             Type::SelfType => "Self".into(),
         }
@@ -416,6 +429,8 @@ fn resolve_inner(
             }
             Ok(structural_record(resolved))
         }
+        TypeExpr::Mut(inner, _) => Ok(Type::Mut(Box::new(resolve_inner(inner, nominal_info)?))),
+        TypeExpr::Ref(inner, _) => Ok(Type::Ref(Box::new(resolve_inner(inner, nominal_info)?))),
     }
 }
 
@@ -461,6 +476,8 @@ pub fn freshen_infer(ty: Type, fresh: &mut impl FnMut() -> Type) -> Type {
         Type::Slice(t) => Type::Slice(Box::new(freshen_infer(*t, fresh))),
         Type::Nullable(t) => Type::Nullable(Box::new(freshen_infer(*t, fresh))),
         Type::ConstOf(t) => Type::ConstOf(Box::new(freshen_infer(*t, fresh))),
+        Type::Mut(t) => Type::Mut(Box::new(freshen_infer(*t, fresh))),
+        Type::Ref(t) => Type::Ref(Box::new(freshen_infer(*t, fresh))),
         Type::Fun(ps, r) => Type::Fun(
             ps.into_iter().map(|p| freshen_infer(p, fresh)).collect(),
             Box::new(freshen_infer(*r, fresh)),

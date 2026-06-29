@@ -142,6 +142,36 @@ pub extern "C-unwind" fn pp_arr_new(elem_size: i64, len: i64) -> *mut Header {
     }
 }
 
+/// A fresh growable array with the same elements as `arr` (the value-passing of a
+/// non-reference array argument). The element bytes are copied into a new buffer;
+/// when `managed != 0` the elements are heap pointers shared with the original, so
+/// each is retained (a one-level copy with sound reference counts).
+///
+/// # Safety
+/// `arr` must be a growable-array object whose elements are `elem_size` bytes each.
+pub unsafe extern "C-unwind" fn pp_arr_copy(
+    arr: *mut Header,
+    elem_size: i64,
+    managed: i64,
+) -> *mut Header {
+    unsafe {
+        let len = *((arr as *mut u8).offset(16) as *mut i64);
+        let src = *((arr as *mut u8).offset(32) as *mut *mut u8);
+        let new = pp_arr_new(elem_size, len);
+        let dst = *((new as *mut u8).offset(32) as *mut *mut u8);
+        std::ptr::copy_nonoverlapping(src, dst, (len * elem_size) as usize);
+        if managed != 0 {
+            for i in 0..len {
+                let slot = dst.offset((i * elem_size) as isize) as *mut *mut Header;
+                if !(*slot).is_null() {
+                    pp_retain(*slot);
+                }
+            }
+        }
+        new
+    }
+}
+
 /// Append `elem_size` bytes from `elem` to the array, growing (doubling) the
 /// element buffer if full.
 ///

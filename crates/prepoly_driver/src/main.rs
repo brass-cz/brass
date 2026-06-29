@@ -283,7 +283,7 @@ fn int_literal_types(typed: &prepoly_hir::TypedProgram) -> HashMap<Span, prepoly
         }
         let kind = match &e.ty {
             Type::Int(k) => Some(*k),
-            Type::ConstOf(inner) => match inner.as_ref() {
+            Type::ConstOf(inner) | Type::Mut(inner) | Type::Ref(inner) => match inner.as_ref() {
                 Type::Int(k) => Some(*k),
                 _ => None,
             },

@@ -312,6 +312,13 @@ pub enum TypeExpr {
     /// `anonymous { field: T, ... }` -- an inline anonymous structure type
     /// (a structural record with the given fields, no nominal name).
     Anonymous(Vec<(String, TypeExpr)>, Span),
+    /// `mut(T)` -- a mutable `T`: a place of this type may be mutated (assigned
+    /// to, or have a mutating method called on it). Plain `T` is immutable.
+    Mut(Box<TypeExpr>, Span),
+    /// `ref(T)` an immutable reference, or `ref(mut(T))` a mutable reference (the
+    /// inner is then a `mut(...)`). A reference parameter borrows the argument
+    /// instead of deep-copying it; a non-reference parameter is passed by copy.
+    Ref(Box<TypeExpr>, Span),
 }
 
 impl TypeExpr {
@@ -323,7 +330,9 @@ impl TypeExpr {
             | TypeExpr::Nullable(_, s)
             | TypeExpr::Fallible(_, s)
             | TypeExpr::Tuple(_, s)
-            | TypeExpr::Anonymous(_, s) => *s,
+            | TypeExpr::Anonymous(_, s)
+            | TypeExpr::Mut(_, s)
+            | TypeExpr::Ref(_, s) => *s,
         }
     }
 }

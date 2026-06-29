@@ -121,6 +121,38 @@ impl<'p> ProgramCtx<'p> {
                 .collect()
         })
     }
+
+    /// Per-parameter "deep-copy the argument" flags for free function `name`: true
+    /// where the parameter is a non-reference heap aggregate (array, tuple, record,
+    /// or sum), so passing it by value copies rather than shares. A `ref(...)`
+    /// parameter borrows (false); a primitive/string or unannotated parameter needs
+    /// no copy (false). `None` if `name` is not a known free function.
+    fn fn_param_copies(&self, module: &[String], name: &str) -> Option<Vec<bool>> {
+        self.program.resolve_function(module, name).map(|info| {
+            info.signature
+                .params
+                .iter()
+                .map(|p| match &p.ty {
+                    Some(t) => self.type_needs_copy(module, t),
+                    None => false,
+                })
+                .collect()
+        })
+    }
+
+    fn type_needs_copy(&self, module: &[String], t: &prepoly_parser::ast::TypeExpr) -> bool {
+        use prepoly_parser::ast::TypeExpr;
+        match t {
+            // A reference borrows; a `mut(T)` is a mutable place whose copy-ness is
+            // that of `T`. A non-reference array/slice parameter is passed by deep
+            // copy. (Records, sums, and tuples are not yet copied at the back end, so
+            // they keep their current shared passing until that is implemented.)
+            TypeExpr::Ref(..) => false,
+            TypeExpr::Mut(inner, _) => self.type_needs_copy(module, inner),
+            TypeExpr::Array(..) => true,
+            _ => false,
+        }
+    }
 }
 
 /// Per-body lowering state.

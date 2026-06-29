@@ -76,7 +76,7 @@ pub fn type_mangle(ty: &Type) -> String {
             format!("fn{}_{}", ps.join("_"), type_mangle(ret))
         }
         Type::Nullable(inner) => format!("opt_{}", type_mangle(inner)),
-        Type::ConstOf(inner) => type_mangle(inner),
+        Type::ConstOf(inner) | Type::Mut(inner) | Type::Ref(inner) => type_mangle(inner),
         Type::Unknown(id) => format!("u{id}"),
         Type::SelfType => "self".into(),
     }

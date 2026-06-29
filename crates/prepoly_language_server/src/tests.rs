@@ -235,10 +235,10 @@ fn labels(items: &[CompletionItem]) -> Vec<String> {
 #[test]
 fn completion_offers_types_and_functions() {
     let src = "type Point = {\n    x: int32\n}\n\nfun helper() {\n}\n\nfun main() {\n    h\n}\n";
-    let full = full_analysis(src);
+    let analyzer = DocAnalyzer::new(path());
     let doc = Document::new(src.to_string(), 1);
     let off = src.rfind("h\n").unwrap() + 1;
-    let items = completion::completion(&doc, Some(&full), &path(), doc.position_at(off));
+    let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(off));
     let labels = labels(&items);
     assert!(
         labels.contains(&"Point".to_string()),
@@ -260,8 +260,9 @@ fn completion_offers_types_and_functions() {
 #[test]
 fn completion_offers_import_modules() {
     let src = "import ";
+    let analyzer = DocAnalyzer::new(path());
     let doc = Document::new(src.to_string(), 1);
-    let items = completion::completion(&doc, None, &path(), doc.position_at(src.len()));
+    let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(src.len()));
     let labels = labels(&items);
     assert!(
         labels.contains(&"math".to_string()),
@@ -281,8 +282,9 @@ fn completion_offers_import_modules() {
 #[test]
 fn completion_offers_imported_names() {
     let src = "import math.{ ";
+    let analyzer = DocAnalyzer::new(path());
     let doc = Document::new(src.to_string(), 1);
-    let items = completion::completion(&doc, None, &path(), doc.position_at(src.len()));
+    let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(src.len()));
     let labels = labels(&items);
     assert!(
         labels
@@ -290,4 +292,68 @@ fn completion_offers_imported_names() {
             .any(|l| l == "sqrt" || l == "abs" || l == "pow"),
         "math's public functions should be offered: {labels:?}"
     );
+}
+
+/// After `arr.` on an array value, offer the built-in array methods and the std
+/// array functions reachable through UFCS -- even though `arr.` does not parse.
+#[test]
+fn completion_offers_array_members() {
+    let src = "fun main() {\n    let a = [1]\n    a.\n}\n";
+    let analyzer = DocAnalyzer::new(path());
+    let doc = Document::new(src.to_string(), 1);
+    // Cursor immediately after the `.`.
+    let off = src.find("a.\n").unwrap() + 2;
+    let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(off));
+    let labels = labels(&items);
+    assert!(labels.contains(&"push".to_string()), "builtin push: {labels:?}");
+    assert!(labels.contains(&"len".to_string()), "builtin len: {labels:?}");
+    assert!(labels.contains(&"map".to_string()), "UFCS map: {labels:?}");
+    assert!(labels.contains(&"filter".to_string()), "UFCS filter: {labels:?}");
+    // A member list must not leak the global symbol list (e.g. type names).
+    assert!(!labels.contains(&"int32".to_string()), "no globals: {labels:?}");
+}
+
+/// After `p.` on a record value, offer that record's methods.
+#[test]
+fn completion_offers_record_methods() {
+    let src = concat!(
+        "type Point = {\n",
+        "    x: int32\n",
+        "    dist(self) -> int32 {\n",
+        "        return self.x\n",
+        "    }\n",
+        "}\n",
+        "\n",
+        "fun main() {\n",
+        "    let p = Point { x: 1 }\n",
+        "    p.\n",
+        "}\n",
+    );
+    let analyzer = DocAnalyzer::new(path());
+    let doc = Document::new(src.to_string(), 1);
+    let off = src.find("p.\n").unwrap() + 2;
+    let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(off));
+    let labels = labels(&items);
+    assert!(labels.contains(&"dist".to_string()), "record method: {labels:?}");
+}
+
+/// After a sum type name (`Shape.`), offer its variants.
+#[test]
+fn completion_offers_sum_variants() {
+    let src = concat!(
+        "type Shape =\n",
+        "    | Circle { radius: float64 }\n",
+        "    | Square\n",
+        "\n",
+        "fun main() {\n",
+        "    Shape.\n",
+        "}\n",
+    );
+    let analyzer = DocAnalyzer::new(path());
+    let doc = Document::new(src.to_string(), 1);
+    let off = src.find("Shape.\n").unwrap() + "Shape.".len();
+    let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(off));
+    let labels = labels(&items);
+    assert!(labels.contains(&"Circle".to_string()), "variant Circle: {labels:?}");
+    assert!(labels.contains(&"Square".to_string()), "variant Square: {labels:?}");
 }

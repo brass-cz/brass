@@ -229,13 +229,13 @@ impl LanguageServer for Backend {
         let Some(entry) = self.docs.get(&uri) else {
             return Ok(None);
         };
-        // Import completion is textual and needs no analysis; code completion
-        // uses the analyzed program when the document parses, else a fallback.
-        // The full analysis holds `!Send` data, so it stays a local and is
-        // dropped before this handler awaits.
-        let full = entry.analyzer.analyze_full(&entry.document.text);
+        // Completion analyzes the document itself (and, for member access, a
+        // probe-spliced variant), so the analyzer is passed in. Any `!Send`
+        // analysis it produces stays inside that synchronous call and is dropped
+        // before this handler awaits.
         let path = uri_to_path(&uri);
-        let items = features::completion::completion(&entry.document, full.as_ref(), &path, pos);
+        let items =
+            features::completion::completion(&entry.document, &entry.analyzer, &path, pos);
         Ok(Some(CompletionResponse::Array(items)))
     }
 

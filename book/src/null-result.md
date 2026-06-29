@@ -1,4 +1,4 @@
-# Chapter 4: `null` and `Result`
+# `null` and `Result`
 
 prepoly has `null` type and `Result` type.
 
@@ -51,7 +51,7 @@ fun get_name(person) -> string {
     }
 }
 
-println({ name: "Asimov" }) // Asimov
-println({ age: 20 })        // no name
-println({ name: 1 })        // no name
+println(get_name({ name: "Asimov" })) // Asimov
+println(get_name({ age: 20 }))        // no name
+println(get_name({ name: 1 }))        // no name
 ```

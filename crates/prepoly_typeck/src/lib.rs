@@ -731,6 +731,89 @@ mod tests {
     }
 
     #[test]
+    fn const_array_mutating_method_is_rejected() {
+        // A const array is immutable: the growable-array mutators
+        // (`push`/`insert`/`remove`/`pop`) modify it in place, so they are rejected
+        // -- the same rule as element assignment and a const record's mutators.
+        for method in ["push(2)", "insert(0, 2)", "remove(0)", "pop()"] {
+            let src = format!("const a = [1]\nfun main() {{\n    a.{method}\n}}\n");
+            let e = errs(&src);
+            assert!(
+                e.iter()
+                    .any(|m| m.contains("on const value `a`")),
+                "`a.{method}` on a const array should be rejected: {e:?}"
+            );
+        }
+        // A mutable array still accepts them.
+        let ok = errs("fun main() {\n    let a = [1]\n    a.push(2)\n}\n");
+        assert!(ok.is_empty(), "mutable array push must be allowed: {ok:?}");
+    }
+
+    #[test]
+    fn const_array_reachable_from_a_const_root_is_immutable() {
+        // An array reachable from a const struct/array root is itself immutable.
+        let e = errs("const m = [[1], [2]]\nfun main() {\n    m[0].push(3)\n}\n");
+        assert!(
+            e.iter().any(|m| m.contains("on const value `m`")),
+            "pushing into an element of a const array should be rejected: {e:?}"
+        );
+    }
+
+    #[test]
+    fn const_array_through_a_mutating_function_is_rejected() {
+        // Mutability is inferred from use: `f` pushes to its parameter, so the
+        // parameter is mutable and passing a const array is rejected -- the same
+        // rule whether the push is written directly or behind a function.
+        let e = errs("fun f(arr) {\n    arr.push(99)\n}\nconst a = [1]\nfun main() {\n    f(a)\n}\n");
+        assert!(
+            e.iter()
+                .any(|m| m.contains("`a`") && m.contains("mutable")),
+            "passing a const array to a function that pushes should be rejected: {e:?}"
+        );
+        // A `let` array satisfies the mutable parameter.
+        let ok = errs("fun f(arr) {\n    arr.push(99)\n}\nfun main() {\n    let a = [1]\n    f(a)\n}\n");
+        assert!(ok.is_empty(), "a mutable array argument must be allowed: {ok:?}");
+    }
+
+    #[test]
+    fn mut_ref_annotation_requires_a_mutable_argument() {
+        // A `ref(mut(T))` parameter is a mutable reference: it requires a mutable
+        // argument even with no mutation in the body (a const is rejected, a `let`
+        // accepted). A bare `mut(T)` is passed by copy, so it has no such
+        // requirement -- the next case checks a const is accepted there.
+        let e = errs(
+            "fun f(arr: ref(mut(int32[]))) {\n    println(arr.len())\n}\nconst a = [1]\nfun main() {\n    f(a)\n}\n",
+        );
+        assert!(
+            e.iter().any(|m| m.contains("`a`") && m.contains("mutable")),
+            "a const argument to a `ref(mut(T))` parameter should be rejected: {e:?}"
+        );
+        let ok = errs(
+            "fun f(arr: ref(mut(int32[]))) {\n    arr.push(2)\n}\nfun main() {\n    let a = [1]\n    f(a)\n}\n",
+        );
+        assert!(ok.is_empty(), "a `let` argument to a `ref(mut(T))` parameter must be allowed: {ok:?}");
+    }
+
+    #[test]
+    fn const_to_a_copied_array_parameter_is_allowed() {
+        // A non-reference array parameter is passed by deep copy, so a const
+        // argument is fine even though the callee mutates its (own) copy.
+        let ok = errs(
+            "fun f(arr: int32[]) {\n    arr.push(2)\n}\nconst a = [1]\nfun main() {\n    f(a)\n}\n",
+        );
+        assert!(ok.is_empty(), "a const argument to a copied array parameter must be allowed: {ok:?}");
+    }
+
+    #[test]
+    fn const_primitive_to_a_reassigning_function_is_allowed() {
+        // Reassigning a parameter (`x = ...`) only rebinds the local; it is not a
+        // through-reference mutation, so the parameter is not mutable and a copied
+        // const primitive argument stays valid.
+        let ok = errs("fun f(x) {\n    x = 5\n}\nconst c = 1\nfun main() {\n    f(c)\n}\n");
+        assert!(ok.is_empty(), "a const primitive to a reassigning function must be allowed: {ok:?}");
+    }
+
+    #[test]
     fn const_readonly_method_call_is_allowed() {
         let e = errs(
             "type Counter = {\n    count: int32\n    get(self) -> int32 {\n        return self.count\n    }\n}\nfun main() {\n    const c = Counter { count: 1 }\n    let value: int32 = c.get()\n}\n",

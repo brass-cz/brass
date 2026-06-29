@@ -1136,6 +1136,20 @@ impl Parser {
             Ok(TypeExpr::Fun(params, Box::new(ret), span.merge(hi)))
         } else {
             let (name, _) = self.ident()?;
+            // `mut(T)` -- a mutable `T`; `ref(T)` / `ref(mut(T))` -- a reference.
+            // Neither is a keyword, so both are read as identifiers and only treated
+            // specially when applied to a parenthesized type.
+            if matches!(name.as_str(), "mut" | "ref") && self.at_p(TokenKind::LParen) {
+                self.open(TokenKind::LParen, "'('")?;
+                let inner = self.parse_type()?;
+                let hi = self.close(TokenKind::RParen, "')'")?;
+                let inner = Box::new(inner);
+                return Ok(if name == "mut" {
+                    TypeExpr::Mut(inner, span.merge(hi))
+                } else {
+                    TypeExpr::Ref(inner, span.merge(hi))
+                });
+            }
             // `anonymous { field: T, ... }` -- an inline structural record type.
             if name == "anonymous" && self.at_p(TokenKind::LBrace) {
                 self.open(TokenKind::LBrace, "'{'")?;

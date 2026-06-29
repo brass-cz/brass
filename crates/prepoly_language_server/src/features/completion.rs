@@ -1,23 +1,30 @@
 //! Completion.
 //!
-//! Two contexts are handled. Inside an `import` statement the cursor is offered
+//! Three contexts are handled. Inside an `import` statement the cursor is offered
 //! module path segments (`import math.|`) and, within the brace list, the public
 //! names a module exports (`import math.{ |`); these are recovered textually
 //! from the current line, so they work even while the line does not yet parse.
-//! Everywhere else the cursor is offered the types and functions visible from
-//! the document -- its own declarations, the imported names, the prelude, and
-//! the built-in types -- taken from the analyzed program when it is available.
+//! After a `.` (`a.|`) the cursor is offered the members reachable on the
+//! receiver -- built-in methods, the receiver type's record methods, and the
+//! free functions callable on it through UFCS -- or, when the receiver is a type
+//! name (`Shape.|`), that type's variants and methods. Everywhere else the
+//! cursor is offered the types and functions visible from the document.
+//!
+//! The member case needs the receiver's inferred type, but `a.` does not parse,
+//! so the source is re-analyzed with a probe identifier spliced in at the cursor
+//! to recover the type. Analysis therefore happens inside this module (via the
+//! document's analyzer) rather than being passed in.
 
 use std::collections::HashSet;
 use std::path::Path;
 
-use prepoly_hir::TypeKind;
+use prepoly_hir::{Type, TypeKind};
 use prepoly_parser::ast::{TopLevel, TypeBody};
 use prepoly_parser::parse;
 use tower_lsp_server::ls_types::{CompletionItem, CompletionItemKind};
 
-use crate::analysis::FullAnalysis;
 use crate::analysis::world::{prelude_module_names, prelude_source};
+use crate::analysis::{DocAnalyzer, FullAnalysis};
 use crate::document::Document;
 use crate::render::render_signature;
 
@@ -31,12 +38,11 @@ const BUILTIN_TYPES: &[&str] = &[
 /// intrinsics), so they would not otherwise appear in the program's functions.
 const BUILTIN_FUNCTIONS: &[&str] = &["len", "error", "ok"];
 
-/// Compute completion items for `pos`. `full` is the analyzed program when the
-/// document parses; it is absent (and code completion falls back to a lighter
-/// source) when the document is mid-edit and does not parse.
+/// Compute completion items for `pos`, analyzing the document (and, for the
+/// member case, a probe-spliced variant of it) through `analyzer` as needed.
 pub fn completion(
     doc: &Document,
-    full: Option<&FullAnalysis>,
+    analyzer: &DocAnalyzer,
     doc_path: &Path,
     pos: tower_lsp_server::ls_types::Position,
 ) -> Vec<CompletionItem> {
@@ -44,15 +50,16 @@ pub fn completion(
     let line_start = doc.text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let prefix = &doc.text[line_start..offset];
 
-    match import_context(prefix) {
-        Some(ImportContext::Names { module, prefix }) => {
-            import_name_items(&module, &prefix, doc_path)
-        }
-        Some(ImportContext::Path { parents, prefix }) => {
-            import_path_items(&parents, &prefix, doc_path)
-        }
-        None => symbol_items(full, doc, doc_path),
+    if let Some(ctx) = import_context(prefix) {
+        return match ctx {
+            ImportContext::Names { module, prefix } => import_name_items(&module, &prefix, doc_path),
+            ImportContext::Path { parents, prefix } => import_path_items(&parents, &prefix, doc_path),
+        };
     }
+    if let Some(items) = member_completion(doc, analyzer, offset) {
+        return items;
+    }
+    symbol_items(analyzer, doc, doc_path)
 }
 
 // ===== import completion =====
@@ -204,18 +211,247 @@ fn dir_module_names(dir: &Path, exclude: Option<&str>) -> Vec<String> {
     names
 }
 
+// ===== member completion =====
+
+/// Identifier spliced in after a dangling `.` so the source parses and the
+/// receiver's type can be recovered. Unlikely to collide with a real name.
+const PROBE: &str = "__prepoly_completion_probe__";
+
+/// Member completion for a cursor right after `recv.` (or `recv.partial`).
+/// Returns `None` when the cursor is not in a member-access position, and
+/// `Some(items)` (possibly empty) when it is -- so the caller does not fall back
+/// to the global symbol list after a `.`.
+fn member_completion(
+    doc: &Document,
+    analyzer: &DocAnalyzer,
+    cursor: usize,
+) -> Option<Vec<CompletionItem>> {
+    let bytes = doc.text.as_bytes();
+    // The current partial member name `[word_start, cursor)`.
+    let mut word_start = cursor;
+    while word_start > 0 && is_ident_byte(bytes[word_start - 1]) {
+        word_start -= 1;
+    }
+    // A `.` must sit immediately before the name, and the receiver before that
+    // `.` must look like the end of an expression (not e.g. a float `3.`).
+    if word_start == 0 || bytes[word_start - 1] != b'.' {
+        return None;
+    }
+    let dot = word_start - 1;
+    match dot.checked_sub(1).map(|i| bytes[i]) {
+        Some(b) if is_ident_byte(b) || b == b')' || b == b']' => {}
+        _ => return None,
+    }
+    let partial = &doc.text[word_start..cursor];
+
+    // `recv.` does not parse, so splice in a probe identifier; `recv.partial`
+    // already parses as a field access.
+    let full = if partial.is_empty() {
+        let patched = format!("{}{PROBE}{}", &doc.text[..cursor], &doc.text[cursor..]);
+        analyzer.analyze_full(&patched)?
+    } else {
+        analyzer.analyze_full(&doc.text)?
+    };
+
+    // A bare type name receiver (`Shape.`) offers that type's variants/methods.
+    if let Some(items) = type_qualified_items(&full, &doc.text, dot) {
+        return Some(filter_prefix(items, partial));
+    }
+    // Otherwise a value receiver: its members come from its inferred type, found
+    // as the expression that ends exactly at the `.`.
+    let recv_hi = full.main_base + dot;
+    let items = match receiver_type_at(&full, recv_hi) {
+        Some(ty) => value_member_items(&full, &ty),
+        None => Vec::new(),
+    };
+    Some(filter_prefix(items, partial))
+}
+
+/// The inferred type of the receiver expression ending at global offset `hi`
+/// (just before the `.`); the widest such expression, so `foo.bar.|` uses
+/// `foo.bar` rather than `bar`.
+fn receiver_type_at(full: &FullAnalysis, hi: usize) -> Option<Type> {
+    full.typed
+        .expressions
+        .iter()
+        .filter(|e| e.span.hi == hi)
+        .min_by_key(|e| e.span.lo)
+        .map(|e| e.ty.clone())
+}
+
+/// Members reachable on a value of `ty`: built-in methods for its kind, the
+/// record type's methods, and free functions callable through UFCS.
+fn value_member_items(full: &FullAnalysis, ty: &Type) -> Vec<CompletionItem> {
+    let base = strip(ty);
+    let mut items = Vec::new();
+
+    match &base {
+        Type::Slice(_) => {
+            for m in ["push", "pop", "insert", "remove", "len"] {
+                items.push(item(m.to_string(), CompletionItemKind::METHOD, None));
+            }
+        }
+        Type::Array(_, _) | Type::Str => {
+            items.push(item("len".to_string(), CompletionItemKind::METHOD, None));
+        }
+        _ => {}
+    }
+
+    if let Some(id) = nominal_id(&base)
+        && let Some(info) = full.program.type_by_id(id)
+        && let TypeKind::Record { methods, .. } = &info.kind
+    {
+        for (name, m) in methods {
+            items.push(item(
+                name.clone(),
+                CompletionItemKind::METHOD,
+                Some(render_signature(&m.signature)),
+            ));
+        }
+    }
+
+    for f in full.program.functions.values() {
+        if ufcs_applies(&base, f) {
+            items.push(item(
+                f.signature.name.clone(),
+                CompletionItemKind::FUNCTION,
+                Some(render_signature(&f.signature)),
+            ));
+        }
+    }
+
+    dedup_by_label(items)
+}
+
+/// Whether free function `f` can be called as `recv.f(...)` -- its first
+/// parameter must accept `recv`. An annotated first parameter is matched by
+/// type; an unannotated (generic) one is accepted only for the std `array`/
+/// `string` helpers of the matching receiver kind, to keep the list focused.
+fn ufcs_applies(recv: &Type, f: &prepoly_hir::FunInfo) -> bool {
+    let Some(first) = f.signature.params.first() else {
+        return false;
+    };
+    match &first.resolved_ty {
+        Some(pty) => types_compatible(recv, &strip(pty)),
+        None => std_module_matches(recv, &f.module),
+    }
+}
+
+fn std_module_matches(recv: &Type, module: &[String]) -> bool {
+    match recv {
+        Type::Slice(_) | Type::Array(_, _) => module == ["std", "array"],
+        Type::Str => module == ["std", "string"],
+        _ => false,
+    }
+}
+
+/// A loose compatibility check for a UFCS receiver against a parameter type:
+/// inference variables match anything, arrays match arrays, and nominal types
+/// match by id.
+fn types_compatible(a: &Type, b: &Type) -> bool {
+    match (a, b) {
+        (Type::Unknown(_), _) | (_, Type::Unknown(_)) => true,
+        (Type::Slice(_) | Type::Array(_, _), Type::Slice(_) | Type::Array(_, _)) => true,
+        (Type::Str, Type::Str) => true,
+        (Type::Bool, Type::Bool) | (Type::Void, Type::Void) => true,
+        (Type::Int(_), Type::Int(_)) => true,
+        (Type::Float(_), Type::Float(_)) => true,
+        (Type::Record(x), Type::Record(y)) | (Type::Sum(x), Type::Sum(y)) => x.id == y.id,
+        _ => false,
+    }
+}
+
+/// When the text before the `.` at `dot` is a standalone identifier naming a
+/// type, the members are that type's variants (sum) or methods (record).
+fn type_qualified_items(
+    full: &FullAnalysis,
+    text: &str,
+    dot: usize,
+) -> Option<Vec<CompletionItem>> {
+    let bytes = text.as_bytes();
+    let mut start = dot;
+    while start > 0 && is_ident_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    // The receiver must be a lone identifier, not part of a longer chain.
+    if start == dot {
+        return None;
+    }
+    if let Some(prev) = start.checked_sub(1) {
+        let b = bytes[prev];
+        if is_ident_byte(b) || b == b'.' || b == b')' || b == b']' {
+            return None;
+        }
+    }
+    let name = &text[start..dot];
+    let info = full.program.resolve_type(&["main".to_string()], name)?;
+    let mut items = Vec::new();
+    match &info.kind {
+        TypeKind::Sum { variants } => {
+            for v in variants {
+                items.push(item(v.name.clone(), CompletionItemKind::ENUM_MEMBER, None));
+            }
+        }
+        TypeKind::Record { methods, .. } => {
+            for (n, m) in methods {
+                items.push(item(
+                    n.clone(),
+                    CompletionItemKind::METHOD,
+                    Some(render_signature(&m.signature)),
+                ));
+            }
+        }
+    }
+    Some(items)
+}
+
+/// Strip transparent wrappers so a nullable/const/mut receiver still resolves to
+/// its underlying type for member lookup.
+fn strip(ty: &Type) -> Type {
+    match ty {
+        Type::Nullable(inner)
+        | Type::ConstOf(inner)
+        | Type::Mut(inner)
+        | Type::Ref(inner) => strip(inner),
+        other => other.clone(),
+    }
+}
+
+fn nominal_id(ty: &Type) -> Option<i32> {
+    match ty {
+        Type::Record(n) | Type::Sum(n) => Some(n.id),
+        _ => None,
+    }
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn filter_prefix(items: Vec<CompletionItem>, prefix: &str) -> Vec<CompletionItem> {
+    if prefix.is_empty() {
+        return items;
+    }
+    items
+        .into_iter()
+        .filter(|i| i.label.starts_with(prefix))
+        .collect()
+}
+
+fn dedup_by_label(mut items: Vec<CompletionItem>) -> Vec<CompletionItem> {
+    let mut seen = HashSet::new();
+    items.retain(|i| seen.insert(i.label.clone()));
+    items
+}
+
 // ===== type / function completion =====
 
 /// Types and functions visible from the document, plus the built-in types and
 /// intrinsic functions. From the analyzed program when available, else a
 /// best-effort set parsed from the document and prelude.
-fn symbol_items(
-    full: Option<&FullAnalysis>,
-    doc: &Document,
-    doc_path: &Path,
-) -> Vec<CompletionItem> {
-    let mut items = match full {
-        Some(f) => program_symbols(f),
+fn symbol_items(analyzer: &DocAnalyzer, doc: &Document, doc_path: &Path) -> Vec<CompletionItem> {
+    let mut items = match analyzer.analyze_full(&doc.text) {
+        Some(f) => program_symbols(&f),
         None => fallback_symbols(doc, doc_path),
     };
     for ty in BUILTIN_TYPES {

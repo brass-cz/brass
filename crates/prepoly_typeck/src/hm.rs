@@ -266,14 +266,17 @@ impl<'p> Hm<'p> {
             self.bind_mono(name, ty.clone());
         }
         self.check_duplicate_params(decl_params, context);
-        // A callable that uses `error(x)` or `expr!` returns `Result<ok, err>`;
-        // bare `return v` then targets `ok` and every error site reconciles to
-        // `err`.
-        self.fallible = block_is_fallible(body);
-        tracing::debug!(context, fallible = self.fallible, "checking callable body");
         self.ok = self.solver.fresh(InferenceVarKind::Source);
         self.err = self.solver.fresh(InferenceVarKind::Source);
         let declared = self.or_fresh(ret_ty);
+        // A callable returns `Result<ok, err>` -- so a bare `return v` is the `Ok`
+        // payload and every error site reconciles to `err` -- when its body uses
+        // `error(x)`/`expr!`, OR its declared return is already a `Result` (a `T!`
+        // annotation, or an explicit Result). The latter makes a bare value unify
+        // with `Result.Ok { value: v }` even when the body raises no error.
+        self.fallible =
+            block_is_fallible(body) || is_result(&self.solver.resolve(&declared));
+        tracing::debug!(context, fallible = self.fallible, "checking callable body");
         if self.fallible {
             let inferred = Type::result(self.ok.clone(), self.err.clone());
             self.unify(&declared, &inferred, span);

@@ -130,6 +130,9 @@ impl Codegen for TextBackend {
     fn pop(&mut self, arr: usize, _elem_ty: &Type) -> usize {
         self.val(format!("pop v{arr}"))
     }
+    fn deep_copy(&mut self, value: usize, _ty: &Type) -> usize {
+        self.val(format!("deep_copy v{value}"))
+    }
     fn int_widen(&mut self, x: usize, from: usize, to: usize, signed: usize) -> usize {
         self.val(format!("int_widen v{x} v{from} v{to} v{signed}"))
     }

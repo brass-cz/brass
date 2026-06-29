@@ -533,7 +533,12 @@ fn array_elem(ty: &Type) -> Option<Type> {
 fn is_concrete(ty: &Type) -> bool {
     match ty {
         Type::Unknown(_) | Type::SelfType => false,
-        Type::Nullable(t) | Type::Slice(t) | Type::ConstOf(t) | Type::Array(t, _) => is_concrete(t),
+        Type::Nullable(t)
+        | Type::Slice(t)
+        | Type::ConstOf(t)
+        | Type::Mut(t)
+        | Type::Ref(t)
+        | Type::Array(t, _) => is_concrete(t),
         Type::Fun(params, ret) => params.iter().all(is_concrete) && is_concrete(ret),
         _ => true,
     }

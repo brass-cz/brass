@@ -127,7 +127,9 @@ impl Solver {
             Type::Array(inner, _)
             | Type::Slice(inner)
             | Type::Nullable(inner)
-            | Type::ConstOf(inner) => self.collect_free(&inner, out),
+            | Type::ConstOf(inner)
+            | Type::Mut(inner)
+            | Type::Ref(inner) => self.collect_free(&inner, out),
             Type::Fun(params, ret) => {
                 params.iter().for_each(|p| self.collect_free(p, out));
                 self.collect_free(&ret, out);
@@ -219,6 +221,8 @@ fn apply_var_map(ty: &Type, map: &HashMap<u32, Type>) -> Type {
         Type::Slice(inner) => Type::Slice(Box::new(apply_var_map(inner, map))),
         Type::Nullable(inner) => Type::Nullable(Box::new(apply_var_map(inner, map))),
         Type::ConstOf(inner) => Type::ConstOf(Box::new(apply_var_map(inner, map))),
+        Type::Mut(inner) => Type::Mut(Box::new(apply_var_map(inner, map))),
+        Type::Ref(inner) => Type::Ref(Box::new(apply_var_map(inner, map))),
         Type::Fun(params, ret) => Type::Fun(
             params.iter().map(|p| apply_var_map(p, map)).collect(),
             Box::new(apply_var_map(ret, map)),

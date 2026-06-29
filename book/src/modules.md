@@ -1,4 +1,4 @@
-# Chapter 3: Modules
+# Modules
 
 prepoly organizes code into modules: every file is a module, and directories form the module path.
 Let's split a program across several files.

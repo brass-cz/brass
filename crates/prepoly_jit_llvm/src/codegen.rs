@@ -35,6 +35,18 @@ struct MirSlot<'ctx> {
 /// Whether a type is a reference-counted heap object (mirrors the engine's
 /// `rc_managed`): a destructor releases such a contained field/element. Releasing a
 /// closure field frees its block (its captures are released by their own owners).
+/// Peel the front-end wrappers that do not change a value's runtime shape
+/// (mutability, reference-ness, const-ness, and a narrowing nullable cell) to
+/// reach the underlying type a deep copy dispatches on.
+fn unwrap_copy_wrappers(ty: &Type) -> &Type {
+    match ty {
+        Type::Mut(inner) | Type::Ref(inner) | Type::ConstOf(inner) | Type::Nullable(inner) => {
+            unwrap_copy_wrappers(inner)
+        }
+        _ => ty,
+    }
+}
+
 fn is_managed_heap(ty: &Type) -> bool {
     matches!(
         ty,
@@ -3073,6 +3085,49 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
             .unwrap()
             .try_as_basic_value()
             .unwrap_basic()
+    }
+
+    fn deep_copy(&mut self, value: BasicValueEnum<'ctx>, ty: &Type) -> BasicValueEnum<'ctx> {
+        let inner = unwrap_copy_wrappers(ty);
+        match inner {
+            // An array/slice argument is passed by deep copy: a new buffer with the
+            // same elements (managed elements retained, see `pp_arr_copy`).
+            Type::Slice(_) | Type::Array(..) => {
+                let elem = prepoly_engine::element_type(inner);
+                let (esize, _) = type_size_align(&elem);
+                let managed = prepoly_engine::rc_managed(&elem) as u64;
+                let fty = self.abi.ptr().fn_type(
+                    &[
+                        self.abi.ptr().into(),
+                        self.abi.i64t().into(),
+                        self.abi.i64t().into(),
+                    ],
+                    false,
+                );
+                let f = self.abi.runtime_fn(&self.module, "pp_arr_copy", fty);
+                self.builder
+                    .build_call(
+                        f,
+                        &[
+                            value.into(),
+                            self.i64c(esize as i64).into(),
+                            self.i64c(managed as i64).into(),
+                        ],
+                        "arrcopy",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic()
+            }
+            // Non-array values are not copied (only array parameters are wrapped).
+            // A managed value is retained so the caller-side temporary owns its own
+            // reference; a scalar is returned unchanged.
+            other if prepoly_engine::rc_managed(other) => {
+                self.retain(value);
+                value
+            }
+            _ => value,
+        }
     }
 
     fn int_widen(

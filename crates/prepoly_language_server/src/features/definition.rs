@@ -81,7 +81,9 @@ fn resolve_member(
 fn nominal_id(ty: &Type) -> Option<i32> {
     match ty {
         Type::Record(n) | Type::Sum(n) => Some(n.id),
-        Type::Nullable(inner) | Type::ConstOf(inner) => nominal_id(inner),
+        Type::Nullable(inner) | Type::ConstOf(inner) | Type::Mut(inner) | Type::Ref(inner) => {
+            nominal_id(inner)
+        }
         _ => None,
     }
 }

@@ -317,7 +317,9 @@ fn refs_type(ty: &TypeExpr, out: &mut HashSet<String>) {
         }
         TypeExpr::Array(inner, _, _)
         | TypeExpr::Nullable(inner, _)
-        | TypeExpr::Fallible(inner, _) => refs_type(inner, out),
+        | TypeExpr::Fallible(inner, _)
+        | TypeExpr::Mut(inner, _)
+        | TypeExpr::Ref(inner, _) => refs_type(inner, out),
         TypeExpr::Fun(params, ret, _) => {
             for p in params {
                 refs_type(p, out);

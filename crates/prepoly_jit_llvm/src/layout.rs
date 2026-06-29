@@ -46,7 +46,7 @@ impl<'ctx> Abi<'ctx> {
             },
             Type::Float(prepoly_hir::FloatKind::F32) => self.ctx.f32_type().into(),
             Type::Float(prepoly_hir::FloatKind::F64) => self.ctx.f64_type().into(),
-            Type::ConstOf(inner) => self.typed_basic(inner),
+            Type::ConstOf(inner) | Type::Mut(inner) | Type::Ref(inner) => self.typed_basic(inner),
             // Heap/reference values and anything not yet given a typed layout
             // cross as an opaque pointer handle.
             _ => self.ptr().into(),
