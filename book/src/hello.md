@@ -14,7 +14,7 @@ Then, execute the program:
 prepoly hello.pp
 ```
 
-Output is as follows:
+The output is as follows:
 
 ```
 Hello, world!
@@ -53,7 +53,9 @@ println(gcd(48, 36))
 This outputs `12`, which is correct!
 
 
-## Using an array
+## Variables and arrays
+
+We can use `const` to declare an immutable variable and `let` to declare a mutable variable.
 
 The following program calculates the gcd of all elements in an array:
 

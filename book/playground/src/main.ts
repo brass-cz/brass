@@ -1,6 +1,13 @@
 import { WASI, File, OpenFile, ConsoleStdout, PreopenDirectory } from "@bjorn3/browser_wasi_shim";
 import * as monaco from "monaco-editor";
-import { PrepolyLsp, SEMANTIC_LEGEND, type Diagnostic, type Hover, type Range } from "./lsp";
+import {
+  PrepolyLsp,
+  SEMANTIC_LEGEND,
+  type CompletionItem,
+  type Diagnostic,
+  type Hover,
+  type Range,
+} from "./lsp";
 
 const wasm = await WebAssembly.compileStreaming(fetch("/playground/prepoly.wasm"));
 
@@ -85,6 +92,25 @@ const wireLanguageFeatures = (
     },
   });
 
+  monaco.languages.registerCompletionItemProvider("prepoly", {
+    // `.` / `{` continue member access and import paths; identifier typing
+    // triggers completion on its own. Mirrors the server's trigger characters.
+    triggerCharacters: [".", "{"],
+    provideCompletionItems: async (model, position) => {
+      const items = await lsp.completion(model.getValue(), toLspPosition(position));
+      // Replace the word under the cursor, so an accepted item overwrites the
+      // already-typed prefix instead of appending to it.
+      const word = model.getWordUntilPosition(position);
+      const range: monaco.IRange = {
+        startLineNumber: position.lineNumber,
+        endLineNumber: position.lineNumber,
+        startColumn: word.startColumn,
+        endColumn: word.endColumn,
+      };
+      return { suggestions: items.map((item) => toCompletion(item, range)) };
+    },
+  });
+
   monaco.languages.registerDocumentSemanticTokensProvider("prepoly", {
     getLegend: () => SEMANTIC_LEGEND,
     provideDocumentSemanticTokens: async (model) => {
@@ -108,6 +134,30 @@ const toRange = (range: Range): monaco.IRange => ({
   startColumn: range.start.character + 1,
   endLineNumber: range.end.line + 1,
   endColumn: range.end.character + 1,
+});
+
+// LSP and Monaco both number their completion-item kinds, but with different
+// values, so map by the LSP value (1..=25) to the named Monaco enum.
+const lspKindToMonaco: Record<number, monaco.languages.CompletionItemKind> = (() => {
+  const k = monaco.languages.CompletionItemKind;
+  return {
+    1: k.Text, 2: k.Method, 3: k.Function, 4: k.Constructor, 5: k.Field,
+    6: k.Variable, 7: k.Class, 8: k.Interface, 9: k.Module, 10: k.Property,
+    11: k.Unit, 12: k.Value, 13: k.Enum, 14: k.Keyword, 15: k.Snippet,
+    16: k.Color, 17: k.File, 18: k.Reference, 19: k.Folder, 20: k.EnumMember,
+    21: k.Constant, 22: k.Struct, 23: k.Event, 24: k.Operator, 25: k.TypeParameter,
+  };
+})();
+
+const toCompletion = (
+  item: CompletionItem,
+  range: monaco.IRange,
+): monaco.languages.CompletionItem => ({
+  label: item.label,
+  kind: lspKindToMonaco[item.kind ?? 1] ?? monaco.languages.CompletionItemKind.Text,
+  detail: item.detail,
+  insertText: item.insertText ?? item.label,
+  range,
 });
 
 const severityToMonaco: Record<number, monaco.MarkerSeverity> = {

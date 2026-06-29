@@ -71,6 +71,12 @@ export interface Hover {
   contents: string | { value: string } | Array<string | { language?: string; value: string }>;
   range?: Range;
 }
+export interface CompletionItem {
+  label: string;
+  kind?: number; // LSP CompletionItemKind (1..=25)
+  detail?: string;
+  insertText?: string;
+}
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -244,6 +250,26 @@ export class PrepolyLsp {
     const result = PrepolyLsp.reply(messages, 1)?.result as Location | Location[] | null;
     if (!result) return null;
     return Array.isArray(result) ? (result[0] ?? null) : result;
+  }
+
+  /// Completion proposals at `position`. The server returns the full candidate
+  /// set (member methods, in-scope symbols, import names); the editor filters
+  /// them against the typed prefix.
+  async completion(text: string, position: Position): Promise<CompletionItem[]> {
+    const messages = await this.run(text, [
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "textDocument/completion",
+        params: { textDocument: { uri: DOC_URI }, position },
+      },
+    ]);
+    const result = PrepolyLsp.reply(messages, 1)?.result as
+      | CompletionItem[]
+      | { items?: CompletionItem[] }
+      | null;
+    if (!result) return [];
+    return Array.isArray(result) ? result : (result.items ?? []);
   }
 
   /// The document's semantic tokens as the protocol's flat delta-encoded
