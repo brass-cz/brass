@@ -5,7 +5,7 @@
 //! Each [`BasicBlock`] is a straight-line statement sequence ended by exactly
 //! one [`Terminator`]; all branching lives in terminators, so the body is a
 //! proper CFG. This is the type-independent shape the whole pipeline shares: it
-//! is built once per callable (PLAN_MIR Stage 1) and later walked by codegen,
+//! is built once per callable and later walked by codegen,
 //! which reinterprets nothing structural and only maps each node to an
 //! instruction by type.
 

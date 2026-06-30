@@ -1,4 +1,4 @@
-//! Visibility rules (DESIGN.md 2.1, 2.7). A name beginning with `_` is private
+//! Visibility rules. A name beginning with `_` is private
 //! to its defining module; a file whose name begins with `_` is itself private
 //! and cannot be imported.
 

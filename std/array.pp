@@ -1,6 +1,6 @@
 // Standard array utilities, written in Prepoly on top of the runtime
 // primitives. The receiver is the first parameter so `arr.map(f)` resolves
-// here through UFCS (DESIGN.md 9.4). These functions are part of the implicit
+// here through UFCS. These functions are part of the implicit
 // prelude and need no import.
 
 // Apply `f` to each element, returning a new array of the results. `infer[]`
@@ -43,7 +43,7 @@ fun each(arr: infer[], f) {
 
 // A copy of `arr[start..end]`. Bounds are `int64` (the type of `len`), so both
 // `arr.slice(1, 4)` and `arr.slice(1, arr.len())` work and the loop counter stays
-// `int64` (Prepoly has no implicit conversion between integer widths).
+// `int64`.
 fun slice(arr: infer[], start: int64, end: int64) {
     let one: int64 = 1
     let result = []
@@ -67,11 +67,9 @@ fun reverse(arr: infer[]) {
     return result
 }
 
-// Membership test. Polymorphic over arrays and strings so that both
-// `coll.contains(x)`: membership of element `x` in a sequence by `==`. Polymorphic
-// over any iterable of comparable elements -- the solver infers the element type
-// per call, so it needs no annotation. Substring search on strings is a distinct
-// operation (`_string_find`), not this element test.
+// Membership test for arrays and other iterable sequences: `coll.contains(x)`
+// checks sequence elements by `==`. Substring search on strings is a distinct
+// operation (`s.find(sub)`), because strings are not iterated directly.
 fun contains(coll, x) {
     for item in coll {
         if item == x {

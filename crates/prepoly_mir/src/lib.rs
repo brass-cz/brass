@@ -1,11 +1,11 @@
 //! Mid-level IR for Prepoly: a type-independent control-flow graph that sits
-//! between the typed HIR and the back end (PLAN_MIR; DESIGN.md 6).
+//! between the typed HIR and the back end (MIR lowering).
 //!
 //! The HIR still carries source AST bodies. This crate lowers each callable body
 //! to a [`MirBody`]: a CFG in three-address form where `if`/`while`/`for`/
 //! `match`/`if let`/`&&`/`||`/`expr!` are decomposed into basic blocks, and
 //! every intermediate value is named by a local. Crucially the lowering is
-//! *type-independent* (PLAN_MIR Stage 1): locals carry type *variables*, not
+//! *type-independent*: locals carry type *variables*, not
 //! concrete types. The pipeline then concretizes those variables per call
 //! instance (monomorphization) and lets a type-driven back end map each node to
 //! an instruction. Building the CFG exactly once, here, removes the duplicate

@@ -1,5 +1,4 @@
-//! Concurrency runtime: real-thread `spawn` and the cown acquire/release lock
-//! (DESIGN.md 12). The language exposes only `spawn(f)` and `with(cown, f)`; the
+//! Concurrency runtime: real-thread `spawn` and the cown acquire/release lock. The language exposes only `spawn(f)` and `with(cown, f)`; the
 //! compiler decides ownership (move/freeze/cown) and inserts acquire/release, so
 //! these primitives are the dynamic half of the two-stage safety model: a cown's
 //! shared mutable object is reached only while its lock is held, which makes
@@ -66,7 +65,7 @@ unsafe fn lock_byte<'a>(obj: *mut Header) -> &'a AtomicU8 {
     unsafe { &*((obj as *mut u8).add(11) as *const AtomicU8) }
 }
 
-/// Acquire a cown's lock, spinning until it is free (DESIGN.md 12.7.2 step 1).
+/// Acquire a cown's lock, spinning until it is free.
 /// Short critical sections make a spinlock the efficient choice; an uncontended
 /// acquire is a single successful compare-exchange.
 ///
@@ -85,7 +84,7 @@ pub unsafe extern "C-unwind" fn pp_lock(obj: *mut Header) {
     }
 }
 
-/// Release a cown's lock (DESIGN.md 12.7.2 step 5).
+/// Release a cown's lock.
 ///
 /// # Safety
 /// `obj` must be a valid object header (or null).
@@ -115,8 +114,7 @@ unsafe fn array_cowns(arr: *mut Header) -> Vec<*mut Header> {
 }
 
 /// Acquire every cown in an array, in a deterministic (address) order so
-/// multiple `with([..])` acquisitions cannot deadlock (DESIGN.md 12.7.2,
-/// "multiple cowns").
+/// multiple `with([..])` acquisitions cannot deadlock.
 ///
 /// # Safety
 /// `arr` must be a growable-array object of cown pointers (or null).
@@ -140,7 +138,7 @@ pub unsafe extern "C-unwind" fn pp_unlock_all(arr: *mut Header) {
     }
 }
 
-/// Spawn a closure on a new OS thread (DESIGN.md 12.7.1). The closure is the
+/// Spawn a closure on a new OS thread. The closure is the
 /// `{ header | fn-ptr@16 | captures... }` object the typed back end builds; a
 /// zero-argument closure's compiled signature is `void(env)`, so the thread calls
 /// the function pointer with the closure object as its environment.
@@ -160,8 +158,7 @@ pub extern "C-unwind" fn pp_spawn(closure: *mut Header) {
             f(env);
             // The spawner moved the closure to this thread (its reference, not a
             // retained copy). Release it via its stored destructor (offset 24),
-            // which releases the captures and frees the environment (DESIGN.md
-            // 8.2/12.7).
+            // which releases the captures and frees the environment.
             let dtor_ptr = *((env as *mut u8).add(24) as *mut usize);
             if dtor_ptr != 0 {
                 let dtor: extern "C" fn(*mut Header) = std::mem::transmute(dtor_ptr);

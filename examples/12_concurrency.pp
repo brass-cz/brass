@@ -29,6 +29,8 @@ fun main() {
         }
     })
 
+    sync()
+
     // Acquire the shared counter to read its final state.
     with(counter, (c) -> {
         println("count = {c.count}, total = {c.total}")

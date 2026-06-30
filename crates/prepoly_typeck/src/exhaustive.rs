@@ -1,4 +1,4 @@
-//! Match exhaustiveness (DESIGN.md 4.6): a match whose arms reference variants
+//! Match exhaustiveness: a match whose arms reference variants
 //! of a sum type must cover every variant unless a catch-all (wildcard or
 //! whole-value binding) is present.
 

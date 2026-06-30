@@ -1,4 +1,4 @@
-//! Heap allocation of the typed back end's objects (DESIGN.md 8.1). Everything
+//! Heap allocation of the typed back end's objects. Everything
 //! is bump-allocated through `crate::mem`; objects are never individually freed.
 //! These are the typed string, array, and conversion-helper entry points the
 //! unboxed code generator calls: their values are concrete unboxed typed data.
@@ -30,7 +30,7 @@ unsafe fn atomic_rc<'a>(h: *mut Header) -> &'a AtomicI64 {
 }
 
 /// Increment `h`'s reference count: a new reference is being created -- a binding,
-/// field store, capture, or argument (DESIGN.md 8.2). A shared object's count
+/// field store, capture, or argument. A shared object's count
 /// (Immutable/Cown) is atomic because it may be reached from several threads; an
 /// owned object's (Local/Contained/Bridge) is not.
 ///
@@ -95,8 +95,7 @@ pub unsafe extern "C-unwind" fn pp_freeze(h: *mut Header) {
 
 /// Allocate a typed monomorphized heap object of `size` bytes (header + the
 /// back end's own typed field layout) and return its header pointer. The object
-/// has `KIND_TYPED`: the typed back end lays out and accesses the fields itself
-/// (DESIGN.md 8.1). Used by the unboxed codegen path.
+/// has `KIND_TYPED`: the typed back end lays out and accesses the fields itself. Used by the unboxed codegen path.
 pub extern "C-unwind" fn pp_typed_alloc(size: i64) -> *mut Header {
     unsafe { init_header(pp_obj_alloc(size), KIND_TYPED, 0) }
 }
@@ -235,8 +234,7 @@ pub unsafe extern "C-unwind" fn pp_arr_push(arr: *mut Header, elem: *const u8, e
     }
 }
 
-/// Insert `elem_size` bytes from `elem` at index `idx` (`_array_insert`, DESIGN.md
-/// 9.1), shifting the elements at and after `idx` one slot toward the end and
+/// Insert `elem_size` bytes from `elem` at index `idx` (`_array_insert`), shifting the elements at and after `idx` one slot toward the end and
 /// growing the buffer if full. `idx` is clamped to `[0, len]` (an `idx == len`
 /// insert is an append).
 ///
@@ -274,7 +272,7 @@ pub unsafe extern "C-unwind" fn pp_arr_insert(
     }
 }
 
-/// Remove and return the element at index `idx` (`_array_remove`, DESIGN.md 9.1),
+/// Remove and return the element at index `idx` (`_array_remove`),
 /// shifting the elements after it one slot toward the front. The removed element's
 /// bytes are returned zero-extended in an `i64` (every typed slice element -- a
 /// scalar or a heap pointer -- is at most 8 bytes); the caller reinterprets them at
@@ -304,7 +302,7 @@ pub extern "C-unwind" fn pp_arr_remove(arr: *mut Header, idx: i64, elem_size: i6
     }
 }
 
-/// Remove and return the last element as a nullable (`_array_pop`, DESIGN.md 9.1):
+/// Remove and return the last element as a nullable (`_array_pop`):
 /// a heap cell `{ header16 | value@16 }` holding the element's bytes, or a null
 /// pointer when the array is empty. The element's ownership transfers to the cell
 /// (the array's length shrinks), mirroring `pp_str_char_at`'s nullable result, so
@@ -415,8 +413,7 @@ pub unsafe extern "C-unwind" fn pp_str_eq(a: *mut Header, b: *mut Header) -> boo
     }
 }
 
-/// Lexicographic (byte-order) comparison of two strings (`_string_cmp`, DESIGN.md
-/// 9.1): -1 if `a < b`, 0 if equal, 1 if `a > b`.
+/// Lexicographic (byte-order) comparison of two strings (`_string_cmp`): -1 if `a < b`, 0 if equal, 1 if `a > b`.
 ///
 /// # Safety
 /// `a` and `b` must be string objects.

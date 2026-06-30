@@ -1,5 +1,5 @@
-//! JIT-time constraint-based type inference over a MIR body (DESIGN.md 1,
-//! "deferred monomorphization"; PLAN.md R1/R9).
+//! JIT-time constraint-based type inference over a MIR body, the consumer side of
+//! deferred monomorphization.
 //!
 //! Where `mono.rs` forward-propagates concrete types per instance, this derives a
 //! body's types by *constraint generation + unification*: each MIR local becomes
@@ -36,7 +36,7 @@ pub struct MirTypeError {
 
 /// What a deferred (runtime-typed) value must structurally provide, gathered from
 /// how a body uses it: the fields it reads (with their inferred types) and the
-/// methods it calls. For deferred monomorphization (DESIGN.md 7.3), the dispatch
+/// methods it calls. For deferred monomorphization, the dispatch
 /// trampoline checks a JSON-built runtime type against this before specializing
 /// the consumer -- a runtime type missing a required field is rejected at the
 /// boundary rather than miscompiled.
@@ -122,7 +122,7 @@ impl Resolver for ProgramResolver<'_> {
     }
 
     /// A record's named field, or a field common to every variant of a sum
-    /// (DESIGN.md 13.4) -- the same rule the AST checker uses.
+    /// -- the same rule the AST checker uses.
     fn field_type(&self, base: &Type, field: &str) -> Option<Type> {
         match &self.type_def(base)?.kind {
             TypeKind::Record { fields, .. } => fields
@@ -131,7 +131,7 @@ impl Resolver for ProgramResolver<'_> {
                 .and_then(|f| f.resolved_ty.clone()),
             // A variant-qualified field (`Variant.field`, from a variant pattern
             // binding) resolves in that variant; a bare name must be common to every
-            // variant of the sum (DESIGN.md 13.4).
+            // variant of the sum.
             TypeKind::Sum { variants } => match field.split_once('.') {
                 Some((variant, fname)) => variants
                     .iter()
@@ -233,7 +233,7 @@ pub fn infer_body<R: Resolver>(
 /// Gather the structural requirement a body places on its `deferred` parameter --
 /// the fields it reads and the methods it calls on that value -- by typing the
 /// body with `deferred` left as a fresh, unseeded type variable. This is the
-/// consumer side of deferred monomorphization (DESIGN.md 7.3): the runtime
+/// consumer side of deferred monomorphization: the runtime
 /// dispatch checks a boundary value's runtime-built type against this requirement
 /// before specializing the consumer, so a type missing a required field is
 /// rejected at the boundary rather than miscompiled.
@@ -797,7 +797,7 @@ mod tests {
     fn gathers_structural_requirement_of_a_deferred_parameter() {
         // `describe` reads `p.age` (used with `+ 1`, so int32) and `p.label`, so a
         // deferred `p` must structurally provide both -- the requirement runtime
-        // dispatch checks a JSON-built type against (DESIGN.md 7.3).
+        // dispatch checks a JSON-built type against.
         let src = "fun describe(p) {\n  let next = p.age + 1\n  let l = p.label\n}\n";
         let ast = prepoly_parser::parse(src).expect("parse");
         let (program, errs) = prepoly_hir::lower(&[prepoly_hir::LoadedModule {

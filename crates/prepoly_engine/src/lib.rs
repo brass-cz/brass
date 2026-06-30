@@ -6,7 +6,7 @@
 //!
 //!  - [`monomorphize`], which performs *true* single-specialization: it checks a
 //!    [`prepoly_mir::MirProgram`] and instantiates every reachable callable into
-//!    a [`MonoProgram`] of concrete-typed instances (DESIGN.md 7);
+//!    a [`MonoProgram`] of concrete-typed instances;
 //!  - the [`Codegen`] trait, whose default methods walk the monomorphized MIR and
 //!    dispatch to small *typed* leaf operations a back end implements -- every
 //!    value has a concrete type, so the back end emits unboxed code and this

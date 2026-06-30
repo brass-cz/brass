@@ -1,6 +1,6 @@
 //! Prepoly command-line driver.
 //!
-//! Pipeline (DESIGN.md 6): resolve the module graph, parse, lower to HIR, check
+//! Pipeline: resolve the module graph, parse, lower to HIR, check
 //! (resolve + typeck), then run the checked program. The standard library is an
 //! embedded prelude.
 //!
@@ -115,7 +115,7 @@ fn exit_code(r: Result<(), u8>) -> ExitCode {
     }
 }
 
-/// Apply the spawn auto-acquire transform (DESIGN.md 12.9) to every function and
+/// Apply the spawn auto-acquire transform to every function and
 /// method body in each module, before lowering. This rewrites a `spawn` closure
 /// that mutates a captured cown to acquire it with `with`, so the source needs no
 /// ownership annotations yet concurrent mutation is serialized by the cown lock.
@@ -154,8 +154,7 @@ fn auto_acquire_modules(modules: &mut [LoadedModule]) {
     }
 }
 
-/// Emit a warning for every `spawn` capture the compiler auto-cowns (DESIGN.md
-/// 12.9.2). The shared ownership analysis (`prepoly_jit_llvm::ownership`) decides
+/// Emit a warning for every `spawn` capture the compiler auto-cowns. The shared ownership analysis (`prepoly_jit_llvm::ownership`) decides
 /// move/freeze/cown from liveness and mutation; a `Cown` decision means the capture
 /// is mutated and still live, so the compiler wraps it for safe concurrent access.
 ///
@@ -271,8 +270,7 @@ fn execute_repl(program: &Program) -> Result<(), String> {
 }
 
 /// Resolve each integer literal's source span to its inferred integer kind when
-/// that kind is unambiguous across all (re-)inferences, for typed-literal codegen
-/// (PLAN.md R4). A span recorded with more than one integer kind (a literal in a
+/// that kind is unambiguous across all (re-)inferences, for typed-literal codegen. A span recorded with more than one integer kind (a literal in a
 /// polymorphic context) is left out, so codegen defaults it.
 fn int_literal_types(typed: &prepoly_hir::TypedProgram) -> HashMap<Span, prepoly_hir::IntKind> {
     use prepoly_hir::{Type, TypedExprKind};
@@ -476,7 +474,7 @@ fn load_module(
 ) -> Result<(), String> {
     let key = path.join(".");
     // A module file whose name begins with `_` is private and cannot be imported
-    // from another module (DESIGN.md 2.7).
+    // from another module.
     if prepoly_resolve::is_private_module(path) {
         return Err(format!("error: cannot import private module `{key}`"));
     }

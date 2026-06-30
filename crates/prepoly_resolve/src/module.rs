@@ -1,5 +1,5 @@
 //! Module-level name resolution: validate that every imported name exists and
-//! is public (DESIGN.md 2.3, 2.7). The file-system module graph is resolved by
+//! is public. The file-system module graph is resolved by
 //! the driver; this checks the resulting program for import errors.
 
 use std::collections::{HashMap, HashSet};
@@ -26,7 +26,7 @@ pub fn check_imports(program: &Program, modules: &[LoadedModule]) -> Vec<Resolve
     let mut errors = Vec::new();
     for m in modules {
         // The same local name imported from two different modules is a local
-        // ambiguity in the importing module (DESIGN.md 2; PLAN.md R2): neither
+        // ambiguity in the importing module: neither
         // origin wins, so a bare use cannot be resolved.
         let mut origins: HashMap<&str, Vec<String>> = HashMap::new();
         for imp in &m.ast.imports {
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn same_name_imported_from_two_modules_is_ambiguous() {
-        // PLAN.md R2: importing `helper` from two different modules into one
+        // Importing `helper` from two different modules into one
         // module is a local ambiguity, reported once and naming both origins.
         // The flat-namespace lower collision is ignored here so the import check
         // is tested in isolation (it is the diagnostic that survives once

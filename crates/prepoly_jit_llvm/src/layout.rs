@@ -1,6 +1,6 @@
 //! The LLVM ABI layer: the typed (unboxed) LLVM representation of Prepoly types
 //! and lazy declarations of the runtime's C-ABI primitives that compiled code
-//! calls (DESIGN.md 8.1, 9.1).
+//! calls.
 
 use inkwell::AddressSpace;
 use inkwell::context::Context;
@@ -29,7 +29,7 @@ impl<'ctx> Abi<'ctx> {
     }
 
     /// The typed (unboxed) LLVM representation of a Prepoly type, for the typed
-    /// monomorphized backend (DESIGN.md 8.1; PLAN.md R5). Primitives map to LLVM
+    /// monomorphized backend. Primitives map to LLVM
     /// primitives (`bool` -> `i1`, `intN`/`uintN` -> `iN`, `float32/64` ->
     /// `f32/f64`); every heap or reference value (string, record, sum, slice,
     /// array, closure, nullable, `Result`, and not-yet-typed unknowns) is a
@@ -63,7 +63,7 @@ impl<'ctx> Abi<'ctx> {
 
     /// The typed LLVM function signature for a fully-known callable, e.g.
     /// `fun add(a: int32, b: int32) -> int32` becomes `i32 (i32, i32)` -- the
-    /// unboxed signature the monomorphized backend emits (PLAN.md R5).
+    /// unboxed signature the monomorphized backend emits.
     pub fn typed_fn_type(&self, params: &[Type], ret: &Type) -> FunctionType<'ctx> {
         let param_tys: Vec<BasicMetadataTypeEnum> =
             params.iter().map(|t| self.typed_basic(t).into()).collect();
@@ -119,7 +119,7 @@ mod tests {
     use inkwell::types::BasicTypeEnum;
     use prepoly_hir::FloatKind;
 
-    /// The typed backend (PLAN.md R5) lowers `fun add(a: int32, b: int32) ->
+    /// The typed backend lowers `fun add(a: int32, b: int32) ->
     /// int32` to the unboxed signature `i32 (i32, i32)`.
     #[test]
     fn typed_signature_unboxes_primitives() {

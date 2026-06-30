@@ -1,4 +1,4 @@
-//! Control-flow completeness (DESIGN.md 4.3, 5.7). A function or method with an
+//! Control-flow completeness. A function or method with an
 //! explicit non-`void` return type must produce a value on every path. Without
 //! this check a body that falls off its end would yield an undefined value at
 //! runtime while still satisfying the declared return type statically.

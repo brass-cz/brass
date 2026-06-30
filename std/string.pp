@@ -104,9 +104,12 @@ fun chars(s: string) -> string[] {
     let result = []
     let i: int64 = 0
     while i < len(s) {
-        let c = _string_char_at(s, i)
-        result.push(c)
-        i += len(c)
+        if let c = _string_char_at(s, i) {
+            result.push(c)
+            i += len(c)
+        } else {
+            break
+        }
     }
     return result
 }

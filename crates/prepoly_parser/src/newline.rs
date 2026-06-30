@@ -1,4 +1,4 @@
-//! Newline-policy lookahead helpers (DESIGN.md 3.2).
+//! Newline-policy lookahead helpers.
 //!
 //! Prepoly treats a newline as a statement terminator by default, but as
 //! whitespace when doing so lets parsing continue: inside brackets, after a

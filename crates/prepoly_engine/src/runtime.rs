@@ -1,5 +1,5 @@
 //! Runtime JIT compilation: the backend-agnostic orchestration of deferred
-//! monomorphization (DESIGN.md 7.3).
+//! monomorphization.
 //!
 //! When a type is fixed by the outside world at runtime (e.g. JSON deserialize),
 //! the consumer must be specialized and compiled *then*. This module owns the
@@ -33,14 +33,14 @@ pub trait RuntimeJit {
 
 /// The memory layout of a monomorphized type: its size and alignment in bytes.
 /// Cached per concrete (substituted) type so a layout is computed once
-/// (DESIGN.md 7.1, the `type_layouts` half of the cache).
+/// (the `type_layouts` half of the cache).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TypeLayout {
     pub size: u64,
     pub align: u64,
 }
 
-/// Monomorphization cache (DESIGN.md 7.1): two memoization tables that make each
+/// Monomorphization cache: two memoization tables that make each
 /// `(function, concrete types)` instance compiled once and each `(type,
 /// substitution)` layout computed once.
 ///
@@ -180,7 +180,7 @@ mod tests {
         assert!(resolve_or_compile(&mut cache, &mut backend, &mono, "nope$x").is_err());
     }
 
-    /// The `type_layouts` half of the cache (DESIGN.md 7.1) computes a concrete
+    /// The `type_layouts` half of the cache computes a concrete
     /// type's layout once and serves it thereafter.
     #[test]
     fn type_layout_is_memoized() {

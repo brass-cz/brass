@@ -545,8 +545,7 @@ fun count_built() {
 fn typed_growable_arrays_pop() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    // `arr.pop()` removes and returns the last element as a nullable (DESIGN.md
-    // 9.1 `_array_pop`): a value when present, null when the array is empty.
+    // `arr.pop()` removes and returns the last element as a nullable (`_array_pop`): a value when present, null when the array is empty.
     let src = "\
 fun pop_last() -> int32 {
     let r = []
@@ -599,7 +598,7 @@ fun pop_empty_is_null() -> int32 {
 fn named_numeric_string_primitives_are_callable() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    // The named conversion/string primitives (DESIGN.md 9.1) are directly
+    // The named conversion/string primitives are directly
     // callable, not only reachable through `Type.from`/`parse` and `+`.
     // The infallible primitives return scalars/strings directly, so they exercise
     // the `extern fn -> iN`/`-> f64` ABI. The fallible parses/truncations are
@@ -1510,7 +1509,7 @@ fn array_renders_as_bracketed_list() {
     assert_eq!(backend.run_entry_i32("show"), Some(9));
 }
 
-/// A trailing nullable parameter is optional at call sites (DESIGN.md 5.6) and keeps
+/// A trailing nullable parameter is optional at call sites and keeps
 /// its declared (nullable) type whether omitted or passed a value -- including a
 /// value type like `int32?`, where `if b` is a null test (so a present `0` takes the
 /// `if` branch) and `b` unwraps to `int32` in arithmetic. `pick(10)` omits `b`
@@ -1541,7 +1540,7 @@ fn trailing_nullable_param_is_optional() {
 }
 
 /// A captured-and-mutated local that is also used in its defining frame after
-/// capture is a shared heap cell (RcCell, DESIGN.md 8.4): the closure's mutations
+/// capture is a shared heap cell (RcCell): the closure's mutations
 /// are seen through the shared capture, not made on a per-closure copy. `g` adds to
 /// `x` twice; `f` returns the shared `x` = 2 (by-value capture would give 0).
 #[test]
@@ -1573,7 +1572,7 @@ fn captured_mutated_local_is_a_shared_cell() {
 }
 
 /// The cycle collector reclaims a reference cycle that plain reference counting
-/// cannot (DESIGN.md 8.3). A self-referential record (`a.next = a`, where `next` is a
+/// cannot. A self-referential record (`a.next = a`, where `next` is a
 /// nullable cell whose retained value points back at the node) keeps its own count
 /// above zero, so it leaks under counting alone; the collector run at program end
 /// frees both the node and its cell, returning the live-block count to its pre-run

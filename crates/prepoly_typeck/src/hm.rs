@@ -1,5 +1,5 @@
 //! Hindley-Milner type inference (Algorithm W) over function and method bodies,
-//! run as a type-checking pass before monomorphization (DESIGN.md 5.7).
+//! run as a type-checking pass before monomorphization.
 //!
 //! The checker builds a global environment of function schemes, then infers each
 //! function and method body under its parameters: every sub-expression gets a
@@ -330,7 +330,7 @@ impl<'p> Hm<'p> {
         self.errors.push(TypeError { message, span });
     }
 
-    /// Report a parameter name that appears twice in `params` (DESIGN.md 13).
+    /// Report a parameter name that appears twice in `params`.
     fn check_duplicate_params(&mut self, params: &[prepoly_parser::ast::Param], context: &str) {
         let mut seen = HashSet::new();
         for p in params {
@@ -376,7 +376,7 @@ impl<'p> Hm<'p> {
     /// Check that a value of type `have` may flow into a `want` position
     /// (assignment, argument, field, return). This is directional: HM flow
     /// unification first, then *structural subtyping* -- a wider record is usable
-    /// where a narrower one is required (DESIGN.md 5.8), but not the reverse.
+    /// where a narrower one is required, but not the reverse.
     fn flow_into(&mut self, have: &Type, want: &Type, span: Span) {
         if self.flow_unify(have, want) {
             return;
@@ -405,7 +405,7 @@ impl<'p> Hm<'p> {
     /// at one type, a propagated `!` at the same type, etc. unify to one error
     /// type), then -- when the payloads are distinct record types that do not
     /// unify -- structural subtyping, accepting them when one error record is
-    /// usable as the other (DESIGN.md 5.6, 5.8, 13.3). Truly unrelated error
+    /// usable as the other. Truly unrelated error
     /// types are a type error.
     fn reconcile_err(&mut self, t: &Type, span: Span) {
         let err = self.err.clone();
@@ -880,7 +880,7 @@ impl<'p> Hm<'p> {
     }
 
     /// A built-in numeric/string conversion call, type-checked against its fixed
-    /// source contract (DESIGN.md 5.2): `string.from(x)` accepts any value and
+    /// source contract: `string.from(x)` accepts any value and
     /// yields a string; `intN.from`/`floatN.from` take a numeric value; `intN.parse`
     /// /`floatN.parse` take a string. `intN.from`/`.parse` are fallible (a narrowing
     /// or parse can fail) so they yield `Result<intN, string>`; `floatN.from` is a
@@ -963,7 +963,7 @@ impl<'p> Hm<'p> {
         })
     }
 
-    /// A built-in `_string_*` primitive (DESIGN.md 5.2): check its arity and its
+    /// A built-in `_string_*` primitive: check its arity and its
     /// string-typed arguments (leniently -- a still-unknown argument defers to the
     /// runtime, as the conversions do, so a polymorphic caller like
     /// `contains(coll, x)` passing fresh variables is not wrongly constrained),
@@ -1044,7 +1044,7 @@ impl<'p> Hm<'p> {
         if let Expr::Field(base, method, _) = callee {
             // Built-in numeric/string conversions `Type.from(x)` / `Type.parse(s)`
             // are calls on a primitive type *name*, with fixed source-value
-            // contracts (DESIGN.md 5.2). Recognize them before the user-method
+            // contracts. Recognize them before the user-method
             // path so their argument class is checked.
             if let Expr::Ident(type_name, _) = base.as_ref()
                 && let Some(ret) = self.conversion_call(type_name, method, args, span)
@@ -1067,7 +1067,7 @@ impl<'p> Hm<'p> {
         let arg_tys: Vec<Type> = args.iter().map(|a| self.infer_expr(&a.expr)).collect();
         match self.solver.resolve(&callee_ty) {
             // The supplied arguments match, or omit only a trailing run of nullable
-            // parameters (each defaults to `null`; DESIGN.md 5.6).
+            // parameters (each defaults to `null`).
             Type::Fun(params, ret)
                 if arg_tys.len() <= params.len()
                     && params[arg_tys.len()..]
@@ -1158,7 +1158,7 @@ impl<'p> Hm<'p> {
 
     /// The declared type of `field` accessed on `ty` (cloned), if known. For a
     /// record this is the named field; for a sum it is a field common to *every*
-    /// variant (DESIGN.md 13.4 sum common-field access) -- `None` if any variant
+    /// variant (common-field access) -- `None` if any variant
     /// lacks it.
     fn record_field_type(&self, ty: &Type, field: &str) -> Option<Type> {
         match &self.type_def(ty)?.kind {
@@ -1166,7 +1166,7 @@ impl<'p> Hm<'p> {
                 .iter()
                 .find(|f| f.name == field)
                 .and_then(|f| f.resolved_ty.clone()),
-            // Common-field access (DESIGN.md 13.4): the field must exist in every
+            // Common-field access: the field must exist in every
             // variant. The principled pass stays permissive about an unannotated
             // (dynamic) common field -- it returns the declared type, which the
             // access path freshens -- and the `infer` pass makes the sound decision

@@ -1,5 +1,5 @@
 //! Rendering a runtime [`Value`] to a string, matching the typed back end's
-//! `to_string` byte-for-byte (DESIGN.md 9.1; the LLVM renderer in
+//! `to_string` byte-for-byte (the LLVM renderer lives in
 //! `prepoly_jit_llvm::codegen`).
 //!
 //! The rules the typed path fixes and this mirrors:

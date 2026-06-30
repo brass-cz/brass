@@ -1,5 +1,5 @@
 //! Unification over `Type` with a substitution for `Unknown` variables
-//! (DESIGN.md 5.7 Phase 4). Records use structural compatibility; sum types are
+//! Records use structural compatibility; sum types are
 //! nominal.
 
 use std::collections::HashMap;
@@ -16,7 +16,7 @@ pub struct Subst {
 }
 
 /// An opaque marker for the substitution state, used to roll back speculative
-/// unifications (e.g. a non-committing assignability probe). DESIGN.md 5.7.
+/// unifications (e.g. a non-committing assignability probe).
 #[derive(Clone, Copy)]
 pub struct Snapshot(usize);
 

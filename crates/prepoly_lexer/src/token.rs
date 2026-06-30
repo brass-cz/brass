@@ -3,7 +3,7 @@
 //! Prepoly uses newlines as statement separators, so the lexer emits an
 //! explicit `Newline` token. The parser decides per-position whether a
 //! newline terminates a statement or should be treated as whitespace
-//! (see the newline-fallback strategy in DESIGN.md 3.2).
+//! (the newline-fallback strategy lives in the parser).
 
 /// A byte-offset source span. `lo`/`hi` are byte indices into the source,
 /// usable for slicing and for computing line/column on demand.

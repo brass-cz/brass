@@ -2,7 +2,7 @@
 //!
 //! A `Module` is one source file: a list of imports followed by top-level
 //! items (type/function declarations and statements). Records and sum types
-//! share the single `TypeDecl` node per DESIGN.md 4.2.
+//! share the single `TypeDecl` node.
 
 use prepoly_lexer::Span;
 

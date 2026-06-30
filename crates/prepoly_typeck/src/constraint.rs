@@ -19,9 +19,9 @@ use prepoly_hir::Type;
 /// when the variable is solved at a call site.
 #[derive(Clone, Debug)]
 pub enum ShapeConstraint {
-    /// The variable must equal a concrete type. Recorded from a same-typed
-    /// binary operator whose other operand is concrete (`x + 1` => `x` is
-    /// `int32`), since Prepoly performs no implicit numeric conversion.
+    /// The variable must equal a concrete non-convertible type. Numeric operands
+    /// can still use the common numeric type selected at the call site, but
+    /// non-numeric operators such as string concatenation require the same type.
     Equals(Type),
     /// The variable must be a value exposing the named method (`x.speak()`).
     HasMethod(String),

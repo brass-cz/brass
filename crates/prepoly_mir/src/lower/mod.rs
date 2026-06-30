@@ -110,8 +110,7 @@ impl<'p> ProgramCtx<'p> {
     }
 
     /// Per-parameter nullability of free function `name` as seen from `module`,
-    /// used to pad omitted trailing nullable arguments with `null` at call sites
-    /// (DESIGN.md 5.6). `None` if `name` is not a known free function.
+    /// used to pad omitted trailing nullable arguments with `null` at call sites. `None` if `name` is not a known free function.
     fn fn_param_nullability(&self, module: &[String], name: &str) -> Option<Vec<bool>> {
         self.program.resolve_function(module, name).map(|info| {
             info.signature
@@ -174,7 +173,7 @@ pub(crate) struct FnLower<'a, 'p> {
     /// Active loop targets as (continue, break) block pairs; innermost last.
     pub(crate) loops: Vec<(BlockId, BlockId)>,
     /// Names heap-promoted to a shared cell (a one-element array): a captured and
-    /// mutated local (DESIGN.md 8.4). Reads/writes of such a name go through the
+    /// mutated local. Reads/writes of such a name go through the
     /// cell's element 0; the closure captures the shared cell pointer.
     pub(crate) cells: std::collections::HashSet<String>,
 }
@@ -224,7 +223,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
     ///
     /// A captured-and-mutated binding (`is_cell`) is heap-promoted to a
     /// one-element cell array shared with the closures that capture it, with the
-    /// value stored at element 0 (DESIGN.md 8.4). Routing every binder through
+    /// value stored at element 0. Routing every binder through
     /// here applies the wrap uniformly: a `for` variable or a destructured field
     /// that a closure captures and mutates is promoted exactly like a `let`,
     /// instead of being stored as a scalar that read/write/capture sites then
@@ -258,7 +257,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
     /// Lower a function/method body: bind parameters, run the statement
     /// sequence, and close any open tail with `return void`.
     fn lower_callable(&mut self, params: &[Param], body: &Block) -> Vec<LocalId> {
-        // Heap-promote captured-and-mutated locals to shared cells (DESIGN.md 8.4).
+        // Heap-promote captured-and-mutated locals to shared cells.
         // Parameters are excluded -- they have no `let` to wrap.
         self.cells = crate::analysis::cell_promotions(body);
         for p in params {

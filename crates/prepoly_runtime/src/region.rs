@@ -1,15 +1,14 @@
-//! Region metadata, the write barrier, and closedness verification (DESIGN.md
-//! 12.3-12.6). A region is the object subgraph owned by a `with` scope; its bridge
+//! Region metadata, the write barrier, and closedness verification. A region is the object subgraph owned by a `with` scope; its bridge
 //! is the object `with` guards. Each region tracks a *local reference count* (LRC):
 //! the number of references into the region from outside it, plus its bridge owner.
 //! A region is **closed** when only its bridge owner references it (LRC == 1) --
 //! nothing escaped.
 //!
-//! Regions form a tree through `parent` links (DESIGN.md 12.3): a region may be
+//! Regions form a tree through `parent` links: a region may be
 //! nested inside another. A borrow reaching into a child region also reaches into
 //! its ancestors, so the first external borrow of a child propagates a borrow up
 //! the parent chain, and dropping the last child borrow propagates the release back
-//! up (DESIGN.md 12.6). This lets the whole nested tree's closedness be read from a
+//! up. This lets the whole nested tree's closedness be read from a
 //! single region's LRC.
 //!
 //! This is an additive layer over the per-object cown lock that already provides
@@ -90,14 +89,14 @@ pub unsafe extern "C-unwind" fn pp_region_open_nested(bridge: *mut Header, paren
         );
         if !bridge.is_null() {
             (*bridge).nchild = id as i32;
-            // The bridge is the region's single external entry point (DESIGN.md 12.2).
+            // The bridge is the region's single external entry point.
             (*bridge).owner = OWNER_BRIDGE;
         }
         id
     }
 }
 
-/// Record a borrow reaching into region `id` (DESIGN.md 12.6): raise its LRC, and
+/// Record a borrow reaching into region `id`: raise its LRC, and
 /// when that is the region's *first* external borrow (LRC 1 -> 2), the borrow also
 /// reaches the parent, so recurse. `regions` is the already-held table guard.
 fn add_borrow(regions: &mut BTreeMap<i64, RegionMeta>, id: i64) {
@@ -111,7 +110,7 @@ fn add_borrow(regions: &mut BTreeMap<i64, RegionMeta>, id: i64) {
     }
 }
 
-/// Drop a borrow into region `id` (DESIGN.md 12.6): lower its LRC, and when that
+/// Drop a borrow into region `id`: lower its LRC, and when that
 /// removes the region's *last* external borrow (LRC 2 -> 1), recurse to the parent.
 fn remove_borrow(regions: &mut BTreeMap<i64, RegionMeta>, id: i64) {
     let Some(meta) = regions.get_mut(&id) else {
@@ -139,7 +138,7 @@ unsafe fn region_of(obj: *mut Header) -> i64 {
     }
 }
 
-/// `_addReference` (DESIGN.md 12.5): account for a new reference `src.field = tgt`
+/// `_addReference`: account for a new reference `src.field = tgt`
 /// against the region model, applying the §12.4 reference rules. This maintains
 /// region *membership* and the local reference count; the per-object reference
 /// count itself is maintained by the typed back end's retain/release (§8.2), so
@@ -155,8 +154,7 @@ pub unsafe extern "C-unwind" fn pp_add_reference(src: *mut Header, tgt: *mut Hea
         let sr = region_of(src);
         let tr = region_of(tgt);
 
-        // Same region: an internal reference, no region bookkeeping (DESIGN.md 12.5
-        // fast path -- `_sameRegion`).
+        // Same region: an internal reference, no region bookkeeping (fast path -- `_sameRegion`).
         if sr != 0 && sr == tr {
             return;
         }
@@ -174,7 +172,7 @@ pub unsafe extern "C-unwind" fn pp_add_reference(src: *mut Header, tgt: *mut Hea
             return;
         }
         // Otherwise src owns a region and tgt is region-less: transfer tgt into src's
-        // region as a Contained interior element (DESIGN.md 12.4 "->move").
+        // region as a Contained interior element ("->move").
         if tr == 0 {
             (*tgt).nchild = sr as i32;
             (*tgt).owner = OWNER_CONTAINED;
@@ -185,7 +183,7 @@ pub unsafe extern "C-unwind" fn pp_add_reference(src: *mut Header, tgt: *mut Hea
     }
 }
 
-/// `_removeReference` (DESIGN.md 12.5): account for the removal of the old value of
+/// `_removeReference`: account for the removal of the old value of
 /// a field. If `old` was an external borrow from `src` into another region, drop
 /// that borrow so the target region can become closed again.
 ///
@@ -206,7 +204,7 @@ pub unsafe extern "C-unwind" fn pp_remove_reference(src: *mut Header, old: *mut 
     }
 }
 
-/// The full write barrier `_writeBarrier(src, old, tgt)` (DESIGN.md 12.5): reject
+/// The full write barrier `_writeBarrier(src, old, tgt)`: reject
 /// writes through an immutable or cown handle, add the new reference, and remove
 /// the old one. Inserted by the typed back end on a field store `src.f = tgt` whose
 /// previous value was `old`.
@@ -219,9 +217,9 @@ pub unsafe extern "C-unwind" fn pp_write_barrier(
     tgt: *mut Header,
 ) {
     unsafe {
-        // 1. A write through an immutable or cown handle is illegal (DESIGN.md 12.4:
+        // 1. A write through an immutable or cown handle is illegal:
         //    Immutable is read-only; a cown's interior is reached only by acquiring it,
-        //    not by writing the cown cell itself).
+        //    not by writing the cown cell itself.
         if !src.is_null() && is_shared((*src).owner) {
             crate::builtins::pp_panic_str("cannot write to immutable or cown object");
         }
@@ -231,8 +229,8 @@ pub unsafe extern "C-unwind" fn pp_write_barrier(
     }
 }
 
-/// Reduced write barrier retained for the typed back end's current field-store path
-/// (DESIGN.md 12.5): same as [`pp_add_reference`] but also performs the local-value
+/// Reduced write barrier retained for the typed back end's current field-store
+/// path: same as [`pp_add_reference`] but also performs the local-value
 /// transfer used when no `src` owner is known. `src` is the container, `value` the
 /// stored value; equivalent to `pp_add_reference` with the container as `src`.
 ///
@@ -244,7 +242,7 @@ pub unsafe extern "C-unwind" fn pp_region_write(container: *mut Header, value: *
     }
 }
 
-/// Drop an external borrow into region `id` (DESIGN.md 12.6): the inverse of the
+/// Drop an external borrow into region `id`: the inverse of the
 /// escape recorded by [`pp_add_reference`], used when an escaping reference is later
 /// released (a removed reference in the write barrier, §12.5). Propagates up the
 /// region tree.
@@ -255,7 +253,7 @@ pub extern "C-unwind" fn pp_region_unborrow(id: i64) {
     remove_borrow(&mut REGIONS.lock().unwrap().regions, id);
 }
 
-/// Closedness verification on region release (DESIGN.md 12.5/12.6): a region is
+/// Closedness verification on region release: a region is
 /// closed iff only its bridge owner references it (LRC == 1) -- i.e. no reference
 /// into it (or, by parent propagation, into any descendant) escaped during the
 /// `with` scope. Returns true when closed.
@@ -318,7 +316,7 @@ mod tests {
     }
 
     /// A borrow into a nested child region propagates up: it opens the parent too,
-    /// and dropping the borrow closes both again (DESIGN.md 12.6 recursive LRC).
+    /// and dropping the borrow closes both again (LRC).
     #[test]
     fn nested_lrc_propagates_to_parent() {
         unsafe {
@@ -354,7 +352,7 @@ mod tests {
         }
     }
 
-    /// The full write barrier's add/remove pair (DESIGN.md 12.5): storing a region
+    /// The full write barrier's add/remove pair: storing a region
     /// object into an external container opens its region (an escape borrow); later
     /// overwriting that field (removing the old reference) closes it again.
     #[test]

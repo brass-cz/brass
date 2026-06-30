@@ -47,7 +47,7 @@ Hello, world!
   both explicit and automatic numeric conversion.
 - **A file-based module system** where each file is a module and a leading `_`
   marks a private name, plus a small standard library written in prepoly itself.
-- **Experimental concurrency.** `spawn(f)` and `with(cown, f)` are the only
+- **Experimental concurrency.** `spawn(f)`, `with(cown, f)`, and `sync()` are the
   primitives; the compiler infers ownership, never the programmer.
 - **Tooling:** an interactive REPL and an LSP server (`prepoly-lsp`).
 
@@ -139,8 +139,8 @@ import students.types.{ Student }    // students/types.pp
 
 ```
 spawn(() -> { for n in nums { counter.add(n) } })
-with(counter, (c) -> { println("total = {c.total}") })
 sync()                               // wait for spawned work before observing it
+with(counter, (c) -> { println("total = {c.total}") })
 ```
 
 ## Building
@@ -190,7 +190,8 @@ knowing:
 - **Concurrency is experimental.** Scheduling is unstructured, so code that must
   observe a spawned task's results calls `sync()` first. Treat it as a preview.
 - **The JIT and interpreter agree across the language's tested surface,** but a
-  few numeric and string corner cases can still differ between the two.
+  few runtime-only features differ: file I/O and concurrency currently require
+  the native runtime rather than `prepoly repl`.
 
 ## License
 

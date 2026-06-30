@@ -1,4 +1,4 @@
-//! End-to-end module-resolution tests (DESIGN.md 2). These exercise the
+//! End-to-end module-resolution tests. These exercise the
 //! driver's file-system module loader, which the per-crate unit tests cannot
 //! reach: missing module files, private module files, and import-name checking.
 
@@ -156,8 +156,7 @@ fn private_name_import_is_rejected() {
 #[test]
 fn non_imported_public_name_is_invisible() {
     // A public name in another module is only usable when imported; calling it
-    // without an import is a name-resolution error, not a silent global lookup
-    // (DESIGN.md 2; PLAN.md R5).
+    // without an import is a name-resolution error, not a silent global lookup.
     let main = setup(
         "non_imported_public",
         &[
@@ -248,7 +247,7 @@ fn run(main: &PathBuf) -> (bool, String) {
 
 #[test]
 fn same_function_name_in_two_modules_coexists_and_dispatches() {
-    // PLAN.md R2: `helper` is defined in both a.util and b.util, both loaded,
+    // `helper` is defined in both a.util and b.util, both loaded,
     // but main imports only a.util's. main's call resolves to a.util's helper,
     // while b.util's `thing` calls b.util's own helper. Both dispatch correctly.
     let main = setup(
@@ -272,7 +271,7 @@ fn same_function_name_in_two_modules_coexists_and_dispatches() {
 
 #[test]
 fn typed_int_functions_compile_and_run_correctly() {
-    // PLAN.md R5: leaf integer-arithmetic functions compile to typed unboxed
+    // Leaf integer-arithmetic functions compile to typed unboxed
     // bodies behind uniform-ABI adapters; results must match the uniform path,
     // including truncation and sign extension across the boundary.
     let main = setup(
@@ -294,7 +293,7 @@ fn typed_int_functions_compile_and_run_correctly() {
 
 #[test]
 fn typed_integer_control_flow_runs_correctly() {
-    // PLAN.md R5: typed codegen now handles integer functions with control flow
+    // Typed codegen now handles integer functions with control flow
     // (if/else, locals, multiple returns), not just single-return leaf bodies.
     let main = setup(
         "typed_int_control_flow",
@@ -316,7 +315,7 @@ fn typed_integer_control_flow_runs_correctly() {
 
 #[test]
 fn typed_integer_direct_calls_run_correctly() {
-    // PLAN.md R5: typed-integer functions call each other's typed instances
+    // Typed-integer functions call each other's typed instances
     // directly (no boxing round trip), resolved as a fixpoint so chains and
     // control-flow callees both qualify.
     let main = setup(
@@ -338,7 +337,7 @@ fn typed_integer_direct_calls_run_correctly() {
 
 #[test]
 fn typed_integer_while_loop_runs_correctly() {
-    // PLAN.md R5: typed integer codegen handles while loops, compound
+    // Typed integer codegen handles while loops, compound
     // assignment, and literal-divisor division/remainder (collatz-style).
     let main = setup(
         "typed_int_while",
@@ -360,7 +359,7 @@ fn typed_integer_while_loop_runs_correctly() {
 
 #[test]
 fn typed_float_and_comparison_functions_run_correctly() {
-    // PLAN.md R5: the typed leaf path covers float64 arithmetic and integer/
+    // The typed leaf path covers float64 arithmetic and integer/
     // float comparisons (bool-returning), through typed bodies + adapters.
     let main = setup(
         "typed_float_cmp",
@@ -381,7 +380,7 @@ fn typed_float_and_comparison_functions_run_correctly() {
 
 #[test]
 fn non_imported_type_in_annotation_is_rejected() {
-    // PLAN.md R2: a type from another module is not visible in an annotation
+    // A type from another module is not visible in an annotation
     // unless imported, even though it is public.
     let main = setup(
         "type_annotation_visibility",
@@ -419,7 +418,7 @@ fn imported_type_in_annotation_is_accepted() {
 
 #[test]
 fn same_type_name_in_two_modules_constructs_and_dispatches() {
-    // PLAN.md R2: `Shape` is defined in both a.shape and b.shape with different
+    // `Shape` is defined in both a.shape and b.shape with different
     // fields and `area` methods. Each module constructs its own Shape, and
     // method dispatch on a value resolves to that value's type's method.
     let main = setup(
@@ -447,7 +446,7 @@ fn same_type_name_in_two_modules_constructs_and_dispatches() {
 
 #[test]
 fn importing_same_name_from_two_modules_is_ambiguous() {
-    // PLAN.md R2: the same function name defined in two modules now coexists; the
+    // The same function name defined in two modules now coexists; the
     // error is the ambiguous import into the module that pulls in both.
     let main = setup(
         "cross_module_collision",
@@ -470,7 +469,7 @@ fn importing_same_name_from_two_modules_is_ambiguous() {
 
 #[test]
 fn stdlib_string_function_rejects_wrong_argument_type() {
-    // PLAN.md R7: annotated public stdlib signatures enforce their contracts, so
+    // Annotated public stdlib signatures enforce their contracts, so
     // calling `split` with a non-string argument is a static error.
     let main = setup(
         "stdlib_string_contract",

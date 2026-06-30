@@ -16,17 +16,13 @@ members = [
     "bootstrap",
     "crates/prepoly_language_server",
 ]
-# The default set is the cross-platform crates -- those that build for every
-# target including wasm. The native-only crates are left out so a plain
-# `cargo build`/`cargo test` (and `cargo build --target wasm32-*`) operates on the
-# portable set without dragging in LLVM or host-only runtime code:
-#   - `prepoly_jit_llvm` / `prepoly_runtime`: the LLVM JIT and its C-ABI runtime
-#     (LLVM cannot link for wasm; the runtime uses raw fds/threads). On native they
-#     are still built and tested as dependencies of `prepoly_driver` (the `jit`
-#     feature) -- and reachable with `-p` or `--workspace`.
-#   - `bootstrap`: the LLVM-downloader / `./x` runner (tokio + reqwest); `./x`
-#     builds it explicitly with `-p bootstrap`.
-# All three remain workspace members.
+# The default set includes the command-line driver. On native targets the driver
+# enables its `jit` feature by default, so a plain `cargo build` may need LLVM;
+# use `./x cargo ...` for that path, or build `prepoly_driver` with
+# `--no-default-features` for the interpreter-only driver. Wasm builds do not pull
+# LLVM because the driver disables the JIT backend for wasm targets. `bootstrap`
+# remains outside the default set because it is only the LLVM-downloader / `./x`
+# runner and is built explicitly with `-p bootstrap`.
 default-members = [
     "crates/prepoly_lexer",
     "crates/prepoly_parser",

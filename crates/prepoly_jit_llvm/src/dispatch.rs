@@ -1,4 +1,4 @@
-//! The runtime dispatch service for deferred monomorphization (DESIGN.md 7.3).
+//! The runtime dispatch service for deferred monomorphization.
 //!
 //! When a type is fixed by the outside world at runtime (e.g. JSON deserialize),
 //! the consumer of that value must be specialized and JIT-compiled *then*. This
@@ -50,7 +50,7 @@ impl<'a, 'ctx, 'p> RuntimeDispatcher<'a, 'ctx, 'p> {
     /// Resolve -- compiling on first use, caching after -- the consumer `base`
     /// specialized for a runtime type, returning its callable address. The type is
     /// given either by name (a declared type) or, when `type_name` is a structural
-    /// descriptor (`"field:tag,..."`, DESIGN.md 7.3), built data-driven from that
+    /// descriptor (`"field:tag,..."`), built data-driven from that
     /// descriptor. Errors if the type is unfit (it lacks a field the consumer
     /// reads): the boundary's structural check, enforced before specialization
     /// rather than miscompiled.
@@ -96,7 +96,7 @@ pub fn with_dispatcher<R>(dispatcher: &mut RuntimeDispatcher, body: impl FnOnce(
     out
 }
 
-/// The dispatch trampoline generated code calls (DESIGN.md 7.3): resolve-or-
+/// The dispatch trampoline generated code calls: resolve-or-
 /// compile the consumer named by `[name_ptr, name_len]` for the runtime type
 /// named by `[type_ptr, type_len]`, returning its callable address (0 if no
 /// service is installed, a name is invalid, or the type is unfit -- the caller
@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(miss, 0, "no dispatcher installed -> 0");
     }
 
-    /// Deferred monomorphization from a *structural* descriptor (DESIGN.md 7.3): the
+    /// Deferred monomorphization from a *structural* descriptor: the
     /// consumer's argument type is built data-driven from `"score:int32"` -- no
     /// declared record has a `score` field -- then specialized and run on a value of
     /// that shape. This exercises the data-driven `Type::Record` construction the

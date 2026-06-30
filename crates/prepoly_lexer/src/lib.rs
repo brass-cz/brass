@@ -1,8 +1,7 @@
 //! Lexer for the Prepoly language.
 //!
 //! Produces a token stream with explicit `Newline` tokens that the parser
-//! uses to delimit statements (with whitespace fallback). See DESIGN.md 3.
-
+//! uses to delimit statements, with parser-side whitespace fallback.
 mod lexer;
 mod token;
 

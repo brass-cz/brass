@@ -1,11 +1,11 @@
-# Installing the prepoly interpreter
+# Installing prepoly
 
 Unfortunately, we don't provide pre-built binaries yet.
-So here we describe how to build and install the prepoly interpreter.
+So here we describe how to build and install the prepoly command-line driver.
 
 ## Clone the repository
 
-First, clone the prepoly interpreter source code:
+First, clone the prepoly source code:
 
 ```bash
 git clone https://github.com/cordx56/prepoly.git
@@ -13,14 +13,14 @@ git clone https://github.com/cordx56/prepoly.git
 
 ## Install the Rust compiler
 
-The prepoly interpreter is written in the Rust language.
+prepoly is written in the Rust language.
 So first you have to install the Rust compiler.
 
 You can learn how to install Rust here: [https://rust-lang.org/tools/install/](https://rust-lang.org/tools/install/)
 
-## Build the prepoly interpreter
+## Build prepoly with the native runtime
 
-After installing Rust, you can build the prepoly interpreter:
+After installing Rust, you can build the default native driver:
 
 ```bash
 ./x cargo build --release
@@ -31,9 +31,15 @@ The `bootstrap` binary downloads LLVM, which is required to use JIT compilation,
 
 The resulting binary `prepoly` is made under the `target/release` directory.
 
-## Install the prepoly interpreter
+If you want the interpreter-only driver without LLVM, disable default features:
 
-Run the following command to install the prepoly interpreter:
+```bash
+cargo build -p prepoly_driver --no-default-features
+```
+
+## Install prepoly
+
+Run the following command to install the default native driver:
 
 ```bash
 ./x cargo install --path crates/prepoly_driver

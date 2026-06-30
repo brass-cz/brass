@@ -1,5 +1,5 @@
 // Standard input/output, written in Prepoly on the runtime File primitives
-// (DESIGN.md 9.2). Part of the implicit prelude.
+//. Part of the implicit prelude.
 
 // Write a value's text to standard output. Values are combined with string
 // interpolation (`"{a} {b}"`), so a single argument is the idiomatic form.

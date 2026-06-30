@@ -1,4 +1,4 @@
-//! Const checking (DESIGN.md 5.4): a value bound with `const` cannot be
+//! Const checking: a value bound with `const` cannot be
 //! reassigned, nor can its fields/elements be mutated. Assignments whose root
 //! place is a const binding are rejected. Calls to methods inferred to mutate
 //! `self` are also rejected when their receiver is a const binding with a known
@@ -29,7 +29,7 @@ struct ConstChecker<'a> {
     mutating_methods: HashSet<(String, String)>,
     /// Function name -> indices of parameters the body directly reassigns a
     /// field/element of. Used to reject passing a const value into a position
-    /// that the callee mutates (DESIGN.md 5.4 / 5.6 interprocedural rule). This
+    /// that the callee mutates. This
     /// is a conservative approximation: it covers direct `param.field = ...`
     /// mutation, not transitive mutation through further calls.
     mutating_params: HashMap<String, HashSet<usize>>,
@@ -86,8 +86,8 @@ impl ConstChecker<'_> {
         }
     }
 
-    /// The top-level `const` bindings visible to every body in the file
-    /// (DESIGN.md 2.5, 5.4). A later top-level `let` that reuses a name shadows
+    /// The top-level `const` bindings visible to every body in the file.
+    /// A later top-level `let` that reuses a name shadows
     /// an earlier const, matching the order-sensitive init scope.
     fn global_consts(&self) -> HashMap<String, Binding> {
         let mut consts = HashMap::new();
@@ -141,8 +141,7 @@ impl ConstChecker<'_> {
                             Binding::Const(binding_type_name(self.program, ty, value))
                         } else if let Some(type_name) = alias {
                             // Aliasing a const record/sum binds another handle to
-                            // the same shared value, so constness propagates
-                            // (DESIGN.md 5.4). The runtime shares heap objects by
+                            // the same shared value, so constness propagates. The runtime shares heap objects by
                             // reference, hence the alias is also immutable.
                             Binding::Const(type_name)
                         } else {
@@ -279,7 +278,7 @@ impl ConstChecker<'_> {
         }
         // The receiver may be a nested projection of a const value
         // (e.g. `o.inner.bump()`); a mutating method on any field reachable from
-        // a const root is rejected (DESIGN.md 5.4 const propagation).
+        // a const root is rejected (propagation).
         let Some(type_name) = self.const_place_type(receiver, scopes) else {
             return;
         };

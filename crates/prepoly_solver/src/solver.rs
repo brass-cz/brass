@@ -1,4 +1,4 @@
-//! The inference solver facade (DESIGN.md 5.7; PLAN.md R1).
+//! The inference solver facade.
 //!
 //! This wraps the persistent `Subst` with stable inference-variable identity and
 //! classification, snapshot/rollback for speculative unification, and a place to
@@ -22,7 +22,7 @@ pub struct InferenceVarId(pub u32);
 
 /// Why an inference variable exists. The kind decides whether an unresolved
 /// variable is a legal deferred contract or a diagnostic at a required position
-/// (DESIGN.md 5.7 Phase 5).
+/// for the inference pipeline.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InferenceVarKind {
     /// A genuine source-level unknown (unannotated binding/parameter).
@@ -42,7 +42,7 @@ pub enum InferenceVarKind {
 /// Deferred constraints accumulated during checking. Equalities are applied
 /// eagerly through `Solver::unify`; the other buckets reserve space for the
 /// structural/numeric/result constraints the checker records elsewhere today and
-/// that future migration will route here (PLAN.md R1 stages 1-2).
+/// that future migration will route here.
 #[derive(Default)]
 pub struct ConstraintSet {
     pub equalities: Vec<(Type, Type)>,
@@ -51,7 +51,7 @@ pub struct ConstraintSet {
 /// A polymorphic type scheme `forall vars. ty` -- the HM let-generalized type of
 /// a binding. The quantified `vars` are instantiated to fresh variables at each
 /// use, which is what lets `let id = (x) -> x` be applied at many argument types
-/// in one program without the first use pinning the rest (DESIGN.md 5.7).
+/// in one program without the first use pinning the rest.
 #[derive(Clone, Debug)]
 pub struct Scheme {
     pub vars: Vec<u32>,
@@ -196,7 +196,7 @@ impl Solver {
     /// Whether `a` and `b` can unify under the *current* solution, without
     /// committing any new bindings. Unlike unifying in a throwaway substitution,
     /// this respects variables already solved, then rolls back so the probe has
-    /// no side effects (PLAN.md R1: `can_assign` for diagnostics).
+    /// no side effects (`can_assign` for diagnostics).
     pub fn can_unify(&mut self, a: &Type, b: &Type) -> bool {
         let snapshot = self.snapshot();
         let ok = self.subst.unify(a, b).is_ok();

@@ -1,5 +1,5 @@
 // Method return types are inferred even without annotations, so callers get a
-// precise static type (DESIGN.md 5.7). Mismatched uses are rejected before
+// precise static type. Mismatched uses are rejected before
 // execution; the matching uses below run.
 
 type Account = {

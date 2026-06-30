@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use prepoly_parser::ast::*;
 
-/// Locals that must be heap-promoted to a shared cell (DESIGN.md 8.4): those a
+/// Locals that must be heap-promoted to a shared cell: those a
 /// closure captures *and* that are assigned (mutated) somewhere -- in the closure or
 /// the enclosing body -- so the mutation is observed through the shared capture, not
 /// made on a per-closure copy. Read-only captures stay by-value. The cell is modeled

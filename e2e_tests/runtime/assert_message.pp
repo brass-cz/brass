@@ -1,0 +1,1 @@
+assert(false, "custom detail")

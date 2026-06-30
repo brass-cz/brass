@@ -1,4 +1,4 @@
-//! Local static type checks (DESIGN.md 5.2, 5.5, 5.7, 5.9).
+//! Local static type checks.
 //!
 //! This pass intentionally remains conservative around genuinely polymorphic or
 //! structurally inferred code, but every type that is explicit in source is
@@ -58,7 +58,7 @@ pub fn check(program: &Program) -> Vec<TypeError> {
 pub struct Inference {
     pub errors: Vec<TypeError>,
     pub typed: TypedProgram,
-    /// Fully-concrete call instances per free-function symbol (PLAN.md R5).
+    /// Fully-concrete call instances per free-function symbol.
     pub fn_instances: HashMap<String, Vec<Vec<Type>>>,
 }
 
@@ -155,15 +155,15 @@ struct Checker<'a> {
     /// substitution so all later uses of the same binding see the solved type,
     /// and `kind_of` distinguishes a bare empty-array element (which cannot
     /// satisfy a required position while unconstrained) from other unknowns
-    /// (DESIGN.md 5.7 Phase 4 / 5; PLAN.md R1).
+    /// used by the local inference and monomorphization passes.
     solver: Solver,
     /// The module whose body is currently being checked, used to enforce
-    /// per-module name visibility (DESIGN.md 2; PLAN.md R5). Set per function,
+    /// per-module name visibility. Set per function,
     /// method, and module-init, and swapped while a called body is re-checked.
     current_module: Vec<String>,
     /// Fully-concrete call instances per free-function symbol: every distinct
     /// tuple of resolved argument types a function is called with. This is the
-    /// input to static monomorphization (DESIGN.md 7.2; PLAN.md R5 stage 5): the
+    /// input to static monomorphization: the
     /// typed backend can compile one specialized instance per tuple. Stored as a
     /// deduplicated `Vec` because `Type` is not `Hash`/`Eq`.
     fn_instances: HashMap<String, Vec<Vec<Type>>>,
@@ -402,7 +402,7 @@ impl<'a> Checker<'a> {
 
     /// Reduce the inferred `Err` payloads of a fallible body to a single type.
     /// A function whose error payload comes from both a propagated `expr!` and
-    /// a local `error(x)` must agree on one payload type (DESIGN.md 5.6); two
+    /// a local `error(x)` must agree on one payload type; two
     /// incompatible concrete payloads are a diagnostic rather than a silent
     /// collapse to a fresh `Unknown` that would accept any later use. `report`
     /// is false at call-site re-inference so the definition site is not
@@ -988,7 +988,7 @@ impl<'a> Checker<'a> {
     }
 
     /// Infer the types of top-level `let`/`const` bindings in module/source
-    /// order and record them in `global_scope` (DESIGN.md Phase 2). Bindings
+    /// order and record them in `global_scope`. Bindings
     /// accumulate as iteration proceeds, so a later global is never visible to
     /// an earlier initializer. Annotation resolution errors are surfaced by
     /// `resolve_annotations`, so they are intentionally swallowed here.
@@ -1170,7 +1170,7 @@ impl<'a> Checker<'a> {
     /// nested inside an `if`/bare block/`match`-arm that is evaluated as an
     /// expression is still checked against the enclosing callable's declared
     /// type, and a `return` inside a closure is checked against the closure's
-    /// own (inferred) context rather than the outer function (PLAN.md R5b).
+    /// own (inferred) context rather than the outer function.
     fn check_return(
         &mut self,
         value: Option<&Expr>,
@@ -1295,9 +1295,9 @@ impl<'a> Checker<'a> {
 
     fn check_expr_against(&mut self, expr: &Expr, want: &Type, scopes: &mut ScopeStack) -> Type {
         // An integer literal in an integer-typed required position takes that
-        // type (DESIGN.md 5.3 contextual resolution): record it at the target
+        // type (resolution): record it at the target
         // kind so its runtime tag matches the annotation rather than defaulting
-        // to int32 (PLAN.md R4 typed literals).
+        // to int32 (typed literals).
         if let Expr::Int(v, _) = expr {
             let target = match self.resolve(want) {
                 Type::Int(k) => Some(k),
@@ -1507,7 +1507,7 @@ impl<'a> Checker<'a> {
                     self.fresh_unknown()
                 } else {
                     // An undeclared value name. Name resolution is a hard
-                    // pre-execution check (DESIGN.md section 6), so this is an
+                    // pre-execution check, so this is an
                     // error rather than a fresh unknown that would launder into
                     // any required type and run as `void`.
                     self.errors.push(TypeError {
@@ -1585,8 +1585,7 @@ impl<'a> Checker<'a> {
                         if let Type::Unknown(_) = other {
                             // Defer, but record that the receiver must be
                             // indexable so a closure like `(x) -> x[0]` rejects
-                            // a non-indexable argument at its call site
-                            // (PLAN.md R2).
+                            // a non-indexable argument at its call site.
                             self.record_shape(&base_ty, ShapeConstraint::Indexable);
                         } else if !is_maybe_indexable(&other) {
                             self.errors.push(TypeError {
@@ -2025,7 +2024,7 @@ impl<'a> Checker<'a> {
     }
 
     /// A fieldless variant written without braces (`Sum.Variant`) is a value of
-    /// the enclosing sum type (DESIGN.md 4.2.2). `base` must name a sum type
+    /// the enclosing sum type. `base` must name a sum type
     /// rather than a value in scope. Returns `None` when this is an ordinary
     /// field access. Variants with fields are excluded: they require `{ ... }`
     /// construction, handled elsewhere.
@@ -2099,7 +2098,7 @@ impl<'a> Checker<'a> {
                 // Accessing a field a structure does not have is an inference
                 // failure typed as the always-null `never?`: an `if` on it is
                 // statically false (then-branch pruned), and using it as a non-null
-                // value is still rejected (sound). (DESIGN: structure-type rules.)
+                // value is still rejected, which keeps structural checks sound.
                 Type::null()
             }
             Type::Sum(sum) => {
@@ -2121,7 +2120,7 @@ impl<'a> Checker<'a> {
                 self.fresh_unknown()
             }
             // A primitive has no fields; accessing one is a static error rather
-            // than a deferred runtime shape (DESIGN.md 5.8). Method calls are
+            // than a deferred runtime shape. Method calls are
             // handled separately in `check_call`.
             other if is_concrete_primitive(&other) => {
                 self.errors.push(TypeError {
@@ -2132,7 +2131,7 @@ impl<'a> Checker<'a> {
             }
             // An unknown receiver defers: record that it must expose this field
             // so a closure like `(x) -> x.name` rejects a record without `name`
-            // at its call site (PLAN.md R2).
+            // at its call site.
             Type::Unknown(_) => {
                 self.record_shape(&base_ty, ShapeConstraint::HasField(name.to_string()));
                 self.fresh_unknown()
@@ -2246,7 +2245,7 @@ impl<'a> Checker<'a> {
             }
             // Only a function visible from the current module resolves here; a
             // function defined in another, non-imported module is invisible and
-            // falls through to the unknown-name path below (PLAN.md R5). The
+            // falls through to the unknown-name path below. The
             // lookup is module-aware so a name defined in several modules
             // resolves to this module's own or imported definition (R2).
             if let Some(info) = self.lookup_function(name) {
@@ -2262,7 +2261,7 @@ impl<'a> Checker<'a> {
                     .or_else(|| self.function_returns.get(&symbol).cloned())
                     .unwrap_or_else(|| self.fresh_unknown());
                 // Record a fully-concrete call instance for static
-                // monomorphization (PLAN.md R5 stage 5).
+                // monomorphization.
                 let resolved_args: Vec<Type> = arg_types.iter().map(|t| self.resolve(t)).collect();
                 if resolved_args.iter().all(is_concrete_type) {
                     let entry = self.fn_instances.entry(symbol.clone()).or_default();
@@ -2289,7 +2288,7 @@ impl<'a> Checker<'a> {
             // local value, or a known free function. A runtime builtin (e.g.
             // `println` when the stdlib is not loaded) still defers below; any
             // other name is undeclared and reported here rather than collapsing
-            // to a fresh unknown (PLAN.md R5a).
+            // to a fresh unknown.
             if !self.is_resolvable_free_name(name) && !self.is_type_word(name) {
                 self.errors.push(TypeError {
                     message: format!("unknown function `{name}`"),
@@ -2367,7 +2366,7 @@ impl<'a> Checker<'a> {
                     .common_type_list(&returns)
                     .unwrap_or_else(|| self.fresh_unknown());
             }
-            // UFCS (DESIGN.md 9.4): `recv.f(args)` falls back to the free
+            // UFCS: `recv.f(args)` falls back to the free
             // function `f(recv, args)` when the receiver has no such method.
             if self.lookup(scopes, method).is_none()
                 && let Some(ret) = self.check_ufcs_call(&recv_ty, method, args, span, scopes)
@@ -2396,7 +2395,7 @@ impl<'a> Checker<'a> {
             }
             // A primitive receiver has a fully known type with no user methods,
             // so an unresolved call is a static error rather than deferred
-            // structural dispatch (DESIGN.md 5.8 use-site shape constraints).
+            // structural dispatch (shape constraints).
             let resolved = self.resolve(&recv_ty);
             if is_concrete_primitive(&resolved) {
                 self.errors.push(TypeError {
@@ -2412,7 +2411,7 @@ impl<'a> Checker<'a> {
             // deferred structural dispatch). If the receiver is an unknown
             // inference variable, record that it must expose this method so a
             // closure like `(x) -> x.speak()` rejects an `int32` argument at
-            // its call site (PLAN.md R2). Evaluate the args and defer.
+            // its call site. Evaluate the args and defer.
             if let Type::Unknown(_) = resolved {
                 self.record_shape(&recv_ty, ShapeConstraint::HasMethod(method.to_string()));
             }
@@ -2515,7 +2514,7 @@ impl<'a> Checker<'a> {
                         // Verify any structural constraints the closure body
                         // recorded on this parameter (e.g. `(x) -> x + 1`
                         // requires a numeric argument) now that the concrete
-                        // argument type is known (PLAN.md R2).
+                        // argument type is known.
                         self.verify_shape_constraints(param, &got, arg.expr.span());
                     } else {
                         self.check_expr(&arg.expr, scopes);
@@ -2539,7 +2538,7 @@ impl<'a> Checker<'a> {
         span: prepoly_lexer::Span,
         scopes: &mut ScopeStack,
     ) -> Option<Type> {
-        // `len` is a runtime primitive (DESIGN.md 9.1) usable as a free
+        // `len` is a runtime primitive usable as a free
         // function. Its result is always `int64`, and its single argument must
         // be a collection or string; a concrete non-collection argument is a
         // static error rather than a deferred runtime panic.
@@ -2592,14 +2591,14 @@ impl<'a> Checker<'a> {
             return Some(ret);
         }
         if name == "open" {
-            // `open(path: string, mode: string) -> File!` (DESIGN.md 9.1).
+            // `open(path: string, mode: string) -> File!`.
             self.check_builtin_args_against("open", args, &[Type::Str, Type::Str], span, scopes);
             return Some(Type::result(self.type_by_name("File"), Type::Str));
         }
         None
     }
 
-    /// Static contracts for the numeric runtime helpers (DESIGN.md 9.1). These
+    /// Static contracts for the numeric runtime helpers. These
     /// map onto LLVM/runtime primitives, so the value class of each argument
     /// must be correct before the runtime reads its payload bits: passing a
     /// float to `_int_to_string`, for example, would reinterpret a bit pattern
@@ -2626,7 +2625,7 @@ impl<'a> Checker<'a> {
             ),
             "_float_sqrt" | "_float_floor" | "_float_ceil" => (vec![NumericClass::Float], f64_ty),
             "_float_pow" => (vec![NumericClass::Float, NumericClass::Float], f64_ty),
-            // Integer width conversions (DESIGN.md 9.1): widening always succeeds;
+            // Integer width conversions: widening always succeeds;
             // narrowing range-checks and yields a Result. Bits/signedness are passed
             // so the runtime matches the target type.
             "_int_widen" => (
@@ -2675,8 +2674,8 @@ impl<'a> Checker<'a> {
         Some(ret)
     }
 
-    /// Minimal static contracts for the concurrency primitives (DESIGN.md 9.1,
-    /// 12.7). `spawn(f: () -> void) -> void` and `with(c, f) -> U` are the only
+    /// Minimal static contracts for the concurrency primitives.
+    /// `spawn(f: () -> void) -> void` and `with(c, f) -> U` are the only
     /// programmer-facing concurrency API. Until cown typing is real the first
     /// `with` argument stays untyped (the closure parameter is deferred), but
     /// the callable shape and `spawn`'s zero-arity are enforced now.
@@ -2898,8 +2897,7 @@ impl<'a> Checker<'a> {
                 };
                 Some(Type::Nullable(Box::new(elem_ty)))
             }
-            // `_array_insert(arr, idx, elem)` / `_array_remove(arr, idx)` primitives
-            // (DESIGN.md 9.1): the slice's element type drives the index/element
+            // `_array_insert(arr, idx, elem)` / `_array_remove(arr, idx)` primitives: the slice's element type drives the index/element
             // checks. Insert yields void; remove yields the removed element.
             "_array_insert" | "_array_remove" => {
                 let want_args = if name == "_array_insert" { 3 } else { 2 };
@@ -3016,13 +3014,13 @@ impl<'a> Checker<'a> {
         Some(ret)
     }
 
-    /// Type the builtin collection methods so their element types are enforced
-    /// (DESIGN.md 9.1): `push(self: T[], value: T) -> void`,
+    /// Type the builtin collection methods so their element types are enforced:
+    /// `push(self: T[], value: T) -> void`,
     /// `pop(self: T[]) -> T?`, and `len(self) -> int64`. Element checking turns
     /// `[1].push("x")` into a static error.
     ///
     /// `push`/`pop` are slice-only: a fixed array `T[n]` has a statically fixed
-    /// length (DESIGN.md 5.1/8.1 model it as an inline `[n x T]`), so a
+    /// length (modeled as an inline `[n x T]`), so a
     /// length-changing call on one is rejected. `len` and indexing remain valid
     /// for both `T[n]` and `T[]` (indexing is handled in the `Index`/place
     /// paths).
@@ -3079,7 +3077,7 @@ impl<'a> Checker<'a> {
                 });
                 Some(Type::Nullable(Box::new(elem.clone())))
             }
-            // `arr.insert(idx, v)`: idx is int64, v is the element (DESIGN.md 9.1).
+            // `arr.insert(idx, v)`: idx is int64, v is the element.
             ("insert", Some(elem)) => {
                 if let Some(idx) = args.first() {
                     let got = self.check_expr(&idx.expr, scopes);
@@ -3092,7 +3090,7 @@ impl<'a> Checker<'a> {
                 self.reject_extra_args(method, args, 2, scopes, span);
                 Some(Type::Void)
             }
-            // `arr.remove(idx) -> T`: removes and returns the element (DESIGN.md 9.1).
+            // `arr.remove(idx) -> T`: removes and returns the element.
             ("remove", Some(elem)) => {
                 if let Some(idx) = args.first() {
                     let got = self.check_expr(&idx.expr, scopes);
@@ -3199,7 +3197,7 @@ impl<'a> Checker<'a> {
         Some(ret)
     }
 
-    /// Constrain the source type of the numeric conversions (DESIGN.md 5.2):
+    /// Constrain the source type of the numeric conversions:
     /// `intN.from`/`floatN.from` take a numeric value and `intN.parse`/
     /// `floatN.parse` take a string. Without this, `float64.from("abc")` would
     /// type-check and silently produce `0.0` at runtime. `string.from` accepts
@@ -3274,7 +3272,7 @@ impl<'a> Checker<'a> {
             "re-elaborating function body at call site"
         );
         // Re-check the callee body in its own module so its internal names
-        // resolve under that module's visibility, not the caller's (PLAN.md R5).
+        // resolve under that module's visibility, not the caller's.
         let saved_module = std::mem::replace(&mut self.current_module, module.to_vec());
         let frame = self.signature_call_frame(params, arg_types, None);
         let mut scopes = vec![frame.clone()];
@@ -3310,7 +3308,7 @@ impl<'a> Checker<'a> {
         self.self_variant = owner
             .split_once('.')
             .map(|(_, variant)| (self_type.to_string(), variant.to_string()));
-        // Re-check the method body in its defining type's module (PLAN.md R5).
+        // Re-check the method body in its defining type's module.
         let owner_type = self_type.to_string();
         let saved_module =
             self.swap_module_for(|p| p.types.get(&owner_type).map(|t| t.module.clone()));
@@ -3624,8 +3622,8 @@ impl<'a> Checker<'a> {
         if let Some(ty) = integer_literal_binary_type(op, left_expr, &left, right_expr, &right) {
             return ty;
         }
-        // A numeric arithmetic/comparison between mixed types implicitly converts
-        // both to their common type (DESIGN: implicit numeric conversions).
+        // Numeric arithmetic/comparison between mixed types implicitly converts
+        // both operands to their common type.
         let is_unknown = matches!(left, Type::Unknown(_)) || matches!(right, Type::Unknown(_));
         let numeric_common = common_numeric_type(&left, &right);
         match op {
@@ -3660,7 +3658,7 @@ impl<'a> Checker<'a> {
                     self.binary_error(op, &left, &right, span)
                 }
             }
-            // Ordering comparisons are numeric only (DESIGN.md 5.9). Strings have
+            // Ordering comparisons are numeric only. Strings have
             // no ordering: `==`/`!=` compare them, but `<`/`>`/`<=`/`>=` do not.
             BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
                 if numeric_common.is_some() || is_unknown {
@@ -3693,7 +3691,7 @@ impl<'a> Checker<'a> {
     ) -> Type {
         self.errors.push(TypeError {
             message: format!(
-                "operator `{}` is not defined for `{}` and `{}` (no implicit conversion)",
+                "operator `{}` is not defined for `{}` and `{}` (no applicable conversion)",
                 op_str(op),
                 left.display(),
                 right.display()
@@ -3747,7 +3745,7 @@ impl<'a> Checker<'a> {
         let want = self.resolve(want);
         // An unconstrained inference variable whose type cannot be inferred
         // reaching a concrete required position is an error rather than a silent
-        // unification (PLAN.md R1 stage 10): a bare empty array carries no
+        // unification: a bare empty array carries no
         // element, and a function that only returns `error(...)` has no `Ok`
         // payload type. A `want` that is itself unknown leaves the contract
         // deferred rather than wrong.
@@ -4188,7 +4186,7 @@ impl<'a> Checker<'a> {
             Type::Record(name) => {
                 // Resolve by the receiver's unique id, and key the resolved
                 // method on the type's symbol so dispatch is correct when two
-                // modules share a type name (PLAN.md R2).
+                // modules share a type name.
                 let info = self.program.type_by_id(name.id)?;
                 let TypeKind::Record { methods, .. } = &info.kind else {
                     return None;
@@ -4329,14 +4327,14 @@ impl<'a> Checker<'a> {
     }
 
     /// Whether a program free function `name` is visible from the module being
-    /// checked (DESIGN.md 2): defined in that module, implicitly imported as
+    /// checked: defined in that module, implicitly imported as
     /// part of the standard-library prelude, or brought in by an `import`.
     fn is_function_visible(&self, name: &str) -> bool {
         self.lookup_function(name).is_some()
     }
 
     /// Resolve a bare free-function name to its definition from the current
-    /// module (DESIGN.md 2; PLAN.md R2). A name defined in a single module keeps
+    /// module. A name defined in a single module keeps
     /// its bare symbol, so the common case is a direct map hit gated by
     /// visibility. A name defined in several modules has only module-qualified
     /// symbols, so resolution prefers this module's own definition, then the one
@@ -4372,7 +4370,7 @@ impl<'a> Checker<'a> {
     /// The per-module visibility rule shared by functions and types: a name
     /// declared in `defining` is visible from `current_module` when it is the
     /// same module, a compiler builtin (empty module path, e.g. `Result`), a
-    /// public standard-library name (implicit prelude, DESIGN.md 9.4), or
+    /// public standard-library name (implicit prelude), or
     /// explicitly imported into the current module.
     fn is_module_name_visible(&self, defining: &[String], name: &str) -> bool {
         if defining == self.current_module.as_slice() || defining.is_empty() {
@@ -4413,11 +4411,10 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Record an equality constraint for an unknown operand of a same-typed
-    /// binary operator. Prepoly's arithmetic, ordering, and bitwise operators
-    /// require both operands to share one numeric/string type (no implicit
-    /// conversion, DESIGN.md 5.9), so an unknown operand paired with a concrete
-    /// one must equal it. This lets `(x) -> x + 1` pin `x` to `int32`.
+    /// Record an equality constraint for an unknown operand when the operator
+    /// needs an exact non-convertible type. Numeric operands are resolved at the
+    /// call site through the common numeric type, so this mainly preserves
+    /// constraints such as string concatenation.
     fn record_binary_shape(&mut self, op: BinOp, left: &Type, right: &Type) {
         let same_typed = matches!(
             op,
@@ -4574,7 +4571,7 @@ impl<'a> Checker<'a> {
     }
 
     /// The unique storage symbol of a user type named `name`, resolved from the
-    /// current module (PLAN.md R2): own/unique, this module's qualified
+    /// current module: own/unique, this module's qualified
     /// definition, or the imported one. Returns an owned String so the borrow
     /// does not outlive into later `&mut self` use.
     fn resolve_type_symbol(&self, name: &str) -> Option<String> {
@@ -4715,7 +4712,7 @@ fn is_concrete_primitive(ty: &Type) -> bool {
 
 /// Whether a (resolved) type is fully concrete: it contains no inference
 /// variable, `Never`, or `Self` placeholder, so it can name a monomorphized
-/// instance (PLAN.md R5 stage 5).
+/// instance.
 /// The value of a constant non-negative integer index (a tuple position), or
 /// `None` if the index is not a literal.
 fn const_index(expr: &Expr) -> Option<i64> {
@@ -5038,8 +5035,7 @@ fn param_expected_type(param: &ParamInfo) -> Option<&Type> {
 }
 
 /// Whether a parameter is nullable. A trailing run of nullable parameters is
-/// optional at call sites: each omitted argument defaults to `null` (DESIGN.md
-/// 5.6). This is how `assert(cond, msg: string?)` accepts both `assert(cond)` and
+/// optional at call sites: each omitted argument defaults to `null`. This is how `assert(cond, msg: string?)` accepts both `assert(cond)` and
 /// `assert(cond, "..")` without function overloading.
 fn param_is_nullable(param: &ParamInfo) -> bool {
     matches!(param.resolved_ty, Some(Type::Nullable(_)))

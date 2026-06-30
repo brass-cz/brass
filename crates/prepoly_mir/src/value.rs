@@ -5,7 +5,7 @@
 //! or an inline constant. An [`Rvalue`] is the one computation a [`MirStmt`]
 //! performs. None of these nodes carry concrete types; operator/operand types
 //! are recovered later from the locals' [`crate::TypeRef`]s, which keeps the IR
-//! type-independent (PLAN_MIR Stage 1).
+//! type-independent.
 
 use std::fmt;
 

@@ -1,15 +1,13 @@
-//! Symbol mangling and the compiled-function cache (DESIGN.md 7.1).
+//! Symbol mangling and the compiled-function cache.
 //!
-//! Implementation mode (temporary): every callable is compiled once against the
-//! uniform tagged-value ABI (`layout::Abi::fn_type`), so a single body serves
-//! every concrete type and this "monomorphization cache" is a name -> LLVM-
-//! function map; the deferred path (DESIGN.md 7.3) is realized by runtime tag
-//! dispatch rather than per-type recompilation. DESIGN.md 7-8 describe typed
-//! monomorphization as the target backend; the uniform ABI is a compatibility
-//! layer to be retired or restricted to dynamic/builtin boundaries, not the
-//! final language design (DESIGN.md 8.1; PLAN.md R5). The mangling is shared
-//! with the driver so it can resolve each symbol's JIT address for the runtime
-//! dispatch tables.
+//! Each callable is compiled once against the uniform tagged-value ABI
+//! (`layout::Abi::fn_type`), so a single body serves every concrete type and this
+//! "monomorphization cache" is a name -> LLVM-function map; the deferred path is
+//! realized by runtime tag dispatch rather than per-type recompilation. Typed
+//! monomorphization is the target backend; the uniform ABI is a compatibility
+//! layer to be retired or restricted to dynamic/builtin boundaries. The mangling
+//! is shared with the driver so it can resolve each symbol's JIT address for the
+//! runtime dispatch tables.
 
 use std::collections::HashMap;
 
@@ -50,7 +48,7 @@ pub fn mangle_init(idx: usize) -> String {
 }
 
 /// A short, collision-resistant mangling of a type, for naming a monomorphized
-/// instance (PLAN.md R5 stage 2). Distinct concrete types yield distinct
+/// instance. Distinct concrete types yield distinct
 /// strings, so a function specialized for `int32` and for `string` gets two
 /// symbols. Heap/nominal types include their nominal id to stay unique across
 /// modules that share a display name (R2).
@@ -96,8 +94,8 @@ fn int_code(k: IntKind) -> &'static str {
 }
 
 /// The symbol of one monomorphized function instance: the base function symbol
-/// plus the concrete argument types it is specialized for (PLAN.md R5 stage 2,
-/// 5). With the typed backend this names a distinct LLVM function per instance;
+/// plus the concrete argument types it is specialized for. With the typed backend
+/// this names a distinct LLVM function per instance;
 /// the uniform ABI compiles a single `mangle_fn` body for all instances.
 pub fn mangle_fn_instance(symbol: &str, arg_types: &[Type]) -> String {
     if arg_types.is_empty() {
@@ -137,7 +135,7 @@ mod tests {
 
     #[test]
     fn instances_differ_by_argument_type() {
-        // PLAN.md R5: a function specialized for int32 and for string is two
+        // A function specialized for int32 and for string is two
         // distinct instances with distinct symbols.
         let for_int = mangle_fn_instance("id", &[Type::Int(IntKind::I32)]);
         let for_str = mangle_fn_instance("id", &[Type::Str]);

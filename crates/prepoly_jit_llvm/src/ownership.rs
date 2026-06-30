@@ -1,4 +1,4 @@
-//! Automatic ownership analysis for `spawn` captures (DESIGN.md 12.7-12.8).
+//! Automatic ownership analysis for `spawn` captures.
 //!
 //! A `spawn` runs its closure on a real OS thread, so each captured value is
 //! shared between the spawner and that thread. The decision here is therefore
@@ -8,8 +8,7 @@
 //! in `with`, which lock-guards it); a read-only capture is frozen (immutable).
 //! Both are `rc_atomic` owner classes, which is what makes the otherwise-racy
 //! cross-thread reference counting sound. [`decide`] additionally classifies a
-//! capture as move/freeze/cown from its liveness for the auto-acquire diagnostic
-//! (DESIGN.md 12.9.2).
+//! capture as move/freeze/cown from its liveness for the auto-acquire diagnostic.
 
 use std::collections::HashSet;
 
@@ -197,7 +196,7 @@ pub struct CaptureDecision {
 }
 
 /// Decide auto-ownership for every `spawn(closure)` capture reachable in a
-/// function `body` (DESIGN.md 12.7-12.8). Liveness is approximated per
+/// function `body`. Liveness is approximated per
 /// statement list: a capture is "live after" the spawn when it is referenced in
 /// a later statement of the same block, so a value used only by the spawned
 /// task is moved, one read afterwards is frozen, and one mutated inside the
@@ -404,11 +403,11 @@ fn stmts_reference(stmts: &[Stmt], var: &str) -> bool {
     refs.contains(var)
 }
 
-// ----- auto-acquire (DESIGN.md 12.9) -----
+// ----- auto-acquire -----
 
 /// Insert automatic `with` acquisition for every `spawn` closure that mutates a
 /// captured cown, so the programmer writes no ownership annotations yet shared
-/// mutation is still serialized through the cown lock (DESIGN.md 12.9.1: wrap the
+/// mutation is still serialized through the cown lock (wrap the
 /// whole closure body in one `with` per cowned capture). A capture that is moved
 /// (exclusive to the thread) or frozen (read-only) needs no lock and is left
 /// alone. `params` are the names already in scope around `stmts`.

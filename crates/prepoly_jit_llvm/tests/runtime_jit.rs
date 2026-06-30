@@ -1,4 +1,4 @@
-//! End-to-end test of the runtime JIT compilation backend (DESIGN.md 7.3): the
+//! End-to-end test of the runtime JIT compilation backend: the
 //! `prepoly_engine`-defined `RuntimeJit` trait, implemented by the LLVM backend,
 //! compiles a monomorphized instance into the *live* execution engine after
 //! `finalize` and returns its callable address.
@@ -47,7 +47,7 @@ fn compiles_and_runs_an_instance_after_finalize() {
     assert_eq!(triple(7), 21);
 }
 
-/// On-demand monomorphization (DESIGN.md 7.3): a consumer with a *deferred*
+/// On-demand monomorphization: a consumer with a *deferred*
 /// parameter is specialized for a type discovered "at runtime" and compiled then.
 /// `get_age(p)` was never specialized statically (its `p` is unannotated and it is
 /// not called with `Person`); monomorphize_instance specializes it for `Person`,
@@ -101,8 +101,8 @@ fn on_demand_monomorphize_and_compile_for_a_runtime_type() {
     assert!(addr != 0, "compiled instance has an address");
 }
 
-/// The full deferred-monomorphization flow and its acceptance (DESIGN.md 7.3,
-/// PLAN R10): a consumer of an externally-typed value is compiled once per
+/// The full deferred-monomorphization flow: a consumer of an externally-typed
+/// value is compiled once per
 /// distinct runtime type (cached) and runs correctly on a value of that type;
 /// a runtime type missing a required field is rejected at the boundary rather
 /// than miscompiled. Driven here through the engine's `resolve_or_compile`
@@ -166,7 +166,7 @@ fn deferred_monomorphization_end_to_end() {
     );
 }
 
-/// The in-language end-to-end (DESIGN.md 7.3): a Prepoly program whose `run_it`
+/// The in-language end-to-end: a Prepoly program whose `run_it`
 /// calls the `__rt_dispatch` builtin triggers deferred monomorphization at
 /// runtime -- `get_age` is JIT-compiled for `Person` in the dispatcher's engine
 /// (separate from the engine running the program, so compiling never reentrantly

@@ -1,7 +1,7 @@
 //! Runtime heap allocation. Each request is a zeroed allocation with a 16-byte
 //! size prefix (so freeing needs no external metadata) and 16-byte alignment for
 //! object headers. The size prefix lets [`pp_obj_free`] release a block by
-//! reference count (DESIGN.md 8.2) -- the substrate for region-based reclamation.
+//! reference count -- the substrate for region-based reclamation.
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::os::raw::c_void;

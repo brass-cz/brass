@@ -1,7 +1,7 @@
 //! Typed HIR sidecar data produced by type checking.
 //!
 //! The current executable HIR still keeps parsed AST nodes for code generation.
-//! This module is the migration surface toward DESIGN.md 6.2: every checked
+//! This module is the migration surface toward a fully typed HIR: every checked
 //! expression can be represented by its source span, inferred type, and
 //! constness until expression kinds are fully lowered into HIR-owned nodes.
 
@@ -18,14 +18,14 @@ pub enum Constness {
     Unknown,
 }
 
-/// A region identifier (DESIGN.md 12.3): the unit of mutable-object ownership a
+/// A region identifier: the unit of mutable-object ownership a
 /// `with` scope establishes. Matches the runtime's 1-based region ids.
 pub type RegionId = u32;
 
-/// The ownership class of a checked expression's value (DESIGN.md 12.10.3). Most
+/// The ownership class of a checked expression's value. Most
 /// values are `Local` (the thread's implicit region); `Immutable`/`Cown`/`InRegion`
 /// are established by freeze/cown/region operations. Several of these are only
-/// settled once concrete types are known at JIT time (DESIGN.md 12.10.2), so an
+/// settled once concrete types are known at JIT time, so an
 /// expression whose ownership the front end has not resolved carries `Unknown`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ownership {
@@ -44,7 +44,7 @@ pub enum Ownership {
 /// The HIR-owned shape of a checked expression.
 ///
 /// This intentionally stores only stable expression identity, not child nodes.
-/// It lets the typed sidecar move toward DESIGN.md 6.2 while the executable
+/// It lets the typed sidecar move toward a fully typed HIR while the executable
 /// HIR still keeps parser AST nodes for code generation.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypedExprKind {
@@ -103,8 +103,8 @@ impl TypedExprKind {
     }
 }
 
-/// Type information for one expression node in the lowered program. Extends
-/// DESIGN.md 12.10.3's `TypedExpr` with the `ownership` class.
+/// Type information for one expression node in the lowered program. Pairs the
+/// expression's inferred type with its `ownership` class.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypedExpr {
     pub kind: TypedExprKind,
@@ -132,7 +132,7 @@ impl TypedProgram {
     pub fn push_kind(&mut self, kind: TypedExprKind, span: Span, ty: Type, constness: Constness) {
         // The front end records the default ownership: a literal value is born in
         // the local region; anything else is settled at JIT time once concrete
-        // types are known (DESIGN.md 12.10.2), so it stays `Unknown` here.
+        // types are known, so it stays `Unknown` here.
         let ownership = match kind {
             TypedExprKind::Int
             | TypedExprKind::Float
@@ -158,8 +158,7 @@ mod tests {
     use super::*;
 
     /// A literal value is born in the local region; a non-literal expression's
-    /// ownership is settled at JIT time, so the front end records `Unknown`
-    /// (DESIGN.md 12.10.3).
+    /// ownership is settled at JIT time, so the front end records `Unknown`.
     #[test]
     fn literals_are_local_others_unknown() {
         let mut prog = TypedProgram::default();

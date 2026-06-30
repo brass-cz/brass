@@ -76,7 +76,7 @@ fn format_float(f: f64) -> String {
 }
 
 /// Truncate a float toward zero to an integral value, range-checked against
-/// `tag` and rejecting non-finite inputs (DESIGN.md 5.2).
+/// `tag` and rejecting non-finite inputs.
 fn float_to_integral(f: f64, tag: i64) -> Result<i128, String> {
     if !f.is_finite() {
         return Err(format!(
@@ -169,7 +169,7 @@ pub unsafe extern "C-unwind" fn pp_conv_int_parse(s: *mut Header, tag: i64) -> *
     }
 }
 
-/// The integer tag for a `(bit width, signedness)` pair (DESIGN.md 5.2), used by
+/// The integer tag for a `(bit width, signedness)` pair, used by
 /// the `_int_widen`/`_int_narrow` primitives whose width/sign arrive at runtime.
 fn bits_to_int_tag(bits: i64, signed: bool) -> i64 {
     match (bits, signed) {
@@ -184,7 +184,7 @@ fn bits_to_int_tag(bits: i64, signed: bool) -> i64 {
     }
 }
 
-/// `_int_widen(x, from_bits, to_bits, signed) -> int64` (DESIGN.md 9.1): widen the
+/// `_int_widen(x, from_bits, to_bits, signed) -> int64`: widen the
 /// `from_bits`-wide integer `x` to a wider type. Widening never loses information,
 /// so this only re-establishes the value at full width (sign- or zero-extending the
 /// source bits); `to_bits` is implied by the result type.
@@ -192,7 +192,7 @@ pub extern "C-unwind" fn pp_int_widen(x: i64, from_bits: i64, _to_bits: i64, sig
     mask_int(x, bits_to_int_tag(from_bits, signed != 0))
 }
 
-/// `_int_narrow(x, from_bits, to_bits, signed) -> int64!` (DESIGN.md 9.1): narrow
+/// `_int_narrow(x, from_bits, to_bits, signed) -> int64!`: narrow
 /// `x` to a `to_bits`-wide integer, returning a typed `Result` that is `Err` when
 /// `x` is out of the target type's range.
 pub extern "C-unwind" fn pp_int_narrow(
@@ -237,7 +237,7 @@ pub unsafe extern "C-unwind" fn pp_conv_float_parse(s: *mut Header, tag: i64) ->
 // ----- typed string conversions -----
 
 /// The UTF-8 character that begins at byte offset `i`. String indexing,
-/// slicing, `find`, and `len` are all byte-offset based (DESIGN.md 9.1), so this
+/// slicing, `find`, and `len` are all byte-offset based, so this
 /// keeps `s[i]` consistent with them: it returns `None` when `i` is out of range
 /// or lands in the middle of a multibyte character.
 fn char_at_byte(s: &str, i: i64) -> Option<char> {
@@ -305,7 +305,7 @@ mod tests {
     }
 
     // Float-to-integer conversion truncates toward zero and rejects non-finite or
-    // out-of-range inputs (DESIGN.md 5.2).
+    // out-of-range inputs.
     #[test]
     fn float_to_integral_truncates_and_range_checks() {
         assert_eq!(float_to_integral(3.9, TAG_INT_I32), Ok(3));

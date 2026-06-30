@@ -29,7 +29,7 @@ pub const KIND_STRING: u8 = 1;
 /// Result cells, and nullable cells the runtime hands back all carry this kind.
 pub const KIND_TYPED: u8 = 8;
 
-// ----- owner classes (DESIGN.md 8.1, 12.2) -----
+// ----- owner classes -----
 //
 // An object's `owner` selects how its reference count behaves and how it may be
 // shared across threads, which is the substrate for move/freeze. The five classes
@@ -84,8 +84,7 @@ pub fn rc_atomic(owner: u8) -> bool {
 }
 
 /// Heap object header. `owner` classifies reference-count behavior (see the owner
-/// constants); `rc` is the reference count the typed back end maintains (DESIGN.md
-/// 8.2). `color`/`flags`/`nchild` are reserved for region metadata.
+/// constants); `rc` is the reference count the typed back end maintains. `color`/`flags`/`nchild` are reserved for region metadata.
 #[repr(C)]
 pub struct Header {
     pub rc: i64,

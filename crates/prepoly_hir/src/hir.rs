@@ -56,8 +56,7 @@ pub fn qualify(local: &str, module: &[String]) -> String {
 /// Resolve a bare top-level `name` referenced from `module` against a program
 /// table keyed by qualified symbol: its own/unique definition, this module's
 /// qualified definition, or the one imported into this module. This is the one
-/// resolution rule shared by type, function, and annotation lookups (DESIGN.md
-/// 2; PLAN.md R2).
+/// resolution rule shared by type, function, and annotation lookups.
 pub fn resolve_qualified<'a, T>(
     table: &'a HashMap<String, T>,
     import_origins: &HashMap<Vec<String>, HashMap<String, Vec<String>>>,
@@ -178,7 +177,7 @@ pub struct TypeInfo {
     /// Globally unique storage/codegen key. Equal to the bare `name` when only
     /// one module defines that name, and module-qualified (`Name@a.b`) when the
     /// same type name is defined in several modules, so both coexist with
-    /// distinct symbols and method-dispatch keys (DESIGN.md 2; PLAN.md R2).
+    /// distinct symbols and method-dispatch keys.
     pub symbol: String,
 }
 
@@ -218,7 +217,7 @@ pub struct FunInfo {
     /// Globally unique storage/codegen key. Equal to the bare name when that
     /// name is defined in only one module; module-qualified (`name@a.b`) when
     /// the same local name is defined in several modules, so both definitions
-    /// coexist with distinct symbols (DESIGN.md 2; PLAN.md R2).
+    /// coexist with distinct symbols.
     pub symbol: String,
 }
 
@@ -236,12 +235,12 @@ pub struct Program {
     /// Names each module brings into scope via `import` (the bare names from
     /// every `import a.b.{ x, y }` in that module). Used by name resolution to
     /// enforce per-module visibility: a public name defined in another module
-    /// is only visible where it is imported (DESIGN.md 2; PLAN.md R5).
+    /// is only visible where it is imported.
     pub module_imports: HashMap<Vec<String>, Vec<String>>,
     /// For each importing module, the origin module path of each imported local
     /// name (`importing module -> local name -> source module path`). Lets name
     /// resolution find the module-qualified symbol of an imported name when the
-    /// same local name is defined in several modules (DESIGN.md 2; PLAN.md R2).
+    /// same local name is defined in several modules.
     /// On an ambiguous import the first origin is kept; the ambiguity itself is
     /// reported separately.
     pub import_origins: HashMap<Vec<String>, HashMap<String, Vec<String>>>,
@@ -259,7 +258,7 @@ impl Program {
     /// Whether any loaded type has the bare display name `name`, regardless of
     /// the module it lives in. Used by validation passes that only need to know
     /// a name denotes some type (not which one), so they do not false-positive
-    /// on a module-qualified symbol such as `Name@a.b` (PLAN.md R2).
+    /// on a module-qualified symbol such as `Name@a.b`.
     pub fn has_type_named(&self, name: &str) -> bool {
         self.types.contains_key(name)
             || self
@@ -270,7 +269,7 @@ impl Program {
 
     /// Resolve a bare type name to its definition as seen from `module`: its
     /// own/unique symbol, this module's qualified definition, or the one imported
-    /// into this module (DESIGN.md 2; PLAN.md R2).
+    /// into this module.
     pub fn resolve_type(&self, module: &[String], name: &str) -> Option<&TypeInfo> {
         resolve_qualified(&self.types, &self.import_origins, module, name)
     }

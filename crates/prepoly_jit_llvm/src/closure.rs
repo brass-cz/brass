@@ -1,4 +1,4 @@
-//! Closure conversion support (DESIGN.md 8.4): free-variable analysis to decide
+//! Closure conversion support: free-variable analysis to decide
 //! which of a function's locals are captured by a nested closure. Captured
 //! locals are boxed in heap cells so that writes through the closure and
 //! through the enclosing scope share state (the accumulator/counter examples).

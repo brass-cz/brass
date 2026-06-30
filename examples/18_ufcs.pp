@@ -1,4 +1,4 @@
-// Uniform Function Call Syntax (DESIGN.md 9.4): `recv.f(args)` resolves to the
+// Uniform Function Call Syntax: `recv.f(args)` resolves to the
 // free function `f(recv, args)` when the receiver has no method `f`. The
 // receiver type is checked against the function's first parameter, and the
 // inferred return type flows to the caller.

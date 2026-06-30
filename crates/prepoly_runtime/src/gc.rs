@@ -1,4 +1,4 @@
-//! Cycle collector (DESIGN.md 8.3): trial deletion (the Bacon-Rajan algorithm)
+//! Cycle collector: trial deletion (the Bacon-Rajan algorithm)
 //! for reference cycles that plain reference counting (`crate::alloc`) cannot
 //! reclaim. A cycle keeps every member's count above zero, so no member is ever
 //! freed by `pp_release`; this collector finds such garbage.
@@ -11,7 +11,7 @@
 //! externally-reachable (scan/scan-black), and free what stays white (a cycle with
 //! no outside references).
 //!
-//! Collection is scheduled generationally (DESIGN.md 8.3): registration advances an
+//! Collection is scheduled generationally: registration advances an
 //! allocation counter that triggers a Gen 0 collection every `GEN0_ALLOCS`
 //! allocations, with Gen 1/Gen 2 milestones every 10th/100th Gen 0 (see
 //! `schedule_tick`). The driver also calls `pp_gc_collect` once before exit to
@@ -28,7 +28,7 @@ use crate::rt::{Header, OWNER_IMMUTABLE};
 /// can skip the registry lock entirely when there is nothing to collect.
 static REGISTERED: AtomicUsize = AtomicUsize::new(0);
 
-// ----- generational collection schedule (DESIGN.md 8.3) -----
+// ----- generational collection schedule -----
 //
 // Cycle-capable allocations are counted; every `gen0_threshold` allocations trigger
 // a Gen 0 collection, every 10th Gen 0 is also a Gen 1, and every 10th Gen 1 a Gen
@@ -129,8 +129,7 @@ pub extern "C-unwind" fn pp_gc_register(obj: *mut Header, trace: usize) {
             .is_none()
     {
         REGISTERED.fetch_add(1, Ordering::Relaxed);
-        // Advance the generational schedule; this may run a collection (DESIGN.md
-        // 8.3). The registry lock above is released before this point, so the
+        // Advance the generational schedule; this may run a collection. The registry lock above is released before this point, so the
         // collection it may trigger does not deadlock against registration.
         schedule_tick();
     }
@@ -246,7 +245,7 @@ extern "C-unwind" fn collect_white_child(c: *mut Header) {
     unsafe { collect_white(c) }
 }
 
-/// Deeply freeze `obj` and everything it transitively owns (DESIGN.md 12.11/12.12):
+/// Deeply freeze `obj` and everything it transitively owns:
 /// mark each Immutable so its reference count becomes atomic and the subgraph is
 /// safely shareable across threads. Children are visited via the same per-type
 /// trace function the collector uses; leaf objects (strings, primitive arrays) have
@@ -404,7 +403,7 @@ mod tests {
     }
 
     /// `pp_freeze_deep` marks an object and everything it transitively owns
-    /// Immutable (DESIGN.md 12.11), following the registered trace; a cycle does not
+    /// Immutable, following the registered trace; a cycle does not
     /// make it loop forever.
     #[test]
     fn freeze_deep_marks_whole_subgraph() {
@@ -432,7 +431,7 @@ mod tests {
         }
     }
 
-    /// The generation schedule (DESIGN.md 8.3): Gen 1 fires every 10th Gen 0 and
+    /// The generation schedule: Gen 1 fires every 10th Gen 0 and
     /// Gen 2 every 10th Gen 1 (every 100th Gen 0); all other Gen 0s are plain.
     #[test]
     fn generation_schedule_escalates() {

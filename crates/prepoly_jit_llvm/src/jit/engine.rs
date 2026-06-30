@@ -1,4 +1,4 @@
-//! The JIT execution engine (DESIGN.md 10.1 prepoly_jit). Builds an LLVM
+//! The JIT execution engine. Builds an LLVM
 //! execution engine for the generated module, maps the runtime's C-ABI
 //! primitives to their host addresses, registers each compiled function's
 //! address into the runtime dispatch tables, and runs the program (module
@@ -34,7 +34,7 @@ pub fn run(
 }
 
 /// Map every runtime primitive the module declares to its host address. This
-/// includes the deferred-dispatch trampoline `pp_resolve` (DESIGN.md 7.3), which
+/// includes the deferred-dispatch trampoline `pp_resolve`, which
 /// lives in the JIT crate rather than `prepoly_runtime`.
 pub(crate) fn map_runtime_symbols(engine: &ExecutionEngine, module: &Module) {
     for (name, addr) in symbols() {
@@ -54,7 +54,7 @@ mod tests {
     use inkwell::context::Context;
     use prepoly_hir::{IntKind, Type};
 
-    /// PLAN.md R5 acceptance #1: a typed `int32 -> int32` callable lowered with
+    /// A typed `int32 -> int32` callable lowered with
     /// the unboxed signature `i32 (i32, i32)` JIT-compiles and executes. This
     /// exercises the typed backend's layout/signature path end to end, distinct
     /// from the uniform tagged-value ABI.
@@ -88,7 +88,7 @@ mod tests {
         assert_eq!(unsafe { add.call(-1, 41) }, 40);
     }
 
-    /// Deferred monomorphization (DESIGN.md 7.3) requires JIT-compiling new code
+    /// Deferred monomorphization requires JIT-compiling new code
     /// *after* the engine is built, when a runtime type first arrives. This proves
     /// the engine can take a module added later (in the same context) and execute
     /// its function -- the capability the compiler-as-runtime-service is built on.

@@ -1,4 +1,4 @@
-//! Nullable narrowing (DESIGN.md 5.5). `if v { ... }` and
+//! Nullable narrowing. `if v { ... }` and
 //! `if v != null { ... }` narrow `v` from `T?` to `T` in the truthy branch;
 //! `if !v { return }` and `if v == null { return }` narrow it after the guard.
 

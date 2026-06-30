@@ -1,4 +1,4 @@
-//! File I/O runtime primitives (DESIGN.md 9.1-9.2).
+//! File I/O runtime primitives.
 //!
 //! A `File` is a typed record object `{ header16 | fd@16 (i64) }` holding an OS
 //! file descriptor. These primitives operate on that descriptor and return typed
@@ -135,7 +135,7 @@ pub unsafe extern "C-unwind" fn pp_file_size(file: *mut Header) -> *mut Header {
 }
 
 /// `file.seek(pos) -> void!`: move the read/write cursor to absolute byte offset
-/// `pos` from the start of the file (DESIGN.md 9.1).
+/// `pos` from the start of the file.
 ///
 /// # Safety
 /// `file` must be a `File` object.

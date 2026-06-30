@@ -1,4 +1,4 @@
-// Numeric conversions and limits (DESIGN.md 9.2). The `Type.from` / `Type.parse`
+// Numeric conversions and limits. The `Type.from` / `Type.parse`
 // forms are recognized directly by the runtime; these named wrappers and the
 // constants complement them and are part of the prelude.
 

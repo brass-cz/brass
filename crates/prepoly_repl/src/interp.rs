@@ -413,7 +413,7 @@ impl<'p, 'm> Interp<'p, 'm> {
             .collect();
         let target: String = match callee {
             // Growable-array methods are runtime operations on the slice, not user
-            // methods (DESIGN.md 9.1).
+            // methods.
             Callee::Method(name)
                 if name == "push"
                     && matches!(arg_types.first().map(unwrap_nullable), Some(Type::Slice(_))) =>
@@ -1216,7 +1216,7 @@ fn int_signed(k: IntKind) -> bool {
 }
 
 /// The integer kind for a `(bit width, signedness)` pair, as the `_int_narrow`
-/// primitive carries them at runtime (DESIGN.md 9.1). A width other than 8/16/32
+/// primitive carries them at runtime. A width other than 8/16/32
 /// is the 64-bit kind.
 fn int_kind_from_bits(bits: i64, signed: bool) -> IntKind {
     match (bits, signed) {

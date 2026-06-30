@@ -1,4 +1,4 @@
-//! Top-level initialization ordering (DESIGN.md 2.5). Module globals are
+//! Top-level initialization ordering. Module globals are
 //! initialized in appearance order, so an initializer that references a global
 //! defined later in the same module is a compile error. Cycles always manifest
 //! as such a forward reference (the first member of the cycle to be initialized

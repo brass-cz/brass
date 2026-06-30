@@ -1,9 +1,8 @@
 //! End-to-end test: examples within the typed (Value-free) subset must run to
 //! completion; every example must still type-check. The typed back end is the
-//! only execution path (the boxed-Value back end has been removed), so a handful
-//! of examples that exercise runtime features outside that subset (concurrency,
-//! file I/O, escaping closures, runtime type-dispatch) type-check but no longer
-//! run.
+//! only execution path (the boxed-Value back end has been removed), so examples
+//! that still exercise runtime features outside that subset type-check but do not
+//! run in this test.
 
 use std::process::Command;
 

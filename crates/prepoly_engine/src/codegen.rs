@@ -31,7 +31,7 @@ use crate::mono::{
 };
 
 /// Whether a type is a reference-counted heap object the back end tracks with
-/// retain/release (DESIGN.md 8.2): strings, records, sums, and arrays/slices.
+/// retain/release: strings, records, sums, and arrays/slices.
 /// Closures are excluded (see below). An array's heap elements and a sum's heap
 /// fields are not yet released recursively, so they leak rather than
 /// use-after-free (they were retained on store); scalar-content aggregates and all
@@ -124,12 +124,18 @@ fn binds_alias(rv: &Rvalue, local_types: &[Type]) -> bool {
     {
         return matches!(operand_type_of(arg, local_types), Type::Str);
     }
+    if let Rvalue::Call(Callee::Builtin(name), args) = rv
+        && name == "__nonnull"
+        && let Some(arg) = args.first()
+    {
+        return rc_managed(unwrap_nullable(&operand_type_of(arg, local_types)));
+    }
     false
 }
 
 /// Whether the program uses `with` -- and so opens regions and needs the write
 /// barrier on heap stores. A back end consults this so a sequential (region-free)
-/// program emits no barriers and pays no barrier cost (a PLAN R6 acceptance).
+/// program emits no barriers and pays no barrier cost.
 pub fn program_uses_with(program: &MonoProgram) -> bool {
     fn rv_with(rv: &Rvalue) -> bool {
         matches!(rv, Rvalue::Call(Callee::Builtin(n), _) if n == "with")
@@ -219,7 +225,7 @@ pub trait Codegen {
     fn string_char_at(&mut self, s: Self::Value, i: Self::Value) -> Self::Value;
     /// A string from a `uint8[]` (`_string_from_bytes`): a `Result<string, string>`.
     fn string_from_bytes(&mut self, bytes: Self::Value) -> Self::Value;
-    /// `open(path, mode)` (DESIGN.md 9.1): a `Result<File, string>`.
+    /// `open(path, mode)`: a `Result<File, string>`.
     fn file_open(&mut self, path: Self::Value, mode: Self::Value) -> Self::Value;
     /// A standard stream as a `File`: `which` is 0 = stdin, 1 = stdout, 2 = stderr
     /// (`File.stdin`/`File.stdout`/`File.stderr`).
@@ -281,7 +287,7 @@ pub trait Codegen {
     /// back end returns [`Codegen::unit`] for a `void` callee).
     fn call(&mut self, symbol: &str, args: &[Self::Value], ret: &Type) -> Self::Value;
 
-    /// Deferred dispatch (DESIGN.md 7.3): resolve-or-compile the consumer named
+    /// Deferred dispatch: resolve-or-compile the consumer named
     /// `consumer` for the runtime type named `type_name`, then call it on `value`,
     /// returning its `int32` result. The back end emits a call to the runtime
     /// dispatch trampoline for the resolution and an indirect call for the
@@ -342,7 +348,7 @@ pub trait Codegen {
     /// before execution continues.
     fn thread_join_all(&mut self);
     /// Increment a heap value's reference count: a new persistent reference to it
-    /// is being created (DESIGN.md 8.2). The engine calls this only for
+    /// is being created. The engine calls this only for
     /// reference-counted (heap) values; scalars never reach it.
     fn retain(&mut self, value: Self::Value);
     /// Decrement a heap value's reference count, freeing the (leaf) object at zero.
@@ -363,13 +369,13 @@ pub trait Codegen {
     fn cown_lock_all(&mut self, arr: Self::Value);
     fn cown_unlock_all(&mut self, arr: Self::Value);
 
-    /// Open a region with `bridge` as its entry object (DESIGN.md 12.3); returns
+    /// Open a region with `bridge` as its entry object; returns
     /// the region id, which `region_close` consumes.
     fn region_open(&mut self, bridge: Self::Value) -> Self::Value;
-    /// Verify closedness on region release (DESIGN.md 12.5): the back end aborts if
+    /// Verify closedness on region release: the back end aborts if
     /// a reference into the region escaped during the `with` scope.
     fn region_close(&mut self, region_id: Self::Value);
-    /// The write barrier (DESIGN.md 12.5): maintain region membership and the local
+    /// The write barrier: maintain region membership and the local
     /// reference count when `value` is stored into `container`.
     fn region_write(&mut self, container: Self::Value, value: Self::Value);
     /// Whether to emit region write barriers -- true when the program uses `with`,
@@ -508,7 +514,7 @@ pub trait Codegen {
                 // An alias binding (copy of a local, field/index/global read, or
                 // `to_string` of a string) makes a second reference to an existing
                 // object, so the count must rise; a fresh value (other call
-                // results, construction) is already owned at count 1 (DESIGN.md 8.2).
+                // results, construction) is already owned at count 1.
                 // A nullable wrap is fresh too (the cell already owns its content), so
                 // an aliased value wrapped into a nullable is not retained again.
                 let wrap = match rv {
@@ -728,7 +734,17 @@ pub trait Codegen {
                 let va = self.codegen_operand(program, f, a, dest_ty);
                 self.un_op(*op, va, dest_ty)
             }
-            Rvalue::Call(callee, args) => self.codegen_call(program, f, callee, args),
+            Rvalue::Call(callee, args) => {
+                let from = self
+                    .call_result_type(program, f, callee, args)
+                    .unwrap_or_else(|| dest_ty.clone());
+                let v = self.codegen_call(program, f, callee, args);
+                if matches!(dest_ty, Type::Void) {
+                    v
+                } else {
+                    self.coerce(v, &from, dest_ty)
+                }
+            }
             // Construct a record: `dest_ty` is its concrete type, carrying each
             // field's type in its substitution.
             Rvalue::Record { fields, .. } => {
@@ -926,8 +942,7 @@ pub trait Codegen {
                 }
                 return self.unit();
             }
-            // `arr.insert(i, v)`: a growable-array insertion (DESIGN.md 9.1
-            // `_array_insert`), not a user method.
+            // `arr.insert(i, v)`: a growable-array insertion (`_array_insert`), not a user method.
             Callee::Method(name)
                 if name == "insert"
                     && matches!(arg_types.first().map(unwrap_nullable), Some(Type::Slice(_))) =>
@@ -945,8 +960,7 @@ pub trait Codegen {
                 }
                 return self.unit();
             }
-            // `arr.remove(i)`: a growable-array removal (DESIGN.md 9.1
-            // `_array_remove`) returning the removed element. Ownership of a managed
+            // `arr.remove(i)`: a growable-array removal (`_array_remove`) returning the removed element. Ownership of a managed
             // element transfers to the caller, so no retain/release is needed.
             Callee::Method(name)
                 if name == "remove"
@@ -958,8 +972,7 @@ pub trait Codegen {
                 let idx = self.codegen_operand(program, f, &args[1], &arg_types[1]);
                 return self.remove(arr, &elem, idx);
             }
-            // `arr.pop()`: a growable-array removal of the last element (DESIGN.md
-            // 9.1 `_array_pop`) returning it as a nullable. Ownership of a managed
+            // `arr.pop()`: a growable-array removal of the last element (`_array_pop`) returning it as a nullable. Ownership of a managed
             // element transfers to the caller (the nullable cell), so no
             // retain/release is needed.
             Callee::Method(name)
@@ -986,7 +999,7 @@ pub trait Codegen {
                     _ => self.string_len(v),
                 };
             }
-            // File I/O methods (DESIGN.md 9.2): the receiver is the builtin `File`
+            // File I/O methods: the receiver is the builtin `File`
             // record, so map to the runtime file primitives rather than a user
             // method.
             Callee::Method(name)
@@ -1059,7 +1072,7 @@ pub trait Codegen {
         self.call(&symbol, &vals, &ret)
     }
 
-    /// Deferred dispatch (DESIGN.md 7.3): `__rt_dispatch("consumer", type_id,
+    /// Deferred dispatch: `__rt_dispatch("consumer", type_id,
     /// value)`. Evaluates the runtime type id and the value, then hands them with
     /// the consumer's source name to the back end's [`Codegen::deferred_dispatch`]
     /// leaf, which (via the runtime dispatch service) JIT-compiles the consumer
@@ -1128,11 +1141,12 @@ pub trait Codegen {
             // `_panic(msg)`: abort with a computed string message (std `assert`).
             "_panic" => {
                 let mty = operand_type_of(&args[0], &f.local_types);
-                let m = self.codegen_operand(program, f, &args[0], &mty);
+                let target = unwrap_nullable(&mty).clone();
+                let m = self.codegen_operand(program, f, &args[0], &target);
                 self.runtime_panic(m);
                 self.unit()
             }
-            // Deferred dispatch (DESIGN.md 7.3): `__rt_dispatch("consumer",
+            // Deferred dispatch: `__rt_dispatch("consumer",
             // "TypeName", value)`.
             "__rt_dispatch" => self.codegen_deferred_dispatch(program, f, args),
             "len" => {
@@ -1197,7 +1211,7 @@ pub trait Codegen {
                 // deadlock-free order); `with(obj, f)` acquires the single cown.
                 let multi = matches!(obj_ty, Type::Slice(_) | Type::Array(..));
                 // A single-cown `with` opens a region with the guarded object as
-                // its bridge (DESIGN.md 12.3); closedness is verified on release.
+                // its bridge; closedness is verified on release.
                 // The lock (data-race-freedom) is kept around the region: acquire it
                 // first, so the region open/close and the body all run under it.
                 // Otherwise concurrent `with`s on the same cown race on the region
@@ -1260,26 +1274,26 @@ pub trait Codegen {
                 self.string_from_bytes(a)
             }
             // `_string_concat(a, b)` is what the `+` operator lowers to; exposed as a
-            // named primitive too (DESIGN.md 9.1).
+            // named primitive too.
             "_string_concat" => {
                 let a = self.codegen_operand(program, f, &args[0], &Type::Str);
                 let b = self.codegen_operand(program, f, &args[1], &Type::Str);
                 self.string_concat(a, b)
             }
-            // `_string_cmp(a, b) -> int32` lexicographic comparison (DESIGN.md 9.1).
+            // `_string_cmp(a, b) -> int32` lexicographic comparison.
             "_string_cmp" => {
                 let a = self.codegen_operand(program, f, &args[0], &Type::Str);
                 let b = self.codegen_operand(program, f, &args[1], &Type::Str);
                 self.string_cmp(a, b)
             }
-            // Numeric-to-string renderings (DESIGN.md 9.1): the argument keeps its
+            // Numeric-to-string renderings: the argument keeps its
             // own numeric type so `to_string` selects the right rendering.
             "_int_to_string" | "_float_to_string" => {
                 let aty = operand_type_of(&args[0], &f.local_types);
                 let v = self.codegen_operand(program, f, &args[0], &aty);
                 self.to_string(v, &aty)
             }
-            // String-to-number parses (DESIGN.md 9.1): a typed `Result`.
+            // String-to-number parses: a typed `Result`.
             "_int_parse" | "_float_parse" => {
                 let s = self.codegen_operand(program, f, &args[0], &Type::Str);
                 let target = if name == "_int_parse" {
@@ -1303,13 +1317,13 @@ pub trait Codegen {
                 let x = self.codegen_operand(program, f, &args[0], &f64t);
                 self.convert(&Type::Int(prepoly_hir::IntKind::I64), "from", &f64t, x)
             }
-            // `open(path, mode) -> File!` (DESIGN.md 9.1).
+            // `open(path, mode) -> File!`.
             "open" => {
                 let p = self.codegen_operand(program, f, &args[0], &Type::Str);
                 let m = self.codegen_operand(program, f, &args[1], &Type::Str);
                 self.file_open(p, m)
             }
-            // Integer width conversions (DESIGN.md 9.1): widen is infallible, narrow
+            // Integer width conversions: widen is infallible, narrow
             // returns a range-checked Result.
             "_int_widen" | "_int_narrow" => {
                 let i64t = Type::Int(prepoly_hir::IntKind::I64);
@@ -1325,6 +1339,99 @@ pub trait Codegen {
             }
             // Other builtins are rejected during monomorphization.
             _ => self.unit(),
+        }
+    }
+
+    /// The type a call produces before any destination-context coercion.
+    ///
+    /// Most calls already return the type expected by their destination, but
+    /// nullable-returning primitives such as `_string_char_at` may flow into a
+    /// non-null slot after a guard or loop invariant proves they are present. The
+    /// call result must then be unwrapped explicitly (`T? -> T`) instead of storing
+    /// the nullable cell pointer where the inner value pointer is expected.
+    fn call_result_type(
+        &self,
+        program: &MonoProgram,
+        f: &MonoFunction,
+        callee: &Callee,
+        args: &[Operand],
+    ) -> Option<Type> {
+        let arg_types: Vec<Type> = args
+            .iter()
+            .map(|a| operand_type_of(a, &f.local_types))
+            .collect();
+        match callee {
+            Callee::Builtin(name) => builtin_result_type(name, args, &f.local_types),
+            Callee::Free(base) if base == "print" || base == "println" => Some(Type::Void),
+            Callee::Free(base) => program
+                .lookup(&instance_symbol(base, &arg_types))
+                .map(|inst| inst.ret.clone()),
+            Callee::Method(name)
+                if name == "push"
+                    && matches!(arg_types.first().map(unwrap_nullable), Some(Type::Slice(_))) =>
+            {
+                Some(Type::Void)
+            }
+            Callee::Method(name)
+                if name == "insert"
+                    && matches!(arg_types.first().map(unwrap_nullable), Some(Type::Slice(_))) =>
+            {
+                Some(Type::Void)
+            }
+            Callee::Method(name)
+                if name == "remove"
+                    && matches!(arg_types.first().map(unwrap_nullable), Some(Type::Slice(_))) =>
+            {
+                let aty = unwrap_nullable(&arg_types[0]);
+                Some(element_type(aty))
+            }
+            Callee::Method(name)
+                if name == "pop"
+                    && matches!(arg_types.first().map(unwrap_nullable), Some(Type::Slice(_))) =>
+            {
+                let aty = unwrap_nullable(&arg_types[0]);
+                Some(Type::Nullable(Box::new(element_type(aty))))
+            }
+            Callee::Method(name)
+                if name == "len"
+                    && matches!(
+                        arg_types.first().map(unwrap_nullable),
+                        Some(Type::Slice(_) | Type::Array(..) | Type::Str)
+                    ) =>
+            {
+                Some(Type::Int(prepoly_hir::IntKind::I64))
+            }
+            Callee::Method(name)
+                if matches!(name.as_str(), "read" | "write" | "close" | "size" | "seek")
+                    && matches!(arg_types.first(), Some(Type::Record(r)) if r.is_name("File")) =>
+            {
+                None
+            }
+            Callee::Method(name) => {
+                let msym = method_symbol(name, &arg_types);
+                let target = if program.lookup(&msym).is_some() {
+                    msym
+                } else {
+                    instance_symbol(name, &arg_types)
+                };
+                program.lookup(&target).map(|inst| inst.ret.clone())
+            }
+            Callee::Static { ty, method } if numeric_conv_ret(ty, method).is_some() => {
+                numeric_conv_ret(ty, method)
+            }
+            Callee::Static { ty, method } if ty == "File" => Some(match method.as_str() {
+                "stdin" | "stdout" | "stderr" => {
+                    Type::Record(prepoly_hir::NominalType::new(-1, "File"))
+                }
+                _ => Type::Void,
+            }),
+            Callee::Static { ty, method } => program
+                .lookup(&static_symbol(ty, method, &arg_types))
+                .map(|inst| inst.ret.clone()),
+            Callee::Indirect(callee) => match operand_type_of(callee, &f.local_types) {
+                Type::Fun(_, ret) => Some(*ret),
+                _ => None,
+            },
         }
     }
 
@@ -1526,6 +1633,37 @@ fn record_from_succeeds(src_ty: &Type, target: &Type) -> bool {
 fn str_const(op: &Operand) -> Option<&str> {
     match op {
         Operand::Const(Literal::Str(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// Typed return shapes for compiler/runtime builtins that are not backed by a
+/// monomorphized function instance. Unknown shapes are left as `None`; callers
+/// then assume the destination type already matches.
+fn builtin_result_type(name: &str, args: &[Operand], local_types: &[Type]) -> Option<Type> {
+    match name {
+        "value_matches" | "result_is_ok" => Some(Type::Bool),
+        "__deep_copy" => args.first().map(|op| operand_type_of(op, local_types)),
+        "__nonnull" => args
+            .first()
+            .map(|op| unwrap_nullable(&operand_type_of(op, local_types)).clone()),
+        "panic" | "_panic" | "print" | "println" | "spawn" | "sync" | "_freeze" | "_cown" => {
+            Some(Type::Void)
+        }
+        "len" | "array_len" => Some(Type::Int(prepoly_hir::IntKind::I64)),
+        "to_string" => Some(Type::Str),
+        "_float_sqrt" | "_float_floor" | "_float_ceil" | "_float_pow" => {
+            Some(Type::Float(prepoly_hir::FloatKind::F64))
+        }
+        "_string_slice" | "_string_concat" => Some(Type::Str),
+        "_string_bytes" => Some(Type::Slice(Box::new(Type::Int(prepoly_hir::IntKind::U8)))),
+        "_string_find" => Some(Type::Nullable(Box::new(Type::Int(
+            prepoly_hir::IntKind::I64,
+        )))),
+        "_string_char_at" => Some(Type::Nullable(Box::new(Type::Str))),
+        "_string_cmp" => Some(Type::Int(prepoly_hir::IntKind::I32)),
+        "_int_to_string" | "_float_to_string" => Some(Type::Str),
+        "_int_to_float" => Some(Type::Float(prepoly_hir::FloatKind::F64)),
         _ => None,
     }
 }

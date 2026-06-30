@@ -2,7 +2,7 @@
 //!
 //! This module owns the runtime side of the LLVM back end: it builds an
 //! execution engine for a generated module, maps the runtime's C-ABI primitives
-//! to their host addresses, and runs the program (DESIGN.md 10.1). Code
+//! to their host addresses, and runs the program. Code
 //! *generation* lives in [`crate::codegen`]. The runtime monomorphization cache
 //! and the `RuntimeJit` orchestration for deferred monomorphization live
 //! backend-agnostically in `prepoly_engine`; the LLVM-specific runtime

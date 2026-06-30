@@ -1,4 +1,4 @@
-//! The Prepoly type representation (DESIGN.md 5.1, 6.2) and its mapping to the
+//! The Prepoly type representation and its mapping to the
 //! runtime value tags. `Unknown` models the parts inference leaves open, which
 //! the JIT handles via runtime tag dispatch (deferred monomorphization).
 
@@ -15,7 +15,7 @@ pub const RESULT_ERR_ERROR: &str = "Err.error";
 /// Type id and name of a *structural* record: one with no declaration, whose
 /// layout and identity come from its field substitution rather than a nominal
 /// definition. Used for anonymous structures (`{ f: v }` / `anonymous { f: T }`)
-/// and records built at the deserialize boundary (DESIGN.md 7.3); both share this
+/// and records built at the deserialize boundary; both share this
 /// id/name so structurally-identical values are the same type. Negative so it
 /// never collides with a declared type's id.
 pub const STRUCTURAL_RECORD_ID: i32 = i32::MIN;
@@ -196,7 +196,7 @@ pub enum Type {
 /// A nominal type substitution keyed by lowered member paths.
 ///
 /// For the built-in `Result`, `Ok.value` and `Err.error` carry the statically
-/// known payload types described by DESIGN.md 6.2.
+/// known payload types.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Substitution {
     entries: BTreeMap<String, Type>,

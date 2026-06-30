@@ -1,5 +1,6 @@
-// String utilities (prelude) and explicit numeric conversions. Prepoly does no
-// implicit numeric conversion: every cross-type conversion is written out.
+// String utilities (prelude) and explicit numeric conversions. Numeric operators
+// implicitly convert mixed numeric operands to a common type; use `from`/`parse`
+// when the conversion itself is the operation you want to spell out.
 
 fun main() {
     let csv = "alice,bob,carol"

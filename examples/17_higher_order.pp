@@ -1,6 +1,6 @@
 // Higher-order functions: closures passed as arguments are called as the local
 // value even when their parameter name matches a global function, and the
-// inferred result type flows to the caller (DESIGN.md 5.7, 5.8).
+// inferred result type flows to the caller.
 
 fun apply_twice(f, x) {
     return f(f(x))

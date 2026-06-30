@@ -1,7 +1,7 @@
 //! Monomorphization: collecting the concrete instances a typed back end
 //! compiles, and resolving every local and return type to a concrete type.
 //!
-//! This is *true* single-specialization (DESIGN.md 7): starting from the
+//! This is *true* single-specialization: starting from the
 //! zero-parameter entry functions, each call site's concrete argument types
 //! select (and, on demand, create) a callee instance, so one polymorphic MIR
 //! body yields a distinct instance per concrete type tuple. Functions, instance
@@ -72,7 +72,7 @@ impl Resolver for MonoResolver<'_, '_> {
                 .find(|f| f.name == field)
                 .and_then(|f| f.resolved_ty.clone()),
             // A variant-qualified field (`Variant.field`) resolves in that variant;
-            // a bare name must be common to every variant (DESIGN.md 13.4).
+            // a bare name must be common to every variant.
             TypeKind::Sum { variants } => match field.split_once('.') {
                 Some((variant, fname)) => variants
                     .iter()
@@ -103,7 +103,7 @@ impl Resolver for MonoResolver<'_, '_> {
     }
 }
 
-/// The JIT-time type check (DESIGN.md 1): re-derive every monomorphized instance's
+/// The JIT-time type check: re-derive every monomorphized instance's
 /// types by constraint solving and report any unification conflict. On a program
 /// the front end already type-checked this finds nothing -- it is the deferred
 /// model's consistency check over the concretely-typed IR, complementing the
@@ -154,7 +154,7 @@ pub struct MonoFunction<'m> {
     /// and its parameters follow it, even when it captures nothing.
     pub is_closure: bool,
     /// Whether this is a fallible callable: a bare `return v` is implicitly
-    /// wrapped as `Result.Ok { value: v }` (DESIGN.md 6.2).
+    /// wrapped as `Result.Ok { value: v }`.
     pub fallible: bool,
 }
 
@@ -197,14 +197,14 @@ pub(crate) fn const_operand_index(op: &Operand) -> Option<usize> {
     }
 }
 
-/// The synthetic `File` record type (DESIGN.md 9.2). `File` is a builtin handle,
+/// The synthetic `File` record type. `File` is a builtin handle,
 /// not a user-declared type, so it carries no registered id -- matching the type
 /// checker, whose `type_by_name("File")` falls back to the same synthetic record.
 fn file_type() -> Type {
     Type::Record(NominalType::new(-1, "File"))
 }
 
-/// The `Result` a `File` instance method returns (DESIGN.md 9.2): `read ->
+/// The `Result` a `File` instance method returns: `read ->
 /// uint8[]!`, `write`/`size -> int64!`, `close`/`seek -> void!`. `None` for a
 /// non-File method name.
 fn file_method_type(name: &str) -> Option<Type> {
@@ -415,7 +415,7 @@ pub fn monomorphize<'m>(mir: &'m MirProgram, program: &Program) -> Result<MonoPr
 }
 
 /// Build the concrete `Type` of a declared record as it arrives at the runtime
-/// deserialize boundary (DESIGN.md 7.3): a nominal carrying every field's declared
+/// deserialize boundary: a nominal carrying every field's declared
 /// type in its substitution, exactly as a constructed record does -- so it
 /// satisfies the typed backend's support check and field reads resolve. Returns
 /// `None` if `name` is not a record type in `module`, or a field type is unknown.
@@ -427,7 +427,7 @@ pub fn boundary_record_type(program: &Program, module: &[String], name: &str) ->
 
 /// Like [`boundary_record_type`] but keyed by the type's id -- the tag a boundary
 /// value carries at runtime. The dispatch trampoline rebuilds the consumer's
-/// argument type from a runtime value's tag with this (DESIGN.md 7.3).
+/// argument type from a runtime value's tag with this.
 pub fn boundary_record_type_by_id(program: &Program, id: i32) -> Option<Type> {
     boundary_record_type_of(program.type_by_id(id)?)
 }
@@ -444,13 +444,13 @@ pub fn boundary_record_type_by_name(program: &Program, name: &str) -> Option<Typ
 }
 
 /// The sentinel type id for a *structural* record built at the deserialize boundary
-/// from a value's shape rather than a declaration (DESIGN.md 7.3). No declared type
+/// from a value's shape rather than a declaration. No declared type
 /// uses this id, so `type_by_id` misses and the typed backend lays the record out
 /// from its substitution (sorted field order) instead of a declaration.
 pub const STRUCTURAL_RECORD_ID: i32 = i32::MIN;
 
-/// Build a `Type::Record` from a field list discovered at the deserialize boundary
-/// (DESIGN.md 7.3): the data structure -- not a declared type name -- drives the
+/// Build a `Type::Record` from a field list discovered at the deserialize
+/// boundary: the data structure -- not a declared type name -- drives the
 /// type. The resulting record has no declaration; its layout comes from the
 /// substitution (the typed backend orders structural fields by name). The consumer
 /// is then monomorphized against this type exactly like a declared one, and the
@@ -469,7 +469,7 @@ pub fn boundary_record_type_from_fields(fields: &[(String, Type)]) -> Type {
 
 /// Parse a structural record descriptor `"field:tag,field:tag"` (optionally brace-
 /// wrapped) into ordered `(field, Type)` pairs, the data-driven type description a
-/// `deserialize` boundary produces (DESIGN.md 7.3). Returns `None` on a malformed
+/// `deserialize` boundary produces. Returns `None` on a malformed
 /// descriptor or an unknown field type tag.
 pub fn parse_structural_descriptor(desc: &str) -> Option<Vec<(String, Type)>> {
     let body = desc
@@ -488,7 +488,7 @@ pub fn parse_structural_descriptor(desc: &str) -> Option<Vec<(String, Type)>> {
     Some(out)
 }
 
-/// The `Type` named by a structural-descriptor field tag (DESIGN.md 5.1 primitives).
+/// The `Type` named by a structural-descriptor field tag.
 fn type_from_tag(tag: &str) -> Option<Type> {
     if let Some(k) = IntKind::from_name(tag) {
         return Some(Type::Int(k));
@@ -518,7 +518,7 @@ fn boundary_record_type_of(info: &prepoly_hir::TypeInfo) -> Option<Type> {
 }
 
 /// Monomorphize a single callable on demand for a concrete argument-type tuple,
-/// for deferred monomorphization (DESIGN.md 7.3): when a type is fixed at runtime,
+/// for deferred monomorphization: when a type is fixed at runtime,
 /// the consumer is specialized for it then. Returns a [`MonoProgram`] containing
 /// that instance and everything it transitively reaches, or an error if the body
 /// cannot be typed for those types -- e.g. the runtime type lacks a field the
@@ -738,7 +738,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         // A non-fallible callable with a non-null declared return cannot return an
         // always-null value (`never?` -- a `null` literal or an absent structural
         // field). This is the back-end backstop that keeps the deferred boundary
-        // (DESIGN.md 7.3) sound: a runtime type lacking a field the consumer reads
+        // sound: a runtime type lacking a field the consumer reads
         // at a non-null type is rejected here rather than returning a null
         // reinterpreted as that type. Only *reachable* returns count: an `if` on a
         // statically-false condition (an absent field reads as `never?`) makes its
@@ -826,7 +826,8 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 *slot = Some(t);
             }
         };
-        for block in &body.blocks {
+        let propagated_returns = propagated_result_returns(body);
+        for (block_idx, block) in body.blocks.iter().enumerate() {
             for stmt in &block.stmts {
                 if let MirStmt::Assign(
                     _,
@@ -850,6 +851,26 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             }
             if let Terminator::Return(op) = &block.term {
                 match self.operand_type(op, local_types)? {
+                    // `expr!` lowers its error arm to `return <the original Result>`.
+                    // That return can only execute for the `Err` variant, so it must
+                    // not define this callable's `Ok` payload. The previous
+                    // implementation treated the propagated `Result<File, string>`
+                    // from `open(...)!` as evidence that the surrounding function
+                    // returned `File!`, which made helpers such as `read_file`
+                    // return a `Result<File, string>` at the typed back end even
+                    // though their successful bare return was a `string`.
+                    Some(Type::Sum(n))
+                        if n.id == RESULT_TYPE_ID
+                            && matches!(
+                                op,
+                                Operand::Local(local)
+                                    if propagated_returns.contains(&(block_idx, *local))
+                            ) =>
+                    {
+                        if let Some((_, err)) = n.result_payloads() {
+                            note(&mut err_e, Some(err.clone()));
+                        }
+                    }
                     // A directly-returned Result carries both payloads.
                     Some(Type::Sum(n)) if n.id == RESULT_TYPE_ID => {
                         if let Some((ok, err)) = n.result_payloads() {
@@ -1016,7 +1037,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                     None => Ok(None),
                 }
             }
-            // `arr.remove(i) -> T` returns the removed element (DESIGN.md 9.1).
+            // `arr.remove(i) -> T` returns the removed element.
             Rvalue::Call(Callee::Method(name), args) if name == "remove" => {
                 match self.operand_type(args.first().unwrap_or(&Operand::void()), local_types)? {
                     Some(t) => match unwrap_nullable(&t) {
@@ -1026,8 +1047,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                     None => Ok(None),
                 }
             }
-            // `arr.pop() -> T?` returns the last element as a nullable (DESIGN.md
-            // 9.1 `_array_pop`).
+            // `arr.pop() -> T?` returns the last element as a nullable (`_array_pop`).
             Rvalue::Call(Callee::Method(name), args) if name == "pop" => {
                 match self.operand_type(args.first().unwrap_or(&Operand::void()), local_types)? {
                     Some(t) => match unwrap_nullable(&t) {
@@ -1089,7 +1109,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 "_float_sqrt" | "_float_floor" | "_float_ceil" | "_float_pow" => {
                     Ok(Some(Type::Float(FloatKind::F64)))
                 }
-                // Integer width conversions (DESIGN.md 9.1): widen is infallible
+                // Integer width conversions: widen is infallible
                 // (int64), narrow yields a range-checked Result.
                 "_int_widen" => Ok(Some(Type::Int(IntKind::I64))),
                 "_int_narrow" => Ok(Some(result_type(Type::Int(IntKind::I64), Type::Str))),
@@ -1100,7 +1120,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 "_string_find" => Ok(Some(Type::Nullable(Box::new(Type::Int(IntKind::I64))))),
                 "_string_char_at" => Ok(Some(Type::Nullable(Box::new(Type::Str)))),
                 "_string_from_bytes" => Ok(Some(result_type(Type::Str, Type::Str))),
-                // Named numeric/string conversion primitives (DESIGN.md 9.1),
+                // Named numeric/string conversion primitives,
                 // callable directly as well as through the `Type.from`/`parse` and
                 // `+` forms.
                 "_string_concat" => Ok(Some(Type::Str)),
@@ -1110,7 +1130,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 "_float_parse" => Ok(Some(result_type(Type::Float(FloatKind::F64), Type::Str))),
                 "_int_to_float" => Ok(Some(Type::Float(FloatKind::F64))),
                 "_float_to_int" => Ok(Some(result_type(Type::Int(IntKind::I64), Type::Str))),
-                // `open(path, mode) -> File!` (DESIGN.md 9.1); a runtime primitive.
+                // `open(path, mode) -> File!`; a runtime primitive.
                 "open" => Ok(Some(result_type(file_type(), Type::Str))),
                 // `to_string` only has a typed conversion for scalars/strings;
                 // other arguments fall back so formatting stays correct.
@@ -1134,7 +1154,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 // `_cown(c)` / `_freeze(c)` promote a spawn capture to a shared
                 // owner before the spawn; each yields nothing.
                 "_cown" | "_freeze" => Ok(Some(Type::Void)),
-                // Deferred dispatch (DESIGN.md 7.3): resolves+calls a consumer at
+                // Deferred dispatch: resolves+calls a consumer at
                 // runtime, yielding `int32`; not a user function to instantiate.
                 "__rt_dispatch" => Ok(Some(Type::Int(IntKind::I32))),
                 "with" => match args.get(1) {
@@ -1245,7 +1265,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         let Some(arg_types) = self.arg_types(args, local_types)? else {
             return Ok(None);
         };
-        // File I/O methods (DESIGN.md 9.2) are runtime primitives over the builtin
+        // File I/O methods are runtime primitives over the builtin
         // `File` record, not user methods, so they return their Result directly with
         // no instance to monomorphize.
         if let Type::Record(n) = &arg_types[0]
@@ -1271,7 +1291,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             }
         }
         // UFCS: `recv.name(args)` resolves to the free function `name(recv, args)`
-        // when the receiver has no such method (DESIGN.md 9.4).
+        // when the receiver has no such method.
         if self.by_fn.contains_key(name) {
             return self.resolve_free(cur_sym, cur_ret, name, arg_types);
         }
@@ -1297,11 +1317,11 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             return Ok(None);
         };
         // Numeric/string conversions (`Type.from`/`Type.parse`) are runtime-
-        // recognized, not user static methods (DESIGN.md 9.2).
+        // recognized, not user static methods.
         if let Some(ret) = numeric_conv_ret(ty, method_name) {
             return Ok(Some(ret));
         }
-        // `File.stdin/stdout/stderr` are runtime standard streams (DESIGN.md 9.2).
+        // `File.stdin/stdout/stderr` are runtime standard streams.
         if ty == "File" && matches!(method_name, "stdin" | "stdout" | "stderr") {
             return Ok(Some(file_type()));
         }
@@ -1825,7 +1845,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         };
         // A variant-qualified field (`Variant.field`, from a variant pattern
         // binding) resolves in that variant; a bare name resolves in the first
-        // variant that declares it (a field common to every variant, DESIGN.md 13.4).
+        // variant that declares it (a field common to every variant).
         let (want_variant, fname) = match field.split_once('.') {
             Some((v, f)) => (Some(v), f),
             None => (None, field),
@@ -1912,7 +1932,7 @@ fn method_ret_annotation(program: &Program, type_symbol: &str, method: &str) -> 
 }
 
 /// The default concrete type of a constant literal (integers default to int32,
-/// floats to float64; DESIGN.md 5.3). Errors on non-scalar constants.
+/// floats to float64). Errors on non-scalar constants.
 fn const_type(lit: &prepoly_mir::Literal) -> Result<Type, String> {
     use prepoly_mir::Literal;
     match lit {
@@ -2168,6 +2188,39 @@ fn result_concrete_ok(t: &Type) -> Option<Type> {
     }
 }
 
+/// The error arms created by `expr!` return the original Result value unchanged.
+/// Those synthetic returns carry only the `Err` payload for the enclosing
+/// callable; their `Ok` payload belongs to the callee that produced the Result.
+fn propagated_result_returns(body: &MirBody) -> HashSet<(usize, LocalId)> {
+    let mut tested_results: HashMap<LocalId, LocalId> = HashMap::new();
+    for block in &body.blocks {
+        for stmt in &block.stmts {
+            if let MirStmt::Assign(test, Rvalue::Call(Callee::Builtin(name), args)) = stmt
+                && name == "result_is_ok"
+                && let Some(Operand::Local(result)) = args.first()
+            {
+                tested_results.insert(*test, *result);
+            }
+        }
+    }
+
+    let mut returns = HashSet::new();
+    for block in &body.blocks {
+        if let Terminator::CondBranch {
+            cond: Operand::Local(test),
+            els,
+            ..
+        } = &block.term
+            && let Some(result) = tested_results.get(test)
+            && let Terminator::Return(Operand::Local(returned)) = body.block(*els).term
+            && returned == *result
+        {
+            returns.insert((els.index(), *result));
+        }
+    }
+    returns
+}
+
 /// Whether a fallible body actually raises an error: an `error(...)` (an `Err`
 /// construction) or an `expr!` propagation (a `result_is_ok` test). A body with
 /// neither never produces an `Err`, so its `Result` error payload is free.
@@ -2184,7 +2237,7 @@ fn body_has_error_source(body: &MirBody) -> bool {
 }
 
 /// Whether `a` and `b` are concrete primitives of different kinds (string/bool/
-/// int/float), a mismatch no implicit conversion bridges. Non-primitive types are
+/// int/float), a mismatch no numeric conversion bridges. Non-primitive types are
 /// treated as non-conflicting (conservative -- the fold only targets clear cases).
 fn primitive_kind_conflict(a: &Type, b: &Type) -> bool {
     fn kind(t: &Type) -> Option<u8> {
@@ -2477,7 +2530,8 @@ fn resolve_alias(alias: &HashMap<LocalId, LocalId>, mut l: LocalId) -> LocalId {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_instances, monomorphize};
+    use super::{check_instances, instance_symbol, monomorphize};
+    use prepoly_hir::{NominalType, RESULT_TYPE_ID, Type};
 
     /// The JIT-time constraint check passes on a valid program: each
     /// monomorphized body (a free function, and a record method whose `self.x +
@@ -2520,5 +2574,32 @@ mod tests {
             jit_errors.is_empty(),
             "valid fallible program: {jit_errors:?}"
         );
+    }
+
+    /// Error propagation with `expr!` contributes only the propagated error type to
+    /// the enclosing function. Its callee-side Ok payload must not override the
+    /// enclosing function's successful bare return.
+    #[test]
+    fn propagated_result_does_not_define_enclosing_ok_payload() {
+        let src = "fun read_text(path: string) {\n  let f = open(path, \"r\")!\n  return \"done\"\n}\n\
+                   fun main() {\n  let r = read_text(\"/tmp/missing\")\n}\n";
+        let ast = prepoly_parser::parse(src).expect("parse");
+        let (program, errs) = prepoly_hir::lower(&[prepoly_hir::LoadedModule {
+            path: vec!["main".into()],
+            ast,
+        }]);
+        assert!(errs.is_empty(), "lower: {errs:?}");
+        let mir = prepoly_mir::lower_program(&program);
+        let mono = monomorphize(&mir, &program).expect("monomorphize");
+        let sym = instance_symbol("read_text", &[Type::Str]);
+        let ret = &mono.lookup(&sym).expect("read_text instance").ret;
+        let Type::Sum(result) = ret else {
+            panic!("read_text should return Result, got {}", ret.display());
+        };
+        assert_eq!(result.id, RESULT_TYPE_ID);
+        let (ok, err) = result.result_payloads().expect("Result payloads");
+        assert_eq!(ok, &Type::Str);
+        assert_eq!(err, &Type::Str);
+        assert_ne!(ok, &Type::Record(NominalType::new(-1, "File")));
     }
 }

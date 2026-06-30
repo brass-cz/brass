@@ -1,4 +1,4 @@
-//! Interface enforcement (DESIGN.md 4.2.3): `type B: A` requires B to provide
+//! Interface enforcement: `type B: A` requires B to provide
 //! every field and method of A with compatible types. For a sum type, every
 //! variant must satisfy the interface.
 
@@ -99,7 +99,7 @@ fn report(
                     // Fields are mutable, so an interface field type must be
                     // matched invariantly: a covariant override would let a
                     // write through the interface install an incompatible
-                    // value (DESIGN.md 4.2.3).
+                    // value.
                     if !w.is_unknown()
                         && !g.is_unknown()
                         && !crate::structural::types_invariant(program, g, w)

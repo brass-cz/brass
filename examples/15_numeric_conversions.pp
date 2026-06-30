@@ -1,5 +1,5 @@
-// Numeric conversions follow DESIGN.md 5.2: conversions that may exceed the
-// destination range return Result and must be unwrapped or matched.
+// Numeric conversions: a conversion that may exceed the destination range
+// returns a Result and must be unwrapped or matched.
 
 
 fun bounded_byte(fail: bool) {

@@ -1,4 +1,4 @@
-//! Structural subtyping (DESIGN.md 5.8): a record type S is usable where T is
+//! Structural subtyping: a record type S is usable where T is
 //! required when S has every field and method of T with compatible types.
 //! Sum types are nominal and excluded.
 
@@ -13,7 +13,7 @@ use prepoly_hir::{
 /// fields and method parameters use this instead of one-directional
 /// assignability: a value stored in a field can be both read and overwritten,
 /// and a parameter is consumed by the body, so widening either direction is
-/// unsound (DESIGN.md 4.2.3, 5.8). Unknowns stay flexible because
+/// unsound. Unknowns stay flexible because
 /// `types_compatible` accepts them in both directions, which preserves
 /// interface constraint propagation.
 pub fn types_invariant(program: &Program, a: &Type, b: &Type) -> bool {

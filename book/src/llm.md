@@ -32,8 +32,9 @@ with `prepoly check file.pp`.
 - Comments: `// line` and `/* block, which may nest */`.
 - Newlines separate statements. A line continues onto the next when it ends
   with a binary operator, or when the next line begins with `.` (method chain).
-- Commas between record/type fields and between match arms are optional;
-  newlines work as separators too. Trailing commas are allowed.
+- Commas between type fields/members and between match arms are optional;
+  newlines work as separators too. Record literal fields still use commas when
+  more than one field is written. Trailing commas are allowed.
 - String interpolation: inside a string literal, `{expr}` evaluates `expr` and
   inserts its text, e.g. `"sum = {a + b}"`. Escapes like `\n`, `\t` work.
 - `if` and `match` are expressions and yield a value.
@@ -130,8 +131,9 @@ type Shape =
 let s = Shape.Circle { radius: 2.0 }     // construct as Type.Variant { ... }
 ```
 
-Variants are nominal. Sum types may also carry methods in a trailing block, and
-they may be recursive (a variant field can be the type itself).
+Variants are nominal. A variant may carry methods in its own field block, but
+sum-wide trailing method blocks are not implemented. Sum types may be recursive
+(a variant field can be the type itself).
 
 ### Interfaces and structural subtyping
 
@@ -236,7 +238,10 @@ fun get_name(obj) {
 - Primitive types: `int8/16/32/64`, `uint8/16/32/64`, `float32`, `float64`,
   `bool`, `string`, `void`. There is no separate char type; a character is a
   one-character `string`.
-- Conversions are explicit. `string.from(x)` always succeeds and returns
+- Numeric operators and comparisons implicitly convert mixed numeric operands to
+  a common type (wider integer width/sign, or the float type for int+float).
+  Explicit conversions are still available and should be used when conversion is
+  the operation being performed. `string.from(x)` always succeeds and returns
   `string`. `float64.from(int)` widens. `int32.from(x)` / `uint8.from(x)` and
   the `T.parse(s)` family can fail and return `T!`, so unwrap with `!` or
   `match`.
@@ -248,7 +253,9 @@ let s = string.from(42)
 let b = uint8.from(300)               // Err: out of range -> match or `!`
 ```
 
-String indices are UTF-8 byte offsets (`len`, slicing, `find`, indexing agree).
+String offsets are UTF-8 byte offsets: `len`, slicing, and `find` agree on byte
+positions. Direct `s[i]` string indexing is not part of the supported runtime
+surface; use `s.chars()` when you need one-character strings.
 
 ## Collections and operators
 
@@ -307,6 +314,8 @@ import geometry.vec.{ Vec2, dot }
 - `assert(cond, msg?)` aborts when `cond` is false (`msg` is optional).
 - Identifiers beginning with `_` (e.g. `_string_bytes`, `_panic`) are runtime
   internals -- do not call them directly; use the prelude wrappers above.
+- File I/O and concurrency run on the native runtime; `prepoly repl` does not
+  implement those runtime features.
 
 ## Concurrency (experimental -- avoid unless asked)
 
@@ -318,11 +327,13 @@ of `main`, so insert `sync()` before a read that may race ahead.
 
 ## Common mistakes to avoid
 
-- Do NOT mix integer widths. `for i in [0..len(xs)]` style counters are `int64`;
-  comparing or combining them with an `int32` is an error. Prefer iterating
-  with `for x in xs`, or convert explicitly.
-- Do NOT rely on implicit `int`->`float` (or any) numeric conversion; call
-  `float64.from(...)` / `int32.from(...)`.
+- Numeric operators convert mixed widths and int+float operands, but annotations
+  and function parameters still enforce their declared type. Use
+  `float64.from(...)` / `int32.from(...)` when storing or passing a converted
+  value explicitly.
+- `len()` returns `int64`. A range like `[0..len(xs)]` does not make the `0`
+  literal an `int64`; write `let start: int64 = 0` first, or prefer
+  `for x in xs`.
 - Use `==` for equality, not `=`.
 - A nullable (`T?`) value cannot be used until narrowed by an `if` guard.
 - Match `Result` with the field names `Ok { value }` / `Err { error }`.

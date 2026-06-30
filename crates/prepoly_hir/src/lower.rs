@@ -33,7 +33,7 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
     // How many modules define each top-level function/type name. A name defined
     // in a single module keeps its bare symbol (so all existing bare-name lookups
     // and codegen symbols are unchanged); a name defined in several modules is
-    // qualified per module so the definitions coexist (PLAN.md R2).
+    // qualified per module so the definitions coexist.
     let fn_name_modules = name_module_counts(modules, |item| match item {
         TopLevel::Fun(f) => Some(&f.name),
         _ => None,
@@ -66,7 +66,7 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
                     // Same symbol => same name twice in one module (a genuine
                     // duplicate, or a clash with the builtin `Result`). A
                     // different module yields a different symbol, so cross-module
-                    // same-named types coexist (PLAN.md R2).
+                    // same-named types coexist.
                     if types.contains_key(&symbol) {
                         if td.name != "Result" {
                             errors.push(LowerError {
@@ -125,7 +125,7 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
 
 /// Count, per top-level name (selected by `extract`), how many distinct modules
 /// define it. A name defined in a single module stays bare; one defined in
-/// several is qualified per module so the definitions coexist (PLAN.md R2).
+/// several is qualified per module so the definitions coexist.
 fn name_module_counts(
     modules: &[LoadedModule],
     extract: impl Fn(&TopLevel) -> Option<&String>,
@@ -253,7 +253,7 @@ fn split_members(
     (fields, methods)
 }
 
-/// Built-in `Result = Ok { value } | Err { error }` (DESIGN.md 5.6).
+/// Built-in `Result = Ok { value } | Err { error }`.
 fn result_type() -> TypeInfo {
     TypeInfo {
         name: "Result".into(),
@@ -306,7 +306,7 @@ fn resolve_program_annotations(program: &mut Program) {
     let import_origins = program.import_origins.clone();
     // Resolve a bare type name to its nominal info from a given module: its own
     // bare/unique symbol, this module's qualified definition, or the imported
-    // one (PLAN.md R2). Captures only the snapshots above, so it does not borrow
+    // one. Captures only the snapshots above, so it does not borrow
     // `program` and can run while the type/function tables are mutated.
     let resolve_nominal = |module: &[String], name: &str| -> Option<NominalInfo> {
         crate::hir::resolve_qualified(&nominal_by_symbol, &import_origins, module, name).copied()
@@ -597,7 +597,7 @@ mod tests {
 
     #[test]
     fn cross_module_same_function_name_coexists() {
-        // PLAN.md R2: the same function name defined in two different modules now
+        // The same function name defined in two different modules now
         // coexists with distinct module-qualified symbols rather than being a
         // lower-time duplicate. (Ambiguity is an error only when both are
         // imported into one module; see prepoly_resolve.)

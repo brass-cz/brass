@@ -1,4 +1,4 @@
-//! Type checking for Prepoly (DESIGN.md 5.7). The passes that have high value
+//! Type checking for Prepoly. The passes that have high value
 //! and low false-positive risk run statically: type-name resolution, interface
 //! enforcement, match exhaustiveness, const checking, and the
 //! no-implicit-numeric-conversion check. Remaining type errors are caught at
@@ -38,7 +38,7 @@ pub struct Analysis {
     pub errors: Vec<TypeError>,
     pub typed: TypedProgram,
     /// Fully-concrete call instances per free-function symbol, the input to
-    /// static monomorphization (PLAN.md R5 stage 5).
+    /// static monomorphization.
     pub fn_instances: std::collections::HashMap<String, Vec<Vec<prepoly_hir::Type>>>,
 }
 
@@ -59,7 +59,7 @@ pub fn analyze(program: &Program) -> Analysis {
     errors.extend(check_reserved_names(program));
     errors.extend(constck::check(program));
     // Hindley-Milner inference runs as the principled type-checking pass before
-    // monomorphization (DESIGN.md 5.7): it infers principal types for the
+    // monomorphization: it infers principal types for the
     // functional core and rejects unification conflicts the ad-hoc pass may miss.
     errors.extend(hm::check(program));
     tracing::debug!(after_hm = errors.len(), "errors after Hindley-Milner pass");
@@ -80,11 +80,11 @@ pub fn analyze(program: &Program) -> Analysis {
 }
 
 /// Reject user definitions that shadow a runtime builtin free function
-/// (DESIGN.md 9.1) or the `error` sugar (DESIGN.md 5.6). These names are
+/// or the `error` sugar. These names are
 /// provided by the runtime/compiler rather than by a `.pp` file, so a user
 /// definition would silently capture the standard library's internal calls
 /// (e.g. `len(s)`) or, in the case of `error`, become dead code because
-/// `error(x)` is always desugared to `Result.Err { error: x }` (PLAN.md R3).
+/// `error(x)` is always desugared to `Result.Err { error: x }`.
 fn check_reserved_names(program: &Program) -> Vec<TypeError> {
     const RESERVED: &[&str] = &["len", "open", "spawn", "with", "sync", "error"];
     let mut errors = Vec::new();
@@ -112,7 +112,7 @@ fn check_constructions(program: &Program) -> Vec<TypeError> {
                 // These validation passes have no module context. For a unique
                 // type name (a direct table key) the precise checks run; a name
                 // defined in several modules is only checked for existence here
-                // and resolved precisely by module-aware inference (PLAN.md R2).
+                // and resolved precisely by module-aware inference.
                 // An empty name is an anonymous structure literal `{ f: v }`
                 // (a structural record), not a named-type construction.
                 Expr::TypeLit(name, _, span) if name != "Self" && !name.is_empty() => match self.program.types.get(name) {
@@ -152,7 +152,7 @@ fn check_constructions(program: &Program) -> Vec<TypeError> {
 }
 
 /// Verify every syntactic type annotation names a type visible from the module
-/// it appears in (DESIGN.md 2; PLAN.md R2). Nominal names are keyed by the
+/// it appears in. Nominal names are keyed by the
 /// type's unique symbol, and each annotation is resolved from its declaring
 /// module (own/unique, this module's qualified definition, or an imported one).
 fn resolve_annotations(program: &Program) -> Vec<TypeError> {
@@ -169,7 +169,7 @@ fn resolve_annotations(program: &Program) -> Vec<TypeError> {
         .collect();
     // A type annotation may only name a type visible from its module: this
     // module's own definition, a built-in, the standard-library prelude, or one
-    // brought in by `import` (DESIGN.md 2; PLAN.md R2). Colliding names resolve
+    // brought in by `import`. Colliding names resolve
     // through the module-qualified symbol; a unique name additionally checks
     // visibility so a public-but-not-imported type from another module does not
     // leak into annotations.
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn collects_concrete_call_instances_for_monomorphization() {
-        // PLAN.md R5 stage 5: a polymorphic function called with two concrete
+        // A polymorphic function called with two concrete
         // types records two instances; the input to static monomorphization.
         let a = analysis(
             "fun id(x) {\n    return x\n}\nfun main() {\n    let a: int32 = id(5)\n    let b: string = id(\"s\")\n}\n",
@@ -701,7 +701,7 @@ mod tests {
 
     #[test]
     fn top_level_const_cannot_be_assigned_in_function_body() {
-        // DESIGN.md 5.4: a const global is immutable everywhere in the file.
+        // A const global is immutable everywhere in the file.
         let e = errs("const value = 1\nfun main() {\n    value = 2\n}\n");
         assert!(
             e.iter()
@@ -836,7 +836,7 @@ mod tests {
     #[test]
     fn const_alias_field_mutation_is_rejected() {
         // Aliasing a const record shares the same value, so mutating through the
-        // alias must be rejected (DESIGN.md 5.4).
+        // alias must be rejected.
         let e = errs(
             "type Point = { x: int32 }\nfun main() {\n    const p = Point { x: 1 }\n    let q = p\n    q.x = 2\n}\n",
         );
@@ -919,7 +919,7 @@ mod tests {
 
     #[test]
     fn top_level_binding_is_visible_in_function_body() {
-        // DESIGN.md Phase 2: a top-level `let` is in scope inside functions.
+        // A top-level `let` is in scope inside functions.
         let e = errs("let value = 1\nfun main() {\n    let s: string = value\n}\n");
         assert!(
             e.iter()
@@ -1035,7 +1035,7 @@ mod tests {
     #[test]
     fn float_from_string_is_rejected() {
         // `from` is a numeric conversion; a string source is a static error
-        // instead of silently producing 0.0 at runtime (DESIGN.md 5.2).
+        // instead of silently producing 0.0 at runtime.
         let e = errs("fun main() {\n    let f = float64.from(\"abc\")\n}\n");
         assert!(
             e.iter()
@@ -1293,7 +1293,7 @@ mod tests {
     #[test]
     fn redefining_the_error_sugar_is_rejected() {
         // `error(x)` is always desugared to `Result.Err { error: x }`, so a user
-        // `fun error` would be dead code; reject it instead (PLAN.md R3).
+        // `fun error` would be dead code; reject it instead.
         let e = errs("fun error(x) {\n    return x\n}\n");
         assert!(
             e.iter()
@@ -1356,7 +1356,7 @@ mod tests {
 
     #[test]
     fn string_ordering_comparison_is_rejected() {
-        // Strings have no ordering (DESIGN.md 5.9): `<`/`>`/`<=`/`>=` are numeric
+        // Strings have no ordering: `<`/`>`/`<=`/`>=` are numeric
         // only. Equality (`==`/`!=`) on strings still type-checks.
         let e = errs("fun main() {\n    let r = \"a\" < \"b\"\n}\n");
         assert!(
@@ -1633,7 +1633,7 @@ mod tests {
 
     #[test]
     fn incompatible_inferred_error_payloads_are_rejected() {
-        // PLAN.md R3 "final verification": one fallible body cannot mix a
+        // One fallible body cannot mix a
         // propagated `string` error payload with a locally constructed `int32`
         // one; the inferred `Err` type must be single.
         let e = errs(
@@ -1656,7 +1656,7 @@ mod tests {
 
     #[test]
     fn error_only_function_ok_payload_in_required_position_is_rejected() {
-        // PLAN.md R1 stage 10 / R3: a function that only returns error(...) has
+        // A function that only returns error(...) has
         // no inferable Ok payload; using it at a concrete type is an error.
         let e = errs(
             "fun a() {\n    return error(\"text\")\n}\nfun main() {\n    let x: int32 = a()!\n}\n",
@@ -1681,7 +1681,7 @@ mod tests {
 
     #[test]
     fn result_pattern_binds_substituted_ok_payload_type() {
-        // PLAN.md R3: matching `Ok { value }` binds `value` at the inferred Ok
+        // Matching `Ok { value }` binds `value` at the inferred Ok
         // payload type (int32 here), so using it as a string is rejected.
         let e = errs(
             "fun parse(s: string) {\n    return int32.parse(s)!\n}\nfun main() {\n    match parse(\"5\") {\n        Ok { value } => {\n            let bad: string = value\n            println(bad)\n        },\n        Err { error } => println(error),\n    }\n}\n",
@@ -2092,7 +2092,7 @@ mod tests {
     fn unknown_name_in_call_argument_is_rejected() {
         // An undeclared value name must not silently collapse to a fresh
         // unknown that runs as `void`; name resolution is a hard pre-execution
-        // check (DESIGN.md section 6).
+        // check.
         let e = errs("fun main() {\n    println(zzz)\n}\n");
         assert!(e.iter().any(|m| m.contains("unknown name `zzz`")), "{e:?}");
     }
@@ -2375,7 +2375,7 @@ mod tests {
     #[test]
     fn push_on_fixed_array_is_rejected() {
         // A fixed array has a statically fixed length, so push is not a method
-        // on it (DESIGN.md 5.1).
+        // on it.
         let e = errs("fun main() {\n    let xs: int32[1] = [1]\n    xs.push(2)\n}\n");
         assert!(
             e.iter()
@@ -2539,7 +2539,7 @@ mod tests {
 
     #[test]
     fn unconstrained_empty_array_in_required_position_is_rejected() {
-        // PLAN.md R1 "final verification": a bare empty array whose element type
+        // A bare empty array whose element type
         // is never pinned must not silently satisfy a concrete required position.
         let e = errs("fun main() {\n    let xs = []\n    let first: int32 = xs[0]\n}\n");
         assert!(

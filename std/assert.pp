@@ -1,4 +1,4 @@
-// Assertions (DESIGN.md 9.2). Part of the prelude.
+// Assertions. Part of the prelude.
 
 // Abort the program if `cond` is false. The message is optional: `msg` is a
 // trailing nullable parameter, so callers may write `assert(cond)` (msg defaults

@@ -287,7 +287,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
     }
 
     /// `expr!`: unwrap a `Result.Ok`, or return the `Result.Err` from the
-    /// enclosing callable. Expressed as an explicit branch (PLAN_MIR: error
+    /// enclosing callable. Expressed as an explicit branch (MIR lowering: error
     /// propagation lives in the CFG, not in a codegen heuristic).
     fn lower_error_prop(&mut self, inner: &Expr) -> Operand {
         let v = self.lower_expr(inner);
@@ -510,7 +510,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
         }
         if let Expr::Ident(name, _) = callee {
             // `error(x)` desugars to the builtin `Result.Err { error: x }` and is
-            // never a user function (DESIGN.md 5.6).
+            // never a user function.
             if name == "error" {
                 let payload = match args.first() {
                     Some(a) => self.lower_expr(&a.expr),
@@ -574,7 +574,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
 
     /// Pad a call's argument list with `null` for each omitted trailing nullable
     /// parameter of `name` (a free function or UFCS method), so a call may leave
-    /// them off (DESIGN.md 5.6). The type checker has already verified the omitted
+    /// them off. The type checker has already verified the omitted
     /// parameters are nullable; padding stops at the first non-nullable one.
     fn pad_trailing_nullable(&self, name: &str, ops: &mut Vec<Operand>) {
         let Some(nullable) = self.ctx.fn_param_nullability(&self.module, name) else {

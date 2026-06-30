@@ -1,7 +1,7 @@
 //! LLVM IR generation. Each Prepoly function/method/closure becomes an LLVM
 //! function with the uniform ABI `Value(env, args, argc)`. Control flow is
 //! native LLVM; values flow as the `Value` struct; most operations are calls
-//! into the runtime (DESIGN.md 6). Captured locals are boxed in heap cells so
+//! into the runtime. Captured locals are boxed in heap cells so
 //! closures observe each other's writes.
 
 use std::collections::HashMap;
@@ -84,7 +84,7 @@ struct MirState<'ctx> {
     init_symbols: Vec<String>,
     /// Immutable heap-typed module globals (never reassigned outside their
     /// initializer): auto-frozen after init so the module namespace is shareable
-    /// across threads (DESIGN.md 12.11/12.12).
+    /// across threads.
     frozen_globals: Vec<String>,
     /// The execution engine, created at finalize and reused to run code.
     engine: Option<inkwell::execution_engine::ExecutionEngine<'ctx>>,
@@ -118,7 +118,7 @@ pub struct LlvmCodegen<'ctx, 'p> {
     /// pass a non-reference argument by value. Memoized to terminate on recursive
     /// types and cleared per module.
     deep_copy_fns: std::collections::HashMap<String, FunctionValue<'ctx>>,
-    /// Per-type cycle-collector trace functions (DESIGN.md 8.3): visit a value's
+    /// Per-type cycle-collector trace functions: visit a value's
     /// managed children. Memoized like destructors, cleared per module.
     tracers: std::collections::HashMap<String, Option<FunctionValue<'ctx>>>,
     /// Whether to emit region write barriers (set in `begin_program` when the
@@ -183,7 +183,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         }
     }
 
-    /// Mark every small defined function `alwaysinline` (DESIGN.md 7.4). "Small" is
+    /// Mark every small defined function `alwaysinline`. "Small" is
     /// approximated by basic-block count: a handful of blocks is a leaf-ish helper
     /// (accessors, tiny arithmetic wrappers like `std/math`'s `pow`) that is cheaper
     /// to inline than to call. Functions keep their external definition (so direct
@@ -207,7 +207,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     }
 
     /// Emit `__pp_freeze_globals`: a `void()` function that loads each immutable
-    /// heap global and deep-freezes it (DESIGN.md 12.11/12.12). `execute` calls it
+    /// heap global and deep-freezes it. `execute` calls it
     /// once after module init so the namespace is frozen before `main` runs. No-op
     /// (function still emitted, empty) when there are no immutable heap globals.
     fn emit_freeze_globals_fn(&mut self) {
@@ -236,7 +236,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         self.builder.build_return(None).unwrap();
     }
 
-    /// Run the always-inliner over the module (DESIGN.md 7.4) so the `alwaysinline`
+    /// Run the always-inliner over the module so the `alwaysinline`
     /// marks above take effect before JIT codegen. Best-effort: optimization is not
     /// required for correctness, so a pass-setup failure is non-fatal.
     fn run_optimization_passes(&self) {
@@ -275,7 +275,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     /// module and memoized before its body so a self-referential type can call
     /// itself. The decrement is non-atomic: these are `local`-owned (codegen never
     /// freezes them). Used by [`Codegen::release_obj`].
-    /// Per-type cycle-collector trace function (DESIGN.md 8.3): `void trace(obj,
+    /// Per-type cycle-collector trace function: `void trace(obj,
     /// visit)` calls `visit` on each managed child of `obj` (record/nullable/array/
     /// sum). `None` for a type with no traced children (a leaf -- never registered).
     /// Unlike the destructor it does not touch reference counts; the collector does.
@@ -466,7 +466,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
 
     /// Register a freshly constructed `obj` with the cycle collector when `ty` is
     /// cycle-capable (has a tracer), so a reference cycle through it can later be
-    /// reclaimed (DESIGN.md 8.3). A no-op for leaf types (no registration cost).
+    /// reclaimed. A no-op for leaf types (no registration cost).
     fn register_for_gc(&mut self, obj: BasicValueEnum<'ctx>, ty: &Type) {
         let Some(tracer) = self.get_or_emit_tracer(ty) else {
             return;
@@ -937,12 +937,11 @@ fn int_signed(k: IntKind) -> bool {
 }
 
 /// The generated function that auto-freezes immutable heap globals after module
-/// init (DESIGN.md 12.11/12.12); called by `execute` between init and `main`.
+/// init; called by `execute` between init and `main`.
 const FREEZE_GLOBALS_FN: &str = "__pp_freeze_globals";
 
 /// The module globals that are immutable (never reassigned outside their
-/// initializer) and heap-pointer-typed -- the ones auto-frozen after init
-/// (DESIGN.md 12.11/12.12). A global written by any non-initializer instance is
+/// initializer) and heap-pointer-typed -- the ones auto-frozen after init. A global written by any non-initializer instance is
 /// mutable and left thread-local (the auto-cown candidates).
 fn immutable_heap_globals(program: &MonoProgram) -> Vec<String> {
     use std::collections::HashSet;
@@ -1438,7 +1437,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     /// The type and byte offset of field `field` in whichever variant defines it.
     /// Read a field from a sum value. A variant-qualified field (`Variant.field`,
     /// from a variant pattern binding) reads that variant's slot directly. A bare
-    /// field common to several variants (DESIGN.md 13.4) may sit at a different byte
+    /// field common to several variants may sit at a different byte
     /// offset in each variant (when preceded by different-sized fields), so its load
     /// is dispatched on the runtime tag; when the offset is the same in every variant
     /// (the common case) it loads directly.
@@ -1859,7 +1858,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
 
 impl<'ctx, 'p> prepoly_engine::RuntimeJit for LlvmCodegen<'ctx, 'p> {
     /// Compile one monomorphized instance into the live execution engine and
-    /// return its callable address (DESIGN.md 7.3, deferred monomorphization).
+    /// return its callable address (deferred monomorphization).
     ///
     /// The instance is emitted into a *fresh* module where every other instance
     /// and global is an external declaration -- the engine resolves those against
@@ -1955,16 +1954,15 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
     }
 
     fn finalize(&mut self) -> Result<(), String> {
-        // Generate the auto-freeze entry over the module's immutable heap globals
-        // (DESIGN.md 12.11/12.12), called between init and `main` in `execute`.
+        // Generate the auto-freeze entry over the module's immutable heap globals, called between init and `main` in `execute`.
         self.emit_freeze_globals_fn();
         self.module
             .verify()
             .map_err(|e| format!("LLVM module verification failed:\n{}", e.to_string()))?;
-        // DESIGN.md 7.4: mark small functions `alwaysinline` and run the optimizer.
+        // Mark small functions `alwaysinline` and run the optimizer.
         self.mark_small_functions_alwaysinline();
         self.run_optimization_passes();
-        // O2-equivalent backend codegen (DESIGN.md 7.4): `Default` is LLVM's `-O2`,
+        // O2-equivalent backend codegen: `Default` is LLVM's `-O2`,
         // not the previous `Aggressive` (~`-O3`).
         let engine = self
             .module
@@ -1996,7 +1994,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
             call(sym);
         }
         // Module init is complete: auto-freeze the namespace's immutable heap
-        // globals (DESIGN.md 12.11/12.12) so they are deeply immutable and safely
+        // globals so they are deeply immutable and safely
         // shareable across threads before `main` (which may `spawn`) runs. The
         // freeze is a generated function (`emit_freeze_globals_fn`) that reads each
         // global and deep-freezes it.
@@ -2010,8 +2008,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
         // Wait for threads `spawn`ed during the run so their work completes and
         // output is deterministic before the program ends.
         prepoly_runtime::conc::pp_join_all();
-        // Reclaim reference cycles that plain reference counting could not free
-        // (DESIGN.md 8.3), so a long-running program does not leak them.
+        // Reclaim reference cycles that plain reference counting could not free, so a long-running program does not leak them.
         prepoly_runtime::gc::pp_gc_collect();
         Ok(())
     }

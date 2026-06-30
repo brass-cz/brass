@@ -3,7 +3,7 @@
 //! Newlines: the lexer emits `Newline` tokens. Inside brackets (`()`, `[]`,
 //! and type-literal / match braces) newlines are insignificant and skipped
 //! automatically (`depth > 0`). At statement level a newline terminates a
-//! statement, with two continuation allowances that cover DESIGN.md 3.2:
+//! statement, with two continuation allowances:
 //!   - a binary/assign operator at end of line continues onto the next line
 //!     (operators call `eat_newlines` before parsing their right operand);
 //!   - a `.` at the start of the next line continues a method chain.
@@ -944,7 +944,7 @@ impl Parser {
     }
 
     /// A match arm body is a block, an expression, or an assignment (the
-    /// assignment form is used to mutate captured state, see DESIGN.md 11.6).
+    /// assignment form is used to mutate captured state).
     fn parse_arm_body(&mut self) -> PResult<Expr> {
         if self.at_p(TokenKind::LBrace) {
             let b = self.parse_block()?;

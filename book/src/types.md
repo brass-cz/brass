@@ -11,6 +11,10 @@ Here, let's see an overview of prepoly's type system.
 - A dynamic array of type `T` is represented by `T[]`
 - A tuple type is represented by `[T, U, ...]`
 
+An arithmetic or comparison operator between two numeric values of different types implicitly converts both operands to a common type: integers widen to the wider width (mixing signed and unsigned yields a signed integer), and an integer combined with a float becomes that float.
+So `int32 + int64` is `int64` and `int32 + float64` is `float64`.
+This conversion applies to numeric *values*; a type annotation still requires its exact type, so a bare integer literal does not satisfy a `float64` annotation (write `1.0`, or convert with `float64.from(x)`).
+
 Also, prepoly uses the following special type annotations:
 
 - A reference to type `T` is written as `ref(T)`
@@ -20,7 +24,7 @@ The type of an argument is treated as a reference type if we don't write any typ
 The mutability of a function argument is inferred:
 
 ```prepoly
-fun double(a) { // a: ref(mut(int32))
+fun double(a) { // a: ref(mut(int32[]))
     for e in a {
         e *= 2
     }
@@ -277,13 +281,13 @@ fun get_name(obj) {
     }
 }
 
-// Ok: Hideki Yukawa
+// Result.Ok { value: Hideki Yukawa }
 println(
     get_name({
         first_name: "Hideki",
         last_name: "Yukawa"
     })
 )
-// error: not a Person type
+// Result.Err { error: not a Person type! }
 println(get_name({ last_name: "Yukawa" }))
 ```

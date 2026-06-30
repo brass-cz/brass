@@ -1,8 +1,8 @@
 //! The type reference a MIR local carries.
 //!
-//! MIR is built *before* type concretization (PLAN_MIR Stage 1): the control
+//! MIR is built *before* type concretization: the control
 //! flow graph is type-independent, so every local starts as a fresh type
-//! *variable*. Monomorphization (PLAN_MIR Stage 3) walks the body for a concrete
+//! *variable*. Monomorphization walks the body for a concrete
 //! call instance and replaces each variable with a `Known` concrete type, after
 //! which type-driven codegen selects instructions purely from these types. The
 //! `Known` variant also lets a future lowering seed types it already knows (for
