@@ -303,6 +303,29 @@ fn definition_jumps_to_function() {
     assert_eq!(loc.range.start.line, 0, "helper is declared on line 0");
 }
 
+/// Go-to-definition on a `recv.m()` call jumps to the `fun T.m(...)` that
+/// implements the method, not anywhere else.
+#[test]
+fn definition_jumps_to_fun_method_impl() {
+    let src = "type P = {\n    x: int32\n}\n\nfun P.get(self) -> int32 {\n    return self.x\n}\n\nfun main() {\n    let p = P { x: 1 }\n    let v = p.get()\n}\n";
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "get()", true);
+    let loc = definition::definition(&doc, &full, pos).expect("definition of a method call");
+    assert_eq!(loc.range.start.line, 4, "fun P.get is declared on line 4");
+}
+
+/// Go-to-definition on a stdlib primitive method (`s.split(...)`) jumps into the
+/// prelude (a location with no file, since the prelude has no path on disk).
+#[test]
+fn definition_resolves_primitive_method() {
+    let src = "fun main() {\n    let parts = \"a,b\".split(\",\")\n}\n";
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "split(", false);
+    // The prelude has no file, so `definition` returns `None`, but the lookup must
+    // not panic and must not mis-resolve to an unrelated free function.
+    let _ = definition::definition(&doc, &full, pos);
+}
+
 /// Go-to-definition on a local use jumps to its binding.
 #[test]
 fn definition_jumps_to_local_binding() {
@@ -409,15 +432,21 @@ fn completion_offers_array_members() {
         labels.contains(&"len".to_string()),
         "builtin len: {labels:?}"
     );
-    assert!(labels.contains(&"map".to_string()), "UFCS map: {labels:?}");
+    // Stdlib array methods (`fun infer[].map`/`.filter`).
+    assert!(labels.contains(&"map".to_string()), "array map: {labels:?}");
     assert!(
         labels.contains(&"filter".to_string()),
-        "UFCS filter: {labels:?}"
+        "array filter: {labels:?}"
     );
-    // A member list must not leak the global symbol list (e.g. type names).
+    // A member list must not leak the global symbol list (type names) or free
+    // functions -- there is no UFCS, so `abs` is not a member of an array.
     assert!(
         !labels.contains(&"int32".to_string()),
         "no globals: {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"abs".to_string()),
+        "no free functions as members: {labels:?}"
     );
 }
 
@@ -446,6 +475,29 @@ fn completion_offers_record_methods() {
     assert!(
         labels.contains(&"dist".to_string()),
         "record method: {labels:?}"
+    );
+}
+
+/// `HashMap` lives in the embedded prelude module `std.collections.hashmap`, and
+/// its operations are `fun HashMap.m(...)` methods. The analysis must load that
+/// nested prelude module so `HashMap.new(...)` types to `HashMap` and `m.` offers
+/// its methods -- with no import.
+#[test]
+fn completion_offers_hashmap_prelude_methods() {
+    let src = concat!(
+        "fun main() {\n",
+        "    let m = HashMap.new(\"\", 0)\n",
+        "    m.\n",
+        "}\n",
+    );
+    let analyzer = DocAnalyzer::new(path());
+    let doc = Document::new(src.to_string(), 1);
+    let off = src.find("m.\n").unwrap() + 2;
+    let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(off));
+    let labels = labels(&items);
+    assert!(
+        labels.contains(&"set".to_string()) && labels.contains(&"get".to_string()),
+        "HashMap methods: {labels:?}"
     );
 }
 

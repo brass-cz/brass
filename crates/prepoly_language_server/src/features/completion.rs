@@ -283,8 +283,10 @@ fn receiver_type_at(full: &FullAnalysis, hi: usize) -> Option<Type> {
         .map(|e| e.ty.clone())
 }
 
-/// Members reachable on a value of `ty`: built-in methods for its kind, the
-/// record type's methods, and free functions callable through UFCS.
+/// Members reachable on a value of `ty`: built-in methods for its kind, a record
+/// type's own methods, and the stdlib methods implemented on a primitive/array
+/// receiver (`fun string.split`, `fun infer[].map`). There is no UFCS, so a plain
+/// free function is not a member.
 fn value_member_items(full: &FullAnalysis, ty: &Type) -> Vec<CompletionItem> {
     let base = strip(ty);
     let mut items = Vec::new();
@@ -314,55 +316,23 @@ fn value_member_items(full: &FullAnalysis, ty: &Type) -> Vec<CompletionItem> {
         }
     }
 
-    for f in full.program.functions.values() {
-        if ufcs_applies(&base, f) {
-            items.push(item(
-                f.signature.name.clone(),
-                CompletionItemKind::FUNCTION,
-                Some(render_signature(&f.signature)),
-            ));
+    // Stdlib methods on this receiver's primitive/array class, dispatched by
+    // class through `primitive_methods` (their bodies live under a class-qualified
+    // symbol in `functions`).
+    if let Some(class) = base.primitive_class() {
+        for ((c, name), symbol) in &full.program.primitive_methods {
+            if c == class {
+                let sig = full
+                    .program
+                    .functions
+                    .get(symbol)
+                    .map(|f| render_signature(&f.signature));
+                items.push(item(name.clone(), CompletionItemKind::METHOD, sig));
+            }
         }
     }
 
     dedup_by_label(items)
-}
-
-/// Whether free function `f` can be called as `recv.f(...)` -- its first
-/// parameter must accept `recv`. An annotated first parameter is matched by
-/// type; an unannotated (generic) one is accepted only for the std `array`/
-/// `string` helpers of the matching receiver kind, to keep the list focused.
-fn ufcs_applies(recv: &Type, f: &prepoly_hir::FunInfo) -> bool {
-    let Some(first) = f.signature.params.first() else {
-        return false;
-    };
-    match &first.resolved_ty {
-        Some(pty) => types_compatible(recv, &strip(pty)),
-        None => std_module_matches(recv, &f.module),
-    }
-}
-
-fn std_module_matches(recv: &Type, module: &[String]) -> bool {
-    match recv {
-        Type::Slice(_) | Type::Array(_, _) => module == ["std", "array"],
-        Type::Str => module == ["std", "string"],
-        _ => false,
-    }
-}
-
-/// A loose compatibility check for a UFCS receiver against a parameter type:
-/// inference variables match anything, arrays match arrays, and nominal types
-/// match by id.
-fn types_compatible(a: &Type, b: &Type) -> bool {
-    match (a, b) {
-        (Type::Unknown(_), _) | (_, Type::Unknown(_)) => true,
-        (Type::Slice(_) | Type::Array(_, _), Type::Slice(_) | Type::Array(_, _)) => true,
-        (Type::Str, Type::Str) => true,
-        (Type::Bool, Type::Bool) | (Type::Void, Type::Void) => true,
-        (Type::Int(_), Type::Int(_)) => true,
-        (Type::Float(_), Type::Float(_)) => true,
-        (Type::Record(x), Type::Record(y)) | (Type::Sum(x), Type::Sum(y)) => x.id == y.id,
-        _ => false,
-    }
 }
 
 /// When the text before the `.` at `dot` is a standalone identifier naming a

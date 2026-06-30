@@ -6,7 +6,7 @@
 //! function, then a free function, then a type. Local resolution beats the
 //! symbol tables so a local shadowing a function jumps to the local.
 
-use prepoly_hir::{Type, TypedExprKind};
+use prepoly_hir::Type;
 use prepoly_lexer::Span;
 use prepoly_parser::ast::{Block, Expr, FieldPat, Pattern, Stmt, StrSeg};
 use tower_lsp_server::ls_types::{Location, Position};
@@ -22,11 +22,11 @@ pub fn definition(doc: &Document, full: &FullAnalysis, pos: Position) -> Option<
     let global = local + full.main_base;
     let module = vec!["main".to_string()];
 
-    // Member access through a receiver type.
-    if let Some(expr) = nav::smallest_typed_at(full, global)
-        && let TypedExprKind::Field(name) = &expr.kind
-        && let Some(loc) = resolve_member(full, &module, expr.span, name)
-    {
+    // Member access `recv.name` -- a field access or a method call. Resolved from
+    // the name under the cursor and the receiver type ending at the preceding `.`,
+    // so it works for a method call (whose `recv.name` callee is not recorded as a
+    // standalone typed expression) as well as a bare field access.
+    if let Some(loc) = member_definition(doc, full, local) {
         return Some(loc);
     }
 
@@ -45,22 +45,31 @@ pub fn definition(doc: &Document, full: &FullAnalysis, pos: Position) -> Option<
     None
 }
 
-/// Resolve `recv.name` given the global span of the whole field expression:
-/// look up the receiver's type, then its method (precise span) or field (the
-/// owning type's span), falling back to a UFCS free function of the same name.
-fn resolve_member(
-    full: &FullAnalysis,
-    module: &[String],
-    field_span: Span,
-    name: &str,
-) -> Option<Location> {
-    let recv_span = receiver_of_field(&full.main_ast, field_span)?;
+/// Resolve a member access `recv.name` at the cursor: the name under the cursor
+/// must be immediately preceded by `.`, and the receiver's type ends at that `.`.
+fn member_definition(doc: &Document, full: &FullAnalysis, local: usize) -> Option<Location> {
+    let (name, span) = nav::ident_at(&doc.text, local)?;
+    let bytes = doc.text.as_bytes();
+    if span.lo == 0 || bytes.get(span.lo - 1) != Some(&b'.') {
+        return None;
+    }
+    let recv_hi = full.main_base + (span.lo - 1);
+    // The widest receiver expression ending at the `.` (so `foo.bar.method` uses
+    // `foo.bar`), mirroring hover/completion.
     let recv_ty = full
         .typed
         .expressions
         .iter()
-        .find(|e| e.span == recv_span)
-        .map(|e| &e.ty)?;
+        .filter(|e| e.span.hi == recv_hi)
+        .min_by_key(|e| e.span.lo)
+        .map(|e| e.ty.clone())?;
+    resolve_member(full, &recv_ty, &name)
+}
+
+/// Look up `name` on receiver type `recv_ty`: its method (precise span) or field
+/// (the owning type's span) for a record, then -- for a primitive/array receiver
+/// -- the stdlib method `fun T.name` implemented on that class.
+fn resolve_member(full: &FullAnalysis, recv_ty: &Type, name: &str) -> Option<Location> {
     if let Some(id) = nominal_id(recv_ty)
         && let Some(info) = full.program.type_by_id(id)
     {
@@ -73,8 +82,18 @@ fn resolve_member(
             return nav::locate(full, info.span);
         }
     }
-    // UFCS: `arr.map(f)` calls the free function `map`.
-    let f = full.program.resolve_function(module, name)?;
+    // A stdlib method on a primitive/array receiver (`fun string.split`),
+    // dispatched by the receiver's class.
+    let mut t = recv_ty;
+    while let Type::Nullable(i) | Type::ConstOf(i) | Type::Mut(i) | Type::Ref(i) = t {
+        t = i;
+    }
+    let class = t.primitive_class()?;
+    let symbol = full
+        .program
+        .primitive_methods
+        .get(&(class.to_string(), name.to_string()))?;
+    let f = full.program.functions.get(symbol)?;
     nav::locate(full, f.signature.span)
 }
 
@@ -233,18 +252,4 @@ fn collect_expr_bindings(e: &Expr, f: &mut impl FnMut(&str, Span)) {
         }
         _ => {}
     }
-}
-
-/// Find the receiver span of the `Expr::Field` whose whole span is `field_span`.
-fn receiver_of_field(main_ast: &prepoly_parser::ast::Module, field_span: Span) -> Option<Span> {
-    let mut result = None;
-    let mut visit = |e: &Expr| {
-        if let Expr::Field(recv, _, span) = e
-            && *span == field_span
-        {
-            result = Some(recv.span());
-        }
-    };
-    nav::walk_exprs(main_ast, &mut visit);
-    result
 }

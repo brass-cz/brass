@@ -18,7 +18,9 @@ use prepoly_parser::ast::{ImportDecl, Module};
 use prepoly_parser::{ParseError, parse_with_base};
 
 /// Embedded standard-library modules (implicit prelude), identical to the
-/// driver's `STDLIB`. Paths are relative to this source file.
+/// driver's `STDLIB`. Paths are relative to this source file. A name with a `/`
+/// is a nested module: its segments become the path under `std` (so
+/// `collections/hashmap` is the module `std.collections.hashmap`).
 const STDLIB: &[(&str, &str)] = &[
     ("io", include_str!("../../../../std/io.pp")),
     ("array", include_str!("../../../../std/array.pp")),
@@ -26,12 +28,21 @@ const STDLIB: &[(&str, &str)] = &[
     ("math", include_str!("../../../../std/math.pp")),
     ("conv", include_str!("../../../../std/conv.pp")),
     ("assert", include_str!("../../../../std/assert.pp")),
+    (
+        "collections/hashmap",
+        include_str!("../../../../std/collections/hashmap.pp"),
+    ),
 ];
 
-/// Names of the embedded prelude modules (`io`, `array`, ...), which are
-/// importable without a file on disk. Used by import completion.
+/// Names of the embedded top-level prelude modules (`io`, `array`, ...), used by
+/// import-path completion. Nested modules (a name with `/`, e.g.
+/// `collections/hashmap`) are excluded: they are not a single importable segment,
+/// and their public names (`HashMap`) are already in the implicit prelude.
 pub fn prelude_module_names() -> impl Iterator<Item = &'static str> {
-    STDLIB.iter().map(|(name, _)| *name)
+    STDLIB
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !name.contains('/'))
 }
 
 /// The source of an embedded prelude module, for listing its public names.
@@ -96,10 +107,11 @@ fn stdlib_cache() -> &'static StdlibCache {
             // The embedded prelude is known-good; a parse failure here is a build
             // bug, so an empty module is a safe degradation rather than a panic.
             if let Ok(ast) = parse_with_base(src, base) {
-                modules.push(LoadedModule {
-                    path: vec!["std".into(), (*name).into()],
-                    ast,
-                });
+                // A `/` in the name nests the module under `std` (matching the
+                // driver), so `collections/hashmap` becomes `std.collections.hashmap`.
+                let mut path = vec!["std".to_string()];
+                path.extend(name.split('/').map(str::to_string));
+                modules.push(LoadedModule { path, ast });
             }
         }
         StdlibCache { modules, sources }
