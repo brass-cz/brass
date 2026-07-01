@@ -41,9 +41,9 @@ println("GCD is {result}")
 type Person = {
     first_name: string,
     last_name: string,
-    display(self) {
-        return "{self.first_name} {self.last_name}"
-    }
+}
+fun Person.display(self) {
+    return "{self.first_name} {self.last_name}"
 }
 fun get_display_name(obj) {
     if let person = Person.from(obj) {
