@@ -555,10 +555,20 @@ pub extern "C-unwind" fn pp_bool_to_str(v: i64) -> *mut Header {
 mod tests {
     use super::*;
 
+    /// Serialize against every other test that touches the shared heap. These
+    /// tests allocate and free through the process-global allocator (mutating the
+    /// `LIVE_BLOCKS` counter and ticking the GC schedule), so without this guard
+    /// they run concurrently with the gc/conc tests whose exact live-block
+    /// assertions the stray allocations would perturb (see `serial_heap_test`).
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        crate::serial_heap_test()
+    }
+
     /// Allocation starts at rc 1; retain/release move it and the object is freed
     /// when the count reaches zero (the local, non-atomic path).
     #[test]
     fn refcount_retain_release_and_free() {
+        let _serial = serial();
         unsafe {
             let h = pp_typed_alloc(32);
             assert_eq!((*h).rc, 1, "fresh object owns one reference");
@@ -576,6 +586,7 @@ mod tests {
     /// threads), and `pp_freeze` records the owner class.
     #[test]
     fn frozen_uses_atomic_refcount() {
+        let _serial = serial();
         unsafe {
             let h = pp_typed_alloc(16);
             pp_freeze(h);
@@ -592,6 +603,7 @@ mod tests {
     /// hold null).
     #[test]
     fn refcount_ops_tolerate_null() {
+        let _serial = serial();
         unsafe {
             pp_retain(std::ptr::null_mut());
             pp_release(std::ptr::null_mut());
@@ -603,6 +615,7 @@ mod tests {
     /// `pp_arr_remove` returns the element and closes the gap (shifting left).
     #[test]
     fn array_insert_and_remove_shift_elements() {
+        let _serial = serial();
         unsafe {
             let arr = pp_arr_new(8, 0);
             for v in [10i64, 20, 30] {
@@ -636,6 +649,7 @@ mod tests {
     /// array; popping an empty array yields a null pointer.
     #[test]
     fn array_pop_returns_last_or_null() {
+        let _serial = serial();
         unsafe {
             let arr = pp_arr_new(8, 0);
             for v in [7i64, 8, 9] {
@@ -660,6 +674,7 @@ mod tests {
     /// free reclaimed live data, reading back would corrupt or fault.
     #[test]
     fn array_growth_frees_old_buffer_without_corrupting() {
+        let _serial = serial();
         unsafe {
             let arr = pp_arr_new(8, 0);
             for i in 0..64i64 {
@@ -677,6 +692,7 @@ mod tests {
     /// `pp_str_cmp` orders strings lexicographically, returning -1 / 0 / 1.
     #[test]
     fn string_cmp_orders_lexicographically() {
+        let _serial = serial();
         unsafe {
             let mk = |s: &str| pp_str_const(s.as_ptr(), s.len() as i64);
             assert_eq!(pp_str_cmp(mk("apple"), mk("banana")), -1);

@@ -164,13 +164,6 @@ impl Subst {
                     Err(format!("cannot unify sum types `{n1}` and `{n2}`"))
                 }
             }
-            // Two records of the same nominal unify by unifying the shared entries
-            // of their generic substitutions, so a record's *inferred* field types
-            // propagate: storing an `_Entry<string, string>` into an element typed
-            // `_Entry<?, ?>` refines the element's open key/value variables. A key
-            // present on only one side is a sparser instance (a bare nominal, or a
-            // record whose annotated field is absent from the dynamic
-            // substitution) and is left unconstrained.
             // Two records of the same *declared* nominal (id >= 0) unify by
             // unifying the shared entries of their generic substitutions, so a
             // record's inferred field types propagate: storing an `_Entry<string,
@@ -181,6 +174,9 @@ impl Subst {
             // records (the synthetic negative `STRUCTURAL_RECORD_ID`) are excluded:
             // their field-presence/compatibility is checked structurally elsewhere,
             // not by unification, so they keep the strict `a == b` behavior below.
+            // Only keys present on both sides are unified; a key on just one side is
+            // a sparser instance (a bare nominal, or a record whose annotated field
+            // is absent from the dynamic substitution) and is left unconstrained.
             (Type::Record(n1), Type::Record(n2)) if n1.id >= 0 && n2.id >= 0 => {
                 if n1.id != n2.id {
                     tracing::debug!(left = %n1, right = %n2, "record type mismatch");
