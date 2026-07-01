@@ -124,6 +124,15 @@ impl<'p> ProgramCtx<'p> {
 
     /// Per-parameter nullability of free function `name` as seen from `module`,
     /// used to pad omitted trailing nullable arguments with `null` at call sites. `None` if `name` is not a known free function.
+    /// The parameter count of free function `name` as seen from `module`, used to
+    /// eta-expand a bare function-name value into a forwarding closure. `None` if
+    /// `name` is not a known free function.
+    fn function_arity(&self, module: &[String], name: &str) -> Option<usize> {
+        self.program
+            .resolve_function(module, name)
+            .map(|info| info.signature.params.len())
+    }
+
     fn fn_param_nullability(&self, module: &[String], name: &str) -> Option<Vec<bool>> {
         self.program.resolve_function(module, name).map(|info| {
             info.signature

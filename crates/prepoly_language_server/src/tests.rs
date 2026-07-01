@@ -105,6 +105,22 @@ fn hover_shows_unknown_numbered_signature() {
     assert!(!text.contains("---"), "no bindings without a call: {text}");
 }
 
+/// Calling an unannotated parameter (`fun apply(f, x) { f(x) }`) constrains it to
+/// a function type, so hover shows `apply` as a higher-order function -- `f` as
+/// `(U) -> V` (a function value, shown without a `ref`/`mut` wrapper) rather than
+/// a bare `unknown`.
+#[test]
+fn hover_infers_called_parameter_as_a_function() {
+    let src = "fun apply(f, x) {\n    return f(x)\n}\n";
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "apply(f, x)", false);
+    let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover over apply"));
+    assert!(
+        text.contains("fun apply(f: (unknown_0) -> unknown_1, x: ref(unknown_0)) -> unknown_1"),
+        "apply must be a higher-order function: {text}"
+    );
+}
+
 /// An unannotated parameter the body mutates is shown as a private `mut` deep
 /// copy, distinguishing it from an unmutated `ref` borrow.
 #[test]

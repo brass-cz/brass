@@ -2513,6 +2513,11 @@ impl<'a> Checker<'a> {
             // A local binding (e.g. a closure parameter) shadows a same-named
             // global function, matching codegen's resolution order.
             if let Some(local) = self.lookup(scopes, name) {
+                // Record the callee's type so hover can recover it. Applying it
+                // below constrains an unknown callee to a function type, and the
+                // final zonking pass then resolves this recorded type through it,
+                // so `fun apply(f, x) { f(x) }` shows `f` as `(U) -> V`.
+                self.record_expr_type(callee, &local);
                 return self.check_callable_value(local, args, span, scopes);
             }
             // Only a function visible from the current module resolves here; a
@@ -2841,6 +2846,22 @@ impl<'a> Checker<'a> {
                     }
                 }
                 subst.resolve_deep(&ret)
+            }
+            // Calling a value of still-unknown type constrains it to a function:
+            // unify it with `(arg types...) -> fresh_ret`. This is the application
+            // rule for an inference variable, so `fun apply(f, x) { return f(x) }`
+            // infers `f: (unknown) -> unknown` (and `apply` as
+            // `((U) -> V, U) -> V`), letting a function argument type-check and
+            // monomorphize instead of leaving `f` an uncallable unknown.
+            callee @ Type::Unknown(_) => {
+                let arg_types: Vec<Type> = args
+                    .iter()
+                    .map(|arg| self.check_expr(&arg.expr, scopes))
+                    .collect();
+                let ret = self.fresh_unknown();
+                let fun_ty = Type::Fun(arg_types, Box::new(ret.clone()));
+                let _ = self.solver.unify(&callee, &fun_ty);
+                ret
             }
             _ => {
                 for arg in args {

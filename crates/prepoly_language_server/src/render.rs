@@ -148,12 +148,16 @@ pub fn render_signature_full(
     )
 }
 
-/// Whether a type is passed by value (a primitive), so an unannotated parameter
-/// of this type is shown without a `ref`/`mut` wrapper. Every other (heap) type
-/// -- string, array, record, sum, tuple, closure, or an unresolved variable --
-/// is passed by reference or copy and is shown wrapped.
+/// Whether a type is shown without a `ref`/`mut` wrapper for an unannotated
+/// parameter: a primitive (passed by value) or a function value (immutable, so a
+/// reference/copy distinction is not meaningful). Every other (heap) type --
+/// string, array, record, sum, tuple, or an unresolved variable -- is passed by
+/// reference or copy and is shown wrapped.
 fn is_value_display_type(ty: &Type) -> bool {
-    matches!(ty, Type::Bool | Type::Int(_) | Type::Float(_))
+    matches!(
+        ty,
+        Type::Bool | Type::Int(_) | Type::Float(_) | Type::Fun(..)
+    )
 }
 
 /// The display form of an unannotated parameter's inferred passing mode: `self`

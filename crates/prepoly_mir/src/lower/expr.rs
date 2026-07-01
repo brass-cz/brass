@@ -86,8 +86,41 @@ impl<'a, 'p> FnLower<'a, 'p> {
         }
         match self.lookup(name) {
             Some(local) => Operand::Local(local),
-            None => self.b.emit(Rvalue::Global(name.to_string())),
+            // A bare reference to a top-level function (not a local, not a global
+            // binding) is a first-class function value: eta-expand it into a
+            // forwarding closure so it lowers exactly like the closure a caller
+            // could write by hand, and the back ends need no dedicated fn-value.
+            None => match self.ctx.function_arity(&self.module, name) {
+                Some(arity) => self.lower_fn_value(name, arity),
+                None => self.b.emit(Rvalue::Global(name.to_string())),
+            },
         }
+    }
+
+    /// Eta-expand a bare reference to top-level function `name` of `arity`
+    /// parameters into the forwarding closure `(a0, .., a{n-1}) -> name(a0, ..,
+    /// a{n-1})`. Reuses closure lowering, so the value is an ordinary closure the
+    /// monomorphizer and both back ends already handle.
+    fn lower_fn_value(&mut self, name: &str, arity: usize) -> Operand {
+        use prepoly_parser::ast::{Arg, Param};
+        let span = prepoly_lexer::Span::new(0, 0);
+        let names: Vec<String> = (0..arity).map(|i| format!("__eta{i}")).collect();
+        let params: Vec<Param> = names
+            .iter()
+            .map(|n| Param {
+                name: n.clone(),
+                ty: None,
+                span,
+            })
+            .collect();
+        let args: Vec<Arg> = names
+            .iter()
+            .map(|n| Arg {
+                expr: Expr::Ident(n.clone(), span),
+            })
+            .collect();
+        let body = Expr::Call(Box::new(Expr::Ident(name.to_string(), span)), args, span);
+        self.lower_closure(&params, &body)
     }
 
     fn lower_binary(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Operand {
