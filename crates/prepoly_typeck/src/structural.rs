@@ -65,12 +65,36 @@ pub fn types_compatible(program: &Program, have: &Type, want: &Type) -> bool {
                 .all(|(h, w)| types_compatible(program, w, h))
                 && types_compatible(program, hr, wr)
         }
+        // Same *declared* record type instantiated two ways: compatible only when
+        // each field the required instance fixes matches the value's. This mirrors
+        // `sum_assignable` and is what the structural path below cannot see -- it
+        // compares against the declaration's (unannotated, so anything-matching)
+        // fields, ignoring the instantiation, which would let `_Entry<string,
+        // int32>` pass as `_Entry<string, string>` and corrupt the unboxed layout.
+        (Type::Record(sub), Type::Record(sup)) if sub.id >= 0 && sub.id == sup.id => {
+            record_refinement_compatible(program, sub, sup)
+        }
         (Type::Record(sub), Type::Record(sup)) if !sub.same_nominal(sup) => {
             record_satisfies(program, sub, sup).is_empty()
         }
         (Type::Sum(a), Type::Sum(b)) => sum_assignable(program, a, b),
         _ => have == want,
     }
+}
+
+/// Whether a value of record instance `sub` is usable where the same declared
+/// record `sup` (a possibly-differently-instantiated version) is required: every
+/// field the required instance fixes in its substitution must be present in the
+/// value's and *invariant* with it (record fields are mutable). A field the
+/// required instance leaves open (absent from its substitution) imposes no
+/// constraint. Mirrors [`sum_assignable`] for records.
+fn record_refinement_compatible(program: &Program, sub: &NominalType, sup: &NominalType) -> bool {
+    sup.substitution
+        .iter()
+        .all(|(key, wt)| match sub.substitution.get(key) {
+            Some(ht) => types_invariant(program, ht, wt),
+            None => true,
+        })
 }
 
 /// Whether a value of sum `have` is usable where sum `want` is required. A sum is
