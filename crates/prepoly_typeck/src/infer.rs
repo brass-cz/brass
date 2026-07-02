@@ -217,6 +217,12 @@ struct Checker<'a> {
     /// method bodies are co-checked and consulted at call sites to type a method
     /// call's result by instantiating the method's scheme against the receiver.
     schemes: HashMap<String, TypeScheme>,
+    /// One-shot marker set while checking the direct array-literal initializer
+    /// of an unannotated `const` binding: the binding is immutable, so the
+    /// literal types as a fixed-length array (`int32[3]`) rather than a growable
+    /// slice. Consumed (reset) by the literal itself, so nested literals and any
+    /// other position stay slices.
+    fixed_array_binding: bool,
 }
 
 impl<'a> Checker<'a> {
@@ -240,6 +246,7 @@ impl<'a> Checker<'a> {
             current_module: Vec::new(),
             fn_instances: HashMap::new(),
             schemes: HashMap::new(),
+            fixed_array_binding: false,
         }
     }
 
@@ -1379,7 +1386,15 @@ impl<'a> Checker<'a> {
                         }
                     }
                 } else {
-                    self.check_expr(value, scopes)
+                    // An unannotated `const` bound directly to a non-empty array
+                    // literal is immutable, so the literal types as a
+                    // fixed-length array; a `let` binding stays a growable
+                    // slice. An annotation (above) always wins.
+                    self.fixed_array_binding =
+                        *is_const && matches!(value, Expr::Array(es, _) if !es.is_empty());
+                    let t = self.check_expr(value, scopes);
+                    self.fixed_array_binding = false;
+                    t
                 };
                 self.check_pattern_against(&binding_ty, pat);
                 self.bind_pattern(pat, &binding_ty, scopes);
@@ -1621,6 +1636,23 @@ impl<'a> Checker<'a> {
     fn record_expr_type(&mut self, expr: &Expr, ty: &Type) {
         let constness = self.expr_constness(expr);
         self.record_expr_type_with(expr, ty, constness);
+    }
+
+    /// Record a pattern binding's type at the binding identifier's own span, as
+    /// a typed `Ident` entry. The binding name is not an expression, so without
+    /// this the declaration site has no typed node and hover falls back to
+    /// borrowing a *use*'s type -- wrong when the annotated binding type differs
+    /// from the initializer's (`let b: int64 = an_int32`), and absent entirely
+    /// for an unused binding. The type may still be open here; `finalize_typed`
+    /// re-resolves it against the final substitution like every other entry.
+    fn record_binding(&mut self, name: &str, span: Span, ty: &Type) {
+        let ty = self.resolve(ty);
+        self.typed.push_kind(
+            prepoly_hir::TypedExprKind::Ident(name.to_string()),
+            span,
+            ty,
+            Constness::Unknown,
+        );
     }
 
     fn record_expr_type_with(&mut self, expr: &Expr, ty: &Type, constness: Constness) {
@@ -1914,19 +1946,41 @@ impl<'a> Checker<'a> {
                 Type::Fun(param_types, Box::new(ret))
             }
             Expr::Array(es, _) => {
+                // Consumed before the elements are checked, so only the direct
+                // initializer of an unannotated `const` binding is fixed-length;
+                // nested literals and every other position stay slices.
+                let fixed = std::mem::take(&mut self.fixed_array_binding);
                 let elem_tys: Vec<Type> = es.iter().map(|e| self.check_expr(e, scopes)).collect();
-                // Heterogeneous concrete elements form a tuple; otherwise an array.
+                // Heterogeneous concrete elements form a tuple; otherwise an
+                // array. A `null` element never forces a tuple: null unifies
+                // with any element type, making the element nullable
+                // (`[4, null, 65]` is an `int32?` sequence).
                 if let Some(tuple) = self.tuple_of_elements(es, &elem_tys) {
                     Type::Tuple(tuple)
                 } else {
-                    let elem_ty = elem_tys
-                        .first()
-                        .cloned()
+                    let base = elem_tys
+                        .iter()
+                        .zip(es)
+                        .find(|(_, e)| !matches!(e, Expr::Null(_)))
+                        .map(|(t, _)| t.clone())
                         .unwrap_or_else(|| self.fresh_empty_array_elem());
-                    for (got, e) in elem_tys.iter().zip(es).skip(1) {
+                    let saw_null = es.iter().any(|e| matches!(e, Expr::Null(_)));
+                    let elem_ty = if saw_null && !matches!(self.resolve(&base), Type::Nullable(_)) {
+                        Type::Nullable(Box::new(base))
+                    } else {
+                        base
+                    };
+                    for (got, e) in elem_tys.iter().zip(es) {
+                        if matches!(e, Expr::Null(_)) {
+                            continue;
+                        }
                         self.expect_expr_assignable(got, &elem_ty, e);
                     }
-                    Type::Slice(Box::new(elem_ty))
+                    if fixed {
+                        Type::Array(Box::new(elem_ty), es.len())
+                    } else {
+                        Type::Slice(Box::new(elem_ty))
+                    }
                 }
             }
             Expr::Range(lo, hi, _) => {
@@ -4422,9 +4476,13 @@ impl<'a> Checker<'a> {
         if elems.len() < 2 {
             return None;
         }
+        // Null elements are excluded from the probe: a null unifies with any
+        // element type (the sequence's element just becomes nullable), so only
+        // the non-null elements decide array-vs-tuple.
         let reps: Vec<Type> = elems
             .iter()
             .zip(elem_tys)
+            .filter(|(e, _)| !matches!(e, Expr::Null(_)))
             .map(|(e, t)| numeric_literal_repr(e).unwrap_or_else(|| self.resolve(t)))
             .collect();
         let (first, rest) = reps.split_first()?;
@@ -4476,9 +4534,10 @@ impl<'a> Checker<'a> {
 
     fn bind_pattern(&mut self, pat: &Pattern, ty: &Type, scopes: &mut ScopeStack) {
         match pat {
-            Pattern::Binding(name, _) => {
+            Pattern::Binding(name, span) => {
                 if !self.is_unit_variant_name(name) {
                     scopes.last_mut().unwrap().insert(name.clone(), ty.clone());
+                    self.record_binding(name, *span, ty);
                 }
             }
             Pattern::Record(variant, fields, _) => {
@@ -4491,6 +4550,7 @@ impl<'a> Checker<'a> {
                     if let Some(subpat) = &fp.pat {
                         self.bind_pattern(subpat, &fty, scopes);
                     } else {
+                        self.record_binding(&fp.name, fp.span, &fty);
                         scopes.last_mut().unwrap().insert(fp.name.clone(), fty);
                     }
                 }

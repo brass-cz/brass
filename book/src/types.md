@@ -11,6 +11,15 @@ Here, let's see an overview of prepoly's type system.
 - A dynamic array of type `T` is represented by `T[]`
 - A tuple type is represented by `[T, U, ...]`
 
+A bracket literal `[...]` is typed in this order:
+
+1. A type annotation (or another inference result, such as the parameter it is passed to) decides: the literal takes that type.
+2. Elements that cannot unify make it a tuple -- but a `null` element never does: `null` unifies with any element type, so `[4, null, 65]` is a sequence of `int32?`.
+3. Bound immutably (`const`), it is a fixed-length array: `const a = [1, 2, 3]` is `int32[3]`.
+4. Bound mutably (`let`) or in any other position, it is a growable array: `let a = [1, 2, 3]` is `int32[]`.
+
+A fixed-length array is usable where a dynamic array of the same element is required (the length is extra static information), but not the reverse.
+
 An arithmetic or comparison operator between two numeric values of different types implicitly converts both operands to a common type: integers widen to the wider width (mixing signed and unsigned yields a signed integer), and an integer combined with a float becomes that float.
 So `int32 + int64` is `int64` and `int32 + float64` is `float64`.
 

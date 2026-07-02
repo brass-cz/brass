@@ -143,9 +143,13 @@ impl<'p> Hm<'p> {
         if elems.len() < 2 {
             return None;
         }
+        // Null elements are excluded from the probe: a null unifies with any
+        // element type (the sequence's element just becomes nullable), so only
+        // the non-null elements decide array-vs-tuple.
         let reps: Vec<Type> = elems
             .iter()
             .zip(elem_tys)
+            .filter(|(e, _)| !matches!(e, Expr::Null(_)))
             .map(|(e, t)| numeric_literal_repr(e).unwrap_or_else(|| self.solver.resolve(t)))
             .collect();
         let (first, rest) = reps.split_first()?;
@@ -638,15 +642,26 @@ impl<'p> Hm<'p> {
                 // same type is a fixed-length tuple; otherwise it is an array whose
                 // single element type is the unification of the elements (the empty
                 // and homogeneous cases, and any element still being inferred).
+                // A `null` element never forces a tuple: null unifies with any
+                // element type, and its presence makes the element nullable.
                 if let Some(tuple) = self.tuple_of_elements(elems, &elem_tys) {
                     Type::Tuple(tuple)
                 } else {
                     let elem = self.solver.fresh(InferenceVarKind::EmptyArrayElem);
+                    let mut saw_null = false;
                     for (t, e) in elem_tys.iter().zip(elems) {
+                        if matches!(e, Expr::Null(_)) {
+                            saw_null = true;
+                            continue;
+                        }
                         self.unify(&elem, t, e.span());
                     }
                     let _ = span;
-                    Type::Slice(Box::new(elem))
+                    if saw_null && !matches!(self.solver.resolve(&elem), Type::Nullable(_)) {
+                        Type::Slice(Box::new(Type::Nullable(Box::new(elem))))
+                    } else {
+                        Type::Slice(Box::new(elem))
+                    }
                 }
             }
             Expr::Range(lo, hi, span) => {

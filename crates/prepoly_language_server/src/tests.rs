@@ -187,9 +187,10 @@ fn hover_bindings_follow_the_call_under_the_cursor() {
     );
     let full = full_analysis(src);
 
+    // The unannotated `const` arrays type as fixed-length (`float64[3]`).
     let (doc, pos) = position(src, "double(arr)", false);
     let t1 = hover_text(&hover::hover(&doc, &full, pos).expect("hover first call"));
-    assert!(t1.contains("unknown_0 = float64[]"), "first call: {t1}");
+    assert!(t1.contains("unknown_0 = float64[3]"), "first call: {t1}");
     assert!(
         !t1.contains("int32"),
         "first call must not show int32: {t1}"
@@ -197,7 +198,7 @@ fn hover_bindings_follow_the_call_under_the_cursor() {
 
     let (doc, pos) = position(src, "double(arr2)", false);
     let t2 = hover_text(&hover::hover(&doc, &full, pos).expect("hover second call"));
-    assert!(t2.contains("unknown_0 = int32[]"), "second call: {t2}");
+    assert!(t2.contains("unknown_0 = int32[3]"), "second call: {t2}");
     assert!(
         !t2.contains("float64"),
         "second call must not show float64: {t2}"
@@ -226,8 +227,80 @@ fn hover_shows_type_at_declaration() {
     let h = hover::hover(&doc, &full, pos).expect("hover over a let binding");
     let text = hover_text(&h);
     assert!(
-        text.contains("count:"),
-        "should show `count: <type>`: {text}"
+        text.contains("count: int32"),
+        "should show `count: int32`: {text}"
+    );
+}
+
+/// Hovering an annotated `let` at its declaration shows the *binding's* type
+/// (the annotation), not the initializer's: `let wide: int64 = a` with an int32
+/// initializer hovers as int64 (the value converts, the binding is int64).
+#[test]
+fn hover_at_declaration_shows_the_annotated_binding_type() {
+    let src = "fun main() {\n    let a: int32 = 5\n    let wide: int64 = a\n    println(wide)\n}\n";
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "wide:", false);
+    let h = hover::hover(&doc, &full, pos).expect("hover over the annotated binding");
+    let text = hover_text(&h);
+    assert!(text.contains("wide: int64"), "annotation wins: {text}");
+}
+
+/// A binding that is never used still hovers with its type at the declaration
+/// (there is no use to borrow a type from).
+#[test]
+fn hover_at_declaration_works_for_an_unused_binding() {
+    let src = "fun main() {\n    let unused: string = \"s\"\n    println(1)\n}\n";
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "unused", false);
+    let h = hover::hover(&doc, &full, pos).expect("hover over an unused binding");
+    let text = hover_text(&h);
+    assert!(text.contains("unused: string"), "{text}");
+}
+
+/// Destructuring `let` bindings hover with each name's own element type at the
+/// declaration site.
+#[test]
+fn hover_at_destructuring_declaration_shows_element_types() {
+    let src = "fun main() {\n    let [n, s] = [1, \"text\"]\n    println(s)\n    println(n)\n}\n";
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "n, s", false);
+    let h = hover::hover(&doc, &full, pos).expect("hover over a destructured binding");
+    let text = hover_text(&h);
+    assert!(text.contains("n: int32"), "tuple position 0: {text}");
+    let (doc2, pos2) = position(src, "s] =", false);
+    let h2 = hover::hover(&doc2, &full, pos2).expect("hover over the second binding");
+    let text2 = hover_text(&h2);
+    assert!(text2.contains("s: string"), "tuple position 1: {text2}");
+}
+
+/// An unannotated array literal containing `null` is a nullable-element
+/// sequence, not a tuple: `null` unifies with any element type. An immutable
+/// (`const`) binding is a fixed-length array; a `let` binding is a growable
+/// slice.
+#[test]
+fn hover_infers_nullable_arrays_not_tuples() {
+    let src = concat!(
+        "const fixed = [4, 1, null, 65]\n",
+        "fun main() {\n",
+        "    let grow = [7, null, 9]\n",
+        "    println(fixed)\n",
+        "    println(grow)\n",
+        "}\n",
+    );
+    let full = full_analysis(src);
+
+    let (doc, pos) = position(src, "fixed", false);
+    let t = hover_text(&hover::hover(&doc, &full, pos).expect("hover over the const binding"));
+    assert!(
+        t.contains("fixed: int32?[4]"),
+        "const nullable literal is a fixed-length nullable array: {t}"
+    );
+
+    let (doc2, pos2) = position(src, "grow", false);
+    let t2 = hover_text(&hover::hover(&doc2, &full, pos2).expect("hover over the let binding"));
+    assert!(
+        t2.contains("grow: int32?[]"),
+        "let nullable literal is a growable nullable slice: {t2}"
     );
 }
 

@@ -2401,6 +2401,42 @@ mod tests {
     }
 
     #[test]
+    fn unannotated_null_containing_array_is_a_nullable_sequence() {
+        // Without an annotation, a `null` element does not force a tuple: null
+        // unifies with any element type, so the literal is a nullable-element
+        // sequence and its elements narrow like any nullable.
+        for src in [
+            // const binding (a fixed-length array) and element narrowing.
+            "const a = [4, 1, null, 65]\nfun main() {\n    let x = a[0]\n    if x {\n        println(x + 1)\n    }\n}\n",
+            // let binding (a growable slice) accepts further pushes of both kinds.
+            "fun main() {\n    let a = [4, null]\n    a.push(null)\n    a.push(7)\n}\n",
+            // all-null literal is a nullable sequence with an open element.
+            "fun main() {\n    let a = [null, null]\n    a.push(5)\n}\n",
+        ] {
+            let e = errs(src);
+            assert!(e.is_empty(), "{src}: {e:?}");
+        }
+        // Genuinely ununifiable elements still form a tuple, null or not.
+        let hetero = errs(
+            "fun main() {\n    let t = [1, null, \"s\"]\n    let s: string = t[2]\n    let n: int32 = t[0]\n}\n",
+        );
+        assert!(hetero.is_empty(), "{hetero:?}");
+    }
+
+    #[test]
+    fn const_array_literal_is_fixed_length_and_flows_into_slices() {
+        // An unannotated const literal is a fixed-length array; it is still
+        // usable where a slice is required (same storage, static length).
+        let e = errs(
+            "fun total(xs: int32[]) -> int32 {\n    return xs[0]\n}\nconst nums = [10, 20, 30]\nfun main() {\n    println(total(nums))\n}\n",
+        );
+        assert!(e.is_empty(), "{e:?}");
+        // A let binding stays growable: push is accepted.
+        let grow = errs("fun main() {\n    let xs = [1, 2]\n    xs.push(3)\n}\n");
+        assert!(grow.is_empty(), "{grow:?}");
+    }
+
+    #[test]
     fn nullable_slice_annotation_works_inside_a_function() {
         // The in-function `let` exercises the HM engine too (it skips top-level
         // init values): a null-containing literal is classified a tuple there and

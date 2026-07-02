@@ -55,6 +55,11 @@ pub fn types_compatible(program: &Program, have: &Type, want: &Type) -> bool {
         // `Animal[]`, store a bare `Animal`, and then read it back as a `Dog`.
         (Type::Array(h, hn), Type::Array(w, wn)) if hn == wn => types_invariant(program, h, w),
         (Type::Slice(h), Type::Slice(w)) => types_invariant(program, h, w),
+        // A fixed-length array is usable where a slice is required: both share
+        // the same runtime storage and the length is extra static information
+        // the slice position simply drops. Not the reverse -- a slice's length
+        // is dynamic, so it cannot satisfy a fixed-length position.
+        (Type::Array(h, _), Type::Slice(w)) => types_invariant(program, h, w),
         // Function parameters are contravariant and the return type covariant: a
         // value usable where `(W) -> R` is required must accept every `W` the
         // caller may pass, so each required parameter `w` must be usable where the
