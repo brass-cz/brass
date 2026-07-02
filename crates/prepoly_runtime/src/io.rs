@@ -173,6 +173,14 @@ pub unsafe extern "C-unwind" fn pp_file_close(file: *mut Header) -> *mut Header 
 mod tests {
     use super::*;
     use crate::alloc::pp_str_const;
+    use std::sync::MutexGuard;
+
+    /// These tests allocate strings/arrays/Results through the shared counted
+    /// heap. Hold the crate's heap-test lock so the tests elsewhere that assert
+    /// on `pp_live_blocks` (gc, conc) never observe these allocations mid-flight.
+    fn serial_io() -> MutexGuard<'static, ()> {
+        crate::serial_heap_test()
+    }
 
     unsafe fn str_obj(s: &str) -> *mut Header {
         unsafe { pp_str_const(s.as_ptr(), s.len() as i64) }
@@ -191,6 +199,7 @@ mod tests {
     // bytes and the reported size match what was written.
     #[test]
     fn write_then_read_round_trip() {
+        let _serial = serial_io();
         unsafe {
             let path = format!(
                 "{}/prepoly_io_test_{}.txt",
@@ -237,6 +246,7 @@ mod tests {
     // Seeking back to the start lets a second read re-read from the beginning.
     #[test]
     fn seek_repositions_the_cursor() {
+        let _serial = serial_io();
         unsafe {
             let path = format!(
                 "{}/prepoly_seek_test_{}.txt",
@@ -272,6 +282,7 @@ mod tests {
     // An invalid mode is reported as an error Result, not a crash.
     #[test]
     fn invalid_mode_is_an_error() {
+        let _serial = serial_io();
         unsafe {
             let r = pp_file_open(str_obj("/tmp/whatever"), str_obj("zzz"));
             assert!(!result_is_ok(r), "invalid mode yields Err");

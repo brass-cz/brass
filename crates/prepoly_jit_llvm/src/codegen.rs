@@ -2212,9 +2212,14 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
             }
             // Nullables share the pointer repr (null = null pointer); coercion
             // between two nullables is identity, value -> nullable wraps it in a
-            // heap cell, and nullable -> value unwraps (narrowing).
+            // heap cell, and nullable -> value unwraps (narrowing). A numeric
+            // value converts to the cell's element type before wrapping
+            // (`int32 -> int64?` stores an int64 cell).
             (Type::Nullable(_), Type::Nullable(_)) => v,
-            (_, Type::Nullable(inner)) => self.nullable_wrap(v, inner),
+            (f, Type::Nullable(inner)) => {
+                let v = self.coerce(v, f, inner);
+                self.nullable_wrap(v, inner)
+            }
             (Type::Nullable(_), _) => self.nullable_unwrap(v, to),
             _ => v,
         }

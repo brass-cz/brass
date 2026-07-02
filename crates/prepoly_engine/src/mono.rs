@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 
 use prepoly_hir::{
     FloatKind, IntKind, NominalType, Program, RESULT_TYPE_ID, Substitution, Type, TypeKind,
+    int_literal_kind,
 };
 use prepoly_mir::{
     BlockId, Callee, ClosureId, LocalId, MirBody, MirClosure, MirFunction, MirMethod, MirProgram,
@@ -1575,8 +1576,18 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         // int type (one operand a variable, the other a literal).
         if let (Some(ta), Some(tb)) = (&ta, &tb) {
             let (na, nb) = (unwrap_nullable(ta), unwrap_nullable(tb));
-            let int_literal_adapt =
-                matches!((na, nb), (Type::Int(_), Type::Int(_))) && (a_local != b_local);
+            // A literal adapts to the variable's type only when it fits: a
+            // magnitude-typed int64 literal (e.g. INT64_MAX) mixed with an int32
+            // variable takes the common (wider) type instead of truncating.
+            let lit_kind = if a_local { nb } else { na };
+            let var_kind = if a_local { na } else { nb };
+            let lit_fits = match (lit_kind, var_kind) {
+                (Type::Int(lk), Type::Int(vk)) => lk.bits() <= vk.bits(),
+                _ => true,
+            };
+            let int_literal_adapt = matches!((na, nb), (Type::Int(_), Type::Int(_)))
+                && (a_local != b_local)
+                && lit_fits;
             if !int_literal_adapt && let Some(common) = prepoly_hir::common_numeric_type(na, nb) {
                 return Ok(Some(common));
             }
@@ -2140,7 +2151,9 @@ fn method_ret_annotation(program: &Program, type_symbol: &str, method: &str) -> 
 fn const_type(lit: &prepoly_mir::Literal) -> Result<Type, String> {
     use prepoly_mir::Literal;
     match lit {
-        Literal::Int(_) => Ok(Type::Int(IntKind::I32)),
+        // An integer literal defaults by magnitude: int32 when it fits, int64
+        // otherwise (a 64-bit constant like INT64_MAX must not truncate).
+        Literal::Int(v) => Ok(Type::Int(int_literal_kind(*v))),
         Literal::Float(_) => Ok(Type::Float(FloatKind::F64)),
         Literal::Bool(_) => Ok(Type::Bool),
         Literal::Void => Ok(Type::Void),

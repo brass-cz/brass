@@ -333,11 +333,11 @@ fn aggregate_result_types(
             TypedExprKind::Call
             | TypedExprKind::TypeLiteral(_)
             | TypedExprKind::VariantLiteral { .. } => is_seedable_instance(&e.ty),
-            // An array literal is seeded only when its element is nullable: a
-            // nullable element is a heap cell, a representation the back end
-            // cannot re-derive from the (bare) element values, so the checked
-            // type must flow into lowering. Other literals stay inferred.
-            TypedExprKind::Array => is_seedable_nullable_array(&e.ty),
+            // An array literal is seeded only when its element representation
+            // (a nullable cell, a non-default numeric width) cannot be
+            // re-derived from the bare element values, so the checked type must
+            // flow into lowering. Other literals stay inferred.
+            TypedExprKind::Array => is_seedable_array(&e.ty),
             _ => false,
         };
         if !relevant {
@@ -429,13 +429,24 @@ fn is_seedable_instance(ty: &prepoly_hir::Type) -> bool {
 }
 
 /// Whether an array literal's checked type is worth seeding onto its result
-/// local: a fully-known slice/array whose *element* is nullable. Matches the
-/// [`prepoly_mir`] filter for array literals (a nullable element is a heap cell
-/// whose representation the back end cannot re-derive from bare element values).
-fn is_seedable_nullable_array(ty: &prepoly_hir::Type) -> bool {
-    use prepoly_hir::Type;
-    matches!(ty, Type::Slice(e) | Type::Array(e, _) if matches!(&**e, Type::Nullable(_)))
-        && is_fully_known(ty)
+/// local: a fully-known slice/array whose *element representation* the back end
+/// would re-derive differently from the element values -- a nullable element (a
+/// heap cell) or a non-default numeric element (`int64[]`, `uint8[]`,
+/// `float32[]`, a different width than the literal defaults). Matches the
+/// [`prepoly_mir`] filter for array literals.
+fn is_seedable_array(ty: &prepoly_hir::Type) -> bool {
+    use prepoly_hir::{FloatKind, IntKind, Type};
+    let elem = match ty {
+        Type::Slice(e) | Type::Array(e, _) => e,
+        _ => return false,
+    };
+    let needs_pin = match elem.as_ref() {
+        Type::Nullable(_) => true,
+        Type::Int(k) => *k != IntKind::I32,
+        Type::Float(f) => *f != FloatKind::F64,
+        _ => false,
+    };
+    needs_pin && is_fully_known(ty)
 }
 
 /// Whether `ty` contains no inference variable, recursing through every

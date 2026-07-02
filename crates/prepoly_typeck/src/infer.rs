@@ -14,7 +14,7 @@ use std::rc::Rc;
 use prepoly_hir::{
     CallableSignature, Constness, FloatKind, FunInfo, IntKind, NominalType, ParamInfo, Program,
     SchemeMethod, Substitution, Type, TypeInfo, TypeKind, TypeScheme, TypedProgram,
-    common_numeric_type,
+    common_numeric_type, int_literal_kind, numeric_flows_into,
 };
 use prepoly_lexer::Span;
 use prepoly_parser::ast::*;
@@ -670,7 +670,7 @@ impl<'a> Checker<'a> {
         errors: &mut Vec<(Type, Span)>,
     ) -> Type {
         match expr {
-            Expr::Int(..) => Type::Int(IntKind::I32),
+            Expr::Int(v, _) => Type::Int(int_literal_kind(*v)),
             Expr::Float(..) => Type::Float(FloatKind::F64),
             Expr::Bool(..) => Type::Bool,
             Expr::Null(_) => Type::null(),
@@ -1414,7 +1414,12 @@ impl<'a> Checker<'a> {
                     }
                 } else {
                     let value_ty = self.check_expr(value, scopes);
-                    let _ = self.check_binary(assign_binop(*op), &target_ty, &value_ty, *span);
+                    let result = self.check_binary(assign_binop(*op), &target_ty, &value_ty, *span);
+                    // The combined result is stored back into the target, so it
+                    // must flow into the target's type: `int64 += int32` widens
+                    // the operand, but `int32 += float64` would need a silent
+                    // float -> int truncation on the write-back and is rejected.
+                    self.expect_assignable(&result, &target_ty, *span);
                 }
             }
             Stmt::Expr(e) => {
@@ -1734,7 +1739,7 @@ impl<'a> Checker<'a> {
 
     fn check_expr_inner(&mut self, e: &Expr, scopes: &mut ScopeStack) -> Type {
         match e {
-            Expr::Int(_, _) => Type::Int(IntKind::I32),
+            Expr::Int(v, _) => Type::Int(int_literal_kind(*v)),
             Expr::Float(_, _) => Type::Float(FloatKind::F64),
             Expr::Bool(_, _) => Type::Bool,
             Expr::Null(_) => Type::null(),
@@ -4242,13 +4247,21 @@ impl<'a> Checker<'a> {
             return;
         }
         if let Type::Nullable(inner) = &want
-            && (self.can_unify(&got, inner) || matches!(got, Type::Never))
+            && (self.can_unify(&got, inner)
+                || numeric_flows_into(&got, &self.resolve(inner))
+                || matches!(got, Type::Never))
         {
             return;
         }
         if self.can_unify(&got, &want)
             || crate::structural::types_compatible(self.program, &got, &want)
         {
+            return;
+        }
+        // Automatic numeric conversion: a numeric value flows into a numeric
+        // position of another type (int widths/signedness, int -> float); the
+        // back ends convert at the flow point. float -> int stays explicit.
+        if numeric_flows_into(&got, &want) {
             return;
         }
         self.errors.push(TypeError {
@@ -5209,7 +5222,7 @@ fn const_index(expr: &Expr) -> Option<i64> {
 /// bracket literal as array vs tuple (an int literal is `int32`, a float `float64`).
 fn numeric_literal_repr(e: &Expr) -> Option<Type> {
     match e {
-        Expr::Int(_, _) => Some(Type::Int(IntKind::I32)),
+        Expr::Int(v, _) => Some(Type::Int(int_literal_kind(*v))),
         Expr::Float(_, _) => Some(Type::Float(FloatKind::F64)),
         _ => None,
     }
@@ -5303,7 +5316,7 @@ fn integer_literal_fits(expr: &Expr, want: &Type) -> bool {
 
 fn literal_pattern_type(expr: &Expr) -> Option<Type> {
     match expr {
-        Expr::Int(..) => Some(Type::Int(IntKind::I32)),
+        Expr::Int(v, _) => Some(Type::Int(int_literal_kind(*v))),
         Expr::Float(..) => Some(Type::Float(FloatKind::F64)),
         Expr::Bool(..) => Some(Type::Bool),
         Expr::Str(..) => Some(Type::Str),

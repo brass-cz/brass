@@ -293,11 +293,20 @@ fn region_is_closed(id: i64) -> bool {
 mod tests {
     use super::*;
     use crate::alloc::pp_typed_alloc;
+    use std::sync::MutexGuard;
+
+    /// These tests allocate through the shared counted heap. Hold the crate's
+    /// heap-test lock so the tests elsewhere that assert on `pp_live_blocks`
+    /// (gc, conc) never observe this module's allocations mid-flight.
+    fn serial_region() -> MutexGuard<'static, ()> {
+        crate::serial_heap_test()
+    }
 
     /// A region with no escape stays closed; an external reference into it (the
     /// write barrier raising the LRC) makes it not closed.
     #[test]
     fn closedness_tracks_escapes() {
+        let _serial = serial_region();
         unsafe {
             let bridge = pp_typed_alloc(32);
             let inner = pp_typed_alloc(16);
@@ -319,6 +328,7 @@ mod tests {
     /// and dropping the borrow closes both again (LRC).
     #[test]
     fn nested_lrc_propagates_to_parent() {
+        let _serial = serial_region();
         unsafe {
             let parent_bridge = pp_typed_alloc(16);
             let child_bridge = pp_typed_alloc(32);
@@ -357,6 +367,7 @@ mod tests {
     /// overwriting that field (removing the old reference) closes it again.
     #[test]
     fn write_barrier_add_then_remove_reference() {
+        let _serial = serial_region();
         unsafe {
             let bridge = pp_typed_alloc(16);
             let inner = pp_typed_alloc(16);
@@ -381,6 +392,7 @@ mod tests {
     /// `with` (the previous unbounded leak).
     #[test]
     fn closing_a_region_disposes_it_with_monotonic_ids() {
+        let _serial = serial_region();
         unsafe {
             let id = pp_region_open(pp_typed_alloc(16));
             assert!(pp_region_close(id), "no escape -> closed");

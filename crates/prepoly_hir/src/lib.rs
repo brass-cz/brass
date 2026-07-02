@@ -22,7 +22,7 @@ pub use typed::{Constness, Ownership, RegionId, TypedExpr, TypedExprKind, TypedP
 pub use types::{
     FloatKind, INFER_VAR, IntKind, NominalInfo, NominalKind, NominalType, STRUCTURAL_RECORD_ID,
     STRUCTURAL_RECORD_NAME, Substitution, Type, common_numeric_type, freshen_infer, index_element,
-    prim_method_symbol, resolve, structural_record,
+    int_literal_kind, numeric_flows_into, prim_method_symbol, resolve, structural_record,
 };
 
 /// Re-exported so back ends can name source spans (e.g. typed-literal codegen

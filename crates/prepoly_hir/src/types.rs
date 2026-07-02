@@ -562,6 +562,34 @@ pub fn prim_method_symbol(class: &str, method: &str) -> String {
     format!("{method}@prim.{class}")
 }
 
+/// The default kind of an unconstrained integer literal: int32 when the value
+/// fits, otherwise int64. A literal like `9223372036854775807` can only be an
+/// int64; defaulting it to int32 (the canonical kind) would silently truncate
+/// the value the programmer wrote out.
+pub fn int_literal_kind(value: i64) -> IntKind {
+    if i32::try_from(value).is_ok() {
+        IntKind::I32
+    } else {
+        IntKind::I64
+    }
+}
+
+/// Whether a numeric value implicitly converts at a *flow* position (an
+/// assignment, argument, return, or element/field store): any integer flows
+/// into any integer type (width/signedness changes, possibly lossy, are part of
+/// the language's automatic numeric conversion), a float into a float of any
+/// width, and an integer into a float. A float does NOT implicitly flow into an
+/// integer -- silently truncating a fractional value is a bug magnet rather
+/// than a width choice, so that direction stays explicit (`int32.from`).
+pub fn numeric_flows_into(from: &Type, to: &Type) -> bool {
+    matches!(
+        (from, to),
+        (Type::Int(_), Type::Int(_))
+            | (Type::Float(_), Type::Float(_))
+            | (Type::Int(_), Type::Float(_))
+    )
+}
+
 /// The result type of an arithmetic or comparison operation between two numeric
 /// types, applying the implicit conversions:
 /// - int op int   -> the wider bit width (a mix of signed and unsigned is signed)

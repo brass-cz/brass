@@ -5,7 +5,7 @@ Here, let's see an overview of prepoly's type system.
 
 ## Primitives and special types
 
-- The default type of an integer literal (e.g. `1`) is `int32`, and the default type of a decimal literal (e.g. `1.0`) is `float64`
+- The default type of an integer literal (e.g. `1`) is `int32` when the value fits, otherwise `int64` (so `9223372036854775807` is an `int64`); the default type of a decimal literal (e.g. `1.0`) is `float64`
 - The type of text is `string`
 - A static array of type `T` with length `n` is represented by `T[n]`
 - A dynamic array of type `T` is represented by `T[]`
@@ -13,7 +13,8 @@ Here, let's see an overview of prepoly's type system.
 
 An arithmetic or comparison operator between two numeric values of different types implicitly converts both operands to a common type: integers widen to the wider width (mixing signed and unsigned yields a signed integer), and an integer combined with a float becomes that float.
 So `int32 + int64` is `int64` and `int32 + float64` is `float64`.
-This conversion applies to numeric *values*; a type annotation still requires its exact type, so a bare integer literal does not satisfy a `float64` annotation (write `1.0`, or convert with `float64.from(x)`).
+
+Numeric values also convert automatically when they *flow* into a numeric position of another type -- an assignment, an argument, a return value, a compound assignment, or an element/field store. Any integer converts to any integer type (a narrowing conversion is allowed and may be lossy), a float to a float of any width, and an integer to a float: `let b: int64 = an_int32` and `total += an_int32` (with `total: int64`) both widen the value. The one exception is float to int, which would silently drop the fraction; convert explicitly with `int32.from(x)`.
 
 Also, prepoly uses the following annotations for how an argument is passed:
 

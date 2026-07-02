@@ -29,15 +29,26 @@ fn is_seedable_result(ty: &Type) -> bool {
 }
 
 /// Whether a checker-resolved array-literal type must be seeded onto its result
-/// local: a slice/array whose *element* is nullable. A nullable element is a heap
-/// cell, not the bare value, so the literal must be built at the annotated
-/// element type; the back end re-derives element types from the element values
-/// alone, which would rebuild `[1, 2]` for an `int32?[]` binding at the bare
-/// `int32` and misrepresent every element. Plain-element literals keep an
-/// inferred `Var` (see [`is_seedable_result`] for why seeding is otherwise
-/// avoided).
-fn is_nullable_element_array(ty: &Type) -> bool {
-    matches!(ty, Type::Slice(e) | Type::Array(e, _) if matches!(**e, Type::Nullable(_)))
+/// local: a slice/array whose *element representation* the back end would
+/// re-derive differently from the element values alone. A nullable element is a
+/// heap cell, not the bare value; a non-default numeric element (`int64[]`,
+/// `uint8[]`, `float32[]`) has a different width than the literal's int32 /
+/// float64 default -- either way the buffer built at the re-derived type would
+/// be reinterpreted at the annotated one and corrupt every element. Literals
+/// whose element matches the derived representation keep an inferred `Var`
+/// (see [`is_seedable_result`] for why seeding is otherwise avoided).
+fn array_element_needs_seed(ty: &Type) -> bool {
+    use prepoly_hir::{FloatKind, IntKind};
+    let elem = match ty {
+        Type::Slice(e) | Type::Array(e, _) => e,
+        _ => return false,
+    };
+    match elem.as_ref() {
+        Type::Nullable(_) => true,
+        Type::Int(k) => *k != IntKind::I32,
+        Type::Float(f) => *f != FloatKind::F64,
+        _ => false,
+    }
 }
 
 impl<'a, 'p> FnLower<'a, 'p> {
@@ -429,11 +440,12 @@ impl<'a, 'p> FnLower<'a, 'p> {
             ops.push(v);
         }
         let rv = Rvalue::Array(ops);
-        // A literal the checker resolved to a nullable-element sequence carries
-        // that type onto its result local, so the back end builds each element
-        // as a nullable cell rather than the bare value it would re-derive.
+        // A literal whose checked element representation differs from what the
+        // back end would re-derive (a nullable cell, a non-default numeric
+        // width) carries that type onto its result local, so the elements are
+        // built at the annotated representation from the start.
         match self.ctx.expr_type(span) {
-            Some(ty) if is_nullable_element_array(ty) => self.b.emit_known(rv, ty.clone()),
+            Some(ty) if array_element_needs_seed(ty) => self.b.emit_known(rv, ty.clone()),
             _ => self.b.emit(rv),
         }
     }

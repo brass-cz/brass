@@ -1943,10 +1943,14 @@ mod tests {
 
     #[test]
     fn error_propagation_preserves_ok_payload_type() {
-        let e = errs("fun main() {\n    let x: int32 = uint8.from(1)!\n}\n");
+        // The unwrapped payload keeps its own type through `!`: a `uint8` payload
+        // in a `string` position is reported as a `uint8` (numeric-to-numeric
+        // positions convert implicitly, so a non-numeric target shows the
+        // preserved type).
+        let e = errs("fun main() {\n    let x: string = uint8.from(1)!\n}\n");
         assert!(
             e.iter()
-                .any(|m| m.contains("cannot use `uint8` where `int32` is required")),
+                .any(|m| m.contains("cannot use `uint8` where `string` is required")),
             "{e:?}"
         );
     }
@@ -2074,12 +2078,15 @@ mod tests {
 
     #[test]
     fn inferred_function_result_keeps_ok_payload_type() {
+        // The inferred `Result` Ok payload survives a second propagation: a
+        // `uint8` payload used at a non-numeric type still names `uint8`
+        // (numeric positions now convert implicitly, so `string` is the probe).
         let e = errs(
-            "fun get_u8() {\n    return uint8.from(1)!\n}\nfun main() {\n    let x: int32 = get_u8()!\n}\n",
+            "fun get_u8() {\n    return uint8.from(1)!\n}\nfun main() {\n    let x: string = get_u8()!\n}\n",
         );
         assert!(
             e.iter()
-                .any(|m| m.contains("cannot use `uint8` where `int32` is required")),
+                .any(|m| m.contains("cannot use `uint8` where `string` is required")),
             "{e:?}"
         );
     }
@@ -2295,6 +2302,85 @@ mod tests {
     fn fixed_array_literal_matches_annotation() {
         let e = errs("fun main() {\n    let values: int32[2] = [1, 2]\n}\n");
         assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn numeric_values_convert_implicitly_at_flow_positions() {
+        // Automatic numeric conversion: a numeric value flows into a numeric
+        // position of a different type -- assignments, arguments, returns, and
+        // compound assignments alike. Narrowing int -> int is allowed (lossy by
+        // design); int -> float is allowed.
+        for (label, src) in [
+            (
+                "assignment widens",
+                "fun main() {\n    let a: int32 = 5\n    let b: int64 = a\n}\n",
+            ),
+            (
+                "assignment narrows (lossy)",
+                "fun main() {\n    let a: int64 = 5\n    let b: int32 = a\n}\n",
+            ),
+            (
+                "argument widens",
+                "fun f(x: int64) -> int64 {\n    return x\n}\nfun main() {\n    let a: int32 = 5\n    f(a)\n}\n",
+            ),
+            (
+                "return widens",
+                "fun g() -> int64 {\n    let a: int32 = 5\n    return a\n}\nfun main() {\n    g()\n}\n",
+            ),
+            (
+                "compound assign widens the operand",
+                "fun main() {\n    let t: int64 = 1\n    let x: int32 = 2\n    t += x\n}\n",
+            ),
+            (
+                "int flows into a float position",
+                "fun main() {\n    let a: int32 = 5\n    let f: float64 = a\n}\n",
+            ),
+            (
+                "int flows into a nullable numeric position",
+                "fun main() {\n    let a: int32 = 5\n    let m: int64? = a\n}\n",
+            ),
+        ] {
+            let e = errs(src);
+            assert!(e.is_empty(), "{label}: {e:?}");
+        }
+    }
+
+    #[test]
+    fn float_does_not_convert_to_int_implicitly() {
+        // float -> int stays explicit (int32.from): the compound write-back would
+        // silently truncate the fraction.
+        let assign = errs("fun main() {\n    let f: float64 = 1.5\n    let n: int32 = f\n}\n");
+        assert!(
+            assign
+                .iter()
+                .any(|m| m.contains("cannot use `float64` where `int32` is required")),
+            "{assign:?}"
+        );
+        let compound =
+            errs("fun main() {\n    let t: int32 = 1\n    let x: float64 = 2.5\n    t += x\n}\n");
+        assert!(
+            compound
+                .iter()
+                .any(|m| m.contains("cannot use `float64` where `int32` is required")),
+            "{compound:?}"
+        );
+    }
+
+    #[test]
+    fn integer_literal_defaults_to_its_magnitude() {
+        // A literal that does not fit int32 defaults to int64 instead of
+        // truncating (the stdlib's `const INT64_MAX = 9223372036854775807`).
+        let e = errs("const BIG = 9223372036854775807\nfun main() {\n    let x: int64 = BIG\n}\n");
+        assert!(e.is_empty(), "{e:?}");
+        // An in-range literal still defaults to int32: it flows into an int8
+        // position numerically, and a string position names int32.
+        let small = errs("fun main() {\n    let x = 5\n    let s: string = x\n}\n");
+        assert!(
+            small
+                .iter()
+                .any(|m| m.contains("cannot use `int32` where `string` is required")),
+            "{small:?}"
+        );
     }
 
     #[test]

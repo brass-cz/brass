@@ -342,10 +342,20 @@ impl<'p, 'm> Interp<'p, 'm> {
                 })))
             }
             Rvalue::Array(es) => {
-                let elem_ty = element_type(dest_ty);
+                // A heterogeneous bracket literal is a tuple: each element is
+                // built at its own positional type (an int64 element must not be
+                // materialized at a uniform int32). A homogeneous one shares the
+                // single element type.
                 let mut vals = Vec::with_capacity(es.len());
-                for op in es {
-                    vals.push(self.eval_operand(f, frame, op, &elem_ty)?);
+                if let Type::Tuple(elem_types) = dest_ty {
+                    for (op, ety) in es.iter().zip(elem_types) {
+                        vals.push(self.eval_operand(f, frame, op, ety)?);
+                    }
+                } else {
+                    let elem_ty = element_type(dest_ty);
+                    for op in es {
+                        vals.push(self.eval_operand(f, frame, op, &elem_ty)?);
+                    }
                 }
                 Ok(Value::Array(Rc::new(RefCell::new(vals))))
             }

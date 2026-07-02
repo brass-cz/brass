@@ -27,7 +27,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use prepoly_hir::{FloatKind, FunInfo, IntKind, MethodInfo, Program, Type, TypeInfo, TypeKind};
+use prepoly_hir::{
+    FloatKind, FunInfo, IntKind, MethodInfo, Program, Type, TypeInfo, TypeKind, int_literal_kind,
+    numeric_flows_into,
+};
 use prepoly_lexer::Span;
 use prepoly_parser::ast::{BinOp, Block, Expr, Pattern, Stmt, StrSeg, UnaryOp};
 
@@ -68,10 +71,11 @@ struct Hm<'p> {
     fallible: bool,
     ok: Type,
     err: Type,
-    /// Numeric-literal variables to finalize: `(id, is_int, span)`. A literal
+    /// Numeric-literal variables to finalize: `(id, default, span)`. A literal
     /// stays a fresh variable so context can pin its exact kind; afterwards it
-    /// must have resolved to the right numeric class (or defaults).
-    lit_vars: Vec<(u32, bool, Span)>,
+    /// must have resolved to the right numeric class, or defaults to `default`
+    /// (int32/int64 by the literal's magnitude, float64).
+    lit_vars: Vec<(u32, Type, Span)>,
     errors: Vec<TypeError>,
 }
 
@@ -410,6 +414,14 @@ impl<'p> Hm<'p> {
                 self.solver.rollback(snap);
             }
         }
+        // Automatic numeric conversion: a numeric value flows into a numeric
+        // position of another type (int widths/signedness, int -> float). The
+        // nullable wrapper on the *want* side is stripped (the converted value is
+        // wrapped into the nullable), but a nullable value itself does not flow
+        // into a non-nullable numeric position. float -> int stays explicit.
+        if !matches!(h, Type::Nullable(_)) && numeric_flows_into(&h, &strip_nullable(w.clone())) {
+            return;
+        }
         // Unification failed; the value only flows if structural subtyping admits
         // it (a wider record into a narrower position). Trace this fallback: it is
         // where a too-permissive structural rule would let an unsound flow through.
@@ -494,7 +506,11 @@ impl<'p> Hm<'p> {
             Stmt::Assign { target, value, .. } => {
                 let t = self.infer_expr(target);
                 let v = self.infer_expr(value);
-                self.unify(&t, &v, stmt.span());
+                // The value flows into the target (rather than unifying with it),
+                // admitting the automatic numeric conversions: `int64_t += int32_v`
+                // widens the operand at the write-back, and a plain assignment
+                // converts the same way. A compound target's own type is unchanged.
+                self.flow_into(&v, &t, stmt.span());
             }
             Stmt::Expr(e) => {
                 self.infer_expr(e);
@@ -546,8 +562,8 @@ impl<'p> Hm<'p> {
 
     fn infer_expr(&mut self, expr: &Expr) -> Type {
         match expr {
-            Expr::Int(_, span) => self.literal_var(true, *span),
-            Expr::Float(_, span) => self.literal_var(false, *span),
+            Expr::Int(v, span) => self.literal_var(Type::Int(int_literal_kind(*v)), *span),
+            Expr::Float(_, span) => self.literal_var(Type::Float(FloatKind::F64), *span),
             Expr::Bool(_, _) => Type::Bool,
             Expr::Str(segs, _) => {
                 for seg in segs {
@@ -636,7 +652,7 @@ impl<'p> Hm<'p> {
             Expr::Range(lo, hi, span) => {
                 // `[lo..hi]` builds an array of the (integer) bound type. Both
                 // bounds share one integer type, which is the element type.
-                let int_v = self.literal_var(true, *span);
+                let int_v = self.literal_var(Type::Int(IntKind::I32), *span);
                 let lo_ty = self.infer_expr(lo);
                 let hi_ty = self.infer_expr(hi);
                 self.unify(&lo_ty, &int_v, lo.span());
@@ -848,11 +864,12 @@ impl<'p> Hm<'p> {
     }
 
     /// A numeric literal: a fresh variable recorded for finalization so context
-    /// can still choose its exact kind (e.g. `let x: int64 = 5`).
-    fn literal_var(&mut self, is_int: bool, span: Span) -> Type {
+    /// can still choose its exact kind (e.g. `let x: int64 = 5`). `default` is
+    /// the type an unconstrained literal falls back to.
+    fn literal_var(&mut self, default: Type, span: Span) -> Type {
         let ty = self.solver.fresh(InferenceVarKind::Source);
         if let Type::Unknown(id) = ty {
-            self.lit_vars.push((id, is_int, span));
+            self.lit_vars.push((id, default, span));
         }
         ty
     }
@@ -1340,7 +1357,7 @@ impl<'p> Hm<'p> {
     /// its context is a type error.
     fn finalize_literals(&mut self) {
         let lit_vars = std::mem::take(&mut self.lit_vars);
-        for (id, is_int, span) in lit_vars {
+        for (id, default, span) in lit_vars {
             // See through the transparent reference/mutability wrappers: a literal
             // forced to a `ref(mut(int32))` (an array element behind a mutable
             // reference) is still an integer literal at an integer type.
@@ -1353,24 +1370,15 @@ impl<'p> Hm<'p> {
                     other => break other,
                 }
             };
+            let is_int = matches!(default, Type::Int(_));
             match (&resolved, is_int) {
-                (Type::Unknown(_), true) => {
+                (Type::Unknown(_), _) => {
                     tracing::debug!(
                         var = id,
-                        "numeric literal unconstrained, defaulting to int32"
+                        default = %default.display(),
+                        "numeric literal unconstrained, defaulting"
                     );
-                    let _ = self
-                        .solver
-                        .unify(&resolved, &Type::Int(prepoly_hir::IntKind::I32));
-                }
-                (Type::Unknown(_), false) => {
-                    tracing::debug!(
-                        var = id,
-                        "numeric literal unconstrained, defaulting to float64"
-                    );
-                    let _ = self
-                        .solver
-                        .unify(&resolved, &Type::Float(prepoly_hir::FloatKind::F64));
+                    let _ = self.solver.unify(&resolved, &default);
                 }
                 (Type::Int(_), true) | (Type::Float(_), false) => {}
                 (other, true) => self.errors.push(TypeError {
@@ -1467,7 +1475,7 @@ fn const_index(expr: &Expr) -> Option<i64> {
 /// any element). `None` for a non-literal element (its inferred type is used).
 fn numeric_literal_repr(e: &Expr) -> Option<Type> {
     match e {
-        Expr::Int(_, _) => Some(Type::Int(prepoly_hir::IntKind::I32)),
+        Expr::Int(v, _) => Some(Type::Int(int_literal_kind(*v))),
         Expr::Float(_, _) => Some(Type::Float(prepoly_hir::FloatKind::F64)),
         _ => None,
     }
