@@ -900,6 +900,22 @@ impl<'p> Hm<'p> {
     /// A numeric literal: a fresh variable recorded for finalization so context
     /// can still choose its exact kind (e.g. `let x: int64 = 5`). `default` is
     /// the type an unconstrained literal falls back to.
+    /// The default numeric type of an unresolved literal variable (`0.5` ->
+    /// `float64`, `1` -> its magnitude-chosen int kind), or `None` when `ty` is
+    /// not one. Lets the binary-operator rules probe a literal at its own
+    /// numeric class instead of unifying it into the other operand's -- which
+    /// would pin `a + 0.5` to `int32` and reject the float literal.
+    fn lit_default(&self, ty: &Type) -> Option<Type> {
+        match ty {
+            Type::Unknown(id) => self
+                .lit_vars
+                .iter()
+                .find(|(v, _, _)| v == id)
+                .map(|(_, d, _)| d.clone()),
+            _ => None,
+        }
+    }
+
     fn literal_var(&mut self, default: Type, span: Span) -> Type {
         let ty = self.solver.fresh(InferenceVarKind::Source);
         if let Type::Unknown(id) = ty {
@@ -944,7 +960,14 @@ impl<'p> Hm<'p> {
             // unify (same type, or a literal adapting to the other).
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
                 let (ra, rb) = (self.solver.resolve(&ta), self.solver.resolve(&tb));
-                if prepoly_hir::common_numeric_type(&ra, &rb).is_none() {
+                // An unresolved literal probes at its own default class, so
+                // `a < 0.5` with an int `a` compares via the common float type
+                // instead of pinning the literal to `a`'s int kind.
+                let (pa, pb) = (
+                    self.lit_default(&ra).unwrap_or_else(|| ra.clone()),
+                    self.lit_default(&rb).unwrap_or_else(|| rb.clone()),
+                );
+                if prepoly_hir::common_numeric_type(&pa, &pb).is_none() {
                     self.unify(&ta, &tb, span);
                 }
                 Type::Bool
@@ -955,8 +978,25 @@ impl<'p> Hm<'p> {
             // `Str` for `+` concatenation).
             _ => {
                 let (ra, rb) = (self.solver.resolve(&ta), self.solver.resolve(&tb));
-                match prepoly_hir::common_numeric_type(&ra, &rb) {
-                    Some(common) => common,
+                // As with comparisons: a literal probes at its own default, so
+                // int+float mixes convert regardless of which side is the
+                // literal. The literal variable is pinned to its default (not
+                // the common type): the value keeps its own class and only the
+                // RESULT is the common type, exactly like two typed operands.
+                let (pa, pb) = (
+                    self.lit_default(&ra).unwrap_or_else(|| ra.clone()),
+                    self.lit_default(&rb).unwrap_or_else(|| rb.clone()),
+                );
+                match prepoly_hir::common_numeric_type(&pa, &pb) {
+                    Some(common) => {
+                        if self.lit_default(&ra).is_some() {
+                            self.unify(&ta, &pa, a.span());
+                        }
+                        if self.lit_default(&rb).is_some() {
+                            self.unify(&tb, &pb, b.span());
+                        }
+                        common
+                    }
                     None => {
                         self.unify(&ta, &tb, span);
                         ta

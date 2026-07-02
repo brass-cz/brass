@@ -653,6 +653,16 @@ impl<'a, 'p> FnLower<'a, 'p> {
                 self.pad_trailing_nullable(name, &mut ops);
                 return Rvalue::Call(Callee::Free(symbol), ops);
             }
+            // A module GLOBAL holding a closure/function value is called
+            // indirectly, exactly like a local: `let inc = (n: int32) -> n + 1`
+            // at top level, then `inc(1)` anywhere in the module.
+            if self.ctx.is_global_name(&self.module, name) {
+                let g = self
+                    .b
+                    .emit(Rvalue::Global(self.ctx.global_symbol(&self.module, name)));
+                let ops = self.lower_args(args);
+                return Rvalue::Call(Callee::Indirect(g), ops);
+            }
             // Otherwise it is a runtime builtin.
             let ops = self.lower_args(args);
             return Rvalue::Call(Callee::Builtin(name.clone()), ops);

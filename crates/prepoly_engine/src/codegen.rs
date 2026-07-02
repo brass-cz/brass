@@ -1303,7 +1303,17 @@ pub trait Codegen {
                 }
                 // `with([c1, c2], f)` acquires every cown in the array (in a
                 // deadlock-free order); `with(obj, f)` acquires the single cown.
-                let multi = matches!(obj_ty, Type::Slice(_) | Type::Array(..));
+                // The multi form applies ONLY to arrays of records -- the shape
+                // the explicit group syntax produces. Any other array shared
+                // with a task (an `int32[]` or `string[]` capture the
+                // auto-acquire pass wrapped) is itself the single cown:
+                // element-locking would chase raw scalars as object pointers
+                // (a crash), and a push's realloc would change the element set
+                // between lock and unlock.
+                let multi = match unwrap_nullable(&obj_ty) {
+                    Type::Slice(e) | Type::Array(e, _) => matches!(**e, Type::Record(_)),
+                    _ => false,
+                };
                 // A single-cown `with` opens a region with the guarded object as
                 // its bridge; closedness is verified on release.
                 // The lock (data-race-freedom) is kept around the region: acquire it

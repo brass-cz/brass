@@ -110,6 +110,25 @@ impl<'p> ProgramCtx<'p> {
     /// (`INT64_MAX` and friends are visible without an import); an unresolved
     /// name keys under the referencing module (the checker rejects genuinely
     /// unknown names).
+    /// Whether `name` resolves to a module-level global visible from `module`
+    /// (its own, an import origin's, or a stdlib prelude global) -- the same
+    /// resolution [`Self::global_symbol`] keys storage by.
+    fn is_global_name(&self, module: &[String], name: &str) -> bool {
+        let defines = |m: &[String]| {
+            self.module_globals
+                .get(m)
+                .is_some_and(|names| names.contains(name))
+        };
+        defines(module)
+            || self
+                .program
+                .import_origins
+                .get(module)
+                .and_then(|o| o.get(name))
+                .is_some_and(|origin| defines(origin))
+            || self.prelude_globals.contains_key(name)
+    }
+
     fn global_symbol(&self, module: &[String], name: &str) -> String {
         let defines = |m: &[String]| {
             self.module_globals

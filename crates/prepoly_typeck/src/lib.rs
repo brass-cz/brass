@@ -2637,9 +2637,12 @@ mod tests {
                 .any(|m| m.contains("cannot use `void` where `int32` is required")),
             "{e:?}"
         );
+        // Without the stdlib, `input` falls back to the same `string!` the real
+        // definition infers.
         assert!(
-            e.iter()
-                .any(|m| m.contains("cannot use `string` where `int32` is required")),
+            e.iter().any(
+                |m| m.contains("cannot use `Result<string, string>` where `int32` is required")
+            ),
             "{e:?}"
         );
     }
@@ -2657,8 +2660,16 @@ mod tests {
 
     #[test]
     fn runtime_input_builtin_is_typed_as_string() {
-        let e = errs("fun main() {\n    let s: string = input()\n}\n");
+        // `input` reads a line fallibly: its type is `string!`, so the bare
+        // value binds only after `!` (or a `match`).
+        let e = errs("fun main() {\n    let s: string = input()!\n}\n");
         assert!(e.is_empty(), "{e:?}");
+        let bare = errs("fun main() {\n    let s: string = input()\n}\n");
+        assert!(
+            bare.iter()
+                .any(|m| m.contains("cannot use `Result<string, string>` where `string` is required")),
+            "{bare:?}"
+        );
     }
 
     #[test]

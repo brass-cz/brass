@@ -931,6 +931,23 @@ impl<'a> Checker<'a> {
                     self.fixed_array_binding = false;
                     t
                 };
+                // Binding a NAME to a `void` value is a mistake with no
+                // representable value behind it -- classically a block-bodied
+                // closure that forgot `return`, whose call site would otherwise
+                // fail much later with an opaque unsupported-construct error.
+                // A wildcard (`let _ = f()`) still discards a void result.
+                if let Pattern::Binding(name, span) = pat
+                    && matches!(self.resolve(&binding_ty), Type::Void)
+                {
+                    self.errors.push(TypeError {
+                        message: format!(
+                            "cannot bind `{name}` to a `void` value (a block-bodied \
+                             closure or function returns `void` without an explicit \
+                             `return`)"
+                        ),
+                        span: *span,
+                    });
+                }
                 self.check_pattern_against(&binding_ty, pat);
                 self.bind_pattern(pat, &binding_ty, scopes);
                 if *is_const {
@@ -1455,10 +1472,22 @@ impl<'a> Checker<'a> {
                 self.const_scopes.push(HashSet::new());
                 self.return_contexts.push(ReturnContext::Inferred);
                 self.return_values.push(Vec::new());
-                let ret = self.check_expr(body, &mut closure_scopes);
-                self.return_values.pop();
+                let body_val = self.check_expr(body, &mut closure_scopes);
+                let collected = self.return_values.pop().unwrap_or_default();
                 self.return_contexts.pop();
                 self.const_scopes.pop();
+                // A BLOCK body yields only what it `return`s (void without one),
+                // matching the back ends -- its trailing expression is not the
+                // value. Any other body form is a single expression whose value
+                // is the implicit return. (Previously inverted on both counts:
+                // the trailing expression typed a block closure's result and an
+                // explicit `return` typed it void.)
+                let ret = if matches!(&**body, Expr::Block(..)) {
+                    self.reconcile_return_types(&collected, false)
+                        .unwrap_or(Type::Void)
+                } else {
+                    body_val
+                };
                 let ret = self.wrap_inferred_fallible_return(ret, &propagated_errors);
                 // Reuse the parameter types from the scope the body was checked
                 // against, so an unannotated parameter's inference variable is

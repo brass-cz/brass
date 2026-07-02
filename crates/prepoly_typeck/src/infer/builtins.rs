@@ -45,12 +45,16 @@ impl<'a> Checker<'a> {
             });
             return Some(Type::Void);
         }
-        if name == "input" {
+        if name == "input" && self.lookup_function("input").is_none() {
+            // The stdlib defines the real `input` (an inferred-fallible
+            // `string!`); resolution above prefers it. This fallback keeps the
+            // same static type when no stdlib is loaded, so the checker never
+            // hands out an unconstrained unknown for the name.
             self.check_arg_count("input", 0, args.len(), span);
             args.iter().for_each(|a| {
                 self.check_expr(&a.expr, scopes);
             });
-            return Some(Type::Str);
+            return Some(Type::result(Type::Str, Type::Str));
         }
         if let Some(ret) = self.array_builtin_type(name, args, span, scopes) {
             return Some(ret);
@@ -278,9 +282,9 @@ impl<'a> Checker<'a> {
     pub(super) fn builtin_function_type_light(&self, name: &str) -> Option<Type> {
         match name {
             "open" => Some(Type::result(self.type_by_name("File"), Type::Str)),
+            "input" => Some(Type::result(Type::Str, Type::Str)),
             "len" => Some(Type::Int(IntKind::I64)),
             "print" | "println" | "assert" => Some(Type::Void),
-            "input" => Some(Type::Str),
             "_string_concat" | "_string_slice" | "_string_char_at" => Some(Type::Str),
             "_string_bytes" => Some(Type::Slice(Box::new(Type::Int(IntKind::U8)))),
             "_string_from_bytes" => Some(Type::result(Type::Str, Type::Str)),

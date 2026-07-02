@@ -424,10 +424,14 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
     fn new(mir: &'m MirProgram, program: &'p Program) -> Self {
         let mut by_method: HashMap<(&str, &str), &MirMethod> = HashMap::new();
         for m in &mir.methods {
-            // Record methods only for now (sum-variant methods are out of scope).
-            if m.variant.is_none() {
-                by_method.insert((m.type_symbol.as_str(), m.method.as_str()), m);
-            }
+            // Record methods carry no variant. A whole-sum method (`fun Sum.m`)
+            // is duplicated into every variant by HIR lowering, so any one copy
+            // stands for the method; the checker requires a method called on a
+            // bare sum value to be common to (and signature-consistent across)
+            // all variants, so first-copy-wins is the whole-sum dispatch.
+            by_method
+                .entry((m.type_symbol.as_str(), m.method.as_str()))
+                .or_insert(m);
         }
         Monomorphizer {
             program,
@@ -1211,8 +1215,8 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         {
             return Ok(Some(ret));
         }
-        // A genuine record method takes priority.
-        if let Type::Record(n) = &arg_types[0]
+        // A genuine record or whole-sum method takes priority.
+        if let Type::Record(n) | Type::Sum(n) = &arg_types[0]
             && let Some(info) = self.program.type_by_id(n.id)
         {
             let type_symbol = info.symbol.clone();
@@ -2097,15 +2101,13 @@ fn aggregate_field_type(ty: &Type, field: &str) -> Option<Type> {
 
 fn method_ret_annotation(program: &Program, type_symbol: &str, method: &str) -> Option<Type> {
     let info = program.types.get(type_symbol)?;
-    let TypeKind::Record { methods, .. } = &info.kind else {
-        return None;
+    let m = match &info.kind {
+        TypeKind::Record { methods, .. } => methods.get(method)?,
+        // A whole-sum method lives (duplicated) in the variants' tables; the
+        // checker keeps the signatures consistent, so the first is canonical.
+        TypeKind::Sum { variants } => variants.iter().find_map(|v| v.methods.get(method))?,
     };
-    methods
-        .get(method)?
-        .signature
-        .ret_ty
-        .clone()
-        .filter(is_supported)
+    m.signature.ret_ty.clone().filter(is_supported)
 }
 
 pub fn is_comparison(op: BinOp) -> bool {

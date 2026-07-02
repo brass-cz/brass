@@ -19,8 +19,9 @@ with `prepoly check file.pp`.
 ## Mental model
 
 - Most types are inferred; annotations are optional and used to constrain.
-- An integer literal defaults to `int32`; a decimal literal defaults to
-  `float64`. `len()` returns `int64`.
+- An integer literal defaults to `int32` (`int64` when the value does not fit
+  in 32 bits); a decimal literal defaults to `float64`. `len()` returns
+  `int64`.
 - Records and arrays have reference semantics; mutating through one binding is
   visible through every binding that shares the object.
 - There are no explicit generic type parameters. Polymorphism comes from type
@@ -63,7 +64,9 @@ fun area(s: Shape) -> float64 {   // optional param and return annotations
 
 - A function with no explicit return type has its return type inferred.
 - `void` is the no-value return type.
-- Top-level statements run in dependency order; `main` is called last if defined.
+- Top-level statements run top to bottom (functions and types may be used
+  before their definitions; a top-level BINDING may not); `main` is called last
+  if defined.
 
 ### References and mutability
 
@@ -259,9 +262,10 @@ let s = string.from(42)
 let b = uint8.from(300)               // Err: out of range -> match or `!`
 ```
 
-String offsets are UTF-8 byte offsets: `len`, slicing, and `find` agree on byte
-positions. Direct `s[i]` string indexing is not part of the supported runtime
-surface; use `s.chars()` when you need one-character strings.
+String offsets are UTF-8 byte offsets: `len` and `find` agree on byte
+positions. There is no string slicing on the surface, and direct `s[i]` string
+indexing is not part of the supported runtime surface; use `s.chars()` when you
+need one-character strings, or `split`/`find`/`replace` for substring work.
 
 ## Collections and operators
 
@@ -314,13 +318,18 @@ import geometry.vec.{ Vec2, dot }
 
 ## Standard library (implicit prelude, no import needed)
 
-- IO: `print`, `println`, `input`, `read_file(path) -> string!`,
+- IO: `print`, `println`, `input() -> string!` (one line, without the trailing
+  newline; unwrap with `!` or `match`), `read_file(path) -> string!`,
   `write_file(path, content) -> void!`. Lower-level: `open`, `File.stdin/stdout`.
 - Arrays: `map`, `filter`, `fold`, `each`, `slice(start, end)`, `reverse`,
   `contains`, `sort`, `len`, `push`.
 - Strings: `split`, `join`, `trim`, `starts_with`, `ends_with`, `find`,
   `replace`, `chars`, `to_upper`, `to_lower`, `len`.
 - Math: `abs`, `min`, `max`, `sqrt`, `floor`, `ceil`, `pow`.
+- Numeric limits: `INT32_MAX`, `INT32_MIN`, `INT64_MAX`, `INT64_MIN`.
+  Free-function conversion aliases also exist (`int32_parse`, `int32_from`,
+  `float64_parse`, `float64_from`, `string_from`), equivalent to the method
+  forms above.
 - Collections: `HashMap` (open-addressing hash map). `let m = HashMap.new()` takes
   no arguments; the key/value types are inferred from the first `set` (so
   `let m = HashMap.new(); m.set("a", 1)` is a `string -> int32` map). Methods:
@@ -347,9 +356,8 @@ of `main`, so insert `sync()` before a read that may race ahead.
   and function parameters still enforce their declared type. Use
   `float64.from(...)` / `int32.from(...)` when storing or passing a converted
   value explicitly.
-- `len()` returns `int64`. A range like `[0..len(xs)]` does not make the `0`
-  literal an `int64`; write `let start: int64 = 0` first, or prefer
-  `for x in xs`.
+- `len()` returns `int64`; implicit int widening covers the common cases
+  (`[0..len(xs)]` works without an annotation).
 - Use `==` for equality, not `=`.
 - A nullable (`T?`) value cannot be used until narrowed by an `if` guard.
 - Match `Result` with the field names `Ok { value }` / `Err { error }`.

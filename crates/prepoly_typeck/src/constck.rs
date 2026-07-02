@@ -380,7 +380,11 @@ impl ConstChecker<'_> {
             if param_permits_mutation(p) || param_is_immutable_ref(p) {
                 continue;
             }
-            if !mutates_root(body, &p.name) {
+            // Rebinding is checked separately from member mutation:
+            // `mutates_root` deliberately ignores a bare `a = v` (rebinding a
+            // private copy never reaches the caller, so it forces no copy), but
+            // an `infer` parameter is READ-ONLY as a binding too.
+            if !mutates_root(body, &p.name) && !rebinds(body, &p.name) {
                 continue;
             }
             self.errors.push(TypeError {
@@ -692,4 +696,44 @@ fn param_scope(params: &[prepoly_hir::ParamInfo], is_method: bool) -> HashMap<St
 /// duplicate error.
 fn param_permits_mutation(p: &ParamInfo) -> bool {
     !param_is_infer(p) && !param_is_immutable_ref(p)
+}
+
+/// Whether `block` (or any nested statement block) REBINDS `name` with a bare
+/// `name = value` assignment. Distinct from `mutates_root`: a rebind of a
+/// private copy never reaches the caller, so it forces no copy -- but a
+/// read-only (`infer`) binding forbids it all the same. Shadowing `let`s are
+/// not rebinding and closures rebind their own capture, so neither is counted.
+fn rebinds(block: &Block, name: &str) -> bool {
+    fn in_stmt(stmt: &Stmt, name: &str) -> bool {
+        match stmt {
+            Stmt::Assign {
+                target: Expr::Ident(n, _),
+                ..
+            } if n == name => true,
+            Stmt::While { body, .. } | Stmt::For { body, .. } => {
+                body.stmts.iter().any(|s| in_stmt(s, name))
+            }
+            Stmt::Expr(e) | Stmt::Return(Some(e), _) | Stmt::Assign { value: e, .. } => {
+                in_expr(e, name)
+            }
+            Stmt::Let { value, .. } => in_expr(value, name),
+            _ => false,
+        }
+    }
+    fn in_expr(e: &Expr, name: &str) -> bool {
+        match e {
+            Expr::If(_, then, els, _) => {
+                then.stmts.iter().any(|s| in_stmt(s, name))
+                    || els.as_deref().is_some_and(|e| in_expr(e, name))
+            }
+            Expr::IfLet(_, _, then, els, _) => {
+                then.stmts.iter().any(|s| in_stmt(s, name))
+                    || els.as_deref().is_some_and(|e| in_expr(e, name))
+            }
+            Expr::Match(_, arms, _) => arms.iter().any(|a| in_expr(&a.body, name)),
+            Expr::Block(b, _) => b.stmts.iter().any(|s| in_stmt(s, name)),
+            _ => false,
+        }
+    }
+    block.stmts.iter().any(|s| in_stmt(s, name))
 }
