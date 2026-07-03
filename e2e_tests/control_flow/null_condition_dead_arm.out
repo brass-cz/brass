@@ -2,5 +2,5 @@ Result.Ok {
     value: 4,
 }
 Result.Err {
-    error: null,
+    error: "null",
 }

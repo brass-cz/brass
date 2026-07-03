@@ -1,5 +1,5 @@
 Alice: 150
 Account {
-    owner: Alice,
+    owner: "Alice",
     balance: 150,
 }

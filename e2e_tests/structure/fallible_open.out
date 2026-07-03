@@ -1,9 +1,9 @@
 Result.Ok {
-    value: Asimov,
+    value: "Asimov",
 }
 Result.Ok {
-    value: no name,
+    value: "no name",
 }
 Result.Ok {
-    value: no name,
+    value: "no name",
 }

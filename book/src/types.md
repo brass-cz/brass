@@ -212,8 +212,8 @@ Executing this shows the following output:
 ```
 1001 (Master 1): Isac Newton
 Student {
-    first_name: Isac,
-    last_name: Newton,
+    first_name: "Isac",
+    last_name: "Newton",
     id: 1001,
     program: DegreeProgram.Master {
         year: 1,

@@ -1,9 +1,9 @@
 Result.Ok {
     value: Person {
-        first_name: a,
-        last_name: b,
+        first_name: "a",
+        last_name: "b",
     },
 }
 Result.Err {
-    error: type mismatch!,
+    error: "type mismatch!",
 }

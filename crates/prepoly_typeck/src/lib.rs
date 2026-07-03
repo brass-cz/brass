@@ -2667,7 +2667,8 @@ mod tests {
         let bare = errs("fun main() {\n    let s: string = input()\n}\n");
         assert!(
             bare.iter()
-                .any(|m| m.contains("cannot use `Result<string, string>` where `string` is required")),
+                .any(|m| m
+                    .contains("cannot use `Result<string, string>` where `string` is required")),
             "{bare:?}"
         );
     }

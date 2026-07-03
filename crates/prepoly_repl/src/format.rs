@@ -148,7 +148,19 @@ fn render_named_fields(
     for (fname, fty) in fields {
         let fv = values.get(fname).cloned().unwrap_or(Value::Void);
         let rendered = format_value_at(program, &fv, fty, depth + 1)?.replace('\n', "\n    ");
-        out.push_str(&format!("    {fname}: {rendered},\n"));
+        // A string-typed field value renders QUOTED (a present nullable string
+        // too; `null` stays bare), so the struct output distinguishes the
+        // string "1" from the number 1 -- mirroring the JIT renderer.
+        let quoted = match fty {
+            Type::Str => true,
+            Type::Nullable(inner) if matches!(**inner, Type::Str) => !fv.is_null(),
+            _ => false,
+        };
+        if quoted {
+            out.push_str(&format!("    {fname}: \"{rendered}\",\n"));
+        } else {
+            out.push_str(&format!("    {fname}: {rendered},\n"));
+        }
     }
     out.push('}');
     Ok(out)

@@ -1,4 +1,4 @@
 test
 JsonValue.String {
-    value: test,
+    value: "test",
 }

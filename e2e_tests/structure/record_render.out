@@ -1,6 +1,6 @@
 Student {
-    first_name: Isac,
-    last_name: Newton,
+    first_name: "Isac",
+    last_name: "Newton",
     id: 1001,
     program: Program.Master {
         year: 1,

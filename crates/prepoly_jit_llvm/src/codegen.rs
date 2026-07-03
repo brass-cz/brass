@@ -1921,7 +1921,18 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         }
         let mut acc = self.const_str(&format!("{header} {{\n"));
         for (fname, fty, offset) in fields {
-            let prefix = self.const_str(&format!("    {fname}: "));
+            // A string-typed field value renders QUOTED, so the struct output
+            // distinguishes the string "1" from the number 1 (and shows empty
+            // strings at all). A plain string field bakes the quotes into the
+            // constant prefix/suffix; a nullable string quotes only when the
+            // value is present (`null` stays bare).
+            let is_str = matches!(fty, Type::Str);
+            let is_opt_str = matches!(fty, Type::Nullable(inner) if matches!(**inner, Type::Str));
+            let prefix = if is_str {
+                self.const_str(&format!("    {fname}: \""))
+            } else {
+                self.const_str(&format!("    {fname}: "))
+            };
             acc = self.str_concat2(acc, prefix);
             let llty = self.abi.typed_basic(fty);
             let fp = self.field_ptr(obj, *offset);
@@ -1929,9 +1940,37 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             // Indent the field's rendering one level so a nested record/sum (which
             // is itself multi-line) sits under its label with deeper indentation.
             let fs = self.to_string(fv, fty);
-            let fs = self.str_indent(fs);
+            let mut fs = self.str_indent(fs);
+            if is_opt_str {
+                let f = self.cur_fn.unwrap();
+                let ptrt = self.abi.ptr();
+                let slot = self.builder.build_alloca(ptrt, "optstr").unwrap();
+                self.builder.build_store(slot, fs).unwrap();
+                let quote_bb = self.ctx.append_basic_block(f, "fld_quote");
+                let done_bb = self.ctx.append_basic_block(f, "fld_done");
+                let is_null = self
+                    .builder
+                    .build_is_null(fv.into_pointer_value(), "fldnull")
+                    .unwrap();
+                self.builder
+                    .build_conditional_branch(is_null, done_bb, quote_bb)
+                    .unwrap();
+                self.builder.position_at_end(quote_bb);
+                let open = self.const_str("\"");
+                let close = self.const_str("\"");
+                let quoted = self.str_concat2(open, fs);
+                let quoted = self.str_concat2(quoted, close);
+                self.builder.build_store(slot, quoted).unwrap();
+                self.builder.build_unconditional_branch(done_bb).unwrap();
+                self.builder.position_at_end(done_bb);
+                fs = self.builder.build_load(ptrt, slot, "optstr_v").unwrap();
+            }
             acc = self.str_concat2(acc, fs);
-            let comma = self.const_str(",\n");
+            let comma = if is_str {
+                self.const_str("\",\n")
+            } else {
+                self.const_str(",\n")
+            };
             acc = self.str_concat2(acc, comma);
         }
         let close = self.const_str("}");
