@@ -2328,88 +2328,8 @@ impl<'a> Checker<'a> {
                 return ret;
             }
             if let Some(methods) = self.methods_for_type(&recv_ty, method) {
-                self.check_common_method_signatures(&methods, method, span);
-                let first_signature = &methods[0].signature;
-                let skip_self = first_signature
-                    .params
-                    .first()
-                    .is_some_and(|p| p.name == "self");
-                // A method without a `self` parameter is static and must be
-                // called as `Type.method(..)`, not through an instance.
-                if !skip_self {
-                    self.errors.push(TypeError {
-                        message: format!(
-                            "`{method}` is a static method; call it as `Type.{method}(...)`"
-                        ),
-                        span,
-                    });
-                }
-                let signature_params: Vec<ParamInfo> = if skip_self {
-                    first_signature.params[1..].to_vec()
-                } else {
-                    first_signature.params.clone()
-                };
-                self.check_arg_count(method, signature_params.len(), args.len(), span);
-                let arg_types = self.check_signature_args_collect(&signature_params, args, scopes);
-                // A method defined in another module (e.g. the stdlib) is checked by
-                // re-elaborating its body with this call's concrete types. When the
-                // call's argument types are inconsistent with the receiver's
-                // instance -- `map.get(1)` on a `string`-keyed map -- the clash
-                // surfaces inside that body, at a span the caller cannot see (and the
-                // LSP cannot show). Re-attribute such body errors to this call site,
-                // so the inconsistency is reported where it originates.
-                let foreign_method = self
-                    .program
-                    .types
-                    .get(&methods[0].self_type)
-                    .is_some_and(|t| t.module != self.current_module);
-                let before = self.errors.len();
-                let mut returns = Vec::with_capacity(methods.len());
-                for resolved in methods {
-                    let declared_ret = resolved.signature.ret_ty.clone();
-                    let fallback_ret = declared_ret
-                        .clone()
-                        .or_else(|| {
-                            self.method_returns
-                                .get(&(resolved.qualifier.clone(), method.to_string()))
-                                .cloned()
-                        })
-                        .unwrap_or(Type::Void);
-                    returns.push(self.instantiate_method_call(MethodCall {
-                        owner: &resolved.qualifier,
-                        self_type: &resolved.self_type,
-                        name: method,
-                        method: &resolved.method,
-                        signature_params: &resolved.signature.params,
-                        receiver_ty: if skip_self {
-                            Some(recv_ty.clone())
-                        } else {
-                            None
-                        },
-                        declared_ret,
-                        fallback_ret,
-                        arg_types: &arg_types,
-                    }));
-                }
-                if foreign_method && self.errors.len() > before {
-                    self.reattribute_errors_to_call(before, method, span);
-                }
-                // The method body ran conceptually: undo narrowings it may have
-                // invalidated (see `invalidate_narrowed_after_call`).
-                self.invalidate_narrowed_after_call(scopes);
-                // Type the call's result by instantiating the method's scheme
-                // against the receiver instance (schemes are built before the
-                // function bodies that call them). The re-elaboration above still
-                // ran for its conflict checks -- a key compared with `==` does not
-                // unify onto a scheme parameter, so a `map.get(1)` clash is caught
-                // there, not by the scheme. The re-elaborated return is the
-                // fallback when the scheme cannot resolve the result.
-                if let Some(ret) = self.scheme_method_return(&recv_ty, method) {
-                    return ret;
-                }
                 return self
-                    .common_type_list(&returns)
-                    .unwrap_or_else(|| self.fresh_unknown());
+                    .check_methods_call(methods, &recv_ty, method, args, span, None, scopes);
             }
             // A stdlib method on a primitive/array receiver (`fun string.split`,
             // `fun infer[].map`): dispatched by the receiver's class. There is no
@@ -2447,6 +2367,74 @@ impl<'a> Checker<'a> {
                         self.check_expr(&a.expr, scopes);
                     }
                     return self.fresh_unknown();
+                }
+                // A STRUCTURAL (anonymous) receiver resolves a method by
+                // satisfaction: the unique in-scope record type declaring the
+                // method whose fields the value provides dispatches without an
+                // annotation. Several satisfied candidates are ambiguous, and a
+                // near-miss (the method exists but the value lacks a field) is
+                // reported AT THE VALUE with the missing constraint -- the
+                // callee's requirements are known here.
+                if record.id == prepoly_hir::STRUCTURAL_RECORD_ID {
+                    let candidates = self.structural_method_candidates(record, method);
+                    match candidates.as_slice() {
+                        [(_, symbol)] => {
+                            let nominal = self
+                                .program
+                                .types
+                                .get(symbol)
+                                .map(|info| info.type_ref())
+                                .unwrap_or_else(|| Type::Record(record.clone()));
+                            if let Some(methods) = self.methods_for_type(&nominal, method) {
+                                let methods = methods
+                                    .into_iter()
+                                    .map(|m| {
+                                        apply_method_substitution(m, &record.substitution, method)
+                                    })
+                                    .collect();
+                                return self.check_methods_call(
+                                    methods,
+                                    &recv_ty,
+                                    method,
+                                    args,
+                                    span,
+                                    Some(base.span()),
+                                    scopes,
+                                );
+                            }
+                        }
+                        [] => {
+                            // Name a near-miss when one exists: which in-scope
+                            // type declares the method, and which fields the
+                            // value is missing for it.
+                            if let Some(msg) = self.structural_near_miss(record, method) {
+                                self.errors.push(TypeError {
+                                    message: msg,
+                                    span: base.span(),
+                                });
+                                for a in args {
+                                    self.check_expr(&a.expr, scopes);
+                                }
+                                return self.fresh_unknown();
+                            }
+                        }
+                        many => {
+                            let names: Vec<&str> = many.iter().map(|(n, _)| n.as_str()).collect();
+                            self.errors.push(TypeError {
+                                message: format!(
+                                    "ambiguous method call: the anonymous structure \
+                                     satisfies `{}`, which all declare `{method}`; \
+                                     annotate the value with one of them",
+                                    names.join("`, `")
+                                ),
+                                span: base.span(),
+                            });
+                            for a in args {
+                                self.check_expr(&a.expr, scopes);
+                            }
+                            return self.fresh_unknown();
+                        }
+                    }
                 }
                 self.errors.push(TypeError {
                     message: format!("`{record}` has no method `{method}`"),
@@ -2588,6 +2576,192 @@ impl<'a> Checker<'a> {
     /// Given a resolved callee type, check argument compatibility for `Fun`
     /// types and yield the call's result type. Each argument is checked exactly
     /// once here.
+    /// Type a resolved method call (the shared tail of nominal and structural
+    /// method resolution): check the signature/arity/arguments, re-elaborate
+    /// each candidate body, and produce the call's result type. Body errors are
+    /// re-attributed to `reattribute_to` when given (a structural receiver's
+    /// value span), else to the call site for a foreign-module method.
+    #[allow(clippy::too_many_arguments)]
+    fn check_methods_call(
+        &mut self,
+        methods: Vec<ResolvedMethod>,
+        recv_ty: &Type,
+        method: &str,
+        args: &[Arg],
+        span: prepoly_lexer::Span,
+        reattribute_to: Option<prepoly_lexer::Span>,
+        scopes: &mut ScopeStack,
+    ) -> Type {
+        self.check_common_method_signatures(&methods, method, span);
+        let first_signature = &methods[0].signature;
+        let skip_self = first_signature
+            .params
+            .first()
+            .is_some_and(|p| p.name == "self");
+        // A method without a `self` parameter is static and must be
+        // called as `Type.method(..)`, not through an instance.
+        if !skip_self {
+            self.errors.push(TypeError {
+                message: format!("`{method}` is a static method; call it as `Type.{method}(...)`"),
+                span,
+            });
+        }
+        let signature_params: Vec<ParamInfo> = if skip_self {
+            first_signature.params[1..].to_vec()
+        } else {
+            first_signature.params.clone()
+        };
+        self.check_arg_count(method, signature_params.len(), args.len(), span);
+        let arg_types = self.check_signature_args_collect(&signature_params, args, scopes);
+        // A method defined in another module (e.g. the stdlib) is checked by
+        // re-elaborating its body with this call's concrete types. When the
+        // call's argument types are inconsistent with the receiver's
+        // instance -- `map.get(1)` on a `string`-keyed map -- the clash
+        // surfaces inside that body, at a span the caller cannot see (and the
+        // LSP cannot show). Re-attribute such body errors to this call site,
+        // so the inconsistency is reported where it originates.
+        let foreign_method = self
+            .program
+            .types
+            .get(&methods[0].self_type)
+            .is_some_and(|t| t.module != self.current_module);
+        let before = self.errors.len();
+        let mut returns = Vec::with_capacity(methods.len());
+        for resolved in methods {
+            let declared_ret = resolved.signature.ret_ty.clone();
+            let fallback_ret = declared_ret
+                .clone()
+                .or_else(|| {
+                    self.method_returns
+                        .get(&(resolved.qualifier.clone(), method.to_string()))
+                        .cloned()
+                })
+                .unwrap_or(Type::Void);
+            returns.push(self.instantiate_method_call(MethodCall {
+                owner: &resolved.qualifier,
+                self_type: &resolved.self_type,
+                name: method,
+                method: &resolved.method,
+                signature_params: &resolved.signature.params,
+                receiver_ty: if skip_self {
+                    Some(recv_ty.clone())
+                } else {
+                    None
+                },
+                declared_ret,
+                fallback_ret,
+                arg_types: &arg_types,
+            }));
+        }
+        if self.errors.len() > before {
+            if let Some(value_span) = reattribute_to {
+                self.reattribute_errors_to_call(before, method, value_span);
+            } else if foreign_method {
+                self.reattribute_errors_to_call(before, method, span);
+            }
+        }
+        // The method body ran conceptually: undo narrowings it may have
+        // invalidated (see `invalidate_narrowed_after_call`).
+        self.invalidate_narrowed_after_call(scopes);
+        // Type the call's result by instantiating the method's scheme
+        // against the receiver instance (schemes are built before the
+        // function bodies that call them). The re-elaboration above still
+        // ran for its conflict checks -- a key compared with `==` does not
+        // unify onto a scheme parameter, so a `map.get(1)` clash is caught
+        // there, not by the scheme. The re-elaborated return is the
+        // fallback when the scheme cannot resolve the result.
+        if let Some(ret) = self.scheme_method_return(recv_ty, method) {
+            return ret;
+        }
+        self.common_type_list(&returns)
+            .unwrap_or_else(|| self.fresh_unknown())
+    }
+
+    /// The in-scope record types that declare method `method` AND whose declared
+    /// fields the structural (anonymous) instance `record` satisfies, sorted by
+    /// name for deterministic diagnostics. "In scope" means the type's bare name
+    /// resolves from the current module to that type.
+    fn structural_method_candidates(
+        &mut self,
+        record: &NominalType,
+        method: &str,
+    ) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let infos: Vec<(String, String)> = self
+            .program
+            .types
+            .values()
+            .filter_map(|info| {
+                let TypeKind::Record { methods, .. } = &info.kind else {
+                    return None;
+                };
+                if !methods.contains_key(method) {
+                    return None;
+                }
+                Some((info.name.clone(), info.symbol.clone()))
+            })
+            .collect();
+        for (name, symbol) in infos {
+            if self.resolve_type_symbol(&name).as_deref() != Some(symbol.as_str()) {
+                continue;
+            }
+            let Some(info) = self.program.types.get(&symbol) else {
+                continue;
+            };
+            let sup = info.type_ref();
+            let Type::Record(sup_n) = &sup else { continue };
+            if crate::structural::record_satisfies_fields(self.program, record, sup_n).is_empty() {
+                out.push((name, symbol));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// A near-miss explanation for a failed structural method resolution: the
+    /// in-scope record types that declare `method` but whose fields the value
+    /// does NOT satisfy, with the unsatisfied members. `None` when no in-scope
+    /// type declares the method at all (the plain has-no-method error reads
+    /// better then).
+    fn structural_near_miss(&mut self, record: &NominalType, method: &str) -> Option<String> {
+        let infos: Vec<(String, String)> = self
+            .program
+            .types
+            .values()
+            .filter_map(|info| {
+                let TypeKind::Record { methods, .. } = &info.kind else {
+                    return None;
+                };
+                if !methods.contains_key(method) {
+                    return None;
+                }
+                Some((info.name.clone(), info.symbol.clone()))
+            })
+            .collect();
+        let mut misses: Vec<String> = Vec::new();
+        for (name, symbol) in infos {
+            if self.resolve_type_symbol(&name).as_deref() != Some(symbol.as_str()) {
+                continue;
+            }
+            let info = self.program.types.get(&symbol)?;
+            let sup = info.type_ref();
+            let Type::Record(sup_n) = &sup else { continue };
+            let issues = crate::structural::record_satisfies_fields(self.program, record, sup_n);
+            if !issues.is_empty() {
+                misses.push(format!("`{name}` (unsatisfied: {})", issues.join(", ")));
+            }
+        }
+        misses.sort();
+        if misses.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "the anonymous structure does not satisfy any in-scope type declaring \
+             `{method}`: {}",
+            misses.join("; ")
+        ))
+    }
+
     /// The stored type of record field `name` on instance `record`, if the field
     /// exists: the instance substitution (an inferred field pinned at
     /// construction) wins over the declaration's annotation. `None` when the

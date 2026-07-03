@@ -1,0 +1,1 @@
+ambiguous method call: the anonymous structure satisfies `Person`, `Robot`, which all declare `display`; annotate the value with one of them

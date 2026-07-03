@@ -1,0 +1,1 @@
+the anonymous structure does not satisfy any in-scope type declaring `display`: `Person` (unsatisfied: field `age`)

@@ -228,9 +228,15 @@ if x { println("first even {x}") }    // x is int32 inside the guard
 
 ## Anonymous records and structural conversion
 
-`{ field: value, ... }` is an anonymous structural record. For a record type
-`T`, `T.from(v)` yields `T?`: the record value when `v` structurally has all of
-`T`'s fields (decided at that call site), else `null`. Pair it with `if let`:
+`{ field: value, ... }` is an anonymous structural record. Calling a method on
+it resolves structurally: if exactly ONE in-scope record type declares that
+method and the value satisfies its fields, that type's method dispatches with
+no annotation (`{ name: "A" }.display()` runs `Person.display`). Several
+satisfying types make the call ambiguous (a compile error at the value asking
+for an annotation); a missing field is reported at the value with the
+unsatisfied constraint. For a record type `T`, `T.from(v)` yields `T?`: the
+record value when `v` structurally has all of `T`'s fields (decided at that
+call site), else `null`. Pair it with `if let`:
 
 ```
 fun get_name(obj) {

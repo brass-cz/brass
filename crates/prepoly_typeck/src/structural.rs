@@ -222,27 +222,7 @@ fn annotated_type_relates(
 /// so it is checked field by field instead of slipping through as compatible with
 /// everything. Returns the list of incompatible members.
 pub fn record_satisfies(program: &Program, sub: &NominalType, sup: &NominalType) -> Vec<String> {
-    let mut issues = Vec::new();
-    let have_fields = record_fields(program, sub);
-    for want in record_fields(program, sup) {
-        match have_fields.iter().find(|h| h.name == want.name) {
-            None => issues.push(format!("field `{}`", want.name)),
-            Some(have) => {
-                // Fields are mutable, so they are invariant: a covariant field
-                // would let writes through one alias install a value the other
-                // alias's type forbids.
-                if !annotated_type_invariant(
-                    program,
-                    have.annotated,
-                    have.ty.as_ref(),
-                    want.annotated,
-                    want.ty.as_ref(),
-                ) {
-                    issues.push(format!("field `{}`", want.name));
-                }
-            }
-        }
-    }
+    let mut issues = record_satisfies_fields(program, sub, sup);
     // Only a named record declares methods; a structural record requires and
     // provides none.
     if let Some(want_methods) = declared_methods(program, sup) {
@@ -265,6 +245,39 @@ pub fn record_satisfies(program: &Program, sub: &NominalType, sup: &NominalType)
             ?issues,
             "record does not structurally satisfy"
         );
+    }
+    issues
+}
+
+/// The FIELD half of [`record_satisfies`]: every field `sup` declares must be
+/// present on `sub` with an invariant type. Structural method resolution on an
+/// anonymous value uses this alone -- the value cannot carry methods, it is
+/// borrowing the candidate type's.
+pub fn record_satisfies_fields(
+    program: &Program,
+    sub: &NominalType,
+    sup: &NominalType,
+) -> Vec<String> {
+    let mut issues = Vec::new();
+    let have_fields = record_fields(program, sub);
+    for want in record_fields(program, sup) {
+        match have_fields.iter().find(|h| h.name == want.name) {
+            None => issues.push(format!("field `{}`", want.name)),
+            Some(have) => {
+                // Fields are mutable, so they are invariant: a covariant field
+                // would let writes through one alias install a value the other
+                // alias's type forbids.
+                if !annotated_type_invariant(
+                    program,
+                    have.annotated,
+                    have.ty.as_ref(),
+                    want.annotated,
+                    want.ty.as_ref(),
+                ) {
+                    issues.push(format!("field `{}`", want.name));
+                }
+            }
+        }
     }
     issues
 }

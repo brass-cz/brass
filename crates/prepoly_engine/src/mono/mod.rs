@@ -1231,6 +1231,49 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 );
             }
         }
+        // A STRUCTURAL (anonymous) receiver resolves a method by satisfaction:
+        // the record type declaring `name` whose declared fields the value
+        // provides. The checker has already enforced that exactly one
+        // module-visible candidate exists; candidates are scanned in sorted
+        // symbol order so the pick is deterministic here too.
+        if let Type::Record(n) = &arg_types[0]
+            && n.id == prepoly_hir::STRUCTURAL_RECORD_ID
+        {
+            let mut symbols: Vec<&String> = self
+                .program
+                .types
+                .values()
+                .filter_map(|info| {
+                    let TypeKind::Record { fields, methods } = &info.kind else {
+                        return None;
+                    };
+                    if !methods.contains_key(name) {
+                        return None;
+                    }
+                    let satisfied = fields.iter().all(|f| match n.substitution.get(&f.name) {
+                        None => false,
+                        Some(have) => match &f.resolved_ty {
+                            Some(decl) if prepoly_hir::is_fully_known(decl) => have == decl,
+                            _ => true,
+                        },
+                    });
+                    satisfied.then_some(&info.symbol)
+                })
+                .collect();
+            symbols.sort();
+            if let Some(&symbol) = symbols.first()
+                && let Some(&method) = self.by_method.get(&(symbol.as_str(), name))
+            {
+                let ret_ann = method_ret_annotation(self.program, symbol, name);
+                let target = method_symbol(name, &arg_types);
+                let body = &method.body;
+                let module = method.module.clone();
+                let fallible = method.fallible;
+                return self.resolve_callable(
+                    cur_sym, cur_ret, target, body, &module, arg_types, ret_ann, None, fallible,
+                );
+            }
+        }
         // A stdlib method on a primitive/array receiver (`fun string.split`,
         // `fun infer[].map`), dispatched by the receiver's class. Its body is an
         // ordinary function stored under a class-qualified symbol; instantiate it

@@ -310,7 +310,31 @@ println(get_name({ name: 1 }))        // no name
 ## `anonymous` structure
 
 Anonymous structure can be written as `{ field: value, ... }`.
-You can access its fields by null checking or type conversion using `T.from()`:
+
+When exactly one in-scope record type declares a method and the anonymous
+value satisfies that type's fields, the method is callable directly -- no
+annotation or conversion needed:
+
+```prepoly
+type Person = {
+    name: string
+}
+
+fun Person.display(self) {
+    println("I am {self.name}")
+}
+
+let someone = { name: "Asimov" }
+someone.display() // I am Asimov
+```
+
+If several in-scope types declare the method and are satisfied, the call is
+ambiguous and rejected at the value (annotate it with the intended type); a
+value missing a required field is likewise rejected at the value, naming the
+unsatisfied constraint.
+
+You can also access its fields by null checking or type conversion using
+`T.from()`:
 
 ```prepoly
 fun get_name(obj) {
