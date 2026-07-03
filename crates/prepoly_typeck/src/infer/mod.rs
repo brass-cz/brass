@@ -2284,6 +2284,7 @@ impl<'a> Checker<'a> {
                         entry.push(resolved_args);
                     }
                 }
+                let before = self.errors.len();
                 let ret = self.instantiate_function_call(
                     &symbol,
                     &module,
@@ -2293,6 +2294,33 @@ impl<'a> Checker<'a> {
                     fallback_ret,
                     &arg_types,
                 );
+                // A body re-elaboration failure caused by an ANONYMOUS argument
+                // is reported at the value, not inside the callee: the body
+                // states the parameter's constraints, the caller's value is
+                // where the mismatch lives. Only a single structural argument
+                // attributes unambiguously; other calls keep the body spans.
+                if self.errors.len() > before {
+                    let structural: Vec<usize> = arg_types
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, t)| {
+                            matches!(
+                                prepoly_hir::peel_modes(&self.resolve(t)),
+                                Type::Record(n) if n.id == prepoly_hir::STRUCTURAL_RECORD_ID
+                            )
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    if let [idx] = structural.as_slice()
+                        && let Some(arg) = args.get(*idx)
+                    {
+                        self.reattribute_errors(
+                            before,
+                            &format!("this value does not fit `{name}`'s parameter"),
+                            arg.expr.span(),
+                        );
+                    }
+                }
                 // User code ran conceptually: a narrowed global (or a local a
                 // closure of this body assigns) may have been re-nulled.
                 self.invalidate_narrowed_after_call(scopes);
@@ -3023,16 +3051,25 @@ impl<'a> Checker<'a> {
         method: &str,
         span: prepoly_lexer::Span,
     ) {
+        self.reattribute_errors(
+            before,
+            &format!("call to `{method}` here does not match the receiver's type"),
+            span,
+        );
+    }
+
+    /// Move the errors recorded past `before` onto `span`, prefixed with
+    /// `frame` (deduplicated -- one inconsistency can surface at several body
+    /// sites). Used to point a callee-body re-elaboration failure at the
+    /// caller's value instead of a span inside the callee.
+    fn reattribute_errors(&mut self, before: usize, frame: &str, span: prepoly_lexer::Span) {
         let mut seen: HashSet<String> = HashSet::new();
         let kept: Vec<TypeError> = self
             .errors
             .split_off(before)
             .into_iter()
             .filter_map(|e| {
-                let message = format!(
-                    "call to `{method}` here does not match the receiver's type: {}",
-                    e.message
-                );
+                let message = format!("{frame}: {}", e.message);
                 seen.insert(message.clone())
                     .then_some(TypeError { message, span })
             })
