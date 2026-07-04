@@ -302,20 +302,20 @@ in order when the module loads; `main`, if defined, runs afterwards.
 
 Base forms:
 
-| Form                         | Meaning                                                               |
-| ---------------------------- | --------------------------------------------------------------------- |
-| `int32`, `Point`, ...        | named type (primitives are ordinary names)                            |
-| `infer`                      | an inferred hole; each occurrence is independent                      |
-| `[T, U, ...]`                | tuple                                                                 |
-| `(T, U) -> R`                | function/closure type                                                 |
-| `Self`                       | the enclosing type, in methods                                        |
-| `mut(T)`                     | mutable value (deep copy in parameter position)                       |
-| `ref(T)`                     | immutable reference                                                   |
-| `ref(mut(T))`                | mutable reference (writes through)                                    |
-| `typeof(expr)`               | the static type of `expr` (see [Reflection](/references/reflection/)) |
-| `anonymous { name: T, ... }` | inline structural record type                                         |
-| `type`                       | a type slot, only as a whole field's type (a type parameter)          |
-| `Self.field`                 | the type of the enclosing type's field/slot named `field`             |
+| Form                         | Meaning                                                                                                      |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `int32`, `Point`, ...        | named type (primitives are ordinary names)                                                                   |
+| `infer`                      | an inferred hole; each occurrence is independent                                                             |
+| `[T, U, ...]`                | tuple                                                                                                        |
+| `(T, U) -> R`                | function/closure type                                                                                        |
+| `Self`                       | the enclosing type, in methods                                                                               |
+| `mut(T)`                     | mutable value (deep copy in parameter position)                                                              |
+| `ref(T)`                     | immutable reference                                                                                          |
+| `ref(mut(T))`                | mutable reference (writes through)                                                                           |
+| `typeof(expr)`               | the static type of `expr` (see [Reflection](/references/reflection/))                                        |
+| `anonymous { name: T, ... }` | inline structural record type                                                                                |
+| `type`                       | a type slot, only as a whole field's type (a type parameter)                                                 |
+| `Self.field`                 | the type of the enclosing type's field/slot named `field`                                                    |
 | `Base { field: T, ... }`     | a refinement pinning `Base`'s slots/fields (see [Type slots](/references/types/#type-slots-and-refinements)) |
 
 Suffixes, applicable repeatedly and in any order:

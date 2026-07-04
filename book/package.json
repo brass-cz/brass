@@ -3,7 +3,7 @@
   "type": "module",
   "version": "0.0.1",
   "scripts": {
-    "prebuild": "(cd ../ && ./x cargo build --release --target wasm32-wasip1 && ./x cargo build --release -p prepoly_language_server --target wasm32-wasip1) && mkdir -p public && cp ../target/wasm32-wasip1/release/prepoly.wasm ../target/wasm32-wasip1/release/prepoly-lsp.wasm ./public",
+    "prebuild": "(cd ../ && ./x cargo build --profile wasm --target wasm32-wasip1 && ./x cargo build --profile wasm -p prepoly_language_server --target wasm32-wasip1) && mkdir -p public && cp ../target/wasm32-wasip1/wasm/prepoly.wasm ../target/wasm32-wasip1/wasm/prepoly-lsp.wasm ./public",
     "dev": "astro dev",
     "start": "astro dev",
     "build": "astro build",
