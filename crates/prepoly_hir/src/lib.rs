@@ -7,6 +7,7 @@ pub mod hir;
 pub mod lower;
 pub mod mutation;
 pub mod typed;
+pub mod typedecl;
 pub mod types;
 
 pub use expand::{
@@ -14,8 +15,8 @@ pub use expand::{
 };
 pub use hir::{
     CallableSignature, FieldInfo, FunInfo, LoadedModule, MethodInfo, ModuleInit, ParamInfo,
-    Program, QualifiedName, RESULT_TYPE_ID, SchemeMethod, TypeInfo, TypeKind, TypeScheme,
-    VariantInfo, qualify, resolve_qualified,
+    Program, QualifiedName, RESULT_TYPE_ID, SchemeMethod, TypeAlias, TypeInfo, TypeKind,
+    TypeScheme, VariantInfo, qualify, resolve_qualified,
 };
 pub use lower::{LowerError, lower};
 pub use mutation::{
@@ -27,7 +28,7 @@ pub use types::{
     FloatKind, INFER_VAR, IntKind, NominalInfo, NominalKind, NominalType, STRUCTURAL_RECORD_ID,
     STRUCTURAL_RECORD_NAME, Substitution, Type, freshen_infer, index_element, int_literal_kind,
     is_fully_known, peel_modes, prim_method_symbol, primitive_kind_conflict, resolve,
-    structural_record, type_key,
+    structural_record, substitute_vars, type_key,
 };
 
 /// Re-exported so back ends can name source spans (e.g. typed-literal codegen

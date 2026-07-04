@@ -540,6 +540,25 @@ fn resolve_inner(
         // `infer` word; the type checker replaces it with `e`'s inferred type
         // when resolving an annotation (see the checker's `resolve_annotation`).
         TypeExpr::TypeOf(_, _) => Ok(Type::Unknown(INFER_VAR)),
+        // `type` slots, `Self.field` references, and `Base { .. }` refinements
+        // depend on the enclosing type's fields (a slot's inference variable) and,
+        // for a refinement, the base type's declared fields. The pure resolver has
+        // neither, so they are resolved by `resolve_type_decls` (which owns the
+        // slot-variable environment and the type table) and never reach here in a
+        // well-formed program.
+        TypeExpr::TypeSlot(_) => {
+            Err("`type` may only appear as a field's whole declared type".into())
+        }
+        TypeExpr::SelfField(field, _) => {
+            Err(format!("`Self.{field}` may only appear inside a type declaration"))
+        }
+        TypeExpr::Refine(base, _, _) => {
+            let base = match base.as_ref() {
+                TypeExpr::Named(n, _) => n.clone(),
+                _ => "<type>".into(),
+            };
+            Err(format!("a `{base} {{ .. }}` refinement is resolved only in a type declaration"))
+        }
     }
 }
 
@@ -686,6 +705,40 @@ pub fn freshen_infer(ty: Type, fresh: &mut impl FnMut() -> Type) -> Type {
         Type::Sum(n) => Type::Sum(freshen_nominal(n, fresh)),
         other => other,
     }
+}
+
+/// Replace each `Unknown(v)` whose `v` is a key of `map` with the mapped type,
+/// recursing through every component. Used to instantiate a type's slot
+/// variables (its parameters) with the types a refinement pins them to.
+pub fn substitute_vars(ty: &Type, map: &BTreeMap<u32, Type>) -> Type {
+    match ty {
+        Type::Unknown(v) => map.get(v).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Array(inner, n) => Type::Array(Box::new(substitute_vars(inner, map)), *n),
+        Type::Slice(inner) => Type::Slice(Box::new(substitute_vars(inner, map))),
+        Type::Nullable(inner) => Type::Nullable(Box::new(substitute_vars(inner, map))),
+        Type::ConstOf(inner) => Type::ConstOf(Box::new(substitute_vars(inner, map))),
+        Type::Mut(inner) => Type::Mut(Box::new(substitute_vars(inner, map))),
+        Type::Ref(inner) => Type::Ref(Box::new(substitute_vars(inner, map))),
+        Type::Tuple(elems) => Type::Tuple(elems.iter().map(|e| substitute_vars(e, map)).collect()),
+        Type::Fun(ps, r) => Type::Fun(
+            ps.iter().map(|p| substitute_vars(p, map)).collect(),
+            Box::new(substitute_vars(r, map)),
+        ),
+        Type::Record(n) => Type::Record(substitute_vars_nominal(n, map)),
+        Type::Sum(n) => Type::Sum(substitute_vars_nominal(n, map)),
+        other => other.clone(),
+    }
+}
+
+fn substitute_vars_nominal(n: &NominalType, map: &BTreeMap<u32, Type>) -> NominalType {
+    if n.substitution.is_empty() {
+        return n.clone();
+    }
+    let mut subst = Substitution::empty();
+    for (k, v) in n.substitution.iter() {
+        subst.insert(k.to_string(), substitute_vars(v, map));
+    }
+    NominalType::with_substitution(n.id, n.name.clone(), subst)
 }
 
 fn freshen_nominal(mut n: NominalType, fresh: &mut impl FnMut() -> Type) -> NominalType {

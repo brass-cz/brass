@@ -31,6 +31,9 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
     // after every type is collected (so a method may precede its type's `type`
     // declaration, and the same-module rule can be enforced).
     let mut method_impls: Vec<(Rc<prepoly_parser::ast::FunDecl>, Vec<String>)> = Vec::new();
+    // `type Alias = <type expr>` declarations, resolved after all nominal types
+    // are collected (an alias may refine a type declared anywhere).
+    let mut alias_decls: Vec<(String, Vec<String>, TypeDecl)> = Vec::new();
 
     types.insert("Result".to_string(), result_type());
 
@@ -84,11 +87,20 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
                     // Same symbol => same name twice in one module (a genuine
                     // duplicate). A different module yields a different symbol,
                     // so cross-module same-named types coexist.
-                    if types.contains_key(&symbol) {
+                    if types.contains_key(&symbol)
+                        || alias_decls.iter().any(|(s, _, _)| *s == symbol)
+                    {
                         errors.push(LowerError {
                             message: format!("duplicate type `{}`", td.name),
                             span: td.span,
                         });
+                        continue;
+                    }
+                    // An alias (`type X = <type expr>`) is not a nominal of its
+                    // own; defer it until every nominal type is known so its
+                    // refinement base resolves.
+                    if matches!(td.body, TypeBody::Alias(_)) {
+                        alias_decls.push((symbol, m.path.clone(), td.clone()));
                         continue;
                     }
                     let info = type_info(td, next_id, &m.path, symbol.clone(), &mut errors);
@@ -146,8 +158,9 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
         module_imports,
         import_origins,
         primitive_methods,
+        type_aliases: HashMap::new(),
     };
-    resolve_program_annotations(&mut program);
+    resolve_program_annotations(&mut program, &alias_decls, &mut errors);
 
     (program, errors)
 }
@@ -361,9 +374,11 @@ fn type_info(
     symbol: String,
     errors: &mut Vec<LowerError>,
 ) -> TypeInfo {
+    let mut slots = Vec::new();
     let kind = match &td.body {
         TypeBody::Record(members) => {
-            let (fields, methods) = split_members(members, &td.name, errors);
+            let (fields, methods, slot_names) = split_members(members, &td.name, errors);
+            slots = slot_names.into_iter().map(|n| (n, 0u32)).collect();
             TypeKind::Record { fields, methods }
         }
         TypeBody::Sum(variants) => {
@@ -380,7 +395,15 @@ fn type_info(
                             });
                         }
                         let owner = format!("{}.{}", td.name, v.name);
-                        let (fields, methods) = split_members(&v.members, &owner, errors);
+                        let (fields, methods, sslots) = split_members(&v.members, &owner, errors);
+                        if !sslots.is_empty() {
+                            errors.push(LowerError {
+                                message: format!(
+                                    "a sum variant `{owner}` cannot declare a `type` slot"
+                                ),
+                                span: v.span,
+                            });
+                        }
                         VariantInfo {
                             name: v.name.clone(),
                             tag: i as i32,
@@ -391,6 +414,8 @@ fn type_info(
                     .collect(),
             }
         }
+        // Aliases are diverted before `type_info`; this arm is never reached.
+        TypeBody::Alias(_) => unreachable!("alias declarations do not build a TypeInfo"),
     };
     TypeInfo {
         name: td.name.clone(),
@@ -400,6 +425,7 @@ fn type_info(
         module: module.to_vec(),
         span: td.span,
         symbol,
+        slots,
     }
 }
 
@@ -407,9 +433,10 @@ fn split_members(
     members: &[Member],
     owner: &str,
     errors: &mut Vec<LowerError>,
-) -> (Vec<FieldInfo>, HashMap<String, MethodInfo>) {
+) -> (Vec<FieldInfo>, HashMap<String, MethodInfo>, Vec<String>) {
     let mut fields = Vec::new();
     let mut methods = HashMap::new();
+    let mut slots = Vec::new();
     let mut field_names = HashSet::new();
     let mut method_names = HashSet::new();
     for m in members {
@@ -420,6 +447,14 @@ fn split_members(
                         message: format!("duplicate field `{owner}.{}`", f.name),
                         span: f.span,
                     });
+                    continue;
+                }
+                // A `slot: type` field is a type parameter, not a value field: it
+                // is recorded as a slot (no runtime storage) rather than in
+                // `fields`, so it is excluded from layout, construction, and
+                // reflection automatically.
+                if matches!(f.ty, Some(prepoly_parser::ast::TypeExpr::TypeSlot(_))) {
+                    slots.push(f.name.clone());
                     continue;
                 }
                 fields.push(FieldInfo {
@@ -446,7 +481,7 @@ fn split_members(
             }
         }
     }
-    (fields, methods)
+    (fields, methods, slots)
 }
 
 /// Built-in `Result = Ok { value } | Err { error }`.
@@ -482,10 +517,15 @@ fn result_type() -> TypeInfo {
         module: Vec::new(),
         span: Span::new(0, 0),
         symbol: "Result".into(),
+        slots: Vec::new(),
     }
 }
 
-fn resolve_program_annotations(program: &mut Program) {
+fn resolve_program_annotations(
+    program: &mut Program,
+    alias_decls: &[(String, Vec<String>, TypeDecl)],
+    errors: &mut Vec<LowerError>,
+) {
     let mut next_unknown = 0;
     // Nominal info keyed by each type's unique symbol (the type-table key).
     let nominal_by_symbol: HashMap<String, NominalInfo> = program
@@ -508,14 +548,25 @@ fn resolve_program_annotations(program: &mut Program) {
         crate::hir::resolve_qualified(&nominal_by_symbol, &import_origins, module, name).copied()
     };
 
+    // Records carry type slots, `Self.field` references, and refinements: resolve
+    // their fields (and the `type Alias = ..` declarations) with the slot-aware
+    // resolver, which also fills each record's slot variables. It shares
+    // `next_unknown` so its variables do not collide with the ones below.
+    crate::typedecl::resolve_type_decls(
+        program,
+        alias_decls,
+        &nominal_by_symbol,
+        &mut next_unknown,
+        errors,
+    );
+
     for info in program.types.values_mut() {
         let module = info.module.clone();
         let nominal = |name: &str| resolve_nominal(&module, name);
         match &mut info.kind {
-            TypeKind::Record { fields, methods } => {
-                fields
-                    .iter_mut()
-                    .for_each(|field| resolve_field_annotation(field, &nominal, &mut next_unknown));
+            // Record fields are resolved by `resolve_type_decls` above; only the
+            // method signatures remain.
+            TypeKind::Record { methods, .. } => {
                 methods.values_mut().for_each(|method| {
                     let assign_ret_unknown = method.decl.body.is_none();
                     resolve_signature_annotations(
@@ -894,6 +945,54 @@ mod tests {
             program.resolve_type(&main, "Vec2").map(|t| &t.symbol),
             Some(&"Vec2@geo".to_string()),
         );
+    }
+
+    #[test]
+    fn type_slots_are_kept_out_of_the_value_fields() {
+        // `key`/`value: type` are slots (type parameters), not value fields; a
+        // real field expresses its type over them with `Self.slot`.
+        let program = lower_program(&[(
+            &["main"],
+            "type _E = {\n key\n value\n }\n\
+             type Box = {\n key: type\n value: type\n \
+             arr: _E { key: Self.key, value: Self.value }?[]\n n: int64\n }\n",
+        )]);
+        let info = program.types.get("Box").expect("Box exists");
+        let TypeKind::Record { fields, .. } = &info.kind else {
+            panic!("Box is a record");
+        };
+        let field_names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(field_names, vec!["arr", "n"]);
+        let slot_names: Vec<&str> = info.slots.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(slot_names, vec!["key", "value"]);
+    }
+
+    #[test]
+    fn self_field_cycle_is_rejected() {
+        // `a` refers to `b`'s type and `b` back to `a`'s: a circular unification,
+        // rejected by the occurs-check.
+        let errors = lower_messages("type Loop = {\n a: Self.b\n b: Self.a\n n: int64\n }\n");
+        assert!(
+            errors.iter().any(|m| m.contains("circular type")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn refinement_alias_is_a_concrete_instance() {
+        // `type IntBox = Box { key: string, value: int64 }` pins Box's slots and
+        // resolves to a Box instance whose substitution covers every real field.
+        let program = lower_program(&[(
+            &["main"],
+            "type Box = {\n key: type\n value: type\n n: int64\n }\n\
+             type IntBox = Box { key: string, value: int64 }\n",
+        )]);
+        let alias = program.type_aliases.get("IntBox").expect("IntBox alias");
+        let Type::Record(nom) = &alias.ty else {
+            panic!("alias resolves to a record instance, got {:?}", alias.ty);
+        };
+        assert_eq!(nom.name, "Box");
+        assert_eq!(nom.substitution.get("n"), Some(&Type::Int(IntKind::I64)));
     }
 
     #[test]

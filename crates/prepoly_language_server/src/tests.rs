@@ -778,8 +778,7 @@ fn hover_infers_for_loop_iterand_and_element() {
 #[test]
 fn hashmap_instance_type_mismatch_is_reported_at_the_call() {
     let mut a = DocAnalyzer::new(path());
-    let src =
-        "import std.collections.hashmap.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    map.get(1)\n}\n";
+    let src = "import std.collections.hashmap.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    map.get(1)\n}\n";
     let diags = a.diagnostics(src);
     assert!(
         diags

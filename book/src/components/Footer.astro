@@ -1,0 +1,14 @@
+---
+// Starlight Footer override: renders the default footer and additionally makes
+// every prepoly code block on the page executable (a Run button that feeds
+// the block to the wasm interpreter).
+import Default from "@astrojs/starlight/components/Footer.astro";
+---
+
+<Default><slot /></Default>
+
+<script>
+  import { attachRunButtons } from "../playground/codeblocks";
+
+  attachRunButtons();
+</script>

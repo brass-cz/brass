@@ -1,0 +1,154 @@
+{
+  "name": "prepoly",
+  "scopeName": "source.prepoly",
+  "fileTypes": ["pp"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#declarations" },
+    { "include": "#types" },
+    { "include": "#calls" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.prepoly",
+          "match": "//.*$"
+        },
+        { "include": "#block-comment" }
+      ]
+    },
+    "block-comment": {
+      "name": "comment.block.prepoly",
+      "begin": "/\\*",
+      "end": "\\*/",
+      "patterns": [{ "include": "#block-comment" }]
+    },
+    "strings": {
+      "name": "string.quoted.double.prepoly",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.prepoly",
+          "match": "\\\\[ntr0\\\\\"{}]"
+        },
+        {
+          "name": "meta.interpolation.prepoly",
+          "begin": "\\{",
+          "beginCaptures": {
+            "0": { "name": "punctuation.section.interpolation.begin.prepoly" }
+          },
+          "end": "\\}",
+          "endCaptures": {
+            "0": { "name": "punctuation.section.interpolation.end.prepoly" }
+          },
+          "patterns": [{ "include": "$self" }]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.prepoly",
+          "match": "\\b0[xX][0-9a-fA-F_]+\\b"
+        },
+        {
+          "name": "constant.numeric.binary.prepoly",
+          "match": "\\b0[bB][01_]+\\b"
+        },
+        {
+          "name": "constant.numeric.octal.prepoly",
+          "match": "\\b0[oO][0-7_]+\\b"
+        },
+        {
+          "name": "constant.numeric.float.prepoly",
+          "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*(?:[eE][+-]?[0-9_]+)?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.prepoly",
+          "match": "\\b[0-9][0-9_]*(?:[eE][+-]?[0-9_]+)?\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.prepoly",
+          "match": "\\b(if|else|match|for|while|in|return|break|continue)\\b"
+        },
+        {
+          "name": "keyword.declaration.prepoly",
+          "match": "\\b(type|fun|let|const|import)\\b"
+        },
+        {
+          "name": "constant.language.prepoly",
+          "match": "\\b(true|false|null)\\b"
+        },
+        {
+          "name": "variable.language.self.prepoly",
+          "match": "\\b(self|Self)\\b"
+        },
+        {
+          "name": "storage.modifier.prepoly",
+          "match": "\\b(ref|mut|anonymous|typeof)\\b(?=\\s*[({])"
+        }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(fun)\\s+(?:([A-Za-z_][A-Za-z0-9_]*(?:\\[\\])?)\\s*\\.)?([A-Za-z_][A-Za-z0-9_]*)(?=\\s*\\()",
+          "captures": {
+            "1": { "name": "keyword.declaration.prepoly" },
+            "2": { "name": "entity.name.type.prepoly" },
+            "3": { "name": "entity.name.function.prepoly" }
+          }
+        },
+        {
+          "match": "\\b(type)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.declaration.prepoly" },
+            "2": { "name": "entity.name.type.prepoly" }
+          }
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.primitive.prepoly",
+          "match": "\\b(int8|int16|int32|int64|uint8|uint16|uint32|uint64|float32|float64|bool|string|void|infer)\\b"
+        },
+        {
+          "name": "entity.name.type.prepoly",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "calls": {
+      "name": "entity.name.function.prepoly",
+      "match": "\\b[a-z_][A-Za-z0-9_]*(?=\\s*\\()"
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.arrow.prepoly",
+          "match": "->|=>"
+        },
+        {
+          "name": "keyword.operator.comparison.prepoly",
+          "match": "==|!=|<=|>=|<<|>>|&&|\\|\\|"
+        },
+        {
+          "name": "keyword.operator.prepoly",
+          "match": "[+\\-*/%=<>!~^&|?]"
+        }
+      ]
+    }
+  }
+}

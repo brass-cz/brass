@@ -217,6 +217,18 @@ fn resolve_annotations(program: &Program) -> Vec<TypeError> {
         {
             return Some(*n);
         }
+        // A `type Alias = ..` name validates as its target's nominal kind (the
+        // pure resolver only needs to know the name denotes some type; the
+        // checker's `resolve_named` expands the alias to its full instance).
+        if let Some(alias) =
+            prepoly_hir::resolve_qualified(&program.type_aliases, &program.import_origins, module, name)
+        {
+            return match &alias.ty {
+                prepoly_hir::Type::Record(n) => Some(NominalInfo::record(n.id)),
+                prepoly_hir::Type::Sum(n) => Some(NominalInfo::sum(n.id)),
+                _ => None,
+            };
+        }
         let info = program.types.get(name)?;
         let def = &info.module;
         let visible = def == module
@@ -286,6 +298,13 @@ fn resolve_annotations(program: &Program) -> Vec<TypeError> {
     }
     let mut errors = Vec::new();
     for (module, te) in &tes {
+        // `Base { .. }` refinements, `Self.field`, and `type` slots are resolved
+        // (and their errors reported) by the lowering-time slot resolver and the
+        // checker's own `resolve_type`; the pure resolver cannot resolve them, so
+        // skip any annotation that uses them here to avoid a spurious error.
+        if mentions_decl_only_syntax(te) {
+            continue;
+        }
         if let Err(msg) = resolve(te, |n| resolve_nominal(module, n)) {
             errors.push(TypeError {
                 message: msg,
@@ -294,6 +313,25 @@ fn resolve_annotations(program: &Program) -> Vec<TypeError> {
         }
     }
     errors
+}
+
+/// Whether a type expression uses syntax the pure resolver cannot handle: a
+/// `type` slot, a `Self.field` reference, or a `Base { .. }` refinement.
+fn mentions_decl_only_syntax(te: &TypeExpr) -> bool {
+    match te {
+        TypeExpr::TypeSlot(_) | TypeExpr::SelfField(..) | TypeExpr::Refine(..) => true,
+        TypeExpr::Array(i, _, _)
+        | TypeExpr::Nullable(i, _)
+        | TypeExpr::Fallible(i, _)
+        | TypeExpr::Mut(i, _)
+        | TypeExpr::Ref(i, _) => mentions_decl_only_syntax(i),
+        TypeExpr::Tuple(es, _) => es.iter().any(mentions_decl_only_syntax),
+        TypeExpr::Fun(ps, r, _) => {
+            ps.iter().any(mentions_decl_only_syntax) || mentions_decl_only_syntax(r)
+        }
+        TypeExpr::Anonymous(fs, _) => fs.iter().any(|(_, t)| mentions_decl_only_syntax(t)),
+        TypeExpr::Named(..) | TypeExpr::TypeOf(..) => false,
+    }
 }
 
 fn collect_method(m: &MethodInfo, out: &mut Vec<TypeExpr>) {

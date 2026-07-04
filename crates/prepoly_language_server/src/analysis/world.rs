@@ -94,7 +94,11 @@ pub fn build(main_path: &Path, main_src: &str) -> Result<World, (String, Span)> 
     // Nested std modules (`std.collections.hashmap`, `std.data.json`) are not in
     // the implicit prelude; load the ones imported by the document or a
     // dependency, transitively.
-    let extra: Vec<Vec<String>> = main_ast.imports.iter().map(|imp| imp.path.clone()).collect();
+    let extra: Vec<Vec<String>> = main_ast
+        .imports
+        .iter()
+        .map(|imp| imp.path.clone())
+        .collect();
     let nested = prepoly_resolve::load_std_nested(&context_modules, &extra, &mut sources);
     context_modules.extend(nested);
 

@@ -476,6 +476,11 @@ pub fn annotated_type_passes_by_copy(program: &Program, module: &[String], t: &T
         // `typeof(e)`'s underlying kind is unknown without inferring `e`;
         // conservatively treat it as a copied aggregate (never a borrow).
         TypeExpr::TypeOf(..) => true,
+        // A refinement is the underlying nominal record: copy like its base.
+        TypeExpr::Refine(base, _, _) => annotated_type_passes_by_copy(program, module, base),
+        // A `Self.field` slot type's kind is unknown here; a `type` slot never
+        // appears as a value parameter. Conservatively treat as a copied aggregate.
+        TypeExpr::SelfField(..) | TypeExpr::TypeSlot(..) => true,
     }
 }
 

@@ -63,6 +63,9 @@ pub(crate) fn resolve_simple_type(te: &TypeExpr) -> Option<Type> {
         // inference); the binding stays inferred and monomorphization recovers
         // its type from the value / use, or from the recorded uninit-let type.
         TypeExpr::TypeOf(..) => None,
+        // A refinement / slot reference is a nominal instance whose concrete
+        // layout the checker resolves; the binding stays inferred here.
+        TypeExpr::Refine(..) | TypeExpr::SelfField(..) | TypeExpr::TypeSlot(..) => None,
     }
 }
 

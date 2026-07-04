@@ -337,6 +337,10 @@ fn refs_type_decl(t: &TypeDecl, out: &mut HashSet<String>) {
             }
             return;
         }
+        TypeBody::Alias(te) => {
+            refs_type(te, out);
+            return;
+        }
     };
     for m in &members {
         refs_member(m, out);
@@ -398,6 +402,15 @@ fn refs_type(ty: &TypeExpr, out: &mut HashSet<String>) {
         }
         // `typeof(e)` names no type by identifier; its type comes from `e`.
         TypeExpr::TypeOf(..) => {}
+        // A refinement mentions its base type name and each pinned field's type.
+        TypeExpr::Refine(base, fields, _) => {
+            refs_type(base, out);
+            for (_, fty) in fields {
+                refs_type(fty, out);
+            }
+        }
+        // `Self.field` / `type` slot name no external type by identifier.
+        TypeExpr::SelfField(..) | TypeExpr::TypeSlot(..) => {}
     }
 }
 

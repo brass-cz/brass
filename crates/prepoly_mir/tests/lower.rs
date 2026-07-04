@@ -20,6 +20,7 @@ fn empty_program() -> Program {
         module_imports: HashMap::new(),
         import_origins: HashMap::new(),
         primitive_methods: HashMap::new(),
+        type_aliases: HashMap::new(),
     }
 }
 

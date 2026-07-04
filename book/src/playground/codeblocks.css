@@ -1,0 +1,51 @@
+/* Run button + output area appended under runnable prepoly code blocks. */
+
+.pp-run {
+  margin-top: 0.35rem;
+}
+
+/* The output area exists from mount but shows only after a run. */
+.pp-run-output[hidden] {
+  display: none;
+}
+
+.pp-run-button {
+  padding: 0.1rem 1.4rem;
+  font-size: var(--sl-text-base);
+  color: var(--sl-color-white);
+  background: var(--sl-color-gray-6);
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.3rem;
+  cursor: pointer;
+}
+
+.pp-run-button:hover:not(:disabled) {
+  background: var(--sl-color-gray-5);
+  border-color: var(--sl-color-accent);
+}
+
+.pp-run-button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.pp-run-output {
+  margin-top: 0.35rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.3rem;
+  background: var(--sl-color-gray-7, var(--sl-color-gray-6));
+}
+
+.pp-run-output pre {
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  font-size: var(--sl-text-sm);
+  overflow-x: auto;
+}
+
+.pp-run-stderr {
+  color: var(--sl-color-red, #c88);
+}

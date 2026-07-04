@@ -276,8 +276,28 @@ impl Parser {
         self.eat_newlines();
         let body = if self.at_p(TokenKind::LBrace) {
             TypeBody::Record(self.parse_member_block()?)
-        } else {
+        } else if self.at_p(TokenKind::Pipe) {
+            // A leading `|` unambiguously marks a sum.
             TypeBody::Sum(self.parse_variants()?)
+        } else {
+            // Ambiguous head: an inline sum (`Red | Green`), a refinement alias
+            // (`Base { .. }`), or a plain alias (`Base`). Parse the first unit as a
+            // type expression; a following `|` makes it a sum whose first variant
+            // is that unit, otherwise it is an alias. (A single-variant sum must
+            // use a leading `|`, freeing `type X = Base { .. }` to be a refinement.)
+            let te = self.parse_type()?;
+            if self.at_p(TokenKind::Pipe) || self.newline_then(TokenKind::Pipe) {
+                let mut variants = vec![self.type_to_variant(te)?];
+                while self.at_p(TokenKind::Pipe) || self.newline_then(TokenKind::Pipe) {
+                    self.eat_newlines();
+                    self.bump(); // '|'
+                    self.eat_newlines();
+                    variants.push(self.parse_one_variant()?);
+                }
+                TypeBody::Sum(variants)
+            } else {
+                TypeBody::Alias(te)
+            }
         };
         Ok(TypeDecl {
             span: lo.merge(self.tokens[self.pos.saturating_sub(1)].span),
@@ -309,7 +329,7 @@ impl Parser {
             let params = self.parse_param_list(TokenKind::RParen)?;
             self.close(TokenKind::RParen, "')'")?;
             let ret = if self.eat(TokenKind::Arrow) {
-                Some(self.parse_type()?)
+                Some(self.parse_return_type()?)
             } else {
                 None
             };
@@ -345,17 +365,7 @@ impl Parser {
         self.eat_newlines();
         self.eat(TokenKind::Pipe); // optional leading '|'
         loop {
-            let (name, lo) = self.ident()?;
-            let members = if self.at_p(TokenKind::LBrace) {
-                self.parse_member_block()?
-            } else {
-                Vec::new()
-            };
-            variants.push(Variant {
-                span: lo,
-                name,
-                members,
-            });
+            variants.push(self.parse_one_variant()?);
             if self.at_p(TokenKind::Pipe) || self.newline_then(TokenKind::Pipe) {
                 self.eat_newlines();
                 self.bump(); // consume '|'
@@ -364,6 +374,55 @@ impl Parser {
             }
         }
         Ok(variants)
+    }
+
+    /// Parse one sum variant: a name and an optional `{ member ... }` block.
+    fn parse_one_variant(&mut self) -> PResult<Variant> {
+        let (name, lo) = self.ident()?;
+        let members = if self.at_p(TokenKind::LBrace) {
+            self.parse_member_block()?
+        } else {
+            Vec::new()
+        };
+        Ok(Variant {
+            span: lo,
+            name,
+            members,
+        })
+    }
+
+    /// Reinterpret a type expression as a sum variant, used when a `type X = A |
+    /// B` inline sum was first parsed head-first as a type. Only a bare name
+    /// (`A`) or a braced form (`A { f: T }`) is a valid variant.
+    fn type_to_variant(&self, te: TypeExpr) -> PResult<Variant> {
+        match te {
+            TypeExpr::Named(name, span) => Ok(Variant {
+                span,
+                name,
+                members: Vec::new(),
+            }),
+            TypeExpr::Refine(base, fields, span) => {
+                let TypeExpr::Named(name, _) = *base else {
+                    return Err(self.error("invalid sum variant".to_string()));
+                };
+                let members = fields
+                    .into_iter()
+                    .map(|(fname, fty)| {
+                        Member::Field(Field {
+                            span: fty.span(),
+                            name: fname,
+                            ty: Some(fty),
+                        })
+                    })
+                    .collect();
+                Ok(Variant {
+                    span,
+                    name,
+                    members,
+                })
+            }
+            _ => Err(self.error("expected a sum variant name".to_string())),
+        }
     }
 
     fn parse_fun_decl(&mut self) -> PResult<FunDecl> {
@@ -389,7 +448,7 @@ impl Parser {
         let params = self.parse_param_list(TokenKind::RParen)?;
         self.close(TokenKind::RParen, "')'")?;
         let ret = if self.eat(TokenKind::Arrow) {
-            Some(self.parse_type()?)
+            Some(self.parse_return_type()?)
         } else {
             None
         };
@@ -1154,7 +1213,21 @@ impl Parser {
     // ----- types -----
 
     fn parse_type(&mut self) -> PResult<TypeExpr> {
-        let mut base = self.parse_base_type()?;
+        self.parse_type_refine(true)
+    }
+
+    /// A return type (after `->`) never grabs a `Base { .. }` refinement: the
+    /// `{` there begins the function body, not a refinement. Refinements in a
+    /// return position are written through a type alias instead.
+    fn parse_return_type(&mut self) -> PResult<TypeExpr> {
+        self.parse_type_refine(false)
+    }
+
+    /// Parse a type with its postfix suffixes. `allow_refine` gates whether a
+    /// bare `Base { .. }` at the head is read as a refinement (disabled for
+    /// return types, where a following `{` is the body).
+    fn parse_type_refine(&mut self, allow_refine: bool) -> PResult<TypeExpr> {
+        let mut base = self.parse_base_type(allow_refine)?;
         // Postfix suffixes in any order, each wrapping the type built so far: array
         // `T[n]`/`T[]`, nullable `T?`, fallible `T!`. Interleaving them lets both
         // `T[]?` (a nullable array) and `T?[]` (an array of nullable elements) be
@@ -1194,9 +1267,14 @@ impl Parser {
         Ok(base)
     }
 
-    fn parse_base_type(&mut self) -> PResult<TypeExpr> {
+    fn parse_base_type(&mut self, allow_refine: bool) -> PResult<TypeExpr> {
         let span = self.span();
-        if self.at_p(TokenKind::LBracket) {
+        if self.at_p(TokenKind::Type) {
+            // The `type` keyword as a field's declared type: a type SLOT, a
+            // type-parameter with no runtime storage.
+            self.bump();
+            Ok(TypeExpr::TypeSlot(span))
+        } else if self.at_p(TokenKind::LBracket) {
             // Tuple type: `[T0, T1, ...]`. (Array types are the postfix `T[]`/`T[n]`
             // handled in `parse_type`; a leading `[` is unambiguously a tuple.)
             self.open(TokenKind::LBracket, "'['")?;
@@ -1221,16 +1299,22 @@ impl Parser {
             }
             self.close(TokenKind::RParen, "')'")?;
             self.expect(TokenKind::Arrow, "'->'")?;
-            let ret = self.parse_type()?;
+            let ret = self.parse_return_type()?;
             let hi = ret.span();
             Ok(TypeExpr::Fun(params, Box::new(ret), span.merge(hi)))
         } else if self.at_p(TokenKind::SelfLower) || self.at_p(TokenKind::SelfUpper) {
             // `self`/`Self` in type position denote the enclosing type, so a
             // closure-typed field may take the enclosing type as a parameter,
             // e.g. `join: (self, string) -> string`. Both spellings resolve to
-            // `Self`.
+            // `Self`. `Self.field` names the enclosing type's field type (a slot
+            // reference), used to express one field's type over another's.
             self.bump();
-            Ok(TypeExpr::Named("Self".to_string(), span))
+            if self.eat(TokenKind::Dot) {
+                let (field, fspan) = self.ident()?;
+                Ok(TypeExpr::SelfField(field, span.merge(fspan)))
+            } else {
+                Ok(TypeExpr::Named("Self".to_string(), span))
+            }
         } else {
             let (name, _) = self.ident()?;
             // `mut(T)` -- a mutable `T`; `ref(T)` / `ref(mut(T))` -- a reference.
@@ -1271,8 +1355,35 @@ impl Parser {
                 let hi = self.close(TokenKind::RBrace, "'}'")?;
                 return Ok(TypeExpr::Anonymous(fields, span.merge(hi)));
             }
+            // `Base { field: T, ... }` -- refine nominal record `Base` by pinning
+            // the named fields/slots. Gated by `allow_refine` so a return type's
+            // following `{` (the function body) is not mistaken for a refinement.
+            if allow_refine && self.at_p(TokenKind::LBrace) {
+                let base = TypeExpr::Named(name, span);
+                let (fields, hi) = self.parse_refine_fields()?;
+                return Ok(TypeExpr::Refine(Box::new(base), fields, span.merge(hi)));
+            }
             Ok(TypeExpr::Named(name, span))
         }
+    }
+
+    /// Parse a refinement's `{ field: T, ... }` body (also `Self.field: T`
+    /// entries): each pins a base field/slot to a type. Returns the entries and
+    /// the closing-brace span.
+    fn parse_refine_fields(&mut self) -> PResult<(Vec<(String, TypeExpr)>, Span)> {
+        self.open(TokenKind::LBrace, "'{'")?;
+        self.eat_newlines();
+        let mut fields = Vec::new();
+        while !self.at_p(TokenKind::RBrace) {
+            let (fname, _) = self.ident()?;
+            self.expect(TokenKind::Colon, "':'")?;
+            let fty = self.parse_type()?;
+            fields.push((fname, fty));
+            self.eat(TokenKind::Comma);
+            self.eat_newlines();
+        }
+        let hi = self.close(TokenKind::RBrace, "'}'")?;
+        Ok((fields, hi))
     }
 
     // ----- string interpolation -----

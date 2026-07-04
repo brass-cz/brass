@@ -67,7 +67,7 @@ pub fn enclosing(main_ast: &Module, global_off: usize) -> Option<(Vec<&Param>, &
             TopLevel::Type(t) => {
                 let members = match &t.body {
                     TypeBody::Record(members) => members,
-                    TypeBody::Sum(_) => continue,
+                    TypeBody::Sum(_) | TypeBody::Alias(_) => continue,
                 };
                 for m in members {
                     if let Member::Method(method) = m
@@ -368,6 +368,7 @@ pub fn walk_exprs(main_ast: &Module, visit: &mut impl FnMut(&Expr)) {
                         }
                         continue;
                     }
+                    TypeBody::Alias(_) => continue,
                 };
                 for m in members {
                     if let Member::Method(method) = m

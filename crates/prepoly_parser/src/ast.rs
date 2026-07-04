@@ -43,6 +43,11 @@ pub struct TypeDecl {
 pub enum TypeBody {
     Record(Vec<Member>),
     Sum(Vec<Variant>),
+    /// `type Alias = <type expression>` -- an alias whose right-hand side is a
+    /// type expression, typically a refinement (`type JsonObject = HashMap {
+    /// key: string, value: JsonValue }`). The alias name resolves to the
+    /// right-hand side's type; it is not a new nominal.
+    Alias(TypeExpr),
 }
 
 #[derive(Clone, Debug)]
@@ -335,6 +340,20 @@ pub enum TypeExpr {
     /// `e`. The checker resolves it by tying the annotation to `e`'s inferred
     /// type; `e` is type-checked but never evaluated at runtime.
     TypeOf(Box<Expr>, Span),
+    /// The `type` keyword as a field's declared type: a TYPE SLOT, a
+    /// type-parameter of the enclosing record with no runtime storage. It is
+    /// filled by a refinement (`Base { slot: T }`) or inferred from use; it
+    /// cannot be read or written as a value.
+    TypeSlot(Span),
+    /// `Self.field` in type position: the type of the enclosing type's field
+    /// named `field` (usually a `type` slot). Lets one field's type be expressed
+    /// over another's, e.g. `entries: _Entry { key: Self.key }?[]`.
+    SelfField(String, Span),
+    /// `Base { field: T, ... }` -- a REFINEMENT of nominal record `Base` that
+    /// pins the named fields/slots to the given types. Omitted fields keep
+    /// `Base`'s declared type (an unpinned slot is left open). A refinement of a
+    /// field whose base type is concrete and does not match is an error.
+    Refine(Box<TypeExpr>, Vec<(String, TypeExpr)>, Span),
 }
 
 impl TypeExpr {
@@ -349,7 +368,10 @@ impl TypeExpr {
             | TypeExpr::Anonymous(_, s)
             | TypeExpr::Mut(_, s)
             | TypeExpr::Ref(_, s)
-            | TypeExpr::TypeOf(_, s) => *s,
+            | TypeExpr::TypeOf(_, s)
+            | TypeExpr::TypeSlot(s)
+            | TypeExpr::SelfField(_, s)
+            | TypeExpr::Refine(_, _, s) => *s,
         }
     }
 }

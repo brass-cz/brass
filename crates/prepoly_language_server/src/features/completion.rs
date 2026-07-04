@@ -529,6 +529,8 @@ fn type_decl_kind(body: &TypeBody) -> CompletionItemKind {
     match body {
         TypeBody::Record(_) => CompletionItemKind::STRUCT,
         TypeBody::Sum(_) => CompletionItemKind::ENUM,
+        // An alias resolves to a refined record; present it as a struct.
+        TypeBody::Alias(_) => CompletionItemKind::STRUCT,
     }
 }
 

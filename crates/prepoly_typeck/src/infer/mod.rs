@@ -803,7 +803,90 @@ impl<'a> Checker<'a> {
             // local `let` it is instead resolved against the binding's scope by
             // `resolve_annotation_scoped`, which ties it to v's type.
             TypeExpr::TypeOf(..) => Ok(self.fresh_unknown()),
+            // `Base { field: T, .. }` refinement (also the target of a
+            // `type Alias = Base { .. }`): pin the named slots/fields of the base
+            // record and instantiate.
+            TypeExpr::Refine(base, entries, _) => self.resolve_refine_annotation(base, entries),
+            // A `type` slot is a declaration-only marker; it is not a value type.
+            TypeExpr::TypeSlot(_) => {
+                Err("`type` is only valid as a record field's declared type".into())
+            }
+            // `Self.field` names a field's type; it is meaningful only inside a
+            // type declaration, resolved during lowering, not in a value position.
+            TypeExpr::SelfField(field, _) => {
+                Err(format!("`Self.{field}` is only valid inside a type declaration"))
+            }
         }
+    }
+
+    /// Resolve an inline refinement `Base { field: T, .. }` to a concrete record
+    /// instance: pin each named slot/field and substitute into the base's
+    /// declared field types. Mirrors the resolution `type Alias = Base { .. }`
+    /// gets during lowering, so an inline annotation and an alias agree.
+    fn resolve_refine_annotation(
+        &mut self,
+        base: &TypeExpr,
+        entries: &[(String, TypeExpr)],
+    ) -> Result<Type, String> {
+        let TypeExpr::Named(bname, _) = base else {
+            return Err("a refinement base must be a named record type".into());
+        };
+        let info = self
+            .program
+            .resolve_type(&self.current_module, bname)
+            .ok_or_else(|| format!("unknown type `{bname}` in refinement"))?;
+        let TypeKind::Record { fields, .. } = &info.kind else {
+            return Err(format!("`{bname}` is not a record type and cannot be refined"));
+        };
+        let (id, name) = (info.id, info.name.clone());
+        let slots = info.slots.clone();
+        let base_fields: Vec<(String, Option<Type>)> = fields
+            .iter()
+            .map(|f| (f.name.clone(), f.resolved_ty.clone()))
+            .collect();
+        // Pin each entry to a resolved type: a slot variable, or a field override.
+        let mut slot_pins: std::collections::BTreeMap<u32, Type> = std::collections::BTreeMap::new();
+        let mut field_pins: std::collections::HashMap<String, Type> =
+            std::collections::HashMap::new();
+        for (fname, fte) in entries {
+            let t = self.resolve_type(fte)?;
+            if let Some((_, v)) = slots.iter().find(|(n, _)| n == fname) {
+                slot_pins.insert(*v, t);
+            } else if let Some((_, declared)) = base_fields.iter().find(|(n, _)| n == fname) {
+                // A concrete base field may only be pinned to the same type.
+                if let Some(d) = declared
+                    && prepoly_hir::is_fully_known(d)
+                    && prepoly_hir::is_fully_known(&t)
+                    && *d != t
+                {
+                    return Err(format!(
+                        "refining field `{fname}` of `{name}`: its type is `{}`, not `{}`",
+                        d.display(),
+                        t.display()
+                    ));
+                }
+                field_pins.insert(fname.clone(), t);
+            } else {
+                return Err(format!("`{name}` has no field or slot `{fname}` to refine"));
+            }
+        }
+        // Every slot variable maps to its pin, or a fresh unknown when omitted.
+        let slot_map: std::collections::BTreeMap<u32, Type> = slots
+            .iter()
+            .map(|(_, v)| (*v, slot_pins.get(v).cloned().unwrap_or_else(|| self.fresh_unknown())))
+            .collect();
+        let mut subst = Substitution::empty();
+        for (fname, declared) in base_fields {
+            let ty = if let Some(t) = field_pins.get(&fname) {
+                t.clone()
+            } else if let Some(d) = declared {
+                prepoly_hir::substitute_vars(&d, &slot_map)
+            } else {
+                self.fresh_unknown()
+            };
+            subst.insert(fname, ty);
+        }
+        Ok(Type::Record(NominalType::with_substitution(id, name, subst)))
     }
 
     fn resolve_named(&mut self, name: &str) -> Result<Type, String> {
@@ -824,10 +907,30 @@ impl<'a> Checker<'a> {
                 .map(|s| self.type_by_name(s))
                 .unwrap_or(Type::SelfType)
                 .pipe(Ok),
-            _ => self
-                .resolve_type_ref(name)
-                .ok_or_else(|| format!("unknown type `{name}`")),
+            _ => {
+                // A `type Alias = ..` name expands to its pre-resolved target
+                // (an `infer` slot the alias left open is freshened per use).
+                if let Some(t) = self.resolve_alias(name) {
+                    return Ok(t);
+                }
+                self.resolve_type_ref(name)
+                    .ok_or_else(|| format!("unknown type `{name}`"))
+            }
         }
+    }
+
+    /// The target type of a `type Alias = ..` declaration named `name`, as seen
+    /// from the current module, with any `infer` slot freshened so distinct uses
+    /// do not share a variable.
+    fn resolve_alias(&mut self, name: &str) -> Option<Type> {
+        let alias = prepoly_hir::resolve_qualified(
+            &self.program.type_aliases,
+            &self.program.import_origins,
+            &self.current_module,
+            name,
+        )?;
+        let ty = alias.ty.clone();
+        Some(prepoly_hir::freshen_infer(ty, &mut || self.fresh_unknown()))
     }
 
     fn type_by_name(&self, name: &str) -> Type {
@@ -4427,6 +4530,12 @@ impl<'a> Checker<'a> {
 
     fn is_type_word(&self, name: &str) -> bool {
         self.program.has_type_named(name)
+            || self.program.type_aliases.contains_key(name)
+            || self
+                .program
+                .type_aliases
+                .keys()
+                .any(|k| k.starts_with(name) && k[name.len()..].starts_with('@'))
             || name == "Self"
             || name == "File"
             || IntKind::from_name(name).is_some()
@@ -4520,7 +4629,8 @@ fn contains_typeof(te: &TypeExpr) -> bool {
         TypeExpr::Tuple(es, _) => es.iter().any(contains_typeof),
         TypeExpr::Fun(ps, r, _) => ps.iter().any(contains_typeof) || contains_typeof(r),
         TypeExpr::Anonymous(fs, _) => fs.iter().any(|(_, t)| contains_typeof(t)),
-        TypeExpr::Named(..) => false,
+        TypeExpr::Refine(b, fs, _) => contains_typeof(b) || fs.iter().any(|(_, t)| contains_typeof(t)),
+        TypeExpr::Named(..) | TypeExpr::TypeSlot(..) | TypeExpr::SelfField(..) => false,
     }
 }
 

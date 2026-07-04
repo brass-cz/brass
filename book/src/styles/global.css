@@ -1,0 +1,38 @@
+/* Tailwind is loaded without its preflight reset: this file is injected after
+   Starlight's own stylesheets, so the preflight (list-style: none on ul/ol,
+   heading resets, ...) would override Starlight's content styling. Only the
+   theme variables and utility classes are used. */
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+
+/* Red-based accent palette: Starlight's default blue accents (hue 224/234)
+   hue-rotated to red at the same saturation and lightness. */
+:root {
+  --sl-color-accent-low: hsl(0, 54%, 20%);
+  --sl-color-accent: hsl(0, 100%, 60%);
+  --sl-color-accent-high: hsl(0, 100%, 85%);
+}
+:root[data-theme="light"] {
+  --sl-color-accent-high: hsl(0, 80%, 30%);
+  --sl-color-accent: hsl(0, 90%, 60%);
+  --sl-color-accent-low: hsl(0, 88%, 90%);
+}
+
+/* The copy button: visible only while hovering (or keyboard-focusing) the
+   code block, on every device class, and smaller than the default 2.5rem. */
+.expressive-code .copy button {
+  width: 1.75rem;
+  height: 1.75rem;
+  opacity: 0;
+}
+.expressive-code .copy button::after {
+  margin: 0.35rem;
+}
+.expressive-code .frame:hover .copy button,
+.expressive-code .frame:focus-within .copy button {
+  opacity: 0.75;
+}
+.expressive-code .copy button:hover,
+.expressive-code .copy button:focus-visible {
+  opacity: 1;
+}

@@ -202,6 +202,12 @@ pub struct TypeInfo {
     /// same type name is defined in several modules, so both coexist with
     /// distinct symbols and method-dispatch keys.
     pub symbol: String,
+    /// Type slots (fields declared `slot: type`): a record's type parameters,
+    /// each paired with the inference variable that stands for it. A slot has no
+    /// runtime storage (it is not in `fields`); its variable appears in the other
+    /// fields' resolved types wherever they wrote `Self.slot`, and a refinement
+    /// (`Base { slot: T }`) or use fills it. Empty for a type without slots.
+    pub slots: Vec<(String, u32)>,
 }
 
 impl TypeInfo {
@@ -275,6 +281,21 @@ pub struct Program {
     /// a scalar type word (`"string"`, `"int32"`, ...) or `"array"`. Used to
     /// route a `recv.m()` call on a primitive receiver, replacing UFCS.
     pub primitive_methods: HashMap<(String, String), String>,
+    /// Type aliases (`type Alias = <type expression>`): the alias name resolves
+    /// to a pre-resolved type, typically a refinement of a nominal record
+    /// (`type JsonObject = HashMap { key: string, value: JsonValue }`). Keyed by
+    /// the alias's unique symbol, mirroring [`Self::types`]. An alias is not a
+    /// nominal of its own; name resolution substitutes its target type.
+    pub type_aliases: HashMap<String, TypeAlias>,
+}
+
+/// A resolved `type Alias = <type expression>` binding: the module it is
+/// declared in and the concrete type its name expands to.
+#[derive(Clone, Debug)]
+pub struct TypeAlias {
+    pub module: Vec<String>,
+    pub ty: Type,
+    pub span: Span,
 }
 
 impl Program {

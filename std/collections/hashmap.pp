@@ -21,13 +21,22 @@ type _Entry = {
 }
 
 type HashMap = {
+    // `key`/`value` are type SLOTS -- the map's key and value types -- declared
+    // with the `type` marker. They have no runtime storage; they name the type
+    // parameters the fields below are expressed over. A refinement pins them,
+    // so `type StringCount = HashMap { key: string, value: int32 }` is a fully
+    // concrete instance, and a bare `HashMap.new()` leaves them to inference.
+    key: type
+    value: type
     // Slot arrays, parallel and `cap`-long. `entries[i]` is meaningful only when
     // `states[i]` is `_FULL`. A slot is `_EMPTY` (never used), `_FULL` (holds a
     // live pair), or `_TOMB` (deleted -- probing passes through it, insertion may
-    // reuse it). `entries` is a nullable-element array: empty slots hold `null`,
-    // which sizes the array at construction without a sample value and lets the
-    // element type be inferred from the `_Entry` values stored into full slots.
-    entries: infer?[]
+    // reuse it). `entries` is a nullable-element array of `_Entry` whose key/value
+    // types are the slots (`Self.key`/`Self.value`): empty slots hold `null`,
+    // which sizes the array at construction without a sample value, and storing a
+    // concrete `_Entry` fixes the slots (the back end follows the resolved
+    // instance).
+    entries: _Entry { key: Self.key, value: Self.value }?[]
     _states: int32[]
     // `cap` is the slot count (a power of two is not required; the table grows by
     // doubling). `count` is the number of live pairs; `tombs` the number of

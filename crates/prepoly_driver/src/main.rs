@@ -117,7 +117,7 @@ fn auto_acquire_modules(modules: &mut [LoadedModule]) -> Vec<(String, Span)> {
                     TopLevel::Type(t) => {
                         let members = match &t.body {
                             TypeBody::Record(members) => members,
-                            TypeBody::Sum(_) => continue,
+                            TypeBody::Sum(_) | TypeBody::Alias(_) => continue,
                         };
                         for member in members {
                             if let Member::Method(method) = member
@@ -239,7 +239,7 @@ fn auto_acquire_modules(modules: &mut [LoadedModule]) -> Vec<(String, Span)> {
                 TopLevel::Type(t) => {
                     let members = match &mut t.body {
                         TypeBody::Record(members) => members,
-                        TypeBody::Sum(_) => continue,
+                        TypeBody::Sum(_) | TypeBody::Alias(_) => continue,
                     };
                     for member in members {
                         if let Member::Method(method) = member
@@ -305,7 +305,7 @@ fn report_spawn_ownership(modules: &[LoadedModule]) {
                 TopLevel::Type(t) => {
                     let members = match &t.body {
                         TypeBody::Record(members) => members,
-                        TypeBody::Sum(_) => continue,
+                        TypeBody::Sum(_) | TypeBody::Alias(_) => continue,
                     };
                     for member in members {
                         if let Member::Method(method) = member

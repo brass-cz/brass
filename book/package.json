@@ -1,0 +1,28 @@
+{
+  "name": "prepoly-book",
+  "type": "module",
+  "version": "0.0.1",
+  "scripts": {
+    "prebuild": "(cd ../ && ./x cargo build --release --target wasm32-wasip1 && ./x cargo build --release -p prepoly_language_server --target wasm32-wasip1) && mkdir -p public && cp ../target/wasm32-wasip1/release/prepoly.wasm ../target/wasm32-wasip1/release/prepoly-lsp.wasm ./public",
+    "dev": "astro dev",
+    "start": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "astro": "astro",
+    "fmt": "prettier -w src"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.41.3",
+    "@bjorn3/browser_wasi_shim": "^0.4.2",
+    "@tailwindcss/vite": "^4.3.2",
+    "astro": "^7.0.2",
+    "monaco-editor": "0.55.1",
+    "sharp": "^0.34.5",
+    "tailwindcss": "^4.3.2"
+  },
+  "devDependencies": {
+    "playwright": "^1.61.1",
+    "prettier": "^3.9.4",
+    "prettier-plugin-astro": "^0.14.1"
+  }
+}

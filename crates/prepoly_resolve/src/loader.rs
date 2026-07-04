@@ -92,7 +92,9 @@ pub fn load_std_nested(
         .chain(extra_imports.iter().cloned())
         .collect();
     while let Some(path) = work.pop() {
-        let Some(key) = nested_key(&path) else { continue };
+        let Some(key) = nested_key(&path) else {
+            continue;
+        };
         if loaded.contains(&path) {
             continue;
         }

@@ -315,6 +315,18 @@ impl Expander<'_> {
                 TypeExpr::Ref(Box::new(self.type_expr(inner)), self.span(*span))
             }
             TypeExpr::TypeOf(e, span) => TypeExpr::TypeOf(Box::new(self.expr(e)), self.span(*span)),
+            TypeExpr::TypeSlot(span) => TypeExpr::TypeSlot(self.span(*span)),
+            TypeExpr::SelfField(field, span) => {
+                TypeExpr::SelfField(field.clone(), self.span(*span))
+            }
+            TypeExpr::Refine(base, fields, span) => TypeExpr::Refine(
+                Box::new(self.type_expr(base)),
+                fields
+                    .iter()
+                    .map(|(n, t)| (n.clone(), self.type_expr(t)))
+                    .collect(),
+                self.span(*span),
+            ),
         }
     }
 }

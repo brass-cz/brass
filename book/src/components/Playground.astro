@@ -1,0 +1,67 @@
+---
+// An embeddable prepoly playground: editor on top, Execute button, stdout and
+// stderr below. Used inside docs pages; the full-screen variant lives at
+// /playground/. The heavy lifting (Monaco + wasm) is in src/playground.
+interface Props {
+  /** CSS height of the editor pane. */
+  height?: string;
+}
+const { height = "30em" } = Astro.props;
+---
+
+<div class="pp-playground" data-prepoly-playground>
+  <section>
+    <div class="pp-editor" data-editor style={`height: ${height}`}></div>
+    <button class="pp-exec" data-exec>Execute</button>
+  </section>
+  <section>
+    <h3>stdout</h3>
+    <div class="pp-out" data-stdout></div>
+    <h3>stderr</h3>
+    <div class="pp-out pp-err" data-stderr></div>
+  </section>
+</div>
+
+<style>
+  .pp-playground {
+    padding: 8px 0;
+  }
+  .pp-playground * {
+    box-sizing: border-box;
+  }
+  .pp-editor {
+    width: 100%;
+    margin: 8px 0;
+    border: 1px solid #ccc;
+  }
+  .pp-exec {
+    width: 100%;
+    margin: 8px 0;
+    padding: 8px;
+    font-size: 1.2em;
+    cursor: pointer;
+  }
+  .pp-out {
+    margin: 8px 0;
+    padding: 12px;
+    border: 1px solid #ccc;
+    font-size: 1.2em;
+    overflow-x: auto;
+  }
+  .pp-err {
+    color: #c88;
+  }
+  .pp-out :global(pre),
+  .pp-out :global(code) {
+    margin: 0;
+    padding: 0;
+  }
+</style>
+
+<script>
+  import { mountPlayground } from "../playground/playground";
+
+  for (const el of document.querySelectorAll<HTMLElement>("[data-prepoly-playground]")) {
+    mountPlayground(el);
+  }
+</script>
