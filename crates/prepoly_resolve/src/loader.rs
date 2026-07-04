@@ -17,9 +17,10 @@ use prepoly_lexer::{Span, line_col};
 use prepoly_parser::ast::ImportDecl;
 use prepoly_parser::parse_with_base;
 
-/// Embedded standard-library modules (implicit prelude). A name with a `/` is a
-/// nested module: its segments become the path under `std` (so
-/// `collections/hashmap` is the module `std.collections.hashmap`).
+/// Embedded prelude modules: the DIRECT children of `std`, always in scope with
+/// no import needed. Only these are the implicit prelude; deeper modules
+/// (`std.collections.*`, `std.data.*`, see [`STDLIB_NESTED`]) must be imported
+/// explicitly.
 pub const STDLIB: &[(&str, &str)] = &[
     ("io", include_str!("../../../std/io.pp")),
     ("array", include_str!("../../../std/array.pp")),
@@ -27,21 +28,25 @@ pub const STDLIB: &[(&str, &str)] = &[
     ("math", include_str!("../../../std/math.pp")),
     ("conv", include_str!("../../../std/conv.pp")),
     ("assert", include_str!("../../../std/assert.pp")),
+];
+
+/// Embedded standard-library modules BELOW `std` (`std.collections.hashmap`,
+/// `std.data.json`). These are not in the implicit prelude: their names are in
+/// scope only after an explicit `import std.<path>.{ Name }`, at which point the
+/// module is loaded on demand ([`load_std_nested`]). Keyed by the module's
+/// dotted path relative to `std` (segments joined with `/`).
+pub const STDLIB_NESTED: &[(&str, &str)] = &[
     (
         "collections/hashmap",
         include_str!("../../../std/collections/hashmap.pp"),
     ),
+    ("data/json", include_str!("../../../std/data/json.pp")),
 ];
 
 /// Names of the embedded top-level prelude modules (`io`, `array`, ...), used by
-/// import-path completion. Nested modules (a name with `/`) are excluded: they
-/// are not a single importable segment, and their public names (`HashMap`) are
-/// already in the implicit prelude.
+/// import-path completion.
 pub fn prelude_module_names() -> impl Iterator<Item = &'static str> {
-    STDLIB
-        .iter()
-        .map(|(name, _)| *name)
-        .filter(|name| !name.contains('/'))
+    STDLIB.iter().map(|(name, _)| *name)
 }
 
 /// The source of an embedded prelude module, for listing its public names.
@@ -53,6 +58,61 @@ pub fn prelude_source(name: &str) -> Option<&'static str> {
 /// rather than a file on disk.
 pub fn is_prelude_path(path: &[String]) -> bool {
     matches!(path, [single] if STDLIB.iter().any(|(name, _)| name == single))
+}
+
+/// The `std/`-relative key of an embedded nested module for a canonical import
+/// path (`["std","collections","hashmap"]` -> `"collections/hashmap"`), or
+/// `None` if the path is not `std.<...>` with two or more segments below `std`.
+fn nested_key(path: &[String]) -> Option<String> {
+    match path {
+        [first, rest @ ..] if first == "std" && rest.len() >= 2 => Some(rest.join("/")),
+        _ => None,
+    }
+}
+
+/// Load the embedded nested std modules (`std.collections.hashmap`,
+/// `std.data.json`) imported by `modules` or named in `extra_imports`
+/// (the active document's imports, when it is kept separate from `modules`),
+/// transitively (a nested module may import another). Returns the newly loaded
+/// modules to append to the graph; nested modules that are not imported
+/// anywhere are never loaded, so they are not part of the implicit prelude. An
+/// import of a `std.<...>` path with no matching embedded module is left for
+/// `check_imports` to report.
+pub fn load_std_nested(
+    modules: &[LoadedModule],
+    extra_imports: &[Vec<String>],
+    sources: &mut SourceMap,
+) -> Vec<LoadedModule> {
+    let mut loaded: HashSet<Vec<String>> = modules.iter().map(|m| m.path.clone()).collect();
+    let mut out: Vec<LoadedModule> = Vec::new();
+    // Seed the worklist from every module already in the graph plus the extras.
+    let mut work: Vec<Vec<String>> = modules
+        .iter()
+        .flat_map(|m| m.ast.imports.iter().map(|imp| imp.path.clone()))
+        .chain(extra_imports.iter().cloned())
+        .collect();
+    while let Some(path) = work.pop() {
+        let Some(key) = nested_key(&path) else { continue };
+        if loaded.contains(&path) {
+            continue;
+        }
+        let Some((_, src)) = STDLIB_NESTED.iter().find(|(k, _)| *k == key) else {
+            continue; // unknown std module: reported by check_imports
+        };
+        let label = format!("<std/{key}>");
+        let base = sources.add(None, label.clone(), (*src).to_string());
+        // The embedded std sources are known-good, so a parse failure is a build
+        // bug; skip on error rather than aborting the user's compile.
+        let Ok(ast) = parse_with_base(src, base) else {
+            continue;
+        };
+        loaded.insert(path.clone());
+        for imp in &ast.imports {
+            work.push(imp.path.clone());
+        }
+        out.push(LoadedModule { path, ast });
+    }
+    out
 }
 
 /// Each loaded source with the disjoint byte-offset base its spans were parsed

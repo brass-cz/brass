@@ -1529,7 +1529,11 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 )),
             };
         }
+        // The Ok payload of a `T!` return is authoritative even when the full
+        // annotation is unsupported (open error payload); compute it from the
+        // raw annotation, then filter for the provisional/return type.
         let declared_ok = ret_ann.as_ref().and_then(result_concrete_ok);
+        let ret_ann = ret_ann.filter(is_supported);
         let sym = self.type_and_store(
             target,
             body,
@@ -2324,7 +2328,11 @@ fn method_ret_annotation(program: &Program, type_symbol: &str, method: &str) -> 
         // checker keeps the signatures consistent, so the first is canonical.
         TypeKind::Sum { variants } => variants.iter().find_map(|v| v.methods.get(method))?,
     };
-    m.signature.ret_ty.clone().filter(is_supported)
+    // The RAW annotation (unfiltered): a fallible `T!` resolves to
+    // `Result<T, Unknown>` whose open error payload is unsupported, but the Ok
+    // payload `T` is still authoritative -- `resolve_callable` needs it to type
+    // a mutually recursive call, and separately filters for the provisional.
+    m.signature.ret_ty.clone()
 }
 
 pub fn is_comparison(op: BinOp) -> bool {

@@ -1,318 +1,213 @@
-# Type system
+# Types and methods
 
-prepoly utilizes **type inference**, so in most cases we don't need to write type annotations even though the program is statically typed.
-Here, let's see an overview of prepoly's type system.
-
-## Primitives and special types
-
-- The default type of an integer literal (e.g. `1`) is `int32` when the value fits, otherwise `int64` (so `9223372036854775807` is an `int64`); the default type of a decimal literal (e.g. `1.0`) is `float64`
-- The type of text is `string`
-- A static array of type `T` with length `n` is represented by `T[n]`
-- A dynamic array of type `T` is represented by `T[]`
-- A tuple type is represented by `[T, U, ...]`
-
-A bracket literal `[...]` is typed in this order:
-
-1. A type annotation (or another inference result, such as the parameter it is passed to) decides: the literal takes that type.
-2. Elements that cannot unify make it a tuple -- but a `null` element never does: `null` unifies with any element type, so `[4, null, 65]` is a sequence of `int32?`.
-3. Bound immutably (`const`), it is a fixed-length array: `const a = [1, 2, 3]` is `int32[3]`.
-4. Bound mutably (`let`) or in any other position, it is a growable array: `let a = [1, 2, 3]` is `int32[]`.
-
-A fixed-length array is usable where a dynamic array of the same element is required (the length is extra static information), but not the reverse.
-
-An arithmetic or comparison operator between two numeric values of different types implicitly converts both operands to their common type: the smallest type BOTH convert to value-preservingly. So `int32 + int64` is `int64`, `uint8 + int32` is `int32`, and `int32 + float64` is `float64`. Pairs with no value-preserving common type (`int64` with `uint64`, `int64` with `float64`) are a compile error; convert one side explicitly.
-
-Numeric values also convert automatically when they *flow* into a numeric position of another type -- an assignment, an argument, a return value, a compound assignment, or an element/field store -- but only when the conversion is VALUE-PRESERVING: a wider integer of the same signedness, an unsigned integer into a strictly wider signed one, `float32` into `float64`, and an integer into a float whose mantissa holds every value exactly (up to `int32`/`uint32` for `float64`, up to `int16`/`uint16` for `float32`). `let b: int64 = an_int32` and `total += an_int32` (with `total: int64`) both widen the value. Anything lossy -- a narrower integer, a sign change, a narrower float, `int64` into `float64`, or float into int -- requires the explicit, fallible conversion: `int32.from(x)!`. Integer literals are unaffected: a literal that FITS the annotated type adapts to it (`let b: int8 = -128` is fine; `let b: int8 = 300` is an error instead of a silent wrap).
-
-Also, prepoly uses the following annotations for how an argument is passed:
-
-- `ref(T)` -- an immutable reference: the callee borrows the value and may read it but not mutate it.
-- `ref(mut(T))` -- a mutable reference: the callee may mutate the value in place, and the change is visible to the caller.
-- `mut(T)` -- a mutable deep copy: the callee gets its own copy to mutate; the caller's value is unchanged.
-
-When a non-numeric argument has no annotation, its passing mode is inferred from how the body uses it.
-A parameter the body only reads is a shared reference (`ref`); one the body mutates is a private deep copy (`mut`), so the mutation stays local and does not reach the caller:
-
-```prepoly
-fun double(a) { // a: mut(int32[]) -- mutated, so a private copy
-    for e in a {
-        e *= 2
-    }
-}
-
-let arr = [1, 2, 3]
-double(arr)
-println(arr) // outputs [1, 2, 3]: `double` doubled its own copy
-```
-
-To mutate the caller's value through a function, annotate the parameter `ref(mut(T))` -- a mutable reference writes through:
-
-```prepoly
-fun double(a: ref(mut(int32[]))) {
-    for e in a {
-        e *= 2
-    }
-}
-
-let arr = [1, 2, 3]
-double(arr)
-println(arr) // outputs [2, 4, 6]
-```
-
-A numeric argument (e.g. `int32`) is always passed by value, so it is never a reference.
-
-The `self` receiver of a method is a special case: it is always a reference.
-A method that only reads `self` receives `ref(Self)`; one that mutates it receives `ref(mut(Self))`, so the change is visible to the caller.
-To work on an owned copy of `self` instead, annotate it `self: Self`.
-
-We can use the `infer` type annotation to explicitly infer a specific part of the type:
-
-```prepoly
-fun print_all(a: infer[]) {
-    for e in a {
-        println(e)
-    }
-}
-
-print_all(["a", "b", "c"])
-```
-
-The `infer` annotation implies neither `ref` nor `mut`: a value annotated with `infer` is a read-only deep copy, so mutating it is an error.
-
-```prepoly
-fun total(a: infer) -> int32 {
-    let sum = 0
-    for e in a {
-        sum += e
-    }
-    return sum
-}
-
-const arr = [1, 2, 3]
-println(total(arr)) // outputs 6; `a` is a read-only copy
-```
-
-## Defining types
+## Record types
 
 We can define new types with their fields as follows:
 
 ```prepoly
-type Person = {
-    first_name: string,
-    last_name: string,
+type Account = {
+    owner: string
+    balance: int32
 }
 ```
 
-Methods are implemented outside the type with `fun T.m(...)`, in the same module
-that declares the type. A method whose first parameter is `self` is an instance
-method (called as `value.method(...)`); one without is a static method (called as
-`Type.method(...)`). `Self` inside a body refers to the type. A method is in
-scope wherever the type is, with no separate import.
+Methods are implemented outside the type with `fun T.m(...)`, in the same
+module that declares the type. A method whose first parameter is `self` is an
+instance method (called as `value.method(...)`); one without is a static
+method (called as `Type.method(...)`). `Self` inside a body refers to the
+type.
 
 ```prepoly
-fun Person.display(self) {
-    return "{self.first_name} {self.last_name}"
+// A static method has no `self` parameter.
+fun Account.open(owner: string) -> Account {
+    return Self { owner: owner, balance: 0 }
+}
+
+// Instance methods take `self` first.
+fun Account.deposit(self, amount: int32) {
+    self.balance += amount
+}
+
+fun Account.describe(self) -> string {
+    return "{self.owner}: {self.balance}"
 }
 
 fun main() {
-    const newton = Person {
-        first_name: "Isac",
-        last_name: "Newton",
-    }
-    println("{newton.display()}")
+    let acc = Account.open("Alice")
+    acc.deposit(100)
+    acc.deposit(50)
+    println(acc.describe())   // Alice: 150
 }
 ```
 
-This program outputs `Isac Newton`.
+Records have reference semantics: `acc.deposit(100)` mutates the account the
+caller sees, because `self` is always a reference. A method is in scope
+wherever the type is, with no separate import.
 
-We can define "OR" types:
+Method return types are inferred like function return types, so `Account.open`
+could omit its `-> Account` annotation.
+
+## Fields without a type
+
+A field may omit its type annotation. Such a field accepts any value, and its
+type is inferred per construction site:
 
 ```prepoly
-type DegreeProgram =
-    | Bachelor {
-        year: int32,
-    }
-    | Master {
-        year: int32,
-    }
-    | Doctor {
-        year: int32,
-    }
+type Student = {
+    name: string
+    id
+}
+
+let a = Student { name: "Newton", id: 1001 }
+let b = Student { name: "Edison", id: "AL17001" }
+println("{a.id} / {b.id}")   // 1001 / AL17001
 ```
 
-Using `DegreeProgram` type, we can define `Student` type:
+## Sum types
+
+The same `type` keyword defines "OR" types (tagged unions). Variants are
+written with `|`, and each variant may carry fields — or none:
 
 ```prepoly
-type Student: Person = {
-    first_name,
-    last_name,
-    id,
-    program: DegreeProgram,
-}
-
-fun Student.display(self) {
-    return "{self.id}: {self.first_name} {self.last_name}"
-}
+type Shape =
+    | Circle { radius: float64 }
+    | Rectangle { width: float64, height: float64 }
+    | Point
 ```
 
-Here, we wrote the `Person` type on the left of `Student`.
-This requires that the `Student` type include all fields of the `Person` type.
-
-Using these definitions, let's write a complete program.
-Here we enhance `display` with a `match` expression that formats each `DegreeProgram` variant:
+Construct a variant as `Type.Variant { ... }` (a unit variant is just
+`Type.Variant`), and take values apart with `match` — see
+[Pattern matching](pattern-matching.md):
 
 ```prepoly
-type Person = {
-    first_name: string,
-    last_name: string,
-}
-fun Person.display(self) {
-    return "{self.first_name} {self.last_name}"
-}
-type DegreeProgram =
-    | Bachelor {
-        year: int32,
+fun area(s: Shape) -> float64 {
+    return match s {
+        Circle { radius } => 3.14159 * radius * radius,
+        Rectangle { width, height } => width * height,
+        Point => 0.0,
     }
-    | Master {
-        year: int32,
-    }
-    | Doctor {
-        year: int32,
-    }
-type Student: Person = {
-    first_name,
-    last_name,
-    id,
-    program: DegreeProgram,
-}
-fun Student.display(self) {
-    const program = match self.program {
-        Bachelor { year } => "Bachelor {year}",
-        Master { year } => "Master {year}",
-        Doctor { year } => "Doctor {year}",
-    }
-    return "{self.id} ({program}): {self.first_name} {self.last_name}"
 }
 
-fun main() {
-    const newton = Student {
-        first_name: "Isac",
-        last_name: "Newton",
-        id: 1001,
-        program: DegreeProgram.Master { year: 1 },
-    }
-    println("{newton.display()}")
-    println("{newton}")
-}
+println(area(Shape.Circle { radius: 2.0 }))   // 12.56636
 ```
 
-Executing this shows the following output:
+A sum type may be recursive: a variant field can be the type itself. This
+expression tree evaluates `1 + 2 * 3`:
 
-```
-1001 (Master 1): Isac Newton
-Student {
-    first_name: "Isac",
-    last_name: "Newton",
-    id: 1001,
-    program: DegreeProgram.Master {
-        year: 1,
+```prepoly
+type Expr =
+    | Num { value: int32 }
+    | BinOp { op: string, left: Expr, right: Expr }
+
+fun eval(e: Expr) -> int32 {
+    return match e {
+        Num { value } => value,
+        BinOp { op, left, right } => {
+            let l = eval(left)
+            let r = eval(right)
+            match op {
+                "+" => l + r,
+                "*" => l * r,
+                _ => 0,
+            }
+        },
+    }
+}
+
+let expr = Expr.BinOp {
+    op: "+",
+    left: Expr.Num { value: 1 },
+    right: Expr.BinOp {
+        op: "*",
+        left: Expr.Num { value: 2 },
+        right: Expr.Num { value: 3 },
     },
 }
+println("result = {eval(expr)}")   // result = 7
 ```
 
-In the above example, we didn't write any type annotation for `Student.id`.
-So we can write a string as the value of `Student.id`:
+## Interfaces
+
+A type whose body contains method *signatures* (a member with parameters but
+no body) acts as an interface. Writing `type B: A = ...` requires `B` to
+provide every member of `A`, checked at compile time. No implementation is
+inherited:
 
 ```prepoly
-const edison = Student {
-    first_name: "Thomas",
-    last_name: "Edison",
-    id: "AL17001",
-    program: DegreeProgram.Doctor { year: 3 },
+type Showable = {
+    to_string(self) -> string
 }
-println("{edison.display()}")
+
+type User: Showable = {
+    name: string
+    age: int32
+}
+
+fun User.to_string(self) -> string {
+    return "{self.name} (age {self.age})"
+}
 ```
 
-This program can be placed alongside the above `newton` example, and the output is as follows:
-
-```
-AL17001 (Doctor 3): Thomas Edison
-```
-
-We can use `Person` type if we would like to define a function which receives `Person` and its derivative:
+Multiple interfaces are comma-separated: `type User: Showable, Comparable`.
+An interface may also require plain fields, and it works for sum types too —
+every variant must satisfy it:
 
 ```prepoly
-fun print_name(person: Person) {
-    println(person.display())
+type Named = {
+    name: string
 }
-print_name(edison)
+
+type Pet: Named =
+    | Cat { name: string, indoor: bool }
+    | Dog { name: string, breed: string }
 ```
 
-## `null` and `Result`
+## Structural subtyping
 
-prepoly has a `null` type and a `Result` type.
-
-Let's see an example:
+Separately from interfaces, a plain function with an unannotated parameter
+accepts *any* value that structurally has the members it uses — no interface
+declaration needed:
 
 ```prepoly
-fun double(a: int32?) -> int32! {
-    if a {
-        return a * 2
-    } else {
-        return error("null")
-    }
+type ConsoleLogger = {
+    prefix: string
 }
 
-println(double(2))
-println(double(null))
-```
-
-The variable `a` of the function `double` has the type `int32?`.
-The `?` means that the value may be `null`.
-A value that may be `null` must be checked with an `if` expression.
-
-Calling the `error` function makes the return value a `Result.Err`.
-When a function returns a plain value where a `Result` is expected, it is wrapped as `Result.Ok`.
-A `Result` type that holds an `int32` value is denoted as `int32!`.
-
-So the output of the above program is as follows:
-
-```
-Result.Ok {
-    value: 4,
-}
-Result.Err {
-    error: null,
-}
-```
-
-We can omit the type annotation for nullable types.
-But if a function receives `null` without a null check, the type check fails and the function is not executed.
-
-In a conditional expression, a type inference failure, such as accessing a non-existent field, becomes `null`.
-So you can write the following program:
-
-```prepoly
-fun get_name(person) -> string {
-    if person.name {
-        return person.name
-    } else {
-        return "no name"
-    }
+fun ConsoleLogger.log(self, msg: string) {
+    println("[{self.prefix}] {msg}")
 }
 
-println(get_name({ name: "Asimov" })) // Asimov
-println(get_name({ age: 20 }))        // no name
-println(get_name({ name: 1 }))        // no name
+type TaggedLogger = {
+    prefix: string
+    tag: string
+}
+
+fun TaggedLogger.log(self, msg: string) {
+    println("[{self.prefix}/{self.tag}] {msg}")
+}
+
+// No constraint on `logger` other than "has a log method".
+fun run_with(logger, task: string) {
+    logger.log("starting {task}")
+    logger.log("done {task}")
+}
+
+run_with(ConsoleLogger { prefix: "APP" }, "task1")
+run_with(TaggedLogger { prefix: "APP", tag: "net" }, "task2")
 ```
 
-## `anonymous` structure
+```
+[APP] starting task1
+[APP] done task1
+[APP/net] starting task2
+[APP/net] done task2
+```
 
-Anonymous structure can be written as `{ field: value, ... }`.
+## Anonymous records
 
-When exactly one in-scope record type declares a method and the anonymous
-value satisfies that type's fields, the method is callable directly -- no
-annotation or conversion needed:
+`{ field: value, ... }` is an anonymous structural record. When exactly one
+in-scope record type declares a method and the anonymous value satisfies that
+type's fields, the method is callable directly:
 
 ```prepoly
 type Person = {
@@ -324,33 +219,25 @@ fun Person.display(self) {
 }
 
 let someone = { name: "Asimov" }
-someone.display() // I am Asimov
+someone.display()   // I am Asimov
 ```
 
-If several in-scope types declare the method and are satisfied, the call is
-ambiguous and rejected at the value (annotate it with the intended type); a
-value missing a required field is likewise rejected at the value, naming the
-unsatisfied constraint.
-
-You can also access its fields by null checking or type conversion using
-`T.from()`:
+You can also convert a value to a record type explicitly with `T.from(v)`,
+which yields `T?` — the record when `v` structurally has all of `T`'s fields,
+else `null`:
 
 ```prepoly
 fun get_name(obj) {
     if let person = Person.from(obj) {
-        return person.display()
+        person.display()
     } else {
-        error("not a Person type!")!
+        println("not a Person")
     }
 }
 
-// Result.Ok { value: Hideki Yukawa }
-println(
-    get_name({
-        first_name: "Hideki",
-        last_name: "Yukawa"
-    })
-)
-// Result.Err { error: not a Person type! }
-println(get_name({ last_name: "Yukawa" }))
+get_name({ name: "Yukawa", age: 42 })   // I am Yukawa
+get_name({ age: 42 })                   // not a Person
 ```
+
+The precise rules for method resolution, ambiguity, and record coercion are in
+the [type system reference](references/types.md#records-and-structural-typing).

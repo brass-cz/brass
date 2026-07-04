@@ -278,7 +278,10 @@ need one-character strings, or `split`/`find`/`replace` for substring work.
 ## Collections and operators
 
 - Arrays: `T[]` dynamic, `T[n]` fixed length, literal `[1, 2, 3]`, index
-  `arr[i]`, append `arr.push(x)`. Tuples: `[T, U]`. Iterate with `for x in xs`.
+  `arr[i]`, append `arr.push(x)`, `arr.pop() -> T?`, `arr.insert(i, x)`,
+  `arr.remove(i) -> T`. The length-changing methods are dynamic-array only.
+  Tuples: `[T, U]`. Iterate with `for x in xs`; `[lo..hi]` is the half-open
+  integer range as an array.
 - Operators: arithmetic `+ - * / %`; comparison `== != < <= > >=`; logical
   `&& || !`; bitwise `& | ^ ~ << >>`; compound assignment `+= -= *= /= %=`.
   Equality is `==` (a single `=` is assignment).
@@ -354,7 +357,7 @@ import geometry.vec.{ Vec2, dot }
   newline; unwrap with `!` or `match`), `read_file(path) -> string!`,
   `write_file(path, content) -> void!`. Lower-level: `open`, `File.stdin/stdout`.
 - Arrays: `map`, `filter`, `fold`, `each`, `slice(start, end)`, `reverse`,
-  `contains`, `sort`, `len`, `push`.
+  `contains`, `sort`, `len`, `push`, `pop`, `insert`, `remove`.
 - Strings: `split`, `join`, `trim`, `starts_with`, `ends_with`, `find`,
   `replace`, `chars`, `to_upper`, `to_lower`, `len`.
 - Math: `abs`, `min`, `max`, `sqrt`, `floor`, `ceil`, `pow`.
@@ -362,12 +365,14 @@ import geometry.vec.{ Vec2, dot }
   Free-function conversion aliases also exist (`int32_parse`, `int32_from`,
   `float64_parse`, `float64_from`, `string_from`), equivalent to the method
   forms above.
-- Collections: `HashMap` (open-addressing hash map). `let m = HashMap.new()` takes
-  no arguments; the key/value types are inferred from the first `set` (so
-  `let m = HashMap.new(); m.set("a", 1)` is a `string -> int32` map). Methods:
-  `set(k, v)`, `get(k)` (nullable), `get_or(k,
-  default)`, `contains_key(k)`, `delete(k)`, `size()`, `is_empty()`, `keys()`,
-  `values()`, `pairs()`, `clear()`, and `HashMap.from_pairs([[k, v], ...])`.
+- Collections: `HashMap` (open-addressing hash map) is in a NESTED std module
+  and needs an explicit `import std.collections.hashmap.{ HashMap }`.
+  `let m = HashMap.new()` takes no arguments; the key/value types are inferred
+  from the first `set` (so `let m = HashMap.new(); m.set("a", 1)` is a
+  `string -> int32` map). Methods: `set(k, v)`, `get(k)` (nullable),
+  `get_or(k, default)`, `contains_key(k)`, `delete(k)`, `size()`,
+  `is_empty()`, `keys()`, `values()`, `pairs()`, `clear()`, and
+  `HashMap.from_pairs([[k, v], ...])`.
 - `assert(cond, msg?)` aborts when `cond` is false (`msg` is optional).
 - Identifiers beginning with `_` (e.g. `_string_bytes`, `_panic`) are runtime
   internals -- do not call them directly; use the prelude wrappers above.
@@ -396,6 +401,8 @@ of `main`, so insert `sync()` before a read that may race ahead.
   as `Type.method(...)`.
 - Block-bodied closures and functions need an explicit `return`; expression
   bodies (`(x) -> x + 1`) do not.
+- The `!` error-propagation operator works only inside a function or closure
+  body — top-level code cannot use `expr!`; wrap the code in `fun main()`.
 
 ## Worked example
 

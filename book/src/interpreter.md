@@ -46,3 +46,16 @@ Run the following command to install the default native driver:
 ```
 
 Note that you have to add the path where the `prepoly` binary is placed to `$PATH`.
+
+## Usage
+
+```bash
+prepoly program.pp     # type-check and run a program
+prepoly check program.pp   # type-check only; prints `ok` on success
+prepoly repl program.pp    # run a program with the interpreter (no JIT)
+prepoly                # start an interactive REPL
+```
+
+Any diagnostic (parse error, type error) is printed to stderr and the process
+exits with a non-zero status; nothing is executed unless the whole program
+checks.

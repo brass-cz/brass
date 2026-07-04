@@ -64,14 +64,19 @@ pub fn mangled_name(method: &str, key: &Type) -> String {
     format!("{method}__{}", prepoly_hir::type_key(key))
 }
 
+/// One generated specialization: the module its receiver lives in, the concrete
+/// method, and its key type (so the caller can make the key visible in that
+/// module -- a record key defined in another module needs a synthetic import).
+pub struct Generated {
+    pub module: Vec<String>,
+    pub decl: FunDecl,
+    pub key: Type,
+}
+
 /// Generate every concrete method reachable from `roots` (transitively: a
-/// record key pulls in a specialization per field type). Returns each as
-/// `(defining module, FunDecl)` for the driver to inject, or an error naming a
+/// record key pulls in a specialization per field type), or an error naming a
 /// construct the specializer cannot handle.
-pub fn specialize_all(
-    program: &Program,
-    roots: &[KeyedNeed],
-) -> Result<Vec<(Vec<String>, FunDecl)>, String> {
+pub fn specialize_all(program: &Program, roots: &[KeyedNeed]) -> Result<Vec<Generated>, String> {
     let mut out = Vec::new();
     let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut work: Vec<KeyedNeed> = roots.to_vec();
@@ -96,7 +101,11 @@ pub fn specialize_all(
         // `unshift_span` (`% SPAN_SHIFT_UNIT`).
         let base = (out.len() + 1) * SPAN_BAND * prepoly_hir::SPAN_SHIFT_UNIT;
         decl.body = shift_spans(&decl.body, base);
-        out.push((module, decl));
+        out.push(Generated {
+            module,
+            decl,
+            key: need.key.clone(),
+        });
     }
     Ok(out)
 }

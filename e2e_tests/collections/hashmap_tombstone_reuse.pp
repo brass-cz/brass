@@ -1,3 +1,5 @@
+import std.collections.hashmap.{ HashMap }
+
 // Deletion leaves tombstones that probing passes through and insertion reuses;
 // growth drops them. Delete-then-reinsert must find the reinserted key, keys
 // deleted before a grow must stay deleted after it, and size bookkeeping must

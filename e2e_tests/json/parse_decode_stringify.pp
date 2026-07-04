@@ -1,0 +1,27 @@
+import std.data.json.{ JsonValue, parse, stringify }
+
+type Address = { city: string, zip: int64 }
+type User = { name: string, age: int64, address: Address }
+
+fun main() {
+    // Parse, navigate, and read typed leaves.
+    const j = parse("[true, \"hi\", 42]")!
+    println(j.at(0)!.as_bool()!)
+    println(j.at(1)!.as_string()!)
+    println(j.at(2)!.as_number()!)
+
+    // Round-trip through the serializer.
+    println(stringify(parse("\{\"x\": 1, \"y\": [2, 3]\}")!))
+
+    // Reflective decode of a nested object into a typed struct.
+    const src = "\{\"name\": \"Aki\", \"age\": 30, \"address\": \{\"city\": \"Tokyo\", \"zip\": 100\}\}"
+    const u: User = parse(src)!.into()!
+    println("{u.name} {u.age} {u.address.city} {u.address.zip}")
+
+    // A missing field is a decode error.
+    const bad: User! = parse("\{\"name\": \"x\"\}")!.into()
+    match bad {
+        Ok { value } => { println("ok") }
+        Err { error } => { println("error: {error}") }
+    }
+}

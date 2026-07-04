@@ -1,81 +1,74 @@
 # Modules
 
-prepoly organizes code into modules: every file is a module, and directories form the module path.
-Let's split a program across several files.
+prepoly organizes code into modules: every file is a module, and directories
+form the module path. Let's split a small geometry library across files.
 
-First, write `students/types.pp`:
+First, write `geometry/vec.pp`:
 
 ```prepoly
-type _Person = {
-    first_name: string,
-    last_name: string,
+type Vec2 = {
+    x: float64
+    y: float64
 }
 
-fun _Person.display(self) {
-    return "{self.first_name} {self.last_name}"
+fun Vec2.new(x: float64, y: float64) {
+    return Self { x: x, y: y }
 }
 
-type DegreeProgram =
-    | Bachelor {
-        year: int32,
-    }
-    | Master {
-        year: int32,
-    }
-    | Doctor {
-        year: int32,
-    }
-
-type Student: _Person = {
-    first_name,
-    last_name,
-    id,
-    program: DegreeProgram,
+fun Vec2.add(self, other: Vec2) -> Vec2 {
+    return Self { x: self.x + other.x, y: self.y + other.y }
 }
 
-fun Student.display(self) {
-    return "{self.id}: {self.first_name} {self.last_name}"
+fun Vec2.length(self) -> float64 {
+    return sqrt(self.x * self.x + self.y * self.y)
+}
+
+fun dot(a: Vec2, b: Vec2) -> float64 {
+    return a.x * b.x + a.y * b.y
+}
+
+fun _helper() {
+    // A name starting with `_` is private to this module.
 }
 ```
 
-Then, write `students.pp`:
+Then use it from `main.pp`, next to the `geometry` directory:
 
 ```prepoly
-import students.types.{ DegreeProgram, Student }
+import geometry.vec.{ Vec2, dot }
 
-fun get_students() {
-    return [
-        Student {
-            first_name: "Isac",
-            last_name: "Newton",
-            id: 1001,
-            program: DegreeProgram.Master { year: 1 },
-        },
-        Student {
-            first_name: "Thomas",
-            last_name: "Edison",
-            id: 1002,
-            program: DegreeProgram.Doctor { year: 3 },
-        },
-    ]
+fun main() {
+    let a = Vec2.new(3.0, 4.0)
+    let b = Vec2.new(1.0, 2.0)
+    let c = a.add(b)
+    println("a + b = ({c.x}, {c.y})")
+    println("a . b = {dot(a, b)}")
+    println("|a|   = {a.length()}")
 }
 ```
-
-Now we can use these modules in `show_students.pp`:
-
-```prepoly
-import students.{ get_students }
-
-println(get_students())
-```
-
-Then, execute it:
 
 ```bash
-prepoly show_students.pp
+prepoly main.pp
 ```
 
-This prints the list of students.
+```
+a + b = (4.0, 6.0)
+a . b = 11.0
+|a|   = 5.0
+```
 
-Note that anything you define with a name starting with `_` becomes private to its module.
-So you can't use `_Person` outside `students/types.pp`.
+The import path follows the directory layout relative to the importing file:
+`geometry.vec` is `geometry/vec.pp`. The braced list names what to import.
+
+A few points worth noting:
+
+- A type's methods travel with it: importing `Vec2` makes `a.add(b)` and
+  `Vec2.new(...)` available with no separate import.
+- A name beginning with `_` (like `_helper`) is private to its module and
+  cannot be imported.
+- The top-level standard library is an implicit prelude — `sqrt`, `println`,
+  and the array/string helpers need no import. Nested standard-library
+  modules are not in the prelude and are imported explicitly, e.g.
+  `import std.collections.hashmap.{ HashMap }`.
+
+The full rules are in the [modules reference](references/modules.md).

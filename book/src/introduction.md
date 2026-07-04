@@ -16,6 +16,11 @@ Features are summarized as follows:
 - Type inference for most types, resolved at execution time
 - Structural subtyping with interface definitions
 
+This book is organized in two parts: the **user guide** introduces the
+language feature by feature, with runnable examples, and the **references**
+describe the language exhaustively — the exact syntax, the type system rules,
+the standard library, and the execution model.
+
 ## Playground
 
 You can try prepoly on your browser:

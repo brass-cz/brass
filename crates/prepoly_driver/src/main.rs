@@ -762,6 +762,11 @@ fn analyze(main_label: &str, main_src: &str, root: &Path) -> Result<Checked, Vec
         ast: main_ast,
     });
 
+    // Nested std modules (`std.collections.hashmap`, `std.data.json`) are not in
+    // the implicit prelude; load only the ones actually imported, transitively.
+    let nested = prepoly_resolve::load_std_nested(&modules, &[], &mut sources);
+    modules.extend(nested);
+
     // The spawn-ownership pass only matters for the JIT runtime (the REPL does not
     // execute concurrency); it lives in the LLVM crate, so it is feature-gated.
     // The pass may reject a `spawn` it cannot analyze; those diagnostics join the
@@ -869,9 +874,38 @@ fn specialize_keyed(
         )
     })?;
     // Inject each generated method into the module that defines its receiver.
-    for (module_path, decl) in generated {
+    // A record key defined in another module (`User` in the caller, decoder in
+    // `std.data.json`) is not visible there, so also inject a synthetic import
+    // of the key type into the receiver's module. Collected per module first so
+    // one import covers every specialization that needs it.
+    use prepoly_hir::Type;
+    let mut synthetic_imports: HashMap<Vec<String>, Vec<(Vec<String>, String)>> = HashMap::new();
+    for g in &generated {
+        if let Type::Record(n) | Type::Sum(n) = &g.key
+            && let Some(info) = program.type_by_id(n.id)
+            && info.module != g.module
+        {
+            let entry = synthetic_imports.entry(g.module.clone()).or_default();
+            let import = (info.module.clone(), n.name.clone());
+            if !entry.contains(&import) {
+                entry.push(import);
+            }
+        }
+    }
+    for g in generated {
+        if let Some(m) = modules.iter_mut().find(|m| m.path == g.module) {
+            m.ast.items.push(TopLevel::Fun(g.decl));
+        }
+    }
+    for (module_path, imports) in synthetic_imports {
         if let Some(m) = modules.iter_mut().find(|m| m.path == module_path) {
-            m.ast.items.push(TopLevel::Fun(decl));
+            for (from_module, name) in imports {
+                m.ast.imports.push(prepoly_parser::ast::ImportDecl {
+                    path: from_module,
+                    names: vec![name],
+                    span: Span::new(0, 0),
+                });
+            }
         }
     }
     // Rewrite the keyed call sites to their specializations.
