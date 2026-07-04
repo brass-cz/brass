@@ -33,7 +33,7 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-          cache-dependency-path: book/playground/pnpm-lock.yaml
+          cache-dependency-path: book/pnpm-lock.yaml
 
       - name: Install playground dependencies
         working-directory: book
