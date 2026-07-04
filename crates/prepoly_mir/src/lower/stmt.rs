@@ -347,7 +347,10 @@ impl FnLower<'_, '_> {
                 let known = Type::Record(prepoly_hir::NominalType::with_substitution(
                     n.id, ty_name, subst,
                 ));
-                Some(self.b.emit_known(Rvalue::Record { ty: ty_sym, fields }, known))
+                Some(
+                    self.b
+                        .emit_known(Rvalue::Record { ty: ty_sym, fields }, known),
+                )
             }
             _ => None,
         }
@@ -627,9 +630,7 @@ fn stmt_reassigns_var(stmt: &Stmt, var: &str) -> bool {
         // A nested `for` that rebinds the same name shadows it, so stop there.
         Stmt::For { var: v, body, .. } => v != var && reassigns_var(body, var),
         Stmt::Expr(e) | Stmt::Return(Some(e), _) => expr_reassigns_var(e, var),
-        Stmt::Let { value, .. } => value
-            .as_ref()
-            .is_some_and(|v| expr_reassigns_var(v, var)),
+        Stmt::Let { value, .. } => value.as_ref().is_some_and(|v| expr_reassigns_var(v, var)),
         _ => false,
     }
 }

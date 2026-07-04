@@ -119,8 +119,9 @@ pub fn analyze(program: &Program) -> Analysis {
 /// (e.g. `len(s)`) or, in the case of `error`, become dead code because
 /// `error(x)` is always desugared to `Result.Err { error: x }`.
 fn check_reserved_names(program: &Program) -> Vec<TypeError> {
-    const RESERVED: &[&str] =
-        &["len", "open", "spawn", "with", "sync", "error", "fields", "typeof"];
+    const RESERVED: &[&str] = &[
+        "len", "open", "spawn", "with", "sync", "error", "fields", "typeof",
+    ];
     let mut errors = Vec::new();
     for name in RESERVED {
         if let Some(info) = program.functions.get(*name) {

@@ -48,9 +48,9 @@ pub fn run(
     // sees only the generic sentence for a program the checker accepted.
     if program.functions.contains_key("main") && mono.lookup("main").is_none() {
         return Err(match &mono.main_skip {
-            Some(reason) => format!(
-                "program uses constructs outside the typed (Value-free) subset: {reason}"
-            ),
+            Some(reason) => {
+                format!("program uses constructs outside the typed (Value-free) subset: {reason}")
+            }
             None => "program uses constructs outside the typed (Value-free) subset".to_string(),
         });
     }

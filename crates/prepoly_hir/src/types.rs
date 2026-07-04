@@ -764,7 +764,6 @@ fn nominal_key(tag: &str, n: &NominalType) -> String {
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use prepoly_lexer::Span;

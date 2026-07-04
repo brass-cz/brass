@@ -145,14 +145,11 @@ impl Expander<'_> {
     fn expr(&self, e: &Expr) -> Expr {
         match e {
             // The descriptor decays to the field name as a string constant...
-            Expr::Ident(name, span) if name == self.var => Expr::Str(
-                vec![StrSeg::Lit(self.field.to_string())],
-                self.span(*span),
-            ),
+            Expr::Ident(name, span) if name == self.var => {
+                Expr::Str(vec![StrSeg::Lit(self.field.to_string())], self.span(*span))
+            }
             // ...except as an index, where it projects the field.
-            Expr::Index(base, idx, span)
-                if matches!(&**idx, Expr::Ident(name, _) if name == self.var) =>
-            {
+            Expr::Index(base, idx, span) if matches!(&**idx, Expr::Ident(name, _) if name == self.var) => {
                 Expr::Field(
                     Box::new(self.expr(base)),
                     self.field.to_string(),
@@ -192,11 +189,9 @@ impl Expander<'_> {
                     .collect(),
                 self.span(*span),
             ),
-            Expr::Field(base, name, span) => Expr::Field(
-                Box::new(self.expr(base)),
-                name.clone(),
-                self.span(*span),
-            ),
+            Expr::Field(base, name, span) => {
+                Expr::Field(Box::new(self.expr(base)), name.clone(), self.span(*span))
+            }
             Expr::Index(base, idx, span) => Expr::Index(
                 Box::new(self.expr(base)),
                 Box::new(self.expr(idx)),
@@ -205,11 +200,9 @@ impl Expander<'_> {
             Expr::ErrorProp(inner, span) => {
                 Expr::ErrorProp(Box::new(self.expr(inner)), self.span(*span))
             }
-            Expr::Closure(params, body, span) => Expr::Closure(
-                params.clone(),
-                Box::new(self.expr(body)),
-                self.span(*span),
-            ),
+            Expr::Closure(params, body, span) => {
+                Expr::Closure(params.clone(), Box::new(self.expr(body)), self.span(*span))
+            }
             Expr::Array(es, span) => {
                 Expr::Array(es.iter().map(|e| self.expr(e)).collect(), self.span(*span))
             }
@@ -267,9 +260,7 @@ impl Expander<'_> {
         match p {
             Pattern::Wildcard(span) => Pattern::Wildcard(self.span(*span)),
             Pattern::Binding(name, span) => Pattern::Binding(name.clone(), self.span(*span)),
-            Pattern::Literal(e, span) => {
-                Pattern::Literal(Box::new(self.expr(e)), self.span(*span))
-            }
+            Pattern::Literal(e, span) => Pattern::Literal(Box::new(self.expr(e)), self.span(*span)),
             Pattern::Record(name, fields, span) => Pattern::Record(
                 name.clone(),
                 fields
@@ -323,9 +314,7 @@ impl Expander<'_> {
             TypeExpr::Ref(inner, span) => {
                 TypeExpr::Ref(Box::new(self.type_expr(inner)), self.span(*span))
             }
-            TypeExpr::TypeOf(e, span) => {
-                TypeExpr::TypeOf(Box::new(self.expr(e)), self.span(*span))
-            }
+            TypeExpr::TypeOf(e, span) => TypeExpr::TypeOf(Box::new(self.expr(e)), self.span(*span)),
         }
     }
 }

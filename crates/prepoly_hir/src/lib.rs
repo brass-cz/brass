@@ -9,13 +9,13 @@ pub mod mutation;
 pub mod typed;
 pub mod types;
 
+pub use expand::{
+    SPAN_SHIFT_UNIT, expand_fields_body, fields_loop_target, keyed_return, unshift_span,
+};
 pub use hir::{
     CallableSignature, FieldInfo, FunInfo, LoadedModule, MethodInfo, ModuleInit, ParamInfo,
     Program, QualifiedName, RESULT_TYPE_ID, SchemeMethod, TypeInfo, TypeKind, TypeScheme,
     VariantInfo, qualify, resolve_qualified,
-};
-pub use expand::{
-    SPAN_SHIFT_UNIT, expand_fields_body, fields_loop_target, keyed_return, unshift_span,
 };
 pub use lower::{LowerError, lower};
 pub use mutation::{

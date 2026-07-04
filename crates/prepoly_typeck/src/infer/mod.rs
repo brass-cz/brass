@@ -1142,8 +1142,7 @@ impl<'a> Checker<'a> {
         // binding's slot (needed when the initializer -- e.g. `null` -- does not
         // itself carry the type).
         if contains_typeof(te) {
-            self.typeof_types
-                .insert(te.span(), self.resolve(&resolved));
+            self.typeof_types.insert(te.span(), self.resolve(&resolved));
         }
         Ok(resolved)
     }
@@ -1188,12 +1187,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn bind_uninit_let(
-        &mut self,
-        pat: &Pattern,
-        ty: Option<&TypeExpr>,
-        scopes: &mut ScopeStack,
-    ) {
+    fn bind_uninit_let(&mut self, pat: &Pattern, ty: Option<&TypeExpr>, scopes: &mut ScopeStack) {
         // The parser only omits the initializer when an annotation is present.
         let Some(te) = ty else { return };
         let binding_ty = match self.resolve_annotation_scoped(te, scopes) {
@@ -1236,14 +1230,20 @@ impl<'a> Checker<'a> {
             Type::Record(n) => {
                 let Some(info) = self.program.type_by_id(n.id) else {
                     self.errors.push(TypeError {
-                        message: format!("`fields(..)` requires a record value, got `{}`", resolved.display()),
+                        message: format!(
+                            "`fields(..)` requires a record value, got `{}`",
+                            resolved.display()
+                        ),
                         span: arg.span(),
                     });
                     return;
                 };
                 let TypeKind::Record { fields, .. } = &info.kind else {
                     self.errors.push(TypeError {
-                        message: format!("`fields(..)` requires a record value, got `{}`", resolved.display()),
+                        message: format!(
+                            "`fields(..)` requires a record value, got `{}`",
+                            resolved.display()
+                        ),
                         span: arg.span(),
                     });
                     return;
@@ -1268,7 +1268,9 @@ impl<'a> Checker<'a> {
         // rebinding inside the body would silently change meaning.
         if block_rebinds(body, var) {
             self.errors.push(TypeError {
-                message: format!("the fields-loop variable `{var}` must not be shadowed in the body"),
+                message: format!(
+                    "the fields-loop variable `{var}` must not be shadowed in the body"
+                ),
                 span: s.span(),
             });
             return;
@@ -4106,8 +4108,7 @@ impl<'a> Checker<'a> {
             // a static-call qualifier -- `typeof(v).from(x)` calls the `from` of
             // v's type. The receiver's type must already be resolved to a
             // nominal (or primitive) here; an open type has no name yet.
-            Expr::Call(callee, args, _)
-                if matches!(&**callee, Expr::Ident(n, _) if n == "typeof") =>
+            Expr::Call(callee, args, _) if matches!(&**callee, Expr::Ident(n, _) if n == "typeof") =>
             {
                 let [arg] = args.as_slice() else {
                     return None;

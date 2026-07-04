@@ -438,9 +438,9 @@ fn collect_local_bindings(stmts: &[Stmt], out: &mut HashSet<String>) {
 fn nested_block_stmts(stmt: &Stmt, f: &mut dyn FnMut(&[Stmt])) {
     match stmt {
         Stmt::While { body, .. } | Stmt::For { body, .. } => f(&body.stmts),
-        Stmt::Expr(e)
-        | Stmt::Let { value: Some(e), .. }
-        | Stmt::Return(Some(e), _) => nested_block_stmts_expr(e, f),
+        Stmt::Expr(e) | Stmt::Let { value: Some(e), .. } | Stmt::Return(Some(e), _) => {
+            nested_block_stmts_expr(e, f)
+        }
         _ => {}
     }
 }
@@ -471,9 +471,9 @@ fn nested_block_stmts_expr(e: &Expr, f: &mut dyn FnMut(&[Stmt])) {
 fn nested_block_stmts_mut(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Vec<Stmt>)) {
     match stmt {
         Stmt::While { body, .. } | Stmt::For { body, .. } => f(&mut body.stmts),
-        Stmt::Expr(e)
-        | Stmt::Let { value: Some(e), .. }
-        | Stmt::Return(Some(e), _) => nested_block_stmts_expr_mut(e, f),
+        Stmt::Expr(e) | Stmt::Let { value: Some(e), .. } | Stmt::Return(Some(e), _) => {
+            nested_block_stmts_expr_mut(e, f)
+        }
         _ => {}
     }
 }
@@ -2259,7 +2259,7 @@ mod tests {
         // The bound closure's body is wrapped in a lock acquisition.
         let bound_wrapped = body.stmts.iter().any(|s| {
             let Stmt::Let {
-                value: Expr::Closure(_, cbody, _),
+                value: Some(Expr::Closure(_, cbody, _)),
                 ..
             } = s
             else {

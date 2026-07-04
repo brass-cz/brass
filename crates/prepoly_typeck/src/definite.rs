@@ -220,9 +220,10 @@ impl<'p, 'e> Walker<'p, 'e> {
                                 )
                             }
                         }
-                        TypeKind::Sum { .. } => {
-                            (None, "its type is a sum type; assign the whole value".into())
-                        }
+                        TypeKind::Sum { .. } => (
+                            None,
+                            "its type is a sum type; assign the whole value".into(),
+                        ),
                     },
                     None => (None, "its type is not a record".into()),
                 };
@@ -464,9 +465,7 @@ impl<'p, 'e> Walker<'p, 'e> {
             Expr::Call(callee, args, _)
                 if matches!(&**callee, Expr::Ident(n, _) if n == "typeof" || n == "fields")
                     && args.len() == 1
-                    && matches!(&args[0].expr, Expr::Ident(n, _) if self.lookup(n).is_some()) =>
-            {
-            }
+                    && matches!(&args[0].expr, Expr::Ident(n, _) if self.lookup(n).is_some()) => {}
             Expr::Call(callee, args, _) => {
                 self.walk_expr(callee);
                 for a in args {

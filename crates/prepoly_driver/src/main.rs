@@ -862,8 +862,12 @@ fn specialize_keyed(
             prepoly_hir::type_key(&b.key),
         ))
     });
-    let generated = prepoly_typesys::specialize_all(program, &roots)
-        .map_err(|e| (format!("reflective specialization failed: {e}"), Span::new(0, 0)))?;
+    let generated = prepoly_typesys::specialize_all(program, &roots).map_err(|e| {
+        (
+            format!("reflective specialization failed: {e}"),
+            Span::new(0, 0),
+        )
+    })?;
     // Inject each generated method into the module that defines its receiver.
     for (module_path, decl) in generated {
         if let Some(m) = modules.iter_mut().find(|m| m.path == module_path) {
@@ -900,9 +904,7 @@ fn rewrite_calls_block(
 
 fn rewrite_calls_stmt(s: &mut Stmt, renames: &std::collections::HashMap<Span, String>) {
     match s {
-        Stmt::Let {
-            value: Some(v), ..
-        } => rewrite_calls_expr(v, renames),
+        Stmt::Let { value: Some(v), .. } => rewrite_calls_expr(v, renames),
         Stmt::Assign { target, value, .. } => {
             rewrite_calls_expr(target, renames);
             rewrite_calls_expr(value, renames);
@@ -920,7 +922,10 @@ fn rewrite_calls_stmt(s: &mut Stmt, renames: &std::collections::HashMap<Span, St
     }
 }
 
-fn rewrite_calls_expr(e: &mut prepoly_parser::ast::Expr, renames: &std::collections::HashMap<Span, String>) {
+fn rewrite_calls_expr(
+    e: &mut prepoly_parser::ast::Expr,
+    renames: &std::collections::HashMap<Span, String>,
+) {
     use prepoly_parser::ast::{Expr, StrSeg};
     match e {
         Expr::Call(callee, args, span) => {
@@ -942,9 +947,9 @@ fn rewrite_calls_expr(e: &mut prepoly_parser::ast::Expr, renames: &std::collecti
             rewrite_calls_expr(r, renames);
         }
         Expr::Array(es, _) => es.iter_mut().for_each(|e| rewrite_calls_expr(e, renames)),
-        Expr::TypeLit(_, fs, _) | Expr::VariantLit(_, _, fs, _) => {
-            fs.iter_mut().for_each(|(_, e)| rewrite_calls_expr(e, renames))
-        }
+        Expr::TypeLit(_, fs, _) | Expr::VariantLit(_, _, fs, _) => fs
+            .iter_mut()
+            .for_each(|(_, e)| rewrite_calls_expr(e, renames)),
         Expr::Str(segs, _) => segs.iter_mut().for_each(|seg| {
             if let StrSeg::Expr(e) = seg {
                 rewrite_calls_expr(e, renames);

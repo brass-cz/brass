@@ -16,11 +16,11 @@ pub mod structural;
 
 pub use convert::{InferFrom, infer_from};
 pub use defaults::default_constructible;
-pub use specialize::{KeyedNeed, mangled_name, specialize_all, type_to_expr};
 pub use flow::{Flow, common_numeric_type, numeric_flow, numeric_flows_into};
 pub use rows::{
     ParamRow, Presence, Row, RowField, RowInfo, RowTy, check_row, field_satisfies, view_type,
 };
+pub use specialize::{KeyedNeed, mangled_name, specialize_all, type_to_expr};
 pub use structural::{
     record_satisfies, record_satisfies_fields, signature_satisfies, types_compatible,
     types_invariant,

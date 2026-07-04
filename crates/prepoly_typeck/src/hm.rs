@@ -548,9 +548,7 @@ impl<'p> Hm<'p> {
                     // A `Self` annotation is resolved positionally by the infer
                     // pass; here it would read as a foreign nominal, so let the
                     // binding's uses pin a fresh variable instead.
-                    (None, Some(_))
-                        if matches!(ty.as_ref(), Some(prepoly_parser::ast::TypeExpr::Named(n, _)) if n == "Self") =>
-                    {
+                    (None, Some(_)) if matches!(ty.as_ref(), Some(prepoly_parser::ast::TypeExpr::Named(n, _)) if n == "Self") => {
                         self.solver.fresh(InferenceVarKind::Source)
                     }
                     (None, Some(annot_ty)) => annot_ty,

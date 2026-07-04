@@ -660,7 +660,14 @@ pub fn lower_program_with_types(
     type_names: &HashMap<Span, String>,
     typeof_types: &HashMap<Span, Type>,
 ) -> MirProgram {
-    let ctx = ProgramCtx::new(program, expr_types, view_args, fields_loops, type_names, typeof_types);
+    let ctx = ProgramCtx::new(
+        program,
+        expr_types,
+        view_args,
+        fields_loops,
+        type_names,
+        typeof_types,
+    );
     let mut out = MirProgram::default();
 
     let mut fn_names: Vec<&String> = program.functions.keys().collect();

@@ -78,7 +78,12 @@ pub fn specialize_all(
     // Bounded by the distinct (recv, method, key) triples the program's type
     // graph can reach -- finite -- so the worklist drains.
     while let Some(need) = work.pop() {
-        let sym = format!("{}.{}:{}", need.recv, need.method, prepoly_hir::type_key(&need.key));
+        let sym = format!(
+            "{}.{}:{}",
+            need.recv,
+            need.method,
+            prepoly_hir::type_key(&need.key)
+        );
         if !done.insert(sym) {
             continue;
         }
@@ -152,7 +157,11 @@ type Bindings = HashMap<String, Type>;
 impl Specializer<'_> {
     fn block(&mut self, b: &Block) -> Block {
         Block {
-            stmts: b.stmts.iter().flat_map(|s| self.stmt(s, &HashMap::new())).collect(),
+            stmts: b
+                .stmts
+                .iter()
+                .flat_map(|s| self.stmt(s, &HashMap::new()))
+                .collect(),
             span: b.span,
         }
     }
@@ -187,7 +196,10 @@ impl Specializer<'_> {
             // is unreachable; but a non-record key only reaches here in an arm
             // that also folds elsewhere, so this stays a faithful unroll.
             Stmt::For {
-                var, iter, body, span,
+                var,
+                iter,
+                body,
+                span,
             } if is_fields_over(iter, "ret") => {
                 // A non-record key cannot iterate fields: the whole arm is not
                 // viable, so fold it to a runtime decode error. The subsequent
@@ -322,9 +334,11 @@ impl Specializer<'_> {
                 *span,
             ),
             Expr::Field(b, n, span) => Expr::Field(Box::new(self.expr(b, binds)), n.clone(), *span),
-            Expr::Index(b, i, span) => {
-                Expr::Index(Box::new(self.expr(b, binds)), Box::new(self.expr(i, binds)), *span)
-            }
+            Expr::Index(b, i, span) => Expr::Index(
+                Box::new(self.expr(b, binds)),
+                Box::new(self.expr(i, binds)),
+                *span,
+            ),
             Expr::ErrorProp(i, span) => Expr::ErrorProp(Box::new(self.expr(i, binds)), *span),
             Expr::Unary(op, i, span) => Expr::Unary(*op, Box::new(self.expr(i, binds)), *span),
             Expr::Binary(op, l, r, span) => Expr::Binary(
@@ -345,18 +359,24 @@ impl Specializer<'_> {
             Expr::Array(es, span) => {
                 Expr::Array(es.iter().map(|e| self.expr(e, binds)).collect(), *span)
             }
-            Expr::Range(l, r, span) => {
-                Expr::Range(Box::new(self.expr(l, binds)), Box::new(self.expr(r, binds)), *span)
-            }
+            Expr::Range(l, r, span) => Expr::Range(
+                Box::new(self.expr(l, binds)),
+                Box::new(self.expr(r, binds)),
+                *span,
+            ),
             Expr::TypeLit(n, fs, span) => Expr::TypeLit(
                 n.clone(),
-                fs.iter().map(|(k, e)| (k.clone(), self.expr(e, binds))).collect(),
+                fs.iter()
+                    .map(|(k, e)| (k.clone(), self.expr(e, binds)))
+                    .collect(),
                 *span,
             ),
             Expr::VariantLit(t, v, fs, span) => Expr::VariantLit(
                 t.clone(),
                 v.clone(),
-                fs.iter().map(|(k, e)| (k.clone(), self.expr(e, binds))).collect(),
+                fs.iter()
+                    .map(|(k, e)| (k.clone(), self.expr(e, binds)))
+                    .collect(),
                 *span,
             ),
             Expr::Closure(ps, b, span) => {
@@ -527,16 +547,18 @@ impl RewriteInto<'_> {
         match e {
             Expr::Call(callee, args, span) => {
                 let new_callee = match &**callee {
-                    Expr::Field(base, m, fspan) if m == self.method => Expr::Field(
-                        Box::new(self.expr(base)),
-                        self.mangled.to_string(),
-                        *fspan,
-                    ),
+                    Expr::Field(base, m, fspan) if m == self.method => {
+                        Expr::Field(Box::new(self.expr(base)), self.mangled.to_string(), *fspan)
+                    }
                     other => self.expr(other),
                 };
                 Expr::Call(
                     Box::new(new_callee),
-                    args.iter().map(|a| Arg { expr: self.expr(&a.expr) }).collect(),
+                    args.iter()
+                        .map(|a| Arg {
+                            expr: self.expr(&a.expr),
+                        })
+                        .collect(),
                     *span,
                 )
             }

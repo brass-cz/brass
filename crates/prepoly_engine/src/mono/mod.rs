@@ -638,9 +638,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         // against the final inferred type when this frame completes.
         let provisional = ret_ann.clone().or_else(|| {
             if fallible {
-                declared_ok
-                    .clone()
-                    .map(|ok| result_type(ok, Type::Str))
+                declared_ok.clone().map(|ok| result_type(ok, Type::Str))
             } else {
                 None
             }
