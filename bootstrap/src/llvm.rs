@@ -1,6 +1,6 @@
 use anyhow::{Context as _, bail};
 use sha2::{Digest, Sha256};
-use std::{fs, path::Path};
+use std::{env, ffi::OsString, fs, path::Path, process::Command};
 use tar::Archive;
 use xz::read::XzDecoder;
 
@@ -36,6 +36,43 @@ pub async fn download_llvm(dest: impl AsRef<Path>) -> anyhow::Result<()> {
     let data = crate::http::download(asset.clone(), llvm_url(&asset)).await?;
     verify_digest(&asset, &data)?;
     extract(&data, dest)
+}
+
+/// Configure child processes so release builds link the downloaded LLVM with a
+/// matching LTO plugin. The official macOS LLVM 22 archives contain bitcode
+/// members in their static libraries; when Cargo's release profile enables LTO,
+/// Apple's default linker otherwise asks Xcode's older `libLTO.dylib` to read
+/// those members and fails before the final executable is produced.
+pub fn configure_linker(cmd: &mut Command, llvm_path: &Path) {
+    if cfg!(target_os = "macos") {
+        let lto = llvm_path.join("lib").join("libLTO.dylib");
+        if lto.is_file() {
+            append_rustflag(
+                cmd,
+                format!("-Clink-arg=-Wl,-lto_library,{}", lto.display()),
+            );
+        }
+    }
+}
+
+fn append_rustflag(cmd: &mut Command, flag: String) {
+    if env::var_os("CARGO_ENCODED_RUSTFLAGS").is_some() {
+        cmd.env(
+            "CARGO_ENCODED_RUSTFLAGS",
+            appended_env("CARGO_ENCODED_RUSTFLAGS", "\x1f", &flag),
+        );
+    } else {
+        cmd.env("RUSTFLAGS", appended_env("RUSTFLAGS", " ", &flag));
+    }
+}
+
+fn appended_env(name: &str, separator: &str, value: &str) -> OsString {
+    let mut values = env::var_os(name).unwrap_or_default();
+    if !values.is_empty() {
+        values.push(separator);
+    }
+    values.push(value);
+    values
 }
 
 /// The release archive file name for the host OS/architecture.

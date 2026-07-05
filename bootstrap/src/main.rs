@@ -14,8 +14,7 @@ async fn main() -> std::io::Result<()> {
 
     let args: Vec<_> = env::args().skip(1).collect();
     let mut cmd = process::Command::new(&args[0]);
-    Err(cmd
-        .args(&args[1..])
-        .env(llvm::LLVM_SYS_ENV, &llvm_path)
-        .exec())
+    cmd.args(&args[1..]).env(llvm::LLVM_SYS_ENV, &llvm_path);
+    llvm::configure_linker(&mut cmd, &llvm_path);
+    Err(cmd.exec())
 }
