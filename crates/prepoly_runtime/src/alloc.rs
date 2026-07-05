@@ -447,7 +447,11 @@ pub unsafe extern "C-unwind" fn pp_str_slice(s: *mut Header, start: i64, end: i6
     unsafe {
         let len = pp_str_len(s);
         let st = start.clamp(0, len) as usize;
-        let en = end.clamp(start.max(0), len) as usize;
+        // Clamp the end against the already-clamped start, not the raw `start`:
+        // a `start > len` would make the range `clamp(min > max)` and panic
+        // (aborting the process across the C-ABI boundary) instead of yielding
+        // an empty slice.
+        let en = end.clamp(st as i64, len) as usize;
         let bytes = std::slice::from_raw_parts(str_bytes_ptr(s), len as usize);
         let st = snap_char_boundary(bytes, st);
         let en = snap_char_boundary(bytes, en);
@@ -719,6 +723,26 @@ mod tests {
             assert_eq!(pp_str_cmp(mk("apple"), mk("apple")), 0);
             // A prefix sorts before the longer string.
             assert_eq!(pp_str_cmp(mk("app"), mk("apple")), -1);
+        }
+    }
+
+    /// `pp_str_slice` clamps an out-of-range range to an empty slice instead of
+    /// aborting. A `start` past the end used to make the end-clamp `min > max`
+    /// and panic across the C-ABI boundary (a process abort mid-JIT-run).
+    #[test]
+    fn str_slice_out_of_range_yields_empty_not_abort() {
+        let _serial = serial();
+        unsafe {
+            let s = pp_str_const("abc".as_ptr(), 3);
+            // start beyond len: empty, no panic.
+            let past = pp_str_slice(s, 10, 20);
+            assert_eq!(pp_str_len(past), 0);
+            // negative start, huge end: clamps to the whole string.
+            let whole = pp_str_slice(s, -5, 100);
+            assert_eq!(pp_str_len(whole), 3);
+            // start > end after clamping: empty.
+            let inverted = pp_str_slice(s, 2, 1);
+            assert_eq!(pp_str_len(inverted), 0);
         }
     }
 }
