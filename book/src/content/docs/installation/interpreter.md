@@ -3,8 +3,7 @@ title: "Installing prepoly"
 description: "Build and install the prepoly command-line driver."
 ---
 
-Unfortunately, we don't provide pre-built binaries yet.
-So here we describe how to build and install the prepoly command-line driver.
+Here we describe how to build and install the prepoly command-line driver.
 
 ## Clone the repository
 

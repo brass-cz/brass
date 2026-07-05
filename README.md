@@ -21,9 +21,10 @@ it executes, and most types are inferred rather than written. A program is run b
 a **just-in-time compiler** for native speed, or by an **interpreter** for the
 REPL and WebAssembly.
 
-```
-$ prepoly hello.pp
-Hello, world!
+Quick start:
+
+```bash
+curl -L https://raw.githubusercontent.com/cordx56/prepoly/refs/heads/main/scripts/installer | sh
 ```
 
 ## Features
