@@ -272,7 +272,10 @@ pub unsafe extern "C-unwind" fn pp_str_char_at(s: *mut Header, i: i64) -> *mut H
 
 /// Typed `_string_from_bytes(bytes)`: a typed `Result<string, string>` from a
 /// `uint8[]` (growable array: len@16, data@32), validating UTF-8.
-pub extern "C-unwind" fn pp_str_from_bytes(arr: *mut Header) -> *mut Header {
+///
+/// # Safety
+/// `arr` must be a growable-array object of `u8` elements.
+pub unsafe extern "C-unwind" fn pp_str_from_bytes(arr: *mut Header) -> *mut Header {
     unsafe {
         let len = *((arr as *mut u8).offset(16) as *mut i64) as usize;
         let data = *((arr as *mut u8).offset(32) as *mut *const u8);

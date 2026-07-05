@@ -31,11 +31,13 @@ use crate::mono::{
 };
 
 /// Whether a type is a reference-counted heap object the back end tracks with
-/// retain/release: strings, records, sums, and arrays/slices.
-/// Closures are excluded (see below). An array's heap elements and a sum's heap
-/// fields are not yet released recursively, so they leak rather than
-/// use-after-free (they were retained on store); scalar-content aggregates and all
-/// strings/records reclaim fully.
+/// retain/release: strings, records, sums, arrays/slices, tuples, closures, and
+/// nullable cells. Aggregates release the heap contents they own recursively
+/// through per-type destructors ([`Codegen::release_obj`]: record/variant
+/// fields, array elements and the element buffer); a closure releases its
+/// captures through the destructor stored in its object
+/// ([`Codegen::release_closure`], since the `Fun` type hides the capture
+/// types); a string is a leaf, freed directly.
 pub fn rc_managed(ty: &Type) -> bool {
     matches!(
         ty,
@@ -397,6 +399,19 @@ pub trait Codegen {
     /// The write barrier: maintain region membership and the local
     /// reference count when `value` is stored into `container`.
     fn region_write(&mut self, container: Self::Value, value: Self::Value);
+    /// The overwriting-store barrier: [`Codegen::region_write`] for `value` plus
+    /// the removal of the slot's previous value `old`, so a reference that
+    /// escaped through the slot is un-counted when it is overwritten. `container`
+    /// is null for a store into a global (a region-less external root).
+    /// `managed_cells` says `old`/`value` are nullable cells wrapping a managed
+    /// value, whose content the barrier accounts as well.
+    fn region_store(
+        &mut self,
+        container: Self::Value,
+        old: Self::Value,
+        value: Self::Value,
+        managed_cells: bool,
+    );
     /// Whether to emit region write barriers -- true when the program uses `with`,
     /// so a sequential program pays no barrier cost (the default).
     fn emit_region_barrier(&self) -> bool {
@@ -554,58 +569,100 @@ pub trait Codegen {
                 let _ = self.codegen_rvalue(program, f, rv, &Type::Void);
             }
             // Store into a record field or an array element. The container gains a
-            // reference to the stored value, so a managed value is retained.
+            // reference to the stored value (retain), the slot's previous value is
+            // dropped (release), and the region model sees both edges (barrier) --
+            // see `overwrite_epilogue`.
             MirStmt::Store(place, op) => match place.proj.as_slice() {
                 [Projection::Field(field)] => {
                     let raw_ty = f.local_type(place.local).clone();
                     let base = self.load_local(place.local);
                     let (base, base_ty) = self.unwrap_narrowed(base, &raw_ty);
                     let fty = record_field_type(&base_ty, field);
-                    let op_ty = operand_type_of(op, &f.local_types);
+                    // Snapshot the slot's previous value before overwriting: the
+                    // slot owned it, and the barrier must read its header before
+                    // the release below can free it.
+                    let old = rc_managed(&fty).then(|| self.load_field(base, &base_ty, field));
                     let v = self.codegen_operand(program, f, op, &fty);
                     self.store_field(base, &base_ty, field, v);
-                    // Retain an aliased managed value (a second reference). A fresh
-                    // constant is owned at 1, and a coerced nullable wrap is a fresh
-                    // cell that already owns its content -- both transfer ownership to
-                    // the field without an extra retain.
-                    if rc_managed(&fty) && operand_is_alias(op) && !is_nullable_wrap(&fty, &op_ty) {
-                        self.retain(v);
-                        // Region write barrier: the container now references `v`.
-                        if self.emit_region_barrier() {
-                            self.region_write(base, v);
-                        }
-                    }
+                    self.overwrite_epilogue(f, base, &fty, op, v, old);
                 }
                 [Projection::Index(idx)] => {
                     let raw_ty = f.local_type(place.local).clone();
                     let arr = self.load_local(place.local);
                     let (arr, arr_ty) = self.unwrap_narrowed(arr, &raw_ty);
                     let elem_ty = element_type(&arr_ty);
-                    let op_ty = operand_type_of(op, &f.local_types);
-                    let v = self.codegen_operand(program, f, op, &elem_ty);
                     let iv = self.codegen_operand(program, f, idx, &index_type(idx, f));
+                    let old = rc_managed(&elem_ty).then(|| self.load_index(arr, &arr_ty, iv));
+                    let v = self.codegen_operand(program, f, op, &elem_ty);
                     self.store_index(arr, &arr_ty, iv, v);
-                    if rc_managed(&elem_ty)
-                        && operand_is_alias(op)
-                        && !is_nullable_wrap(&elem_ty, &op_ty)
-                    {
-                        self.retain(v);
-                        if self.emit_region_barrier() {
-                            self.region_write(arr, v);
-                        }
-                    }
+                    self.overwrite_epilogue(f, arr, &elem_ty, op, v, old);
                 }
-                _ => {}
+                // MIR lowering always emits single-step places (nested accesses
+                // go through temporaries); silently dropping any other shape
+                // would miscompile the store, so a lowering bug fails loudly.
+                proj => {
+                    panic!("internal error: store through unsupported place projection {proj:?}")
+                }
             },
-            // Write a module-level global with its concrete (init) type.
+            // Write a module-level global with its concrete (init) type. A global
+            // is a region-less external root, so the barrier runs with a null
+            // container: a stored region value is an escape borrow, and the
+            // overwritten value's borrow is dropped.
             MirStmt::SetGlobal(name, op) => {
                 let gty = program.global_type(name).cloned().unwrap_or(Type::Void);
+                let old = rc_managed(&gty).then(|| self.load_global(name, &gty));
                 let v = self.codegen_operand(program, f, op, &gty);
                 self.store_global(name, &gty, v);
-                if rc_managed(&gty) {
-                    self.retain(v);
-                }
+                let root = self.const_null();
+                self.overwrite_epilogue(f, root, &gty, op, v, old);
             }
+        }
+    }
+
+    /// The shared ownership/region epilogue of an overwriting store of operand
+    /// `op` (evaluated to `v` at slot type `slot_ty`) into a slot of `container`
+    /// whose previous value is `old` (`None` when the slot type is unmanaged; a
+    /// global's `container` is null). In order:
+    ///
+    /// 1. Retain an *aliased* value: the slot is a second reference. A fresh
+    ///    constant is owned at count 1 and a nullable wrap is a fresh cell that
+    ///    already owns its content -- both transfer that ownership to the slot,
+    ///    so retaining them too would leak.
+    /// 2. Emit the region barrier for *every* managed store (not only aliased
+    ///    ones): a fresh value or wrap cell stored into a region container joins
+    ///    the region all the same, and the overwritten value's (possibly
+    ///    escaping) reference is dropped symmetrically. A managed-content
+    ///    nullable slot passes `managed_cells` so the cells' *content* -- a
+    ///    separately tracked object reachable through the slot -- is accounted
+    ///    (and un-accounted) together with the cell itself.
+    /// 3. Release the old value: the slot owned it and it is no longer reachable
+    ///    through the slot, so without this every overwrite leaked it.
+    fn overwrite_epilogue(
+        &mut self,
+        f: &MonoFunction,
+        container: Self::Value,
+        slot_ty: &Type,
+        op: &Operand,
+        v: Self::Value,
+        old: Option<Self::Value>,
+    ) {
+        if !rc_managed(slot_ty) {
+            return;
+        }
+        let op_ty = operand_type_of(op, &f.local_types);
+        if operand_is_alias(op) && !is_nullable_wrap(slot_ty, &op_ty) {
+            self.retain(v);
+        }
+        if self.emit_region_barrier() {
+            let old_v = match old {
+                Some(old) => old,
+                None => self.const_null(),
+            };
+            let cells = matches!(slot_ty, Type::Nullable(inner) if rc_managed(inner));
+            self.region_store(container, old_v, v, cells);
+        }
+        if let Some(old) = old {
+            self.emit_release(old, slot_ty);
         }
     }
 
@@ -1005,7 +1062,12 @@ pub trait Codegen {
                         self.load_index(arr, &arr_ty, iv)
                     }
                 }
-                _ => self.unit(),
+                // Same single-step invariant as `MirStmt::Store`: any other
+                // shape is a lowering bug, and a placeholder value here would
+                // silently miscompile the read.
+                proj => {
+                    panic!("internal error: load through unsupported place projection {proj:?}")
+                }
             },
             // Read a module-level global.
             Rvalue::Global(name) => {
@@ -1015,9 +1077,10 @@ pub trait Codegen {
         }
     }
 
-    /// Generate a call, routing free / instance-method / static calls to the
-    /// matching monomorphized instance (computed from the argument types the same
-    /// way the monomorphizer did).
+    /// Generate a call, branching on the shared [`classify_call`] dispatch (the
+    /// same classification [`Codegen::call_result_type`] types results with) and
+    /// routing free / instance-method / static calls to the matching
+    /// monomorphized instance.
     fn codegen_call(
         &mut self,
         program: &MonoProgram,
@@ -1030,85 +1093,52 @@ pub trait Codegen {
             .iter()
             .map(|a| operand_type_of(a, &f.local_types))
             .collect();
-        let target = match callee {
-            // `arr.push(v)`: a growable-array append, not a user method. The receiver
-            // type is stripped of a top-level nullable (a narrowed `T[]?`), and the
-            // operand is loaded at that stripped type so the cell is unwrapped.
-            Callee::Method(name)
-                if name == "push"
-                    && matches!(arg_types.first().map(unwrap_nullable), Some(Type::Slice(_))) =>
-            {
+        let target = match classify_call(program, callee, &arg_types, dest_ty) {
+            // The receiver type is stripped of a top-level nullable (a narrowed
+            // `T[]?`), and the operand is loaded at that stripped type so the
+            // cell is unwrapped.
+            CallKind::ArrayPush => {
                 let aty = unwrap_nullable(&arg_types[0]);
                 let elem = element_type(aty);
                 let arr = self.codegen_operand(program, f, &args[0], aty);
                 let v = self.codegen_operand(program, f, &args[1], &elem);
                 self.push(arr, &elem, v);
-                // The array now holds a reference to a managed element. Same
-                // ownership rule as `MirStmt::Store`: only an aliased element's
-                // count rises -- a fresh constant and a nullable-wrap cell already
-                // own their single reference and hand it to the array (retaining
-                // them too leaked one reference per push).
-                if rc_managed(&elem)
-                    && operand_is_alias(&args[1])
-                    && !is_nullable_wrap(&elem, &operand_type_of(&args[1], &f.local_types))
-                {
-                    self.retain(v);
-                }
+                // The array now holds a reference to a managed element: the same
+                // ownership rule and region barrier as `MirStmt::Store`, minus an
+                // old value (an append overwrites nothing).
+                self.overwrite_epilogue(f, arr, &elem, &args[1], v, None);
                 return self.unit();
             }
-            // `arr.insert(i, v)`: a growable-array insertion (`_array_insert`), not a user method.
-            Callee::Method(name)
-                if name == "insert"
-                    && matches!(arg_types.first().map(unwrap_nullable), Some(Type::Slice(_))) =>
-            {
+            CallKind::ArrayInsert => {
                 let aty = unwrap_nullable(&arg_types[0]);
                 let elem = element_type(aty);
                 let arr = self.codegen_operand(program, f, &args[0], aty);
                 let idx = self.codegen_operand(program, f, &args[1], &arg_types[1]);
                 let v = self.codegen_operand(program, f, &args[2], &elem);
                 self.insert(arr, &elem, idx, v);
-                // The array now holds a reference to a managed element (its
-                // destructor releases it). Aliased elements only -- see `push`.
-                if rc_managed(&elem)
-                    && operand_is_alias(&args[2])
-                    && !is_nullable_wrap(&elem, &operand_type_of(&args[2], &f.local_types))
-                {
-                    self.retain(v);
-                }
+                // The array now holds a reference to a managed element: the same
+                // ownership rule and region barrier as `push` (nothing overwritten).
+                self.overwrite_epilogue(f, arr, &elem, &args[2], v, None);
                 return self.unit();
             }
-            // `arr.remove(i)`: a growable-array removal (`_array_remove`) returning the removed element. Ownership of a managed
-            // element transfers to the caller, so no retain/release is needed.
-            Callee::Method(name)
-                if name == "remove"
-                    && matches!(arg_types.first().map(unwrap_nullable), Some(Type::Slice(_))) =>
-            {
+            // Ownership of a managed removed element transfers to the caller, so
+            // no retain/release is needed.
+            CallKind::ArrayRemove => {
                 let aty = unwrap_nullable(&arg_types[0]);
                 let elem = element_type(aty);
                 let arr = self.codegen_operand(program, f, &args[0], aty);
                 let idx = self.codegen_operand(program, f, &args[1], &arg_types[1]);
                 return self.remove(arr, &elem, idx);
             }
-            // `arr.pop()`: a growable-array removal of the last element (`_array_pop`) returning it as a nullable. Ownership of a managed
-            // element transfers to the caller (the nullable cell), so no
-            // retain/release is needed.
-            Callee::Method(name)
-                if name == "pop"
-                    && matches!(arg_types.first().map(unwrap_nullable), Some(Type::Slice(_))) =>
-            {
+            // Ownership of a managed popped element transfers to the caller (the
+            // nullable cell), so no retain/release is needed.
+            CallKind::ArrayPop => {
                 let aty = unwrap_nullable(&arg_types[0]);
                 let elem = element_type(aty);
                 let arr = self.codegen_operand(program, f, &args[0], aty);
                 return self.pop(arr, &elem);
             }
-            // `arr.len()` / `s.len()`: the length builtin in UFCS method form.
-            Callee::Method(name)
-                if name == "len"
-                    && matches!(
-                        arg_types.first().map(unwrap_nullable),
-                        Some(Type::Slice(_) | Type::Array(..) | Type::Str)
-                    ) =>
-            {
+            CallKind::Len => {
                 let aty = unwrap_nullable(&arg_types[0]);
                 let v = self.codegen_operand(program, f, &args[0], aty);
                 return match aty {
@@ -1116,15 +1146,9 @@ pub trait Codegen {
                     _ => self.string_len(v),
                 };
             }
-            // File I/O methods: the receiver is the builtin `File`
-            // record, so map to the runtime file primitives rather than a user
-            // method.
-            Callee::Method(name)
-                if matches!(name.as_str(), "read" | "write" | "close" | "size" | "seek")
-                    && matches!(arg_types.first(), Some(Type::Record(r)) if r.is_name("File")) =>
-            {
+            CallKind::FileMethod(name) => {
                 let file = self.codegen_operand(program, f, &args[0], &arg_types[0]);
-                return match name.as_str() {
+                return match name {
                     "read" => {
                         let n = self.codegen_operand(program, f, &args[1], &arg_types[1]);
                         self.file_read(file, n)
@@ -1141,49 +1165,20 @@ pub trait Codegen {
                     _ => self.file_close(file),
                 };
             }
-            // Instance method (`arg_types[0]` is the receiver). A nominal method
-            // instance is keyed by `method_symbol`; a stdlib primitive/array
-            // method (`fun string.split`) by its class-qualified symbol. The type
-            // checker has already rejected any other `recv.m()`.
-            Callee::Method(name) => {
-                let msym = method_symbol(name, &arg_types);
-                if program.lookup(&msym).is_some() {
-                    msym
-                } else if let Some(psym) = prim_method_instance(program, name, &arg_types) {
-                    psym
-                } else {
-                    instance_symbol(name, &arg_types)
-                }
-            }
-            // Runtime-recognized numeric/string conversions (not user statics).
-            Callee::Static { ty, method } if numeric_conv_ret(ty, method).is_some() => {
+            CallKind::FileStd(which) => return self.file_std(which),
+            CallKind::NumericConv { ty, method } => {
                 return self.codegen_conv(program, f, ty, method, args);
             }
-            // `File.stdin()`/`stdout()`/`stderr()`: a standard stream object.
-            Callee::Static { ty, method } if ty == "File" => {
-                return self.file_std(match method.as_str() {
-                    "stdin" => 0,
-                    "stdout" => 1,
-                    _ => 2,
-                });
-            }
-            // The destination type keys a return-polymorphic, no-argument
-            // constructor (a witness-free `new()`) to the same instance the
-            // monomorphizer created for this result type.
-            Callee::Static { ty, method } => static_symbol(ty, method, &arg_types, Some(dest_ty)),
-            // Typed I/O: `print`/`println` write to stdout directly.
-            Callee::Free(base) if base == "print" || base == "println" => {
-                return self.codegen_io(program, f, base, args);
-            }
-            Callee::Free(base) => instance_symbol(base, &arg_types),
-            // MIR-internal builtins used by `match` lowering.
-            Callee::Builtin(name) => return self.codegen_builtin(program, f, name, args),
-            // Indirect (closure) call through a runtime function pointer.
-            Callee::Indirect(callee) => return self.codegen_indirect(program, f, callee, args),
+            CallKind::Io(name) => return self.codegen_io(program, f, name, args),
+            CallKind::Builtin(name) => return self.codegen_builtin(program, f, name, args),
+            CallKind::Indirect(callee) => return self.codegen_indirect(program, f, callee, args),
+            CallKind::Instance(target) => target,
         };
         let Some(inst) = program.lookup(&target) else {
-            // Should not happen for validated MIR.
-            return self.unit();
+            // Validated MIR always resolves to an emitted instance; emitting a
+            // placeholder value here would silently miscompile the call, so a
+            // compiler bug must fail loudly instead.
+            panic!("internal error: call target `{target}` has no monomorphized instance");
         };
         let params = inst.type_args.clone();
         let ret = inst.ret.clone();
@@ -1217,8 +1212,12 @@ pub trait Codegen {
         self.deferred_dispatch(consumer, type_name, value)
     }
 
-    /// MIR-internal builtins emitted by `match` lowering: `value_matches` (a
-    /// variant test) and `panic` (the unmatched fallthrough).
+    /// MIR-internal builtins: the `match`-lowering tests (`value_matches`,
+    /// `panic`), the runtime string/array/conversion primitives, and the
+    /// concurrency operations. Paired with [`builtin_result_type`], which types
+    /// the result of every builtin whose shape differs from its destination --
+    /// when adding a builtin here, add its result shape there unless the
+    /// destination type already matches.
     fn codegen_builtin(
         &mut self,
         program: &MonoProgram,
@@ -1530,8 +1529,11 @@ pub trait Codegen {
                     self.int_narrow(x, from, to, signed)
                 }
             }
-            // Other builtins are rejected during monomorphization.
-            _ => self.unit(),
+            // Every builtin the front end accepts has an arm above; MIR lowering
+            // turns any unresolved name into `Callee::Builtin`, so a name landing
+            // here is a front-end/back-end sync bug and a placeholder value would
+            // silently miscompile the call.
+            _ => panic!("internal error: unknown builtin `{name}` reached codegen"),
         }
     }
 
@@ -1542,6 +1544,11 @@ pub trait Codegen {
     /// non-null slot after a guard or loop invariant proves they are present. The
     /// call result must then be unwrapped explicitly (`T? -> T`) instead of storing
     /// the nullable cell pointer where the inner value pointer is expected.
+    ///
+    /// Branches on the same [`classify_call`] dispatch as
+    /// [`Codegen::codegen_call`], so the emitted call and its assumed result type
+    /// cannot disagree. A `None` means the shape is unknown here and the
+    /// destination type is assumed to match.
     fn call_result_type(
         &self,
         program: &MonoProgram,
@@ -1554,78 +1561,23 @@ pub trait Codegen {
             .iter()
             .map(|a| operand_type_of(a, &f.local_types))
             .collect();
-        match callee {
-            Callee::Builtin(name) => builtin_result_type(name, args, &f.local_types),
-            Callee::Free(base) if base == "print" || base == "println" => Some(Type::Void),
-            Callee::Free(base) => program
-                .lookup(&instance_symbol(base, &arg_types))
-                .map(|inst| inst.ret.clone()),
-            Callee::Method(name)
-                if name == "push"
-                    && matches!(arg_types.first().map(unwrap_nullable), Some(Type::Slice(_))) =>
-            {
-                Some(Type::Void)
-            }
-            Callee::Method(name)
-                if name == "insert"
-                    && matches!(arg_types.first().map(unwrap_nullable), Some(Type::Slice(_))) =>
-            {
-                Some(Type::Void)
-            }
-            Callee::Method(name)
-                if name == "remove"
-                    && matches!(arg_types.first().map(unwrap_nullable), Some(Type::Slice(_))) =>
-            {
-                let aty = unwrap_nullable(&arg_types[0]);
-                Some(element_type(aty))
-            }
-            Callee::Method(name)
-                if name == "pop"
-                    && matches!(arg_types.first().map(unwrap_nullable), Some(Type::Slice(_))) =>
-            {
-                let aty = unwrap_nullable(&arg_types[0]);
-                Some(Type::Nullable(Box::new(element_type(aty))))
-            }
-            Callee::Method(name)
-                if name == "len"
-                    && matches!(
-                        arg_types.first().map(unwrap_nullable),
-                        Some(Type::Slice(_) | Type::Array(..) | Type::Str)
-                    ) =>
-            {
-                Some(Type::Int(prepoly_hir::IntKind::I64))
-            }
-            Callee::Method(name)
-                if matches!(name.as_str(), "read" | "write" | "close" | "size" | "seek")
-                    && matches!(arg_types.first(), Some(Type::Record(r)) if r.is_name("File")) =>
-            {
-                None
-            }
-            Callee::Method(name) => {
-                let msym = method_symbol(name, &arg_types);
-                let target = if program.lookup(&msym).is_some() {
-                    msym
-                } else {
-                    instance_symbol(name, &arg_types)
-                };
-                program.lookup(&target).map(|inst| inst.ret.clone())
-            }
-            Callee::Static { ty, method } if numeric_conv_ret(ty, method).is_some() => {
-                numeric_conv_ret(ty, method)
-            }
-            Callee::Static { ty, method } if ty == "File" => Some(match method.as_str() {
-                "stdin" | "stdout" | "stderr" => {
-                    Type::Record(prepoly_hir::NominalType::new(-1, "File"))
-                }
-                _ => Type::Void,
-            }),
-            Callee::Static { ty, method } => program
-                .lookup(&static_symbol(ty, method, &arg_types, Some(dest_ty)))
-                .map(|inst| inst.ret.clone()),
-            Callee::Indirect(callee) => match operand_type_of(callee, &f.local_types) {
+        match classify_call(program, callee, &arg_types, dest_ty) {
+            CallKind::ArrayPush | CallKind::ArrayInsert => Some(Type::Void),
+            CallKind::ArrayRemove => Some(element_type(&arg_types[0])),
+            CallKind::ArrayPop => Some(Type::Nullable(Box::new(element_type(&arg_types[0])))),
+            CallKind::Len => Some(Type::Int(prepoly_hir::IntKind::I64)),
+            // File methods return typed Results the back-end leaves build at the
+            // destination type already.
+            CallKind::FileMethod(_) => None,
+            CallKind::FileStd(_) => Some(Type::Record(prepoly_hir::NominalType::new(-1, "File"))),
+            CallKind::NumericConv { ty, method } => numeric_conv_ret(ty, method),
+            CallKind::Io(_) => Some(Type::Void),
+            CallKind::Builtin(name) => builtin_result_type(name, args, &f.local_types),
+            CallKind::Indirect(callee) => match operand_type_of(callee, &f.local_types) {
                 Type::Fun(_, ret) => Some(*ret),
                 _ => None,
             },
+            CallKind::Instance(target) => program.lookup(&target).map(|inst| inst.ret.clone()),
         }
     }
 
@@ -1772,6 +1724,112 @@ pub trait Codegen {
     }
 }
 
+/// How a call site dispatches, derived from the callee and the concrete
+/// argument types. [`Codegen::codegen_call`] (emission) and
+/// [`Codegen::call_result_type`] (result typing) both branch on this one
+/// classification, so the two can never disagree about which primitive or
+/// instance a call resolves to.
+enum CallKind<'c> {
+    /// `arr.push(v)`: a growable-array append, not a user method.
+    ArrayPush,
+    /// `arr.insert(i, v)`: a growable-array insertion (`_array_insert`).
+    ArrayInsert,
+    /// `arr.remove(i)`: a growable-array removal (`_array_remove`) returning
+    /// the removed element.
+    ArrayRemove,
+    /// `arr.pop()`: removal of the last element (`_array_pop`), returned as a
+    /// nullable.
+    ArrayPop,
+    /// `arr.len()` / `s.len()`: the length builtin in method form.
+    Len,
+    /// A `read`/`write`/`close`/`size`/`seek` method on the builtin `File`
+    /// record: a runtime file primitive, not a user method.
+    FileMethod(&'c str),
+    /// `File.stdin()`/`stdout()`/`stderr()`: a standard stream (0/1/2).
+    FileStd(u8),
+    /// A runtime-recognized numeric/string conversion `ty.method(arg)` (not a
+    /// user static).
+    NumericConv { ty: &'c str, method: &'c str },
+    /// Typed I/O: `print`/`println` write to stdout directly.
+    Io(&'c str),
+    /// A MIR-internal builtin (`match` lowering, runtime primitives).
+    Builtin(&'c str),
+    /// An indirect (closure) call through a runtime function value.
+    Indirect(&'c Operand),
+    /// A monomorphized instance, called by its resolved symbol.
+    Instance(String),
+}
+
+/// Classify how `callee` dispatches for these concrete argument types. The
+/// receiver checks strip a top-level nullable (a narrowed `T[]?` receiver still
+/// carries its declared nullable type in MIR).
+fn classify_call<'c>(
+    program: &MonoProgram,
+    callee: &'c Callee,
+    arg_types: &[Type],
+    dest_ty: &Type,
+) -> CallKind<'c> {
+    let slice_receiver = || matches!(arg_types.first().map(unwrap_nullable), Some(Type::Slice(_)));
+    match callee {
+        Callee::Method(name) if name == "push" && slice_receiver() => CallKind::ArrayPush,
+        Callee::Method(name) if name == "insert" && slice_receiver() => CallKind::ArrayInsert,
+        Callee::Method(name) if name == "remove" && slice_receiver() => CallKind::ArrayRemove,
+        Callee::Method(name) if name == "pop" && slice_receiver() => CallKind::ArrayPop,
+        Callee::Method(name)
+            if name == "len"
+                && matches!(
+                    arg_types.first().map(unwrap_nullable),
+                    Some(Type::Slice(_) | Type::Array(..) | Type::Str)
+                ) =>
+        {
+            CallKind::Len
+        }
+        Callee::Method(name)
+            if matches!(name.as_str(), "read" | "write" | "close" | "size" | "seek")
+                && matches!(arg_types.first(), Some(Type::Record(r)) if r.is_name("File")) =>
+        {
+            CallKind::FileMethod(name)
+        }
+        // Instance method (`arg_types[0]` is the receiver). A nominal method
+        // instance is keyed by `method_symbol`; a stdlib primitive/array method
+        // (`fun string.split`) by its class-qualified symbol. The type checker
+        // has already rejected any other `recv.m()`.
+        Callee::Method(name) => {
+            let msym = method_symbol(name, arg_types);
+            let target = if program.lookup(&msym).is_some() {
+                msym
+            } else if let Some(psym) = prim_method_instance(program, name, arg_types) {
+                psym
+            } else {
+                instance_symbol(name, arg_types)
+            };
+            CallKind::Instance(target)
+        }
+        Callee::Static { ty, method } if numeric_conv_ret(ty, method).is_some() => {
+            CallKind::NumericConv { ty, method }
+        }
+        Callee::Static { ty, method }
+            if ty == "File" && matches!(method.as_str(), "stdin" | "stdout" | "stderr") =>
+        {
+            CallKind::FileStd(match method.as_str() {
+                "stdin" => 0,
+                "stdout" => 1,
+                _ => 2,
+            })
+        }
+        // The destination type keys a return-polymorphic, no-argument
+        // constructor (a witness-free `new()`) to the same instance the
+        // monomorphizer created for this result type.
+        Callee::Static { ty, method } => {
+            CallKind::Instance(static_symbol(ty, method, arg_types, Some(dest_ty)))
+        }
+        Callee::Free(base) if base == "print" || base == "println" => CallKind::Io(base),
+        Callee::Free(base) => CallKind::Instance(instance_symbol(base, arg_types)),
+        Callee::Builtin(name) => CallKind::Builtin(name),
+        Callee::Indirect(op) => CallKind::Indirect(op),
+    }
+}
+
 /// The `Ok` payload type of a `Result` return type (`void` if not a `Result`).
 fn result_ok_type(ret: &Type) -> Type {
     match strip_ret_nullable(ret) {
@@ -1900,7 +1958,11 @@ fn str_const(op: &Operand) -> Option<&str> {
 
 /// Typed return shapes for compiler/runtime builtins that are not backed by a
 /// monomorphized function instance. Unknown shapes are left as `None`; callers
-/// then assume the destination type already matches.
+/// then assume the destination type already matches. Paired with
+/// [`Codegen::codegen_builtin`], which emits these builtins: a builtin emitted
+/// there needs an entry here exactly when its result shape can differ from its
+/// destination (e.g. a nullable-returning primitive flowing into a narrowed
+/// slot).
 fn builtin_result_type(name: &str, args: &[Operand], local_types: &[Type]) -> Option<Type> {
     match name {
         "value_matches" | "result_is_ok" => Some(Type::Bool),

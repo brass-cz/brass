@@ -38,8 +38,10 @@ struct RegionMeta {
 /// `with` entry and removed on close ([`pp_region_close`]), so the table is bounded
 /// by the number of *currently open* regions rather than growing once per `with`
 /// for the program's lifetime. Ids are monotonic and never reused: an object still
-/// carrying a closed region's id in its `nchild` slot resolves to no entry (a
-/// no-op) instead of aliasing a different, live region.
+/// carrying a closed region's id in its `nchild` slot can never alias a different,
+/// live region; [`live_region_of`] resolves such a stale id to "no region" and
+/// lazily restores the header, so the object behaves as region-less again (and can
+/// be adopted by a later region) instead of being written into a dead region.
 struct RegionTable {
     regions: BTreeMap<i64, RegionMeta>,
     next_id: i64,
@@ -126,15 +128,32 @@ fn remove_borrow(regions: &mut BTreeMap<i64, RegionMeta>, id: i64) {
     }
 }
 
-/// The region id an object belongs to (its `nchild` slot), or 0 for a region-less
-/// (local) object.
-unsafe fn region_of(obj: *mut Header) -> i64 {
+/// The *live* region id an object belongs to, or 0 for a region-less (local)
+/// object. An object may still carry the id of a region that has since closed
+/// (close cannot rewrite its members' headers -- it does not know the member
+/// graph); such a stale id resolves to "no region" here, and the header is
+/// lazily restored (id cleared, a `Contained` owner back to `Local`) so the
+/// object is a plain local again: it can be adopted by a live region instead of
+/// being written into a dead one. `regions` is the already-held table guard, so
+/// the resolution and the caller's bookkeeping are atomic.
+unsafe fn live_region_of(regions: &BTreeMap<i64, RegionMeta>, obj: *mut Header) -> i64 {
     unsafe {
         if obj.is_null() {
-            0
-        } else {
-            (*obj).nchild as i64
+            return 0;
         }
+        let id = (*obj).nchild as i64;
+        if id == 0 || regions.contains_key(&id) {
+            return id;
+        }
+        // Stale: the region closed. `Contained` only ever replaced `Local` (a
+        // shared owner never enters a region as an interior element), so `Local`
+        // is the correct restoration; a closed bridge's owner was already
+        // restored by `pp_region_close`.
+        (*obj).nchild = 0;
+        if (*obj).owner == OWNER_CONTAINED {
+            (*obj).owner = OWNER_LOCAL;
+        }
+        0
     }
 }
 
@@ -151,8 +170,11 @@ pub unsafe extern "C-unwind" fn pp_add_reference(src: *mut Header, tgt: *mut Hea
         if tgt.is_null() {
             return;
         }
-        let sr = region_of(src);
-        let tr = region_of(tgt);
+        // One guard across resolution and bookkeeping: a stale id must not be
+        // resolved against one table state and acted on against another.
+        let mut table = REGIONS.lock().unwrap();
+        let sr = live_region_of(&table.regions, src);
+        let tr = live_region_of(&table.regions, tgt);
 
         // Same region: an internal reference, no region bookkeeping (fast path -- `_sameRegion`).
         if sr != 0 && sr == tr {
@@ -167,7 +189,7 @@ pub unsafe extern "C-unwind" fn pp_add_reference(src: *mut Header, tgt: *mut Hea
         // tracked by the LRC (propagated up the region tree).
         if sr == 0 {
             if tr != 0 {
-                add_borrow(&mut REGIONS.lock().unwrap().regions, tr);
+                add_borrow(&mut table.regions, tr);
             }
             return;
         }
@@ -178,7 +200,7 @@ pub unsafe extern "C-unwind" fn pp_add_reference(src: *mut Header, tgt: *mut Hea
             (*tgt).owner = OWNER_CONTAINED;
         } else {
             // tgt is in a different region than src: an external borrow into tr.
-            add_borrow(&mut REGIONS.lock().unwrap().regions, tr);
+            add_borrow(&mut table.regions, tr);
         }
     }
 }
@@ -194,12 +216,13 @@ pub unsafe extern "C-unwind" fn pp_remove_reference(src: *mut Header, old: *mut 
         if old.is_null() {
             return;
         }
-        let sr = region_of(src);
-        let or = region_of(old);
+        let mut table = REGIONS.lock().unwrap();
+        let sr = live_region_of(&table.regions, src);
+        let or = live_region_of(&table.regions, old);
         // An external borrow existed only when `old` was in a different region than
         // `src` (and `src` did not share `old`'s region). Drop it.
         if or != 0 && or != sr {
-            remove_borrow(&mut REGIONS.lock().unwrap().regions, or);
+            remove_borrow(&mut table.regions, or);
         }
     }
 }
@@ -262,6 +285,61 @@ pub unsafe extern "C-unwind" fn pp_region_write(container: *mut Header, value: *
             reject_frozen_write();
         }
         pp_add_reference(container, value);
+    }
+}
+
+/// The heap value held by a nullable cell `{ header16 | value@16 }`, or null for
+/// an absent cell. Only meaningful when the cell's content is a managed pointer
+/// (the caller's `managed_cells` flag).
+unsafe fn cell_content(cell: *mut Header) -> *mut Header {
+    unsafe {
+        if cell.is_null() {
+            std::ptr::null_mut()
+        } else {
+            *((cell as *mut u8).add(16) as *mut *mut Header)
+        }
+    }
+}
+
+/// The typed back end's full store barrier for an overwriting store
+/// `container.f = value` whose previous value was `old`: reject a write into a
+/// frozen container, account the new reference, and drop the old one. This is
+/// [`pp_write_barrier`] with [`pp_region_write`]'s container rule -- a *cown*
+/// container is legal because the back end emits this barrier only for stores it
+/// performs under the cown's lock (a `with`-acquired bridge or group member) --
+/// so escaped references are counted *and* un-counted symmetrically: without the
+/// old-reference removal, an overwritten escape would keep a region open forever.
+///
+/// `managed_cells != 0` says the slot is a nullable whose content is itself a
+/// managed pointer: `old`/`value` are then cells wrapping a separately tracked
+/// object, and that content is accounted exactly like the cell -- otherwise a
+/// region member stored through a `T?` slot would raise the borrow on the way in
+/// (or join the region) with no matching drop when the slot is overwritten.
+///
+/// # Safety
+/// `container`/`old`/`value` must be valid object headers (or null); when
+/// `managed_cells != 0`, `old` and `value` must be nullable cells whose value
+/// slot holds an object header (or null).
+pub unsafe extern "C-unwind" fn pp_region_store(
+    container: *mut Header,
+    old: *mut Header,
+    value: *mut Header,
+    managed_cells: i64,
+) {
+    unsafe {
+        if !container.is_null() && (*container).owner == OWNER_IMMUTABLE {
+            reject_frozen_write();
+        }
+        pp_add_reference(container, value);
+        if managed_cells != 0 {
+            pp_add_reference(container, cell_content(value));
+        }
+        // Drop the old references only after the new ones are counted, so an
+        // old == value re-store never dips a borrow to zero in between.
+        if managed_cells != 0 {
+            pp_remove_reference(container, cell_content(old));
+        }
+        pp_remove_reference(container, old);
     }
 }
 
@@ -424,6 +502,67 @@ mod tests {
                 pp_region_write(container, value);
             });
             assert!(result.is_err(), "frozen write must fail loudly");
+        }
+    }
+
+    /// An object still carrying a closed region's id must act as region-less: a
+    /// store *through* it must not adopt the value into the dead region, and its
+    /// header is lazily restored to the local state.
+    #[test]
+    fn stale_id_does_not_transfer_into_a_dead_region() {
+        let _serial = serial_region();
+        unsafe {
+            let bridge = pp_typed_alloc(24);
+            let inner = pp_typed_alloc(16);
+            let id = pp_region_open(bridge);
+            pp_region_write(bridge, inner); // inner joins the region
+            assert!(pp_region_close(id));
+
+            // `inner` still carries the dead id. Using it as a container must not
+            // write a fresh object into the dead region (that object would then
+            // carry a dead id and a Contained owner forever).
+            let fresh = pp_typed_alloc(16);
+            pp_region_write(inner, fresh);
+            assert_eq!((*fresh).nchild, 0, "no adoption into a closed region");
+            assert_eq!((*fresh).owner, OWNER_LOCAL);
+            // The stale header was lazily restored to the region-less state.
+            assert_eq!((*inner).nchild, 0, "stale id cleared on first touch");
+            assert_eq!((*inner).owner, OWNER_LOCAL, "Contained restored to Local");
+        }
+    }
+
+    /// A member of a closed region can be adopted by a *later* region, and borrow
+    /// accounting against it works again: before the stale-id resolution, the
+    /// object kept the dead id, the new region never adopted it, and an external
+    /// borrow of it went uncounted (a silent escape).
+    #[test]
+    fn closed_region_member_rejoins_a_live_region_and_escapes_are_counted() {
+        let _serial = serial_region();
+        unsafe {
+            let first_bridge = pp_typed_alloc(24);
+            let obj = pp_typed_alloc(16);
+            let first = pp_region_open(first_bridge);
+            pp_region_write(first_bridge, obj);
+            assert!(pp_region_close(first));
+
+            // A later region adopts the same object on write.
+            let second_bridge = pp_typed_alloc(24);
+            let second = pp_region_open(second_bridge);
+            pp_region_write(second_bridge, obj);
+            assert_eq!(
+                (*obj).nchild,
+                second as i32,
+                "the stale member is re-adopted by the live region"
+            );
+
+            // An external reference to the re-adopted member is a real escape and
+            // must be counted against the live region.
+            let outside = pp_typed_alloc(16);
+            pp_region_write(outside, obj);
+            assert!(
+                !pp_region_close(second),
+                "the escape through a re-adopted member is detected"
+            );
         }
     }
 

@@ -313,6 +313,11 @@ impl Codegen for TextBackend {
     fn region_write(&mut self, container: usize, value: usize) {
         self.line(format!("region_write v{container} v{value}"));
     }
+    fn region_store(&mut self, container: usize, old: usize, value: usize, managed_cells: bool) {
+        self.line(format!(
+            "region_store v{container} v{old} v{value} cells={managed_cells}"
+        ));
+    }
 
     fn emit_return(&mut self, v: Option<usize>) {
         match v {

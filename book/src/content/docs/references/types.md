@@ -289,8 +289,9 @@ reconcile to one payload type).
   `error(...)`, and a nullable `!` therefore infers `Result<T, E>?`: consume
   it by narrowing the `?` first, then matching the Result. An explicit
   non-nullable return annotation rejects a nullable `!` in the body.
-- `!` is allowed inside any function or closure whose return can carry the
-  failure, **at the module top level, and in `main`**. At those two entry
+- `!` is allowed inside any named function whose return can carry the
+  failure, **at the module top level, and in `main`** (not yet in closures —
+  see [Closures](#closures)). At those two entry
   points a failed `!` does not propagate (there is no caller to receive it):
   the program aborts with `unhandled error: <payload>` (or the null
   message) on stderr and a non-zero exit. Elsewhere, a function explicitly
@@ -418,9 +419,12 @@ Closures **capture by reference**: the closure sees (and may mutate) the live
 binding, and mutations through the closure are visible outside. A closure's
 parameter and return types are inferred (annotations optional); a closure used
 polymorphically instantiates per call. A closure parameter shadows a global
-function of the same name — the local value is called. Each closure has its
-own return context, so `!` inside a closure propagates to the closure's own
-return value.
+function of the same name — the local value is called.
+
+Closures cannot yet be **fallible**: a closure body that uses `error(...)` or
+a Result-operand `!` is not supported (it currently fails when the closure is
+compiled or called). Move the fallible logic into a named function and call
+that from the closure.
 
 ## Concurrency typing
 

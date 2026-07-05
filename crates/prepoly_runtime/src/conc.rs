@@ -315,31 +315,51 @@ pub unsafe extern "C-unwind" fn pp_unlock_span(ptrs: *const *mut Header, n: i64)
 /// `{ header | fn-ptr@16 | captures... }` object the typed back end builds; a
 /// zero-argument closure's compiled signature is `void(env)`, so the thread calls
 /// the function pointer with the closure object as its environment.
-pub extern "C-unwind" fn pp_spawn(closure: *mut Header) {
+///
+/// # Safety
+/// `closure` must be a closure object as laid out by the typed back end (a
+/// function pointer at offset 16 and a destructor pointer -- or 0 -- at offset
+/// 24), whose reachable captures the ownership analysis has made safe to hand to
+/// another thread (moved, frozen, or cowned).
+pub unsafe extern "C-unwind" fn pp_spawn(closure: *mut Header) {
     let captured = SendPtr(closure);
     // Mark a spawn active before the thread starts and clear it only after the
     // thread's last heap operation, so the cycle collector defers while it runs.
     ACTIVE_SPAWNS.fetch_add(1, Ordering::SeqCst);
     let handle = std::thread::spawn(move || {
+        // Balance the counter on *every* exit path of the thread body. The body
+        // is not supposed to unwind in a real program (runtime errors exit the
+        // process), but a test/embedding diagnostic can panic through it; a lost
+        // decrement would keep `has_active_spawns()` true forever and silently
+        // disable cycle collection for the rest of the process.
+        struct SpawnDone;
+        impl Drop for SpawnDone {
+            fn drop(&mut self) {
+                ACTIVE_SPAWNS.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _done = SpawnDone;
         // Bind the whole `SendPtr` so the closure captures it (which is `Send`),
         // not its raw pointer field (disjoint capture would not be `Send`).
         let captured = captured;
         let env = captured.0;
         unsafe {
             let fnptr = *((env as *mut u8).add(16) as *mut usize);
-            let f: extern "C" fn(*mut Header) = std::mem::transmute(fnptr);
+            // "C-unwind" matches the convention the bodies are compiled with, so
+            // an unwinding body propagates as a panic (caught by the join) rather
+            // than aborting the process at this frame. An unwound body skips its
+            // destructor: the environment leaks, which is sound (never freed twice).
+            let f: extern "C-unwind" fn(*mut Header) = std::mem::transmute(fnptr);
             f(env);
             // The spawner moved the closure to this thread (its reference, not a
             // retained copy). Release it via its stored destructor (offset 24),
             // which releases the captures and frees the environment.
             let dtor_ptr = *((env as *mut u8).add(24) as *mut usize);
             if dtor_ptr != 0 {
-                let dtor: extern "C" fn(*mut Header) = std::mem::transmute(dtor_ptr);
+                let dtor: extern "C-unwind" fn(*mut Header) = std::mem::transmute(dtor_ptr);
                 dtor(env);
             }
         }
-        // Heap work done; allow collection again once every thread has cleared.
-        ACTIVE_SPAWNS.fetch_sub(1, Ordering::SeqCst);
     });
     threads().lock().unwrap().push(handle);
 }
@@ -348,6 +368,12 @@ pub extern "C-unwind" fn pp_spawn(closure: *mut Header) {
 /// program waits for spawned work before exiting. With all threads joined the main
 /// thread is again the sole mutator, so it runs a collection to reclaim any cycle
 /// garbage whose collection was deferred while spawned threads ran.
+///
+/// A joined thread that terminated by unwinding (possible only in test/embedding
+/// runs; a real program's runtime errors exit the process) is not silently
+/// discarded: after every thread is joined, the first failure's payload is
+/// re-raised on the joining thread so a failed spawned task surfaces instead of
+/// being lost.
 pub extern "C-unwind" fn pp_join_all() {
     // A spawned task may itself call `sync()`, and the global registry then
     // contains the *calling thread's own* handle. Joining it would be a self-join
@@ -355,6 +381,7 @@ pub extern "C-unwind" fn pp_join_all() {
     // the program -- so the caller's handle is set aside and handed back to the
     // registry for an enclosing join (ultimately main's epilogue) to drain.
     let me = std::thread::current().id();
+    let mut failure: Option<Box<dyn std::any::Any + Send>> = None;
     // A spawned thread may itself spawn (a nested/late spawn), pushing a new handle
     // after this drain started. Loop until the registry holds nothing but the
     // caller's own handle: each round joins the threads taken so far, during which
@@ -372,8 +399,15 @@ pub extern "C-unwind" fn pp_join_all() {
             break;
         }
         for h in others {
-            let _ = h.join();
+            if let Err(payload) = h.join() {
+                // Keep joining the remaining threads (so none leak into process
+                // teardown), then surface the first failure below.
+                failure.get_or_insert(payload);
+            }
         }
+    }
+    if let Some(payload) = failure {
+        std::panic::resume_unwind(payload);
     }
     crate::gc::pp_gc_collect();
 }
@@ -440,7 +474,7 @@ mod tests {
                 *((clo as *mut u8).add(16) as *mut usize) = work as *const () as usize;
                 *((clo as *mut u8).add(32) as *mut *mut Header) = counter;
             }
-            pp_spawn(clo);
+            unsafe { pp_spawn(clo) };
         }
         pp_join_all();
 
@@ -514,7 +548,7 @@ mod tests {
                 *((clo as *mut u8).add(16) as *mut usize) = work as *const () as usize;
                 *((clo as *mut u8).add(32) as *mut *mut Header) = counter;
             }
-            pp_spawn(clo);
+            unsafe { pp_spawn(clo) };
         }
         pp_join_all();
 
@@ -544,7 +578,7 @@ mod tests {
             // captures and no destructor).
             let clo = unsafe { pp_obj_alloc(32) as *mut Header };
             unsafe { *((clo as *mut u8).add(16) as *mut usize) = bump as *const () as usize };
-            pp_spawn(clo);
+            unsafe { pp_spawn(clo) };
         }
         pp_join_all();
         assert_eq!(RAN.load(Ordering::SeqCst), N, "all spawned closures ran");
@@ -567,12 +601,12 @@ mod tests {
             // Spawn a grandchild from inside this already-spawned thread.
             let clo = unsafe { pp_obj_alloc(32) as *mut Header };
             unsafe { *((clo as *mut u8).add(16) as *mut usize) = grandchild as *const () as usize };
-            pp_spawn(clo);
+            unsafe { pp_spawn(clo) };
         }
 
         let clo = unsafe { pp_obj_alloc(32) as *mut Header };
         unsafe { *((clo as *mut u8).add(16) as *mut usize) = parent as *const () as usize };
-        pp_spawn(clo);
+        unsafe { pp_spawn(clo) };
         pp_join_all();
         assert_eq!(
             RAN.load(Ordering::SeqCst),
@@ -634,7 +668,7 @@ mod tests {
                 *((clo as *mut u8).add(16) as *mut usize) = work as *const () as usize;
                 *((clo as *mut u8).add(32) as *mut *mut Header) = arr;
             }
-            pp_spawn(clo);
+            unsafe { pp_spawn(clo) };
         }
         pp_join_all();
 
@@ -662,7 +696,7 @@ mod tests {
             // registry also holds this thread's own handle at this point.
             let clo = unsafe { pp_obj_alloc(32) as *mut Header };
             unsafe { *((clo as *mut u8).add(16) as *mut usize) = sibling as *const () as usize };
-            pp_spawn(clo);
+            unsafe { pp_spawn(clo) };
             pp_join_all();
             // The sibling's effect is visible after the inner join.
             assert_eq!(RAN.load(Ordering::SeqCst), 1);
@@ -671,7 +705,7 @@ mod tests {
 
         let clo = unsafe { pp_obj_alloc(32) as *mut Header };
         unsafe { *((clo as *mut u8).add(16) as *mut usize) = syncer as *const () as usize };
-        pp_spawn(clo);
+        unsafe { pp_spawn(clo) };
         pp_join_all();
         assert_eq!(
             RAN.load(Ordering::SeqCst),
@@ -757,7 +791,7 @@ mod tests {
                 *((clo as *mut u8).add(32) as *mut *mut Header) = x;
                 *((clo as *mut u8).add(40) as *mut *mut Header) = y;
             }
-            pp_spawn(clo);
+            unsafe { pp_spawn(clo) };
         }
         pp_join_all();
         assert_eq!(unsafe { *field(a) }, 2 * PER_THREAD);
@@ -818,6 +852,36 @@ mod tests {
             pp_live_blocks(),
             before - 1,
             "the final release frees it exactly once"
+        );
+    }
+
+    #[test]
+    fn unwinding_spawned_body_balances_active_spawns_and_surfaces() {
+        // A spawned body that unwinds (possible in test/embedding runs; a real
+        // program's runtime errors exit the process) must still balance
+        // ACTIVE_SPAWNS -- a lost decrement would keep `has_active_spawns()`
+        // true forever and silently disable cycle collection -- and its failure
+        // must surface from `pp_join_all` instead of being discarded.
+        let _serial = serial_spawn();
+
+        extern "C-unwind" fn boom(_env: *mut Header) {
+            panic!("spawned body failed");
+        }
+
+        // `{ header(16) | fn@16 | dtor@24 (zero) }`; the unwound body never
+        // reaches its destructor, so the environment intentionally leaks.
+        let clo = unsafe { pp_obj_alloc(32) as *mut Header };
+        unsafe { *((clo as *mut u8).add(16) as *mut usize) = boom as *const () as usize };
+        unsafe { pp_spawn(clo) };
+
+        let joined = std::panic::catch_unwind(|| pp_join_all());
+        assert!(
+            joined.is_err(),
+            "the spawned task's failure must surface from the join"
+        );
+        assert!(
+            !has_active_spawns(),
+            "the counter must be balanced even when the body unwinds"
         );
     }
 }

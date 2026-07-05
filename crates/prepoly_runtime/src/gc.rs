@@ -120,7 +120,13 @@ fn pending_free() -> &'static Mutex<Vec<usize>> {
 
 /// Register `obj` (a cycle-capable object) with its trace function. The typed back
 /// end calls this right after constructing a record/sum/array/closure.
-pub extern "C-unwind" fn pp_gc_register(obj: *mut Header, trace: usize) {
+///
+/// # Safety
+/// `obj` must be a valid object header (or null) that stays valid until it is
+/// freed through [`crate::mem::pp_obj_free`], and `trace` must be the address of
+/// a [`TraceFn`] that visits exactly `obj`'s managed children (the collector
+/// later transmutes and calls it).
+pub unsafe extern "C-unwind" fn pp_gc_register(obj: *mut Header, trace: usize) {
     if !obj.is_null()
         && registry()
             .lock()

@@ -24,7 +24,7 @@ REPL and WebAssembly.
 Quick start:
 
 ```bash
-curl -L https://raw.githubusercontent.com/cordx56/prepoly/refs/heads/main/scripts/installer | sh
+curl -L https://raw.githubusercontent.com/cordx56/prepoly/refs/heads/main/scripts/install.sh | sh
 ```
 
 ## Features
@@ -57,102 +57,12 @@ curl -L https://raw.githubusercontent.com/cordx56/prepoly/refs/heads/main/script
   primitives; the compiler infers ownership, never the programmer.
 - **Tooling:** an interactive REPL and an LSP server (`prepoly-lsp`).
 
-## Language tour
+## Learning the language
 
-### Types and pattern matching
-
-`type` defines both records and sum types. A member is a field, or a method
-*signature* (an interface requirement). Methods are implemented outside the type
-with `fun T.m(...)` — an instance method when its first parameter is `self`,
-otherwise static. `match` over a sum type is checked for exhaustiveness.
-
-```
-type Shape =
-    | Circle { radius: float64 }
-    | Rectangle { width: float64, height: float64 }
-    | Point
-
-fun area(s: Shape) -> float64 {
-    return match s {
-        Circle { radius } => 3.14159 * radius * radius,
-        Rectangle { width, height } => width * height,
-        Point => 0.0,
-    }
-}
-```
-
-### Interfaces
-
-`type B: A` makes `B` satisfy `A` structurally; a function with no annotation
-accepts anything that has the members it uses.
-
-```
-type Showable = { to_string(self) -> string }
-
-type User: Showable = {
-    name: string
-}
-
-fun User.to_string(self) -> string { return self.name }
-
-fun print_info(obj) { println(obj.to_string()) }   // accepts anything Showable
-```
-
-### Nullable and Result
-
-```
-fun parse_positive(s: string) {
-    let n = int32.parse(s)!            // returns early on failure
-    if n < 0 { return error("negative") }
-    return n                           // wrapped in Result.Ok
-}
-
-let n = parse_positive("42")!          // `!` at the top level: a failure
-println(n)                             // prints the error and exits
-
-let x: int32? = first_even(nums)
-if x { println("got {x}") }            // x is int32 inside the guard
-```
-
-### References and mutability
-
-An argument without a type annotation is a reference whose mutability is
-inferred, so a function can mutate its caller's value. `infer` opts out and
-deep-copies instead.
-
-```
-fun double(a) {                  // a is a mutable reference
-    for e in a { e *= 2 }
-}
-let arr = [1, 2, 3]
-double(arr)
-println(arr)                     // [2, 4, 6]
-
-fun untouched(a: infer) {        // a is deep-copied
-    for e in a { e *= 2 }
-}
-const xs = [1, 2, 3]
-untouched(xs)
-println(xs)                      // [1, 2, 3]
-```
-
-### Modules
-
-One file is one module and the directory layout is the module path. Public names
-(no leading `_`) can be imported; an import path is resolved relative to the
-importing file.
-
-```
-import students.types.{ Student }    // students/types.pp
-```
-
-### Concurrency
-
-```
-spawn(() -> { for n in nums { counter.add(n) } })
-sync()                               // wait for spawned work before observing it
-with(counter, (c) -> { println("total = {c.total}") })
-```
+Read the **[documentation](https://prepoly.56.ax)**: a step-by-step tutorial,
+per-feature guides, language references, and a browser playground, built from
+[`book/`](book/). Every language feature also has a runnable example in
+[`examples/`](examples/), each checked by `cargo test`.
 
 ## Building
 
@@ -189,9 +99,6 @@ A bare file argument is type-checked and then run on the JIT when it is built in
 otherwise on the interpreter. Each module's top-level statements run in dependency
 order, then `main` is called if defined. The standard library is an implicit
 prelude.
-
-A tutorial lives in [`book/`](book/) (mdBook), and every language feature has a
-runnable example in [`examples/`](examples/), each checked by `cargo test`.
 
 ## Status
 

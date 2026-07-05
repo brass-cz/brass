@@ -3408,6 +3408,33 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
             .unwrap();
     }
 
+    fn region_store(
+        &mut self,
+        container: BasicValueEnum<'ctx>,
+        old: BasicValueEnum<'ctx>,
+        value: BasicValueEnum<'ctx>,
+        managed_cells: bool,
+    ) {
+        let ty = self.ctx.void_type().fn_type(
+            &[
+                self.abi.ptr().into(),
+                self.abi.ptr().into(),
+                self.abi.ptr().into(),
+                self.abi.i64t().into(),
+            ],
+            false,
+        );
+        let f = self.abi.runtime_fn(&self.module, "pp_region_store", ty);
+        let cells = self.i64c(managed_cells as i64);
+        self.builder
+            .build_call(
+                f,
+                &[container.into(), old.into(), value.into(), cells.into()],
+                "",
+            )
+            .unwrap();
+    }
+
     fn emit_region_barrier(&self) -> bool {
         self.region_barriers
     }

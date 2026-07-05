@@ -72,6 +72,7 @@ pub fn symbols() -> Vec<(&'static str, usize)> {
         region::pp_region_open,
         region::pp_region_open_nested,
         region::pp_region_write,
+        region::pp_region_store,
         region::pp_add_reference,
         region::pp_remove_reference,
         region::pp_write_barrier,

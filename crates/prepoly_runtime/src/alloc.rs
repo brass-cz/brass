@@ -277,7 +277,10 @@ pub unsafe extern "C-unwind" fn pp_arr_insert(
 /// bytes are returned zero-extended in an `i64` (every typed slice element -- a
 /// scalar or a heap pointer -- is at most 8 bytes); the caller reinterprets them at
 /// the element type. An out-of-range `idx` returns 0 without modifying the array.
-pub extern "C-unwind" fn pp_arr_remove(arr: *mut Header, idx: i64, elem_size: i64) -> i64 {
+///
+/// # Safety
+/// `arr` must be a growable-array object whose elements are `elem_size` bytes each.
+pub unsafe extern "C-unwind" fn pp_arr_remove(arr: *mut Header, idx: i64, elem_size: i64) -> i64 {
     unsafe {
         let len_p = (arr as *mut u8).offset(16) as *mut i64;
         let data_pp = (arr as *mut u8).offset(32) as *mut *mut u8;
@@ -307,7 +310,10 @@ pub extern "C-unwind" fn pp_arr_remove(arr: *mut Header, idx: i64, elem_size: i6
 /// pointer when the array is empty. The element's ownership transfers to the cell
 /// (the array's length shrinks), mirroring `pp_str_char_at`'s nullable result, so
 /// no extra retain/release is needed for a managed element.
-pub extern "C-unwind" fn pp_arr_pop(arr: *mut Header, elem_size: i64) -> *mut Header {
+///
+/// # Safety
+/// `arr` must be a growable-array object whose elements are `elem_size` bytes each.
+pub unsafe extern "C-unwind" fn pp_arr_pop(arr: *mut Header, elem_size: i64) -> *mut Header {
     unsafe {
         let len_p = (arr as *mut u8).offset(16) as *mut i64;
         let data_pp = (arr as *mut u8).offset(32) as *mut *mut u8;
@@ -382,7 +388,10 @@ pub unsafe extern "C-unwind" fn pp_str_const(ptr: *const u8, len: i64) -> *mut H
 }
 
 /// The byte length of a string object.
-pub extern "C-unwind" fn pp_str_len(h: *mut Header) -> i64 {
+///
+/// # Safety
+/// `h` must be a string object.
+pub unsafe extern "C-unwind" fn pp_str_len(h: *mut Header) -> i64 {
     unsafe { *((h as *const u8).offset(16) as *const i64) }
 }
 

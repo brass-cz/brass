@@ -1359,6 +1359,58 @@ fn rc_reclaims_array_and_sum() {
     assert_eq!(after, before, "array + sum reclaimed: {before} -> {after}");
 }
 
+/// R6 RC overwrite: storing into a managed record field, array element,
+/// nullable field, or global releases the value being overwritten -- the slot
+/// owned it and it is no longer reachable through the slot. Before the
+/// release-on-overwrite each loop iteration leaked the previous value (and a
+/// nullable slot leaked its cell too), so live blocks grew with the iteration
+/// count; now they return to baseline.
+#[test]
+fn rc_releases_overwritten_field_element_and_global() {
+    let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let src = "type Box = {\n  value: string\n}\n\
+               type Cell = {\n  s: string?\n}\n\
+               let g = string.from(0)\n\
+               fun churn() -> int32 {\n\
+               \x20 let b = Box { value: string.from(1) }\n\
+               \x20 let c = Cell { s: null }\n\
+               \x20 let xs = [string.from(2)]\n\
+               \x20 let i = 0\n\
+               \x20 while i < 20 {\n\
+               \x20   b.value = string.from(i)\n\
+               \x20   c.s = string.from(i)\n\
+               \x20   xs[0] = string.from(i)\n\
+               \x20   g = string.from(i)\n\
+               \x20   i = i + 1\n\
+               \x20 }\n\
+               \x20 return i\n\
+               }\n\
+               fun main() {\n}\n";
+    let ast = prepoly_parser::parse(src).expect("parse");
+    let (program, errors) = lower(&[LoadedModule {
+        path: vec!["main".into()],
+        ast,
+    }]);
+    assert!(errors.is_empty(), "lower: {errors:?}");
+    let mir = lower_program(&program);
+    let mono = monomorphize(&mir, &program).expect("monomorphize");
+
+    let ctx = Context::create();
+    let mut backend = LlvmCodegen::new_backend(&ctx, &program);
+    Engine::run(&mut backend, &mono).expect("engine run");
+
+    // The global holds one string at baseline and one (different) string after,
+    // so a balanced run returns exactly to baseline; every overwritten value
+    // leaking would leave ~80 extra blocks.
+    let before = prepoly_runtime::mem::pp_live_blocks();
+    assert_eq!(backend.run_entry_i32("churn"), Some(20));
+    let after = prepoly_runtime::mem::pp_live_blocks();
+    assert_eq!(
+        after, before,
+        "overwritten field/element/cell/global values reclaimed: {before} -> {after}"
+    );
+}
+
 /// R6 RC recursive array content: an array of strings reclaims its elements (the
 /// element loop in the destructor releases each), so live blocks return to baseline.
 #[test]

@@ -42,6 +42,15 @@ programmer never writes `move`/`freeze`/`cown`:
 internally acquires multiple cowns in address order, so a consistent lock
 order is maintained.
 
+A single-cown `with` scope is also a **region**: objects stored into the
+guarded object while the scope runs belong to it, and references reaching into
+the region from outside (a module global, an object that outlives the scope)
+are counted. Leaving the scope while such a reference survives is a runtime
+error — ``region not closed: a reference escaped a `with` scope`` — because
+the escaped reference could later be used without holding the lock.
+Overwriting the escaping slot (e.g. setting the field back to `null`) before
+the scope ends releases the reference, and the scope closes normally.
+
 ## Static restrictions
 
 These are compile errors today:
