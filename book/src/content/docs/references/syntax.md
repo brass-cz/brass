@@ -306,6 +306,10 @@ before their textual definition; a top-level _binding_ may not (using a global
 before its initializer runs is a compile error). Top-level statements execute
 in order when the module loads; `main`, if defined, runs afterwards.
 
+Top-level statements may use the `!` operator: a failed propagation stops
+the program with the error instead of returning a Result (see
+[Result](/references/types/#result)).
+
 ## Type expressions
 
 Base forms:

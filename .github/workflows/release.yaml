@@ -15,9 +15,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       pre_release: ${{ steps.pre-release.outputs.pre_release }}
-    needs:
-      - check
-      - build
     steps:
       - name: Check pre-release
         id: pre-release
@@ -27,6 +24,29 @@ jobs:
           else
             echo "pre_release=true" >> $GITHUB_OUTPUT
           fi
+
+  build:
+    name: Build
+    runs-on: ${{ matrix.host }}
+    strategy:
+      matrix:
+        host:
+          - ubuntu-22.04
+          - ubuntu-22.04-arm64
+          - macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build All
+        run: |
+          ./x cargo install --root . --path crates/prepoly_driver
+          ./x cargo install --root . --path crates/prepoly_language_server
+          ./x cargo install --root . --path crates/prepoly_formatter
+          tar czf prepoly-"$(rustc --print=host-tuple)".tar.gz bin
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: prepoly-${{ matrix.host }}
+          path: *.tar.gz
 
   github-release:
     name: Create A GitHub Release
@@ -45,19 +65,17 @@ jobs:
           npx changelogithub@latest --contributors --output release.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build All
-        run: |
-          ./x cargo build --release -p prepoly_driver
-          ./x cargo build --release -p prepoly_language_server
-          ./x cargo build --release -p prepoly_formatter
-
-          mkdir bin
-          mv target/release/prepoly target/release/prepoly-lsp target/release/prepoly-fmt bin/
-          tar czf prepoly-"$(rustc --print=host-tuple)".tar.gz bin
+      - name: Download Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: prepoly-*
+          merge-multiple: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Release
         uses: softprops/action-gh-release@v3
         with:
-          files: *.tar.gz
+          files: artifacts/*
           draft: true
           body_path: release.md
           prerelease: ${{ needs.meta.outputs.pre_release == 'true' }}

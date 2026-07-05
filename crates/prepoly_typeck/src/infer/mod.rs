@@ -82,6 +82,16 @@ struct ResolvedMethod {
     method: Method,
 }
 
+/// Propagation signals the light pass collects while walking a body: the
+/// `Err` payload types of `error(...)` / Result-operand `expr!` sites, and
+/// the spans of nullable-operand `expr!` sites (whose null case returns null,
+/// making the enclosing callable's return type nullable).
+#[derive(Default)]
+pub(super) struct LightProps {
+    pub(super) errors: Vec<(Type, Span)>,
+    pub(super) nulls: Vec<Span>,
+}
+
 #[derive(Clone)]
 enum ReturnContext {
     Inferred,
@@ -144,6 +154,10 @@ pub struct Inference {
     /// keyed by the annotation's span; MIR seeds the slot from this (the type
     /// is not recoverable from a `null`/inferred initializer alone).
     pub typeof_types: HashMap<Span, Type>,
+    /// Spans of `expr!` operators whose operand is a nullable rather than a
+    /// `Result`: the value case unwraps, the null case propagates as
+    /// `Result.Null`. MIR lowering emits the presence-test shape for these.
+    pub null_props: HashSet<Span>,
 }
 
 pub fn analyze(program: &Program) -> Inference {
@@ -200,13 +214,18 @@ pub fn analyze(program: &Program) -> Inference {
     }
     checker.schemes = checker.build_schemes();
 
-    for f in program.functions.values() {
+    for (symbol, f) in &program.functions {
         tracing::debug!(function = %f.signature.name, "inferring function body");
         let mut scopes = checker.signature_scopes(&f.signature.params);
         let ret = f.signature.ret_ty.clone();
         checker.current_module = f.module.clone();
+        // The root module's bare `main` symbol is the program entry; its `!`
+        // propagations abort at runtime, waiving the fallible-return-context
+        // requirement for its own body.
+        checker.in_entry_main = symbol == "main";
         checker.check_block_root(&f.decl.body, &mut scopes, ret.as_ref());
     }
+    checker.in_entry_main = false;
 
     let mut scopes = vec![HashMap::new()];
     checker.const_scopes = vec![HashSet::new()];
@@ -244,6 +263,7 @@ pub fn analyze(program: &Program) -> Inference {
         type_names: checker.type_names,
         keyed_calls: checker.keyed_calls,
         typeof_types: checker.typeof_types,
+        null_props: checker.null_props,
     }
 }
 
@@ -334,6 +354,15 @@ struct Checker<'a> {
     fields_loops: HashMap<Span, Vec<String>>,
     /// Resolved type names of checked `typeof(x)` calls, keyed by call span.
     type_names: HashMap<Span, String>,
+    /// Spans of `expr!` operators whose operand is a NULLABLE (not a `Result`):
+    /// the null case propagates as `Result.Null`. MIR lowering emits the
+    /// presence-test shape for exactly these spans (see [`Inference::null_props`]).
+    null_props: HashSet<Span>,
+    /// Whether the body currently being checked is the entry `main` (the root
+    /// module's bare `main` symbol). Its `!` propagations abort at runtime
+    /// instead of returning a `Result`, so the return-context requirement is
+    /// waived for its own body (depth 1 -- closures inside it still propagate).
+    in_entry_main: bool,
 }
 
 impl<'a> Checker<'a> {
@@ -367,6 +396,8 @@ impl<'a> Checker<'a> {
             view_args: HashSet::new(),
             fields_loops: HashMap::new(),
             type_names: HashMap::new(),
+            null_props: HashSet::new(),
+            in_entry_main: false,
         }
     }
 

@@ -164,6 +164,42 @@ pub(super) fn propagated_result_returns(body: &MirBody) -> HashSet<(usize, Local
     returns
 }
 
+/// The return blocks created by the null arm of a nullable-operand `expr!`:
+/// the else-target of a branch on a `__present` test, returning the `null`
+/// constant. Those returns type the enclosing callable's return NULLABLE (an
+/// outer `?` around the fallible `Result`); they carry no Ok/Err payload. A
+/// USER-written `return null` in a fallible body is not of this shape and
+/// keeps its meaning (an Ok payload that may be null).
+pub(super) fn null_prop_returns(body: &MirBody) -> HashSet<usize> {
+    let mut present_tests: HashSet<LocalId> = HashSet::new();
+    for block in &body.blocks {
+        for stmt in &block.stmts {
+            if let MirStmt::Assign(test, Rvalue::Call(Callee::Builtin(name), _)) = stmt
+                && name == "__present"
+            {
+                present_tests.insert(*test);
+            }
+        }
+    }
+    let mut returns = HashSet::new();
+    for block in &body.blocks {
+        if let Terminator::CondBranch {
+            cond: Operand::Local(test),
+            els,
+            ..
+        } = &block.term
+            && present_tests.contains(test)
+            && matches!(
+                body.block(*els).term,
+                Terminator::Return(Operand::Const(Literal::Null))
+            )
+        {
+            returns.insert(els.index());
+        }
+    }
+    returns
+}
+
 /// Whether a fallible body actually raises an error: an `error(...)` (an `Err`
 /// construction) or an `expr!` propagation (a `result_is_ok` test). A body with
 /// neither never produces an `Err`, so its `Result` error payload is free.

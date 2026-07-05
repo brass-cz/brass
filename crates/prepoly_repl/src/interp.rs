@@ -156,7 +156,13 @@ impl<'p, 'm> Interp<'p, 'm> {
             return Ok(Value::Void);
         }
         let op_ty = operand_type_of(op, &f.local_types);
-        if f.fallible && !is_result_ty(&op_ty) {
+        // A fallible callable implicitly Ok-wraps a bare return value. Exempt:
+        // a `null` returned when the ret is `Result<..>?` -- the failure arm
+        // of a nullable `expr!` returns null itself, not `Ok(null)`. (With a
+        // plain `Result` ret, a null IS an Ok payload.)
+        let null_passthrough =
+            op_ty.is_null() && matches!(&f.ret, Type::Nullable(inner) if inner.is_result_type());
+        if f.fallible && !is_result_ty(&op_ty) && !null_passthrough {
             let ok_ty = result_ok_type(&f.ret);
             let v = self.eval_operand(f, frame, op, &ok_ty)?;
             Ok(make_variant("Ok", &[("value", v)]))
@@ -1411,6 +1417,12 @@ fn is_result_ty(ty: &Type) -> bool {
 }
 
 fn result_ok_type(ret: &Type) -> Type {
+    // A `Result<..>?` ret (a body that also propagates a null) Ok-wraps at
+    // its inner Result's payload.
+    let ret = match ret {
+        Type::Nullable(inner) if inner.is_result_type() => inner,
+        other => other,
+    };
     match ret {
         Type::Sum(n) => n
             .result_payloads()

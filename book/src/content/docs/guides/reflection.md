@@ -56,17 +56,15 @@ a field.
 type in type position, and a static receiver for method calls:
 
 ```prepoly
-fun main() {
-    let xs = [1, 2, 3]
-    println(typeof(xs))            // int32[] — a growable array
-    const ys = [1, 2, 3]
-    println(typeof(ys))            // int32[3] — const binds a fixed-length array
+let xs = [1, 2, 3]
+println(typeof(xs))            // int32[] — a growable array
+const ys = [1, 2, 3]
+println(typeof(ys))            // int32[3] — const binds a fixed-length array
 
-    let n = 1
-    let m: typeof(n) = 2           // m has n's type
-    let k = typeof(n).from(3.9)!   // int32.from — k is 3
-    println("{m} {k}")
-}
+let n = 1
+let m: typeof(n) = 2           // m has n's type
+let k = typeof(n).from(3.9)!   // int32.from — k is 3
+println("{m} {k}")
 ```
 
 These pieces combine into reflective _deserialization_ — filling a struct from

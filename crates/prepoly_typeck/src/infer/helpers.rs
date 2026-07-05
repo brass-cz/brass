@@ -171,6 +171,12 @@ pub(super) fn literal_pattern_matches(expr: &Expr, lit_ty: &Type, scrutinee: &Ty
 }
 
 pub(super) fn is_result_return_type(ty: &Type) -> bool {
+    // A `Result<..>?` return (a body that also propagates a null) still
+    // receives propagated errors.
+    let ty = match ty {
+        Type::Nullable(inner) => inner,
+        other => other,
+    };
     ty.is_unknown() || ty.is_result_type()
 }
 

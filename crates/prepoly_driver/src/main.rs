@@ -379,6 +379,7 @@ fn install_jit_panic_guard() {
 /// Run a checked program through the default runtime: the LLVM JIT, used when the
 /// JIT back end is available (the `jit` feature on a non-wasm target).
 #[cfg(jit_backend)]
+#[allow(clippy::too_many_arguments)] // mirrors the checker's channel outputs
 fn execute(
     program: &Program,
     int_lit_types: &HashMap<Span, prepoly_hir::IntKind>,
@@ -387,6 +388,7 @@ fn execute(
     fields_loops: &HashMap<Span, Vec<String>>,
     type_names: &HashMap<Span, String>,
     typeof_types: &HashMap<Span, prepoly_hir::Type>,
+    null_props: &HashSet<Span>,
 ) -> Result<(), String> {
     install_jit_panic_guard();
     prepoly_jit_llvm::run(
@@ -397,12 +399,14 @@ fn execute(
         fields_loops,
         type_names,
         typeof_types,
+        null_props,
     )
 }
 
 /// Run a checked program through the default runtime: the REPL interpreter, used
 /// when the JIT back end is unavailable (no `jit` feature, or a wasm target).
 #[cfg(not(jit_backend))]
+#[allow(clippy::too_many_arguments)] // mirrors the checker's channel outputs
 fn execute(
     program: &Program,
     _int_lit_types: &HashMap<Span, prepoly_hir::IntKind>,
@@ -411,6 +415,7 @@ fn execute(
     fields_loops: &HashMap<Span, Vec<String>>,
     type_names: &HashMap<Span, String>,
     typeof_types: &HashMap<Span, prepoly_hir::Type>,
+    null_props: &HashSet<Span>,
 ) -> Result<(), String> {
     prepoly_repl::run(
         program,
@@ -419,6 +424,7 @@ fn execute(
         fields_loops,
         type_names,
         typeof_types,
+        null_props,
         &mut io::stdout(),
     )
 }
@@ -432,6 +438,7 @@ fn execute_repl(
     fields_loops: &HashMap<Span, Vec<String>>,
     type_names: &HashMap<Span, String>,
     typeof_types: &HashMap<Span, prepoly_hir::Type>,
+    null_props: &HashSet<Span>,
 ) -> Result<(), String> {
     prepoly_repl::run(
         program,
@@ -440,6 +447,7 @@ fn execute_repl(
         fields_loops,
         type_names,
         typeof_types,
+        null_props,
         &mut io::stdout(),
     )
 }
@@ -697,6 +705,9 @@ struct Checked {
     type_names: HashMap<Span, String>,
     /// Resolved binding types of `typeof`-bearing local annotations.
     typeof_types: HashMap<Span, prepoly_hir::Type>,
+    /// Spans of `expr!` operators with a nullable operand (null propagates as
+    /// `Result.Null`); MIR lowering emits the presence-test shape for these.
+    null_props: HashSet<Span>,
 }
 
 /// Drive the front end on a source file, then act per `mode`. Front-end
@@ -732,6 +743,7 @@ fn drive(mode: Mode, file: &str) -> Result<(), u8> {
             &checked.fields_loops,
             &checked.type_names,
             &checked.typeof_types,
+            &checked.null_props,
         )
         .map_err(|e| {
             eprintln!("error: {e}");
@@ -744,6 +756,7 @@ fn drive(mode: Mode, file: &str) -> Result<(), u8> {
             &checked.fields_loops,
             &checked.type_names,
             &checked.typeof_types,
+            &checked.null_props,
         )
         .map_err(|e| {
             eprintln!("error: {e}");
@@ -892,6 +905,7 @@ fn analyze(main_label: &str, main_src: &str, root: &Path) -> Result<Checked, Vec
         fields_loops: analysis.fields_loops,
         type_names: analysis.type_names,
         typeof_types: analysis.typeof_types,
+        null_props: analysis.null_props,
     })
 }
 
@@ -1190,6 +1204,7 @@ fn run_capture(defs: &[String], body: &[String], root: &Path) -> Result<String, 
         &checked.fields_loops,
         &checked.type_names,
         &checked.typeof_types,
+        &checked.null_props,
         &mut buf,
     )?;
     Ok(String::from_utf8_lossy(&buf).into_owned())

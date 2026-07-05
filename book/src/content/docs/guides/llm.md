@@ -204,8 +204,16 @@ match n {
   such as reading a nonexistent field becomes `null` rather than an error.
 - `T!` is a `Result`. Construct an error with `error(x)`. A bare value returned
   where a `Result` is expected is automatically wrapped as `Ok`. The postfix
-  `!` operator propagates: `expr!` unwraps `Ok` or returns the `Err` early from
-  the enclosing function.
+  `!` operator propagates: `expr!` unwraps `Ok` or returns the `Err` early
+  from the enclosing function.
+- On a NULLABLE operand, `expr!` unwraps the value and a null returns null
+  itself early: the enclosing function's return type gains an outer `?`
+  (`fun pick() { return find()! }` is `-> T?`, not fallible). Mixing bare
+  returns, `error(...)`, and a nullable `!` in one body infers
+  `Result<T, E>?` -- narrow the `?` with `if r { ... }`, then match.
+- `!` also works at the module top level and in `main`: a failed
+  propagation there (an `Err` or a null) prints `unhandled error: ...` and
+  exits non-zero instead of returning.
 - The Result variants are `Ok { value }` and `Err { error }`; match on those
   field names.
 
@@ -415,8 +423,9 @@ of `main`, so insert `sync()` before a read that may race ahead.
   as `Type.method(...)`.
 - Block-bodied closures and functions need an explicit `return`; expression
   bodies (`(x) -> x + 1`) do not.
-- The `!` error-propagation operator works only inside a function or closure
-  body — top-level code cannot use `expr!`; wrap the code in `fun main()`.
+- The `!` error-propagation operator needs a fallible context, the top
+  level, or `main` — a function explicitly annotated with a non-Result
+  return type rejects `expr!` in its body.
 
 ## Worked example
 

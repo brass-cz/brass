@@ -193,9 +193,7 @@ import std.data.json.{ JsonValue, parse }
 type Address = { city: string, zip: int64 }
 type User = { name: string, age: int64, address: Address }
 
-fun main() {
-    const src = "\{\"name\": \"Aki\", \"age\": 30, \"address\": \{\"city\": \"Tokyo\", \"zip\": 100\}\}"
-    const u: User = parse(src)!.into()!
-    println("{u.name} {u.age} {u.address.city}")   // Aki 30 Tokyo
-}
+const src = "\{\"name\": \"Aki\", \"age\": 30, \"address\": \{\"city\": \"Tokyo\", \"zip\": 100\}\}"
+const u: User = parse(src)!.into()!
+println("{u.name} {u.age} {u.address.city}")   // Aki 30 Tokyo
 ```

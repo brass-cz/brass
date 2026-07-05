@@ -90,7 +90,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
             }
             Expr::Field(base, name, _) => self.lower_field(base, name),
             Expr::Index(base, idx, _) => self.lower_index(base, idx),
-            Expr::ErrorProp(inner, _) => self.lower_error_prop(inner),
+            Expr::ErrorProp(inner, span) => self.lower_error_prop(inner, *span),
             Expr::Closure(params, body, _) => self.lower_closure(params, body),
             Expr::Array(es, span) => self.lower_array(es, *span),
             Expr::Range(lo, hi, span) => self.lower_range(lo, hi, *span),
@@ -379,15 +379,27 @@ impl<'a, 'p> FnLower<'a, 'p> {
         self.seal_value_merge(res, reached)
     }
 
-    /// `expr!`: unwrap a `Result.Ok`, or return the `Result.Err` from the
-    /// enclosing callable. Expressed as an explicit branch (MIR lowering: error
-    /// propagation lives in the CFG, not in a codegen heuristic).
-    fn lower_error_prop(&mut self, inner: &Expr) -> Operand {
+    /// `expr!`: unwrap a `Result.Ok` -- or, for a nullable operand (a span the
+    /// checker recorded in `null_props`), unwrap the non-null value. The
+    /// failure arm returns the error `Result` unchanged -- or, for a nullable
+    /// operand, returns `null` itself (the enclosing callable's return type is
+    /// then nullable) -- or aborts the program when this body is an entry
+    /// point (`abort_error_prop`). Expressed as an explicit branch (MIR
+    /// lowering: error propagation lives in the CFG, not in a codegen
+    /// heuristic).
+    fn lower_error_prop(&mut self, inner: &Expr, span: prepoly_parser::Span) -> Operand {
+        let nullable = self.ctx.is_null_prop(span);
         let v = self.lower_expr(inner);
         let v = self.b.make_local(v);
         let res = self.b.fresh_local(None);
+        // A nullable operand succeeds on presence; a Result succeeds on `Ok`.
+        let test = if nullable {
+            "__present"
+        } else {
+            "result_is_ok"
+        };
         let is_ok = self.b.emit(Rvalue::Call(
-            Callee::Builtin("result_is_ok".into()),
+            Callee::Builtin(test.into()),
             vec![Operand::Local(v)],
         ));
         let ok_bb = self.b.new_block();
@@ -400,19 +412,74 @@ impl<'a, 'p> FnLower<'a, 'p> {
         });
 
         self.b.switch_to(ok_bb);
-        let val = self.b.emit(Rvalue::Load(Place::projected(
-            v,
-            vec![Projection::Field("value".into())],
-        )));
+        let val = if nullable {
+            // Narrow the proven-non-null value (same shape as `if let`).
+            self.b.emit(Rvalue::Call(
+                Callee::Builtin("__nonnull".into()),
+                vec![Operand::Local(v)],
+            ))
+        } else {
+            self.b.emit(Rvalue::Load(Place::projected(
+                v,
+                vec![Projection::Field("value".into())],
+            )))
+        };
         self.b.push(MirStmt::Assign(res, Rvalue::Use(val)));
         self.b.terminate(Terminator::Goto(cont_bb));
 
         self.b.switch_to(err_bb);
-        // Propagate the error Result unchanged.
-        self.b.terminate(Terminator::Return(Operand::Local(v)));
+        if self.abort_error_prop {
+            self.abort_failed_prop(v, nullable);
+        } else if nullable {
+            // A nullable's null is returned as-is: the enclosing callable's
+            // return type is nullable (`T?`, or `Result<..>?` when the body
+            // also raises errors).
+            self.b
+                .terminate(Terminator::Return(Operand::Const(Literal::Null)));
+        } else {
+            // Propagate the error Result unchanged.
+            self.b.terminate(Terminator::Return(Operand::Local(v)));
+        }
 
         self.b.switch_to(cont_bb);
         Operand::Local(res)
+    }
+
+    /// The failure arm of an `expr!` at an entry point (the entry `main` or a
+    /// module init's top level), where there is no caller to propagate to:
+    /// abort the program with a non-zero exit. A nullable operand's null
+    /// aborts with a fixed message; an `Err` aborts with its rendered
+    /// payload.
+    fn abort_failed_prop(&mut self, v: LocalId, nullable: bool) {
+        if nullable {
+            self.b.push(MirStmt::Eval(Rvalue::Call(
+                Callee::Builtin("panic".into()),
+                vec![Operand::Const(Literal::Str(
+                    "unhandled error: null value propagated by `!`".into(),
+                ))],
+            )));
+            self.b.terminate(Terminator::Unreachable);
+            return;
+        }
+        let err = self.b.emit(Rvalue::Load(Place::projected(
+            v,
+            vec![Projection::Field("error".into())],
+        )));
+        let rendered = self
+            .b
+            .emit(Rvalue::Call(Callee::Builtin("to_string".into()), vec![err]));
+        let msg = self.b.emit(Rvalue::Call(
+            Callee::Builtin("_string_concat".into()),
+            vec![
+                Operand::Const(Literal::Str("unhandled error: ".into())),
+                rendered,
+            ],
+        ));
+        self.b.push(MirStmt::Eval(Rvalue::Call(
+            Callee::Builtin("_panic".into()),
+            vec![msg],
+        )));
+        self.b.terminate(Terminator::Unreachable);
     }
 
     fn lower_field(&mut self, base: &Expr, name: &str) -> Operand {

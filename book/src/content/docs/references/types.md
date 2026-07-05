@@ -271,19 +271,30 @@ a condition.
 ## Result
 
 `T!` is the built-in `Result` type with variants `Ok { value: T }` and
-`Err { error: E }`; the error payload type `E` is inferred from the `error(x)`
-calls the function makes (all error sites of one function must reconcile to
-one payload type).
+`Err { error: E }`; the error payload type `E` is inferred from the
+`error(x)` calls the function makes (all error sites of one function must
+reconcile to one payload type).
 
 - `error(x)` constructs an `Err`. It is a reserved builtin.
-- A function is _fallible_ when its body uses `error(...)` or `expr!`, or its
-  declared return type is a Result. In a fallible function, `return v` with a
-  plain value wraps it as `Ok { value: v }` automatically; returning a Result
-  value passes it through whole.
+- A function is _fallible_ when its body uses `error(...)` or a
+  Result-operand `expr!`, or its declared return type is a Result. In a
+  fallible function, `return v` with a plain value wraps it as
+  `Ok { value: v }` automatically; returning a Result value passes it
+  through whole.
 - The postfix **`!`** operator propagates: `expr!` unwraps an `Ok` or returns
-  the `Err` early from the enclosing function. It is allowed only inside a
-  function or closure whose return can be fallible — not at the top level and
-  not in a function explicitly annotated with a non-Result return type.
+  the `Err` early from the enclosing function.
+- On a **NULLABLE** operand, `expr!` unwraps the value, and a null returns
+  **null itself** early -- the enclosing function's return type gains an
+  outer `?` (it does not become fallible). A body mixing bare returns,
+  `error(...)`, and a nullable `!` therefore infers `Result<T, E>?`: consume
+  it by narrowing the `?` first, then matching the Result. An explicit
+  non-nullable return annotation rejects a nullable `!` in the body.
+- `!` is allowed inside any function or closure whose return can carry the
+  failure, **at the module top level, and in `main`**. At those two entry
+  points a failed `!` does not propagate (there is no caller to receive it):
+  the program aborts with `unhandled error: <payload>` (or the null
+  message) on stderr and a non-zero exit. Elsewhere, a function explicitly
+  annotated with an incompatible return type rejects `!`.
 - Consume a Result by matching `Ok { value }` / `Err { error }`.
 - A function that can only ever `error(...)` (no successful return) cannot be
   used where a value is required.

@@ -40,6 +40,9 @@ curl -L https://raw.githubusercontent.com/cordx56/prepoly/refs/heads/main/script
 - **Exhaustive pattern matching** with `match` and `if let`.
 - **Nullable and Result.** `T?` is narrowed by `if`; `T!` is a `Result`, with
   `error(x)`, `expr!` early-return propagation, and automatic `Ok` wrapping.
+  `!` on a nullable unwraps or returns null early (the return type gains
+  `?`), and works at the top level and in `main`, where a failure prints the
+  error and exits.
 - **Structural conversion.** `T.from(v)` for a record type `T` yields `T?` — the
   record when `v` structurally has all of `T`'s fields, else null — so
   `if let p = T.from(v)` branches on the actual value.
@@ -103,6 +106,9 @@ fun parse_positive(s: string) {
     if n < 0 { return error("negative") }
     return n                           // wrapped in Result.Ok
 }
+
+let n = parse_positive("42")!          // `!` at the top level: a failure
+println(n)                             // prints the error and exits
 
 let x: int32? = first_even(nums)
 if x { println("got {x}") }            // x is int32 inside the guard

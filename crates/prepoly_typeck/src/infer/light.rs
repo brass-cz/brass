@@ -11,13 +11,13 @@ impl<'a> Checker<'a> {
         block: &Block,
         env: &mut HashMap<String, Type>,
         normal: &mut Vec<(Type, Span)>,
-        errors: &mut Vec<(Type, Span)>,
+        props: &mut LightProps,
     ) {
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Let { pat, value, .. } => {
                     let ty = match value {
-                        Some(value) => self.infer_expr_light(value, env, errors),
+                        Some(value) => self.infer_expr_light(value, env, props),
                         // Uninitialized `let`: the light pass has no annotation
                         // resolution; the full check types the binding.
                         None => Type::Unknown(prepoly_hir::INFER_VAR),
@@ -25,7 +25,7 @@ impl<'a> Checker<'a> {
                     self.bind_pattern_light(pat, &ty, env);
                 }
                 Stmt::Assign { value, .. } => {
-                    self.infer_expr_light(value, env, errors);
+                    self.infer_expr_light(value, env, props);
                 }
                 Stmt::Expr(value) => {
                     // Grow a locally-built collection's element type: a
@@ -34,29 +34,29 @@ impl<'a> Checker<'a> {
                     // collection (e.g. `slice`/`map`) infers its element type from
                     // the values pushed -- which the rest of this light pass would
                     // otherwise miss, leaving the return an unconstrained `?[]`.
-                    self.track_collection_growth(value, env, errors);
-                    self.infer_returns_expr(value, env, normal, errors);
+                    self.track_collection_growth(value, env, props);
+                    self.infer_returns_expr(value, env, normal, props);
                 }
                 Stmt::While { cond, body, .. } => {
-                    self.infer_expr_light(cond, env, errors);
-                    self.infer_returns_block(body, &mut env.clone(), normal, errors);
+                    self.infer_expr_light(cond, env, props);
+                    self.infer_returns_block(body, &mut env.clone(), normal, props);
                 }
                 Stmt::For {
                     var, iter, body, ..
                 } => {
-                    let iter_ty = self.infer_expr_light(iter, env, errors);
+                    let iter_ty = self.infer_expr_light(iter, env, props);
                     let item_ty = prepoly_hir::index_element(&iter_ty)
                         .unwrap_or_else(|| self.fresh_unknown());
                     let mut inner = env.clone();
                     inner.insert(var.clone(), item_ty);
-                    self.infer_returns_block(body, &mut inner, normal, errors);
+                    self.infer_returns_block(body, &mut inner, normal, props);
                 }
                 Stmt::Return(Some(expr), _) => {
-                    let ty = self.infer_expr_light(expr, env, errors);
+                    let ty = self.infer_expr_light(expr, env, props);
                     let resolved = self.resolve(&ty);
                     match resolved.result_payloads() {
                         Some((ok, err)) if ok.is_unknown() => {
-                            errors.push((err.clone(), expr.span()))
+                            props.errors.push((err.clone(), expr.span()))
                         }
                         _ => normal.push((ty, expr.span())),
                     }
@@ -72,34 +72,34 @@ impl<'a> Checker<'a> {
         expr: &Expr,
         env: &mut HashMap<String, Type>,
         normal: &mut Vec<(Type, Span)>,
-        errors: &mut Vec<(Type, Span)>,
+        props: &mut LightProps,
     ) {
         match expr {
             Expr::If(cond, then, els, _) => {
-                self.infer_expr_light(cond, env, errors);
-                self.infer_returns_block(then, &mut env.clone(), normal, errors);
+                self.infer_expr_light(cond, env, props);
+                self.infer_returns_block(then, &mut env.clone(), normal, props);
                 if let Some(els) = els {
-                    self.infer_returns_expr(els, &mut env.clone(), normal, errors);
+                    self.infer_returns_expr(els, &mut env.clone(), normal, props);
                 }
             }
             Expr::IfLet(_, scrut, then, els, _) => {
-                self.infer_expr_light(scrut, env, errors);
-                self.infer_returns_block(then, &mut env.clone(), normal, errors);
+                self.infer_expr_light(scrut, env, props);
+                self.infer_returns_block(then, &mut env.clone(), normal, props);
                 if let Some(els) = els {
-                    self.infer_returns_expr(els, &mut env.clone(), normal, errors);
+                    self.infer_returns_expr(els, &mut env.clone(), normal, props);
                 }
             }
             Expr::Match(scrut, arms, _) => {
-                self.infer_expr_light(scrut, env, errors);
+                self.infer_expr_light(scrut, env, props);
                 for arm in arms {
-                    self.infer_returns_expr(&arm.body, &mut env.clone(), normal, errors);
+                    self.infer_returns_expr(&arm.body, &mut env.clone(), normal, props);
                 }
             }
             Expr::Block(block, _) => {
-                self.infer_returns_block(block, &mut env.clone(), normal, errors)
+                self.infer_returns_block(block, &mut env.clone(), normal, props)
             }
             other => {
-                self.infer_expr_light(other, env, errors);
+                self.infer_expr_light(other, env, props);
             }
         }
     }
@@ -114,16 +114,16 @@ impl<'a> Checker<'a> {
         &mut self,
         expr: &Expr,
         env: &HashMap<String, Type>,
-        errors: &mut Vec<(Type, Span)>,
+        props: &mut LightProps,
     ) {
         if let Expr::Call(callee, args, _) = expr
             && let Expr::Field(recv, method, _) = callee.as_ref()
             && matches!(method.as_str(), "push" | "insert")
             && let Some(value_arg) = args.last()
         {
-            let recv_ty = self.infer_expr_light(recv, env, errors);
+            let recv_ty = self.infer_expr_light(recv, env, props);
             if let Some(elem) = prepoly_hir::index_element(&self.resolve(&recv_ty)) {
-                let value_ty = self.infer_expr_light(&value_arg.expr, env, errors);
+                let value_ty = self.infer_expr_light(&value_arg.expr, env, props);
                 let _ = self.solver.unify(&elem, &value_ty);
             }
         }
@@ -133,7 +133,7 @@ impl<'a> Checker<'a> {
         &mut self,
         expr: &Expr,
         env: &HashMap<String, Type>,
-        errors: &mut Vec<(Type, Span)>,
+        props: &mut LightProps,
     ) -> Type {
         match expr {
             Expr::Int(v, _) => Type::Int(int_literal_kind(*v)),
@@ -149,15 +149,15 @@ impl<'a> Checker<'a> {
                 .get("self")
                 .cloned()
                 .unwrap_or_else(|| self.fresh_unknown()),
-            Expr::Unary(_, inner, _) => self.infer_expr_light(inner, env, errors),
+            Expr::Unary(_, inner, _) => self.infer_expr_light(inner, env, props),
             Expr::Binary(op, left, right, _) => {
-                let left = self.infer_expr_light(left, env, errors);
-                let right = self.infer_expr_light(right, env, errors);
+                let left = self.infer_expr_light(left, env, props);
+                let right = self.infer_expr_light(right, env, props);
                 self.infer_binary_light(*op, left, right)
             }
-            Expr::Call(callee, args, _) => self.infer_call_light(callee, args, env, errors),
-            Expr::Field(base, name, _) => self.infer_field_light(base, name, env, errors),
-            Expr::Index(base, _, _) => match self.infer_expr_light(base, env, errors) {
+            Expr::Call(callee, args, _) => self.infer_call_light(callee, args, env, props),
+            Expr::Field(base, name, _) => self.infer_field_light(base, name, env, props),
+            Expr::Index(base, _, _) => match self.infer_expr_light(base, env, props) {
                 ref bt if prepoly_hir::index_element(bt).is_some() => {
                     prepoly_hir::index_element(bt).unwrap()
                 }
@@ -165,10 +165,16 @@ impl<'a> Checker<'a> {
                 _ => self.fresh_unknown(),
             },
             Expr::ErrorProp(inner, span) => {
-                let ty = self.infer_expr_light(inner, env, errors);
+                let ty = self.infer_expr_light(inner, env, props);
                 if let Some((ok, err)) = ty.result_payloads() {
-                    errors.push((err.clone(), *span));
+                    props.errors.push((err.clone(), *span));
                     ok.clone()
+                } else if let Type::Nullable(inner_ty) = &ty {
+                    // `e!` on a nullable unwraps the value; the null case
+                    // returns null from the enclosing callable, whose return
+                    // type therefore gains an outer `?` (no error payload).
+                    props.nulls.push(*span);
+                    (**inner_ty).clone()
                 } else {
                     self.fresh_unknown()
                 }
@@ -183,7 +189,7 @@ impl<'a> Checker<'a> {
                         .unwrap_or_else(|| self.fresh_unknown());
                     inner.insert(param.name.clone(), ty);
                 }
-                let ret = self.infer_expr_light(body, &inner, errors);
+                let ret = self.infer_expr_light(body, &inner, props);
                 Type::Fun(
                     params
                         .iter()
@@ -200,7 +206,7 @@ impl<'a> Checker<'a> {
             Expr::Array(items, _) => {
                 let elem_tys: Vec<Type> = items
                     .iter()
-                    .map(|e| self.infer_expr_light(e, env, errors))
+                    .map(|e| self.infer_expr_light(e, env, props))
                     .collect();
                 // Mirror the full check's array-vs-tuple classification and its
                 // null handling. The light pass seeds `global_scope`: a global
@@ -228,8 +234,8 @@ impl<'a> Checker<'a> {
             // bounds' common integer type, a literal bound adapting to the
             // other side (so `[0..n]` follows `n`'s width, not the literal's).
             Expr::Range(lo, hi, _) => {
-                let lo_ty = self.infer_expr_light(lo, env, errors);
-                let hi_ty = self.infer_expr_light(hi, env, errors);
+                let lo_ty = self.infer_expr_light(lo, env, props);
+                let hi_ty = self.infer_expr_light(hi, env, props);
                 let lo_r = self.resolve(&lo_ty);
                 let hi_r = self.resolve(&hi_ty);
                 let elem = if matches!(hi_r, Type::Int(_)) && integer_literal_fits(lo, &hi_r) {
@@ -241,37 +247,37 @@ impl<'a> Checker<'a> {
                 };
                 Type::Slice(Box::new(elem))
             }
-            Expr::TypeLit(name, fields, _) => self.infer_type_lit_light(name, fields, env, errors),
+            Expr::TypeLit(name, fields, _) => self.infer_type_lit_light(name, fields, env, props),
             Expr::VariantLit(name, variant, fields, _) => {
-                self.infer_variant_lit_light(name, variant, fields, env, errors)
+                self.infer_variant_lit_light(name, variant, fields, env, props)
             }
             Expr::If(_, then, els, _) => {
-                let then_ty = self.infer_block_value_light(then, &mut env.clone(), errors);
+                let then_ty = self.infer_block_value_light(then, &mut env.clone(), props);
                 let else_ty = els
                     .as_ref()
-                    .map(|e| self.infer_expr_light(e, env, errors))
+                    .map(|e| self.infer_expr_light(e, env, props))
                     .unwrap_or(Type::Void);
                 self.common_type_or_unknown(then_ty, else_ty)
             }
             Expr::IfLet(_, scrut, then, els, _) => {
-                self.infer_expr_light(scrut, env, errors);
-                let then_ty = self.infer_block_value_light(then, &mut env.clone(), errors);
+                self.infer_expr_light(scrut, env, props);
+                let then_ty = self.infer_block_value_light(then, &mut env.clone(), props);
                 let else_ty = els
                     .as_ref()
-                    .map(|e| self.infer_expr_light(e, env, errors))
+                    .map(|e| self.infer_expr_light(e, env, props))
                     .unwrap_or(Type::Void);
                 self.common_type_or_unknown(then_ty, else_ty)
             }
             Expr::Match(scrut, arms, _) => {
-                self.infer_expr_light(scrut, env, errors);
+                self.infer_expr_light(scrut, env, props);
                 let tys: Vec<Type> = arms
                     .iter()
-                    .map(|arm| self.infer_expr_light(&arm.body, env, errors))
+                    .map(|arm| self.infer_expr_light(&arm.body, env, props))
                     .collect();
                 self.common_type_list(&tys)
                     .unwrap_or_else(|| self.fresh_unknown())
             }
-            Expr::Block(block, _) => self.infer_block_value_light(block, &mut env.clone(), errors),
+            Expr::Block(block, _) => self.infer_block_value_light(block, &mut env.clone(), props),
         }
     }
 
@@ -280,25 +286,25 @@ impl<'a> Checker<'a> {
         callee: &Expr,
         args: &[Arg],
         env: &HashMap<String, Type>,
-        errors: &mut Vec<(Type, Span)>,
+        props: &mut LightProps,
     ) -> Type {
         if let Expr::Ident(name, _) = callee {
             if name == "error" {
                 let err = args
                     .first()
-                    .map(|a| self.infer_expr_light(&a.expr, env, errors))
+                    .map(|a| self.infer_expr_light(&a.expr, env, props))
                     .unwrap_or(Type::Void);
                 return Type::result(self.fresh_unknown(), err);
             }
             if let Some(ret) = self.builtin_function_type_light(name) {
                 args.iter().for_each(|arg| {
-                    self.infer_expr_light(&arg.expr, env, errors);
+                    self.infer_expr_light(&arg.expr, env, props);
                 });
                 return ret;
             }
             if let Some(ret) = self.function_returns.get(name).cloned() {
                 args.iter().for_each(|arg| {
-                    self.infer_expr_light(&arg.expr, env, errors);
+                    self.infer_expr_light(&arg.expr, env, props);
                 });
                 return ret;
             }
@@ -310,23 +316,23 @@ impl<'a> Checker<'a> {
                 let ret = self.primitive_static_type(tname, method);
                 if ret.is_some() {
                     args.iter().for_each(|arg| {
-                        self.infer_expr_light(&arg.expr, env, errors);
+                        self.infer_expr_light(&arg.expr, env, props);
                     });
                 }
                 if let Some(ret) = ret {
                     return ret;
                 }
             }
-            let recv = self.infer_expr_light(base, env, errors);
+            let recv = self.infer_expr_light(base, env, props);
             if let Some(ret) = builtin_method_return(&recv, method) {
                 args.iter().for_each(|arg| {
-                    self.infer_expr_light(&arg.expr, env, errors);
+                    self.infer_expr_light(&arg.expr, env, props);
                 });
                 return ret;
             }
         }
         args.iter().for_each(|arg| {
-            self.infer_expr_light(&arg.expr, env, errors);
+            self.infer_expr_light(&arg.expr, env, props);
         });
         self.fresh_unknown()
     }
@@ -336,7 +342,7 @@ impl<'a> Checker<'a> {
         base: &Expr,
         name: &str,
         env: &HashMap<String, Type>,
-        errors: &mut Vec<(Type, Span)>,
+        props: &mut LightProps,
     ) -> Type {
         let shadowed = matches!(base, Expr::Ident(n, _) if env.contains_key(n));
         if let Some(ty) = self.unit_variant_type(base, name, shadowed) {
@@ -347,7 +353,7 @@ impl<'a> Checker<'a> {
         // since pinned to a record (e.g. `self.entries[idx]` is the map's entry
         // type once a `push` fixed it). Without resolving, the match falls through
         // and the field type is lost as a fresh unknown.
-        let base_ty = self.infer_expr_light(base, env, errors);
+        let base_ty = self.infer_expr_light(base, env, props);
         match self.resolve(&base_ty) {
             Type::Record(record) => record.substitution.get(name).cloned().unwrap_or_else(|| {
                 self.program
@@ -373,12 +379,12 @@ impl<'a> Checker<'a> {
         name: &str,
         fields: &[(String, Expr)],
         env: &HashMap<String, Type>,
-        errors: &mut Vec<(Type, Span)>,
+        props: &mut LightProps,
     ) -> Type {
         if name.is_empty() {
             let field_tys: Vec<(String, Type)> = fields
                 .iter()
-                .map(|(fname, e)| (fname.clone(), self.infer_expr_light(e, env, errors)))
+                .map(|(fname, e)| (fname.clone(), self.infer_expr_light(e, env, props)))
                 .collect();
             return prepoly_hir::structural_record(field_tys);
         }
@@ -394,11 +400,11 @@ impl<'a> Checker<'a> {
             });
         let Some((ret, declared)) = resolved else {
             fields.iter().for_each(|(_, expr)| {
-                self.infer_expr_light(expr, env, errors);
+                self.infer_expr_light(expr, env, props);
             });
             return self.fresh_unknown();
         };
-        let substitution = self.infer_lit_field_substitution(None, &declared, fields, env, errors);
+        let substitution = self.infer_lit_field_substitution(None, &declared, fields, env, props);
         apply_nominal_substitution(ret, substitution)
     }
 
@@ -408,7 +414,7 @@ impl<'a> Checker<'a> {
         variant: &str,
         fields: &[(String, Expr)],
         env: &HashMap<String, Type>,
-        errors: &mut Vec<(Type, Span)>,
+        props: &mut LightProps,
     ) -> Type {
         let tn = self.resolve_self_name(type_name);
         let resolved = self
@@ -420,12 +426,12 @@ impl<'a> Checker<'a> {
             });
         let Some((ret, declared)) = resolved else {
             fields.iter().for_each(|(_, expr)| {
-                self.infer_expr_light(expr, env, errors);
+                self.infer_expr_light(expr, env, props);
             });
             return self.fresh_unknown();
         };
         let substitution =
-            self.infer_lit_field_substitution(Some(variant), &declared, fields, env, errors);
+            self.infer_lit_field_substitution(Some(variant), &declared, fields, env, props);
         apply_nominal_substitution(ret, substitution)
     }
 
@@ -435,12 +441,12 @@ impl<'a> Checker<'a> {
         declared: &[prepoly_hir::FieldInfo],
         fields: &[(String, Expr)],
         env: &HashMap<String, Type>,
-        errors: &mut Vec<(Type, Span)>,
+        props: &mut LightProps,
     ) -> Substitution {
         let mut substitution = Substitution::empty();
         for field in declared {
             if let Some((_, expr)) = fields.iter().find(|(name, _)| name == &field.name) {
-                let got = self.infer_expr_light(expr, env, errors);
+                let got = self.infer_expr_light(expr, env, props);
                 if field.resolved_ty.as_ref().is_some_and(Type::is_unknown) {
                     substitution.insert(field_substitution_key(variant, &field.name), got);
                 }
@@ -453,21 +459,21 @@ impl<'a> Checker<'a> {
         &mut self,
         block: &Block,
         env: &mut HashMap<String, Type>,
-        errors: &mut Vec<(Type, Span)>,
+        props: &mut LightProps,
     ) -> Type {
         let mut last = Type::Void;
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Let { pat, value, .. } => {
                     let ty = match value {
-                        Some(value) => self.infer_expr_light(value, env, errors),
+                        Some(value) => self.infer_expr_light(value, env, props),
                         None => Type::Unknown(prepoly_hir::INFER_VAR),
                     };
                     self.bind_pattern_light(pat, &ty, env);
                     last = Type::Void;
                 }
-                Stmt::Expr(expr) => last = self.infer_expr_light(expr, env, errors),
-                Stmt::Return(Some(expr), _) => return self.infer_expr_light(expr, env, errors),
+                Stmt::Expr(expr) => last = self.infer_expr_light(expr, env, props),
+                Stmt::Return(Some(expr), _) => return self.infer_expr_light(expr, env, props),
                 _ => last = Type::Void,
             }
         }

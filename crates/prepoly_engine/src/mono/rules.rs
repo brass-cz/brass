@@ -370,6 +370,15 @@ pub(super) fn merge_return_types(a: &Type, b: &Type) -> Type {
         // `Never` types only a statically-unreachable path; the other arm wins.
         (Type::Never, _) => b.clone(),
         (_, Type::Never) => a.clone(),
+        // A bare `null` return joining a void fall-through (a nullable `!`
+        // used as a statement): the callable is void -- the null carries no
+        // value a caller could observe, and a `void?` return would give the
+        // fall-through path no representable value.
+        (Type::Nullable(x), Type::Void) | (Type::Void, Type::Nullable(x))
+            if matches!(**x, Type::Never) =>
+        {
+            Type::Void
+        }
         (Type::Nullable(x), Type::Nullable(y)) => {
             Type::Nullable(Box::new(merge_return_types(x, y)))
         }

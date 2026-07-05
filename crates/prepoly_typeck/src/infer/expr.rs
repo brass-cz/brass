@@ -154,8 +154,8 @@ impl<'a> Checker<'a> {
         }
         let mut inferred_env = env_from_scopes(scopes);
         inferred_env.extend(closure_scope.clone());
-        let mut propagated_errors = Vec::new();
-        self.infer_expr_light(body, &inferred_env, &mut propagated_errors);
+        let mut light_props = LightProps::default();
+        self.infer_expr_light(body, &inferred_env, &mut light_props);
         let mut closure_scopes = scopes.clone();
         closure_scopes.push(closure_scope);
         self.const_scopes.push(HashSet::new());
@@ -181,6 +181,12 @@ impl<'a> Checker<'a> {
         match self.return_contexts.last() {
             Some(ReturnContext::Inferred) => {}
             Some(ReturnContext::Explicit(ret)) if is_result_return_type(&self.resolve(ret)) => {}
+            // The entry `main`'s OWN body (context depth 1: not a closure or a
+            // re-checked callee inside it) may propagate regardless of its
+            // annotation: a failed `!` there aborts the program with the error
+            // instead of returning a `Result`.
+            Some(ReturnContext::Explicit(_))
+                if self.in_entry_main && self.return_contexts.len() == 1 => {}
             Some(ReturnContext::Explicit(ret)) => {
                 self.errors.push(TypeError {
                     message: format!(
@@ -190,24 +196,48 @@ impl<'a> Checker<'a> {
                     span,
                 });
             }
-            None => {
-                self.errors.push(TypeError {
-                    message: "error propagation cannot be used outside a function or closure"
-                        .to_string(),
-                    span,
-                });
+            // Module top level: a failed `!` aborts the program with the
+            // error, so propagation needs no enclosing fallible callable.
+            None => {}
+        }
+    }
+
+    /// `e!` on a NULLABLE operand returns null from the enclosing callable on
+    /// the null case, so that callable's return must be able to be null: an
+    /// inferred return (it gains an outer `?`), a nullable annotation, or a
+    /// void one (statement use -- the null carries no observable value). The
+    /// entry `main`'s own body and the module top level abort at runtime
+    /// instead, so they need no such return type.
+    fn check_null_propagation_return_context(&mut self, span: prepoly_parser::Span) {
+        match self.return_contexts.last() {
+            Some(ReturnContext::Inferred) | None => {}
+            Some(ReturnContext::Explicit(_))
+                if self.in_entry_main && self.return_contexts.len() == 1 => {}
+            Some(ReturnContext::Explicit(ret)) => {
+                let resolved = self.resolve(ret);
+                if !matches!(resolved, Type::Nullable(_) | Type::Void) && !resolved.is_unknown() {
+                    self.errors.push(TypeError {
+                        message: format!(
+                            "null propagation (`!` on a nullable) requires a nullable return type, found `{}`",
+                            resolved.display()
+                        ),
+                        span,
+                    });
+                }
             }
         }
     }
 
-    fn wrap_inferred_fallible_return(&mut self, ok: Type, errors: &[(Type, Span)]) -> Type {
-        if errors.is_empty() {
-            return ok;
-        }
-        let err = self
-            .reconcile_error_payloads(errors, true)
-            .unwrap_or_else(|| self.fresh_unknown());
-        Type::result(ok, err)
+    fn wrap_inferred_fallible_return(&mut self, ok: Type, props: &LightProps) -> Type {
+        let base = if props.errors.is_empty() {
+            ok
+        } else {
+            let err = self
+                .reconcile_error_payloads(&props.errors, true)
+                .unwrap_or_else(|| self.fresh_unknown());
+            Type::result(ok, err)
+        };
+        super::precompute::wrap_null_propagated_return(base, &props.nulls)
     }
 
     pub(super) fn check_expr_inner(&mut self, e: &Expr, scopes: &mut ScopeStack) -> Type {
@@ -338,6 +368,16 @@ impl<'a> Checker<'a> {
                     t
                 };
                 let resolved = self.resolve(&ty);
+                // `e!` on a NULLABLE operand unwraps the value; the null case
+                // returns null itself from the enclosing callable, whose
+                // return type therefore gains an outer `?`. The span is
+                // recorded so MIR lowering emits the presence-test shape
+                // instead of the `Result` tag-test shape.
+                if let Type::Nullable(inner_ty) = &resolved {
+                    self.check_null_propagation_return_context(*span);
+                    self.null_props.insert(*span);
+                    return (**inner_ty).clone();
+                }
                 match resolved.result_payloads() {
                     Some((ok, _)) => {
                         self.check_error_propagation_return_context(*span);
@@ -351,7 +391,7 @@ impl<'a> Checker<'a> {
                     None => {
                         self.errors.push(TypeError {
                             message: format!(
-                                "error propagation requires `Result`, found `{}`",
+                                "error propagation requires `Result` or a nullable, found `{}`",
                                 resolved.display()
                             ),
                             span: inner.span(),
@@ -365,8 +405,8 @@ impl<'a> Checker<'a> {
                 let mut inferred_env = env_from_scopes(scopes);
                 let closure_scope = self.param_scope(params);
                 inferred_env.extend(closure_scope.clone());
-                let mut propagated_errors = Vec::new();
-                self.infer_expr_light(body, &inferred_env, &mut propagated_errors);
+                let mut propagated = LightProps::default();
+                self.infer_expr_light(body, &inferred_env, &mut propagated);
                 let mut closure_scopes = scopes.clone();
                 closure_scopes.push(closure_scope);
                 self.const_scopes.push(HashSet::new());
@@ -388,7 +428,7 @@ impl<'a> Checker<'a> {
                 } else {
                     body_val
                 };
-                let ret = self.wrap_inferred_fallible_return(ret, &propagated_errors);
+                let ret = self.wrap_inferred_fallible_return(ret, &propagated);
                 // Reuse the parameter types from the scope the body was checked
                 // against, so an unannotated parameter's inference variable is
                 // shared between the `Fun` parameter and the return type. This
@@ -578,6 +618,13 @@ impl<'a> Checker<'a> {
         right: Type,
         span: prepoly_parser::Span,
     ) -> Type {
+        // A diverged branch (`Never` -- it always returns or propagates, e.g.
+        // a bare `null!`) constrains nothing; the other branch's type wins.
+        match (self.resolve(&left), self.resolve(&right)) {
+            (Type::Never, _) => return right,
+            (_, Type::Never) => return left,
+            _ => {}
+        }
         if let Some(nullable) = common_nullable_type(&left, &right) {
             return nullable;
         }

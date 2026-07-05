@@ -48,19 +48,30 @@ impl<'a> Checker<'a> {
     }
 
     /// Choose an inferred-return body's return type: the full check's
-    /// reconciliation when it produced one and is not a `Result` (the full check
-    /// observes the stores/pushes the light pass misses), otherwise the light
-    /// `infer_return_from_frame`, which assembles a fallible body's `Result` from
-    /// its error sites -- something the normal-return reconciliation does not do.
+    /// reconciliation when it produced one and the body raises no propagation
+    /// (the full check observes the stores/pushes the light pass misses),
+    /// otherwise the light assembly -- a fallible body's `Result` from its
+    /// error sites, wrapped in `?` when a nullable `expr!` can return null --
+    /// which the normal-return reconciliation does not build.
     fn prefer_full_return(
         &mut self,
         full_ret: Option<Type>,
         body: &Block,
         frame: HashMap<String, Type>,
     ) -> Type {
-        let light = self.infer_return_from_frame(body, frame);
+        let mut env = frame;
+        let mut normal = Vec::new();
+        let mut props = LightProps::default();
+        self.infer_returns_block(body, &mut env, &mut normal, &mut props);
+        let has_props = !props.errors.is_empty() || !props.nulls.is_empty();
+        // Call-site re-inference does not report conflicts; the definition
+        // site already did.
+        let normal_ty = self.reconcile_return_types(&normal, false);
+        let err_ty = self.reconcile_error_payloads(&props.errors, false);
+        let base = self.result_from_payloads(normal_ty, err_ty);
+        let light = super::precompute::wrap_null_propagated_return(base, &props.nulls);
         match full_ret {
-            Some(t) if !self.resolve(&light).is_result_type() => t,
+            Some(t) if !has_props => t,
             _ => light,
         }
     }
@@ -349,17 +360,6 @@ impl<'a> Checker<'a> {
                     TypeKind::Sum { .. } => None,
                 })
         })
-    }
-
-    fn infer_return_from_frame(&mut self, body: &Block, mut env: HashMap<String, Type>) -> Type {
-        let mut normal = Vec::new();
-        let mut errors = Vec::new();
-        self.infer_returns_block(body, &mut env, &mut normal, &mut errors);
-        // Call-site re-inference does not report conflicts; the definition site
-        // already did.
-        let normal_ty = self.reconcile_return_types(&normal, false);
-        let err_ty = self.reconcile_error_payloads(&errors, false);
-        self.result_from_payloads(normal_ty, err_ty)
     }
 }
 

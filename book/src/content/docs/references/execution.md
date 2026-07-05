@@ -61,6 +61,10 @@ interpreter.
   stack, so runaway recursion aborts on stack overflow instead.
 - On the JIT, a runtime panic **aborts** the process (JIT frames cannot be
   unwound); the interpreter unwinds and reports.
+- A failed `!` at an entry point (module top level or `main`) prints
+  `unhandled error: <payload>` (or the null-propagation message) to stderr
+  and exits non-zero, on both back ends (see
+  [Result](/references/types/#result)).
 
 ## Environment
 

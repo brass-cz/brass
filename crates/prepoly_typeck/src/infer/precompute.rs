@@ -151,13 +151,14 @@ impl<'a> Checker<'a> {
             env.insert("self".to_string(), self.type_by_name(self_type));
         }
         let mut normal = Vec::new();
-        let mut errors = Vec::new();
-        self.infer_returns_block(body, &mut env, &mut normal, &mut errors);
+        let mut props = LightProps::default();
+        self.infer_returns_block(body, &mut env, &mut normal, &mut props);
         self.self_type = saved;
         self.self_variant = saved_variant;
         let normal_ty = self.reconcile_return_types(&normal, true);
-        let err_ty = self.reconcile_error_payloads(&errors, true);
-        self.result_from_payloads(normal_ty, err_ty)
+        let err_ty = self.reconcile_error_payloads(&props.errors, true);
+        let base = self.result_from_payloads(normal_ty, err_ty);
+        wrap_null_propagated_return(base, &props.nulls)
     }
 
     /// Generalize every record type into a [`TypeScheme`]. Run after the per-type
@@ -224,11 +225,12 @@ impl<'a> Checker<'a> {
     fn infer_function_return(&mut self, params: &[ParamInfo], body: &Block) -> Type {
         let mut env = self.signature_param_env(params);
         let mut normal = Vec::new();
-        let mut errors = Vec::new();
-        self.infer_returns_block(body, &mut env, &mut normal, &mut errors);
+        let mut props = LightProps::default();
+        self.infer_returns_block(body, &mut env, &mut normal, &mut props);
         let normal_ty = self.reconcile_return_types(&normal, true);
-        let err_ty = self.reconcile_error_payloads(&errors, true);
-        self.result_from_payloads(normal_ty, err_ty)
+        let err_ty = self.reconcile_error_payloads(&props.errors, true);
+        let base = self.result_from_payloads(normal_ty, err_ty);
+        wrap_null_propagated_return(base, &props.nulls)
     }
 
     /// Combine the inferred normal (Ok) and error (Err) return payloads into a
@@ -355,7 +357,7 @@ impl<'a> Checker<'a> {
     pub(super) fn precompute_global_bindings(&mut self) {
         let program = self.program;
         let mut env: HashMap<String, Type> = HashMap::new();
-        let mut errors = Vec::new();
+        let mut props = LightProps::default();
         for init in &program.inits {
             for stmt in &init.stmts {
                 let Stmt::Let { pat, ty, value, .. } = stmt else {
@@ -371,7 +373,7 @@ impl<'a> Checker<'a> {
                     });
                     continue;
                 };
-                let value_ty = self.infer_expr_light(value, &env, &mut errors);
+                let value_ty = self.infer_expr_light(value, &env, &mut props);
                 let binding_ty = match ty {
                     Some(te) => match self.resolve_type(te) {
                         Ok(annotated) => self.instantiate_annotated_type(&annotated, &value_ty),
@@ -401,5 +403,19 @@ impl<'a> Checker<'a> {
         let mut env = self.global_scope.clone();
         env.extend(self.signature_param_scope(params));
         env
+    }
+}
+
+/// Wrap a body's inferred return in an outer `?` when it contains a
+/// nullable-operand `expr!` (`nulls` non-empty): the null case returns null
+/// from the callable. A void base stays void (a statement use has no value a
+/// caller could observe) and an already-nullable base is not double-wrapped.
+pub(super) fn wrap_null_propagated_return(base: Type, nulls: &[Span]) -> Type {
+    if nulls.is_empty() {
+        return base;
+    }
+    match base {
+        Type::Void | Type::Nullable(_) => base,
+        other => Type::Nullable(Box::new(other)),
     }
 }

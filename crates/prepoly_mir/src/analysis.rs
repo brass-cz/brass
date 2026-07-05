@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 
+use prepoly_parser::Span;
 use prepoly_parser::ast::*;
 
 /// Locals that must be heap-promoted to a shared cell: those a
@@ -298,46 +299,91 @@ fn block_exprs(b: &Block, f: &mut impl FnMut(&Expr)) {
 /// `error(...)` or the `expr!` propagation operator. Mirrors codegen's
 /// `fallible_block` so MIR records the same fallibility bit.
 pub fn fallible_block(b: &Block) -> bool {
-    b.stmts.iter().any(fallible_stmt)
+    scan_block(b, Props::Count(&HashSet::new()))
 }
 
-fn fallible_stmt(s: &Stmt) -> bool {
+/// Like [`fallible_block`], but an `expr!` whose span is in `null_props` (a
+/// nullable-operand propagation, per the checker) does not count: its failure
+/// arm returns `null`, not an error `Result`, so a body whose only `!`s are
+/// nullable is not fallible -- its return type is nullable instead.
+pub fn fallible_block_except(b: &Block, null_props: &HashSet<Span>) -> bool {
+    scan_block(b, Props::Count(null_props))
+}
+
+/// Whether a body constructs an error `Result` with `error(...)`. Unlike
+/// [`fallible_block`], `expr!` does not count: in the entry `main` a failed
+/// propagation aborts the program instead of returning an error Result, so
+/// only an explicit `error(...)` makes such a body fallible.
+pub fn constructs_error_block(b: &Block) -> bool {
+    scan_block(b, Props::Ignore)
+}
+
+/// How `expr!` sites count while scanning for fallibility: as error sources
+/// (except the given nullable-operand spans), or not at all.
+#[derive(Clone, Copy)]
+enum Props<'a> {
+    Count(&'a HashSet<Span>),
+    Ignore,
+}
+
+impl Props<'_> {
+    fn counts(&self, span: Span) -> bool {
+        match self {
+            Props::Count(null_props) => !null_props.contains(&span),
+            Props::Ignore => false,
+        }
+    }
+}
+
+fn scan_block(b: &Block, props: Props) -> bool {
+    b.stmts.iter().any(|s| scan_stmt(s, props))
+}
+
+fn scan_stmt(s: &Stmt, props: Props) -> bool {
     match s {
-        Stmt::Let { value, .. } => value.as_ref().is_some_and(fallible_expr),
-        Stmt::Assign { target, value, .. } => fallible_expr(target) || fallible_expr(value),
-        Stmt::Expr(e) => fallible_expr(e),
-        Stmt::While { cond, body, .. } => fallible_expr(cond) || fallible_block(body),
-        Stmt::For { iter, body, .. } => fallible_expr(iter) || fallible_block(body),
-        Stmt::Return(Some(e), _) => fallible_expr(e),
+        Stmt::Let { value, .. } => value.as_ref().is_some_and(|e| scan_expr(e, props)),
+        Stmt::Assign { target, value, .. } => scan_expr(target, props) || scan_expr(value, props),
+        Stmt::Expr(e) => scan_expr(e, props),
+        Stmt::While { cond, body, .. } => scan_expr(cond, props) || scan_block(body, props),
+        Stmt::For { iter, body, .. } => scan_expr(iter, props) || scan_block(body, props),
+        Stmt::Return(Some(e), _) => scan_expr(e, props),
         _ => false,
     }
 }
 
-fn fallible_expr(e: &Expr) -> bool {
+fn scan_expr(e: &Expr, props: Props) -> bool {
     match e {
-        Expr::ErrorProp(..) => true,
+        Expr::ErrorProp(inner, span) => props.counts(*span) || scan_expr(inner, props),
         Expr::Call(c, args, _) => {
             matches!(&**c, Expr::Ident(n, _) if n == "error")
-                || fallible_expr(c)
-                || args.iter().any(|a| fallible_expr(&a.expr))
+                || scan_expr(c, props)
+                || args.iter().any(|a| scan_expr(&a.expr, props))
         }
-        Expr::Unary(_, a, _) | Expr::Field(a, _, _) => fallible_expr(a),
-        Expr::Binary(_, a, b, _) | Expr::Index(a, b, _) => fallible_expr(a) || fallible_expr(b),
-        Expr::Array(es, _) => es.iter().any(fallible_expr),
+        Expr::Unary(_, a, _) | Expr::Field(a, _, _) => scan_expr(a, props),
+        Expr::Binary(_, a, b, _) | Expr::Index(a, b, _) => {
+            scan_expr(a, props) || scan_expr(b, props)
+        }
+        Expr::Array(es, _) => es.iter().any(|e| scan_expr(e, props)),
         Expr::TypeLit(_, fs, _) | Expr::VariantLit(_, _, fs, _) => {
-            fs.iter().any(|(_, v)| fallible_expr(v))
+            fs.iter().any(|(_, v)| scan_expr(v, props))
         }
         Expr::Str(segs, _) => segs
             .iter()
-            .any(|s| matches!(s, StrSeg::Expr(e) if fallible_expr(e))),
+            .any(|s| matches!(s, StrSeg::Expr(e) if scan_expr(e, props))),
         Expr::If(c, t, e, _) => {
-            fallible_expr(c) || fallible_block(t) || e.as_ref().is_some_and(|e| fallible_expr(e))
+            scan_expr(c, props)
+                || scan_block(t, props)
+                || e.as_ref().is_some_and(|e| scan_expr(e, props))
         }
         Expr::IfLet(_, s, t, e, _) => {
-            fallible_expr(s) || fallible_block(t) || e.as_ref().is_some_and(|e| fallible_expr(e))
+            scan_expr(s, props)
+                || scan_block(t, props)
+                || e.as_ref().is_some_and(|e| scan_expr(e, props))
         }
-        Expr::Match(s, arms, _) => fallible_expr(s) || arms.iter().any(|a| fallible_expr(&a.body)),
-        Expr::Block(b, _) => fallible_block(b),
+        Expr::Match(s, arms, _) => {
+            scan_expr(s, props) || arms.iter().any(|a| scan_expr(&a.body, props))
+        }
+        Expr::Block(b, _) => scan_block(b, props),
         _ => false,
     }
 }

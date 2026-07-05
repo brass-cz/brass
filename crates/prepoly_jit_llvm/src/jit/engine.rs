@@ -17,6 +17,7 @@ use prepoly_runtime::symbols;
 /// typed, fully unboxed back end (no boxed `Value`). There is no Value fallback:
 /// a program whose `main` reaches a construct outside the typed subset is
 /// rejected rather than executed.
+#[allow(clippy::too_many_arguments)] // mirrors the checker's channel outputs
 pub fn run(
     program: &Program,
     _int_lit_types: &std::collections::HashMap<prepoly_hir::Span, prepoly_hir::IntKind>,
@@ -25,6 +26,7 @@ pub fn run(
     fields_loops: &std::collections::HashMap<prepoly_hir::Span, Vec<String>>,
     type_names: &std::collections::HashMap<prepoly_hir::Span, String>,
     typeof_types: &std::collections::HashMap<prepoly_hir::Span, prepoly_hir::Type>,
+    null_props: &std::collections::HashSet<prepoly_hir::Span>,
 ) -> Result<(), String> {
     let mir = prepoly_mir::lower_program_with_types(
         program,
@@ -33,6 +35,7 @@ pub fn run(
         fields_loops,
         type_names,
         typeof_types,
+        null_props,
     );
     // Debugging aid: dump the lowered MIR when requested
     // (PREPOLY_LOG_TYPE=mir) -- the first thing needed when monomorphization

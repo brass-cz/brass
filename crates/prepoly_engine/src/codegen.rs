@@ -692,13 +692,25 @@ pub trait Codegen {
                 } else {
                     let op_ty = operand_type_of(op, &f.local_types);
                     // A fallible callable implicitly wraps a bare (non-Result)
-                    // return value as `Result.Ok { value: v }`.
-                    if f.fallible && !op_ty.is_result_type() {
+                    // return value as `Result.Ok { value: v }`. Exempt: a
+                    // `null` returned when the ret is `Result<..>?` -- the
+                    // failure arm of a nullable `expr!` returns null itself,
+                    // not `Ok(null)`. (With a plain `Result` ret, a null IS an
+                    // Ok payload: a fallible body's own `return null`.)
+                    let null_passthrough = op_ty.is_null()
+                        && matches!(&f.ret, Type::Nullable(inner) if inner.is_result_type());
+                    if f.fallible && !op_ty.is_result_type() && !null_passthrough {
                         let ok_ty = result_ok_type(&f.ret);
                         let v = self.codegen_operand(program, f, op, &ok_ty);
+                        // Construct at the Result type itself, then coerce to
+                        // the declared return: a `Result<..>?` ret wraps the
+                        // fresh Result the same way the pass-through path
+                        // coerces a propagated one.
+                        let result_ty = strip_ret_nullable(&f.ret).clone();
+                        let wrapped = self.make_variant(&result_ty, "Ok", &[("value", v)]);
                         let ret = f.ret.clone();
-                        let wrapped = self.make_variant(&ret, "Ok", &[("value", v)]);
-                        self.emit_return(Some(wrapped));
+                        let out = self.coerce(wrapped, &result_ty, &ret);
+                        self.emit_return(Some(out));
                     } else {
                         let ret = f.ret.clone();
                         let v = self.codegen_operand(program, f, op, &ret);
@@ -1218,6 +1230,10 @@ pub trait Codegen {
             "value_matches" => {
                 let subj_ty = operand_type_of(&args[0], &f.local_types);
                 let subj = self.codegen_operand(program, f, &args[0], &subj_ty);
+                // A narrowed nullable scrutinee still carries its declared
+                // `T?`; test the unwrapped value's tag (same as aggregate
+                // receivers), not the nullable cell.
+                let (subj, subj_ty) = self.unwrap_narrowed(subj, &subj_ty);
                 let variant = str_const(&args[1]).unwrap_or_default();
                 self.pattern_matches(subj, &subj_ty, variant)
             }
@@ -1252,6 +1268,8 @@ pub trait Codegen {
             "result_is_ok" => {
                 let subj_ty = operand_type_of(&args[0], &f.local_types);
                 let subj = self.codegen_operand(program, f, &args[0], &subj_ty);
+                // A narrowed `Result<..>?` operand tests the unwrapped Result.
+                let (subj, subj_ty) = self.unwrap_narrowed(subj, &subj_ty);
                 self.pattern_matches(subj, &subj_ty, "Ok")
             }
             "panic" => {
@@ -1756,12 +1774,21 @@ pub trait Codegen {
 
 /// The `Ok` payload type of a `Result` return type (`void` if not a `Result`).
 fn result_ok_type(ret: &Type) -> Type {
-    match ret {
+    match strip_ret_nullable(ret) {
         Type::Sum(n) => n
             .result_payloads()
             .map(|(ok, _)| ok.clone())
             .unwrap_or(Type::Void),
         _ => Type::Void,
+    }
+}
+
+/// A fallible return type with its outer nullability stripped: `Result<..>?`
+/// (a body that also propagates a null) reads as its `Result`.
+fn strip_ret_nullable(ret: &Type) -> &Type {
+    match ret {
+        Type::Nullable(inner) if inner.is_result_type() => inner,
+        other => other,
     }
 }
 

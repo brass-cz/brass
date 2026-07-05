@@ -26,7 +26,6 @@ use prepoly_hir::{Program, Type, TypeKind};
 use prepoly_parser::Span;
 use prepoly_parser::ast::{AssignOp, BinOp, Block, Param};
 
-use crate::analysis::fallible_block;
 use crate::builder::BodyBuilder;
 use crate::cfg::MirBody;
 use crate::ids::{BlockId, ClosureId, LocalId};
@@ -66,6 +65,12 @@ pub(crate) struct ProgramCtx<'p> {
     /// Resolved binding types of `typeof`-bearing local annotations, keyed by
     /// the annotation span; a `let x: typeof(v)` slot is seeded from this.
     typeof_types: &'p HashMap<Span, Type>,
+    /// Spans of `expr!` operators the checker resolved with a NULLABLE operand:
+    /// those lower to a presence test (`__present`/`__nonnull`) whose null arm
+    /// propagates `Result.Null`, instead of the `Result` tag-test shape. Empty
+    /// when lowering without a checked program (tests, deferred re-lowering),
+    /// where a nullable `!` is therefore unsupported.
+    null_props: &'p std::collections::HashSet<Span>,
     /// Names each module's init binds as module-level globals (top-level
     /// `let`s), used to key global storage per defining module.
     module_globals: HashMap<Vec<String>, std::collections::HashSet<String>>,
@@ -85,6 +90,7 @@ impl<'p> ProgramCtx<'p> {
         fields_loops: &'p HashMap<Span, Vec<String>>,
         type_names: &'p HashMap<Span, String>,
         typeof_types: &'p HashMap<Span, Type>,
+        null_props: &'p std::collections::HashSet<Span>,
     ) -> Self {
         let mut variant_names = std::collections::HashSet::new();
         for info in program.types.values() {
@@ -125,6 +131,7 @@ impl<'p> ProgramCtx<'p> {
             fields_loops,
             type_names,
             typeof_types,
+            null_props,
             module_globals,
             prelude_globals,
             closures: RefCell::new(Vec::new()),
@@ -136,6 +143,12 @@ impl<'p> ProgramCtx<'p> {
     /// its callee parameter's view.
     fn is_view_arg(&self, span: Span) -> bool {
         self.view_args.contains(&span)
+    }
+
+    /// Whether the checker resolved the `expr!` at `span` with a nullable
+    /// operand (null propagates as `Result.Null`).
+    fn is_null_prop(&self, span: Span) -> bool {
+        self.null_props.contains(&span)
     }
 
     /// The storage key of module-level global `name` as referenced from
@@ -352,6 +365,13 @@ pub(crate) struct FnLower<'a, 'p> {
     pub(crate) ctx: &'a ProgramCtx<'p>,
     pub(crate) module: Vec<String>,
     pub(crate) self_type: Option<String>,
+    /// Whether a failed `expr!` in this body ABORTS the program (printing the
+    /// error and exiting non-zero) instead of returning the error `Result`
+    /// (or null) from the enclosing callable. True for the entry `main` and
+    /// for module-init bodies (top-level statements): both have no caller to
+    /// propagate to. A closure lowered inside such a body gets its own
+    /// `FnLower` and propagates normally.
+    pub(crate) abort_error_prop: bool,
     /// Lexical scopes mapping source names to bindings; innermost last.
     scopes: Vec<HashMap<String, ScopeBinding>>,
     /// Active loops; innermost last.
@@ -382,6 +402,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
             ctx,
             module,
             self_type,
+            abort_error_prop: false,
             scopes: vec![HashMap::new()],
             loops: Vec::new(),
             cells: std::collections::HashSet::new(),
@@ -609,6 +630,7 @@ pub fn lower_body(
     let no_fields_loops = HashMap::new();
     let no_type_names = HashMap::new();
     let no_typeof_types = HashMap::new();
+    let no_null_props = std::collections::HashSet::new();
     let ctx = ProgramCtx::new(
         program,
         &no_types,
@@ -616,6 +638,7 @@ pub fn lower_body(
         &no_fields_loops,
         &no_type_names,
         &no_typeof_types,
+        &no_null_props,
     );
     let body = lower_one(
         &ctx,
@@ -623,6 +646,7 @@ pub fn lower_body(
         self_type.map(str::to_string),
         params,
         body,
+        false,
     );
     let mut closures = ctx.closures.into_inner();
     closures.sort_by_key(|c| c.id.0);
@@ -630,14 +654,18 @@ pub fn lower_body(
 }
 
 /// Lower one callable into a [`MirBody`] using a shared context.
+/// `abort_error_prop` is true only for the entry `main` (see
+/// [`FnLower::abort_error_prop`]).
 fn lower_one(
     ctx: &ProgramCtx,
     module: Vec<String>,
     self_type: Option<String>,
     params: &[Param],
     body: &Block,
+    abort_error_prop: bool,
 ) -> MirBody {
     let mut fl = FnLower::new(ctx, module, self_type);
+    fl.abort_error_prop = abort_error_prop;
     let param_locals = fl.lower_callable(params, body);
     fl.b.finish(param_locals, BlockId(0))
 }
@@ -653,6 +681,7 @@ pub fn lower_program(program: &Program) -> MirProgram {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &std::collections::HashSet::new(),
     )
 }
 
@@ -670,6 +699,7 @@ pub fn lower_program_with_types(
     fields_loops: &HashMap<Span, Vec<String>>,
     type_names: &HashMap<Span, String>,
     typeof_types: &HashMap<Span, Type>,
+    null_props: &std::collections::HashSet<Span>,
 ) -> MirProgram {
     let ctx = ProgramCtx::new(
         program,
@@ -678,6 +708,7 @@ pub fn lower_program_with_types(
         fields_loops,
         type_names,
         typeof_types,
+        null_props,
     );
     let mut out = MirProgram::default();
 
@@ -685,18 +716,29 @@ pub fn lower_program_with_types(
     fn_names.sort();
     for name in fn_names {
         let info = &program.functions[name];
+        // The entry `main` (the root module's bare `main` symbol) is the
+        // program: a failed `expr!` there aborts with the error instead of
+        // propagating (there is no caller to receive a Result), so `!` alone
+        // does not make `main` fallible -- only an explicit `error(...)` does.
+        let entry_main = info.symbol == "main";
         let body = lower_one(
             &ctx,
             info.module.clone(),
             None,
             &info.decl.params,
             &info.decl.body,
+            entry_main,
         );
+        let fallible = if entry_main && info.decl.ret.is_none() {
+            crate::analysis::constructs_error_block(&info.decl.body)
+        } else {
+            function_fallible(info.decl.ret.as_ref(), &info.decl.body, null_props)
+        };
         out.functions.push(MirFunction {
             name: info.decl.name.clone(),
             symbol: info.symbol.clone(),
             module: info.module.clone(),
-            fallible: function_fallible(info.decl.ret.as_ref(), &info.decl.body),
+            fallible,
             body,
         });
     }
@@ -784,7 +826,14 @@ fn lower_method(
     body: &Block,
     self_type: Option<String>,
 ) -> MirMethod {
-    let mir_body = lower_one(ctx, info.module.clone(), self_type.clone(), params, body);
+    let mir_body = lower_one(
+        ctx,
+        info.module.clone(),
+        self_type.clone(),
+        params,
+        body,
+        false,
+    );
     MirMethod {
         type_name: info.name.clone(),
         type_symbol: info.symbol.clone(),
@@ -792,27 +841,39 @@ fn lower_method(
         method: method.to_string(),
         self_type,
         module: info.module.clone(),
-        fallible: method_fallible(params, body),
+        fallible: method_fallible(params, body, ctx.null_props),
         body: mir_body,
     }
 }
 
 /// A method auto-wraps plain returns in `Result.Ok` when it has no declared
-/// return type and its body uses `error`/`expr!` (matches codegen).
-fn method_fallible(_params: &[Param], body: &Block) -> bool {
-    fallible_block(body)
+/// return type and its body uses `error`/`expr!` (matches codegen). An `expr!`
+/// on a nullable operand (a `null_props` span) does not count: its failure arm
+/// returns `null`, making the return type nullable rather than a `Result`.
+fn method_fallible(
+    _params: &[Param],
+    body: &Block,
+    null_props: &std::collections::HashSet<Span>,
+) -> bool {
+    crate::analysis::fallible_block_except(body, null_props)
 }
 
 /// A free function auto-wraps plain returns in `Result.Ok` (and propagates
 /// errors) when its return type is `T!` (explicitly fallible), or when it has no
 /// return annotation and its body uses `error(...)`/`expr!` (inferred fallible).
 /// An explicit non-`T!` return type means the body builds its own value, so bare
-/// returns are not wrapped.
-fn function_fallible(ret: Option<&prepoly_parser::ast::TypeExpr>, body: &Block) -> bool {
+/// returns are not wrapped. An `expr!` on a nullable operand (a `null_props`
+/// span) does not count: its failure arm returns `null`, making the return
+/// type nullable rather than a `Result`.
+fn function_fallible(
+    ret: Option<&prepoly_parser::ast::TypeExpr>,
+    body: &Block,
+    null_props: &std::collections::HashSet<Span>,
+) -> bool {
     match ret {
         Some(prepoly_parser::ast::TypeExpr::Fallible(..)) => true,
         Some(_) => false,
-        None => fallible_block(body),
+        None => crate::analysis::fallible_block_except(body, null_props),
     }
 }
 
@@ -826,6 +887,10 @@ fn lower_init(
     use prepoly_parser::ast::Stmt;
 
     let mut fl = FnLower::new(ctx, module, None);
+    // Top-level statements are an entry point: a failed `expr!` aborts (see
+    // `FnLower::abort_error_prop`) -- an init body's return type is void, so
+    // there is no Result to propagate into.
+    fl.abort_error_prop = true;
     for s in stmts {
         if fl.b.terminated() {
             break;

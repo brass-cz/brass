@@ -332,7 +332,14 @@ impl<'p> Hm<'p> {
         // `error(x)`/`expr!`, OR its declared return is already a `Result` (a `T!`
         // annotation, or an explicit Result). The latter makes a bare value unify
         // with `Result.Ok { value: v }` even when the body raises no error.
-        self.fallible = block_is_fallible(body) || is_result(&self.solver.resolve(&declared));
+        // Only an explicit `error(...)` construction (or a `Result`-shaped
+        // annotation) makes a body fallible here. A bare `expr!` does not: a
+        // nullable-operand `!` returns null (a nullable, not a Result), the
+        // entry `main` aborts, and a Result-operand `!` in an inferred-return
+        // function is typed authoritatively by the infer pass -- forcing a
+        // `Result` shape here from syntax alone would wrongly reject the
+        // nullable cases.
+        self.fallible = block_constructs_error(body) || is_result(&self.solver.resolve(&declared));
         tracing::debug!(context, fallible = self.fallible, "checking callable body");
         if self.fallible {
             let inferred = Type::result(self.ok.clone(), self.err.clone());
@@ -677,7 +684,10 @@ impl<'p> Hm<'p> {
                     // trailing expression value, if any, is also the result.
                     Expr::Block(block, _) => {
                         let val = self.infer_block_value(block);
-                        if !matches!(self.solver.resolve(&val), Type::Void) {
+                        // A void tail has no value; a `Never` tail (the block
+                        // ends in `return`) already bound the ret via the
+                        // return statement itself.
+                        if !matches!(self.solver.resolve(&val), Type::Void | Type::Never) {
                             self.unify(&val, &cret, body.span());
                         }
                     }
@@ -763,8 +773,7 @@ impl<'p> Hm<'p> {
                 match els {
                     Some(e) => {
                         let else_ty = self.infer_expr(e);
-                        self.unify(&then_ty, &else_ty, *span);
-                        then_ty
+                        self.join_branches(then_ty, else_ty, *span)
                     }
                     None => Type::Void,
                 }
@@ -888,9 +897,14 @@ impl<'p> Hm<'p> {
                 }
             }
             // `expr!`: the operand is a `Result<o, e>`; the operator yields `o`
-            // and propagates `e` into this function's error type.
+            // and propagates `e` into this function's error type. A NULLABLE
+            // operand unwraps instead: the null case propagates as the
+            // payload-less `Result.Null`, constraining no error type.
             Expr::ErrorProp(e, span) => {
                 let et = self.infer_expr(e);
+                if let Type::Nullable(inner) = self.solver.resolve(&et) {
+                    return *inner;
+                }
                 let o = self.solver.fresh(InferenceVarKind::Source);
                 let e_err = self.solver.fresh(InferenceVarKind::Source);
                 let res = Type::result(o.clone(), e_err.clone());
@@ -949,7 +963,11 @@ impl<'p> Hm<'p> {
                     self.bind_pattern(&arm.pattern, &st);
                     let body = self.infer_expr(&arm.body);
                     self.scopes.pop();
-                    self.unify(&body, &result, *span);
+                    // A diverged arm (it always returns/propagates) constrains
+                    // nothing; the value arms agree among themselves.
+                    if !matches!(self.solver.resolve(&body), Type::Never) {
+                        self.unify(&body, &result, *span);
+                    }
                 }
                 result
             }
@@ -970,8 +988,7 @@ impl<'p> Hm<'p> {
                 match els {
                     Some(e) => {
                         let else_ty = self.infer_expr(e);
-                        self.unify(&then_ty, &else_ty, *span);
-                        then_ty
+                        self.join_branches(then_ty, else_ty, *span)
                     }
                     None => Type::Void,
                 }
@@ -1332,7 +1349,29 @@ impl<'p> Hm<'p> {
             self.infer_stmt(stmt);
         }
         self.scopes.pop();
+        // A block whose last statement is a `return` diverges: it produces no
+        // value for the surrounding branch join, so it must not force the
+        // other branch to `void` (`if { return 1 } else { error("x")! }`).
+        if matches!(block.stmts.last(), Some(Stmt::Return(..))) {
+            return Type::Never;
+        }
         value
+    }
+
+    /// Join two branch values: a diverged branch (`Never` -- it always
+    /// returns or propagates) is absorbed by the other; otherwise the
+    /// branches must unify.
+    fn join_branches(&mut self, then_ty: Type, else_ty: Type, span: Span) -> Type {
+        let t = self.solver.resolve(&then_ty);
+        let e = self.solver.resolve(&else_ty);
+        match (matches!(t, Type::Never), matches!(e, Type::Never)) {
+            (true, _) => else_ty,
+            (_, true) => then_ty,
+            _ => {
+                self.unify(&then_ty, &else_ty, span);
+                then_ty
+            }
+        }
     }
 
     // ----- annotations -----
@@ -1577,43 +1616,53 @@ fn is_result(ty: &Type) -> bool {
 /// Whether a function body is fallible: it constructs an error (`error(x)`) or
 /// propagates one (`expr!`). Nested closures are their own callables, so their
 /// error use does not make the enclosing function fallible.
-fn block_is_fallible(block: &Block) -> bool {
-    block.stmts.iter().any(stmt_is_fallible)
+/// Whether a body constructs an error `Result` with `error(...)`. A bare
+/// `expr!` does not count (see `check_callable`): a nullable-operand `!`
+/// returns null rather than a Result, and a Result-operand `!` is typed
+/// authoritatively by the infer pass.
+fn block_constructs_error(block: &Block) -> bool {
+    block.stmts.iter().any(stmt_constructs_error)
 }
 
-fn stmt_is_fallible(stmt: &Stmt) -> bool {
+fn stmt_constructs_error(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Let {
             value: Some(value), ..
         }
-        | Stmt::Return(Some(value), _) => expr_is_fallible(value),
+        | Stmt::Return(Some(value), _) => expr_constructs_error(value),
         Stmt::Let { value: None, .. } => false,
-        Stmt::Assign { target, value, .. } => expr_is_fallible(target) || expr_is_fallible(value),
-        Stmt::Expr(e) => expr_is_fallible(e),
-        Stmt::While { cond, body, .. } => expr_is_fallible(cond) || block_is_fallible(body),
-        Stmt::For { iter, body, .. } => expr_is_fallible(iter) || block_is_fallible(body),
+        Stmt::Assign { target, value, .. } => {
+            expr_constructs_error(target) || expr_constructs_error(value)
+        }
+        Stmt::Expr(e) => expr_constructs_error(e),
+        Stmt::While { cond, body, .. } => {
+            expr_constructs_error(cond) || block_constructs_error(body)
+        }
+        Stmt::For { iter, body, .. } => expr_constructs_error(iter) || block_constructs_error(body),
         Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => false,
     }
 }
 
-fn expr_is_fallible(e: &Expr) -> bool {
+fn expr_constructs_error(e: &Expr) -> bool {
     match e {
-        Expr::ErrorProp(_, _) => true,
+        Expr::ErrorProp(inner, _) => expr_constructs_error(inner),
         Expr::Call(callee, args, _) => {
             matches!(&**callee, Expr::Ident(n, _) if n == "error")
-                || expr_is_fallible(callee)
-                || args.iter().any(|a| expr_is_fallible(&a.expr))
+                || expr_constructs_error(callee)
+                || args.iter().any(|a| expr_constructs_error(&a.expr))
         }
-        Expr::Field(b, _, _) | Expr::Index(b, _, _) | Expr::Unary(_, b, _) => expr_is_fallible(b),
-        Expr::Binary(_, a, b, _) => expr_is_fallible(a) || expr_is_fallible(b),
-        Expr::Block(block, _) => block_is_fallible(block),
+        Expr::Field(b, _, _) | Expr::Index(b, _, _) | Expr::Unary(_, b, _) => {
+            expr_constructs_error(b)
+        }
+        Expr::Binary(_, a, b, _) => expr_constructs_error(a) || expr_constructs_error(b),
+        Expr::Block(block, _) => block_constructs_error(block),
         Expr::If(c, t, e, _) => {
-            expr_is_fallible(c)
-                || block_is_fallible(t)
-                || e.as_ref().is_some_and(|e| expr_is_fallible(e))
+            expr_constructs_error(c)
+                || block_constructs_error(t)
+                || e.as_ref().is_some_and(|e| expr_constructs_error(e))
         }
         Expr::Match(scrut, arms, _) => {
-            expr_is_fallible(scrut) || arms.iter().any(|a| expr_is_fallible(&a.body))
+            expr_constructs_error(scrut) || arms.iter().any(|a| expr_constructs_error(&a.body))
         }
         // A nested closure has its own fallibility; do not descend.
         _ => false,

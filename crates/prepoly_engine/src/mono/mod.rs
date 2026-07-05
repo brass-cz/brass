@@ -25,8 +25,8 @@ use prepoly_hir::{
     int_literal_kind,
 };
 use prepoly_mir::{
-    BlockId, Callee, ClosureId, LocalId, MirBody, MirClosure, MirFunction, MirMethod, MirProgram,
-    MirStmt, Operand, Projection, Rvalue, Terminator,
+    BlockId, Callee, ClosureId, Literal, LocalId, MirBody, MirClosure, MirFunction, MirMethod,
+    MirProgram, MirStmt, Operand, Projection, Rvalue, Terminator,
 };
 use prepoly_parser::ast::{BinOp, UnaryOp};
 
@@ -62,7 +62,7 @@ use rules::{
 };
 use scan::{
     binding_name_of, body_has_error_source, collect_array_pushes, collect_closure_passes,
-    collect_indirect_args, collect_record_field_closures, method_ret_annotation,
+    collect_indirect_args, collect_record_field_closures, method_ret_annotation, null_prop_returns,
     propagated_result_returns, result_concrete_ok, seed_returned_aggregate,
 };
 use symbols::is_return_polymorphic_result;
@@ -866,6 +866,9 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
     ) -> Result<Option<Type>, String> {
         let mut ok_t: Option<Type> = declared_ok.cloned();
         let mut err_e: Option<Type> = None;
+        // Whether some nullable-operand `expr!` returns `null` from this body:
+        // the fallible return type is then wrapped in an outer `?`.
+        let mut saw_null_prop = false;
         let note = |slot: &mut Option<Type>, t: Option<Type>| {
             if slot.is_none()
                 && let Some(t) = t
@@ -874,6 +877,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             }
         };
         let propagated_returns = propagated_result_returns(body);
+        let null_prop_blocks = null_prop_returns(body);
         for (block_idx, block) in body.blocks.iter().enumerate() {
             for stmt in &block.stmts {
                 if let MirStmt::Assign(
@@ -897,6 +901,12 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 }
             }
             if let Terminator::Return(op) = &block.term {
+                // The null arm of a nullable `expr!` returns `null` itself; it
+                // carries no Ok/Err payload, only the outer nullability.
+                if null_prop_blocks.contains(&block_idx) {
+                    saw_null_prop = true;
+                    continue;
+                }
                 match self.operand_type(op, local_types)? {
                     // `expr!` lowers its error arm to `return <the original Result>`.
                     // That return can only execute for the `Err` variant, so it must
@@ -931,15 +941,24 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 }
             }
         }
+        // A body that also returns `null` (a nullable `expr!`'s failure arm)
+        // has a NULLABLE fallible return: `Result<ok, err>?`.
+        let wrap = |t: Type| {
+            if saw_null_prop {
+                Type::Nullable(Box::new(t))
+            } else {
+                t
+            }
+        };
         match (ok_t, err_e) {
-            (Some(ok), Some(err)) => Ok(Some(result_type(ok, err))),
+            (Some(ok), Some(err)) => Ok(Some(wrap(result_type(ok, err)))),
             // A callable made fallible only by a `T!` return annotation never
             // produces an error, so its error payload is unconstrained: default it
             // to `string` (the conventional error type) once the Ok payload is
             // known. Guarded by the absence of any error source, so a fallible body
             // that does raise errors still waits for the real error type.
             (Some(ok), None) if !body_has_error_source(body) => {
-                Ok(Some(result_type(ok, Type::Str)))
+                Ok(Some(wrap(result_type(ok, Type::Str))))
             }
             _ => Ok(None),
         }
@@ -1363,7 +1382,12 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 fields,
             } => {
                 if ty == "Result" {
-                    Ok(cur_ret.clone().filter(|t| t.is_result_type()))
+                    // The enclosing return may be `Result<..>?` (a body that
+                    // also propagates a null); the construction is the Result.
+                    Ok(cur_ret
+                        .as_ref()
+                        .map(|t| unwrap_nullable(t).clone())
+                        .filter(|t| t.is_result_type()))
                 } else {
                     self.variant_type(module, ty, variant, fields, local_types)
                 }

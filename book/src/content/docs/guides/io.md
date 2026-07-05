@@ -25,38 +25,37 @@ println(Point { x: 1, y: 2 })
 ## Reading input
 
 `input()` reads one line from standard input, without the trailing newline.
-It returns `string!` (reading can fail), so unwrap it with `!` or `match`:
+It returns `string!` (reading can fail), so unwrap it with `!` — at the top
+level a failure just ends the program with the error — or handle it with
+`match`:
 
 ```prepoly
-fun main() {
-    println("What's your name?")
-    let name = input()!
-    println("Hello, {name}!")
-}
+println("What's your name?")
+let name = input()!
+println("Hello, {name}!")
 ```
 
 ## Files
 
 `read_file(path)` and `write_file(path, content)` cover whole-file text I/O.
-Both return a Result:
+Both return a Result. In a quick script, unwrap with `!` and let a failure
+stop the program:
 
 ```prepoly
-fun main() {
-    let path = "demo.txt"
+let path = "demo.txt"
+write_file(path, "line one\nline two")!
+let content = read_file(path)!
+for line in content.split("\n") {
+    println("  {line}")
+}
+```
 
-    match write_file(path, "line one\nline two") {
-        Ok { value } => println("written"),
-        Err { error } => println("write failed: {error}"),
-    }
+Where a failure should be handled instead, match on the Result:
 
-    match read_file(path) {
-        Ok { value } => {
-            for line in value.split("\n") {
-                println("  {line}")
-            }
-        },
-        Err { error } => println("read failed: {error}"),
-    }
+```prepoly
+match read_file("missing.txt") {
+    Ok { value } => println(value),
+    Err { error } => println("read failed: {error}"),
 }
 ```
 

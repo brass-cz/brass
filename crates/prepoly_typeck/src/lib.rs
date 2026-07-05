@@ -63,6 +63,10 @@ pub struct Analysis {
     /// Resolved binding types of `typeof`-bearing local annotations, keyed by
     /// the annotation span; MIR seeds the slot from this.
     pub typeof_types: std::collections::HashMap<Span, prepoly_hir::Type>,
+    /// Spans of `expr!` operators whose operand is a nullable rather than a
+    /// `Result` (the null case propagates as `Result.Null`); MIR lowering
+    /// emits the presence-test shape for exactly these spans.
+    pub null_props: std::collections::HashSet<Span>,
 }
 
 /// Run all static checks. Returns the errors found (sorted by position).
@@ -109,6 +113,7 @@ pub fn analyze(program: &Program) -> Analysis {
         type_names: infer.type_names,
         keyed_calls: infer.keyed_calls,
         typeof_types: infer.typeof_types,
+        null_props: infer.null_props,
     }
 }
 
@@ -2170,7 +2175,8 @@ mod tests {
         let e = errs("fun main() {\n    let x = 1!\n}\n");
         assert!(
             e.iter()
-                .any(|m| m.contains("error propagation requires `Result`, found `int32`")),
+                .any(|m| m
+                    .contains("error propagation requires `Result` or a nullable, found `int32`")),
             "{e:?}"
         );
     }
@@ -2187,12 +2193,54 @@ mod tests {
     }
 
     #[test]
-    fn error_propagation_is_rejected_at_top_level() {
-        let e = errs("let x = int32.parse(\"1\")!\n");
+    fn error_propagation_is_allowed_at_top_level() {
+        // A failed `!` at the module top level aborts the program at runtime
+        // (there is no enclosing callable to return a `Result` from), so it
+        // is not a compile error, and the binding takes the Ok payload type.
+        let e = errs("let x = int32.parse(\"1\")!\nlet y: int64 = x\n");
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn error_propagation_on_nullable_makes_return_nullable() {
+        // `!` on a nullable operand unwraps the value type; the null case
+        // returns null itself, so the enclosing function's inferred return is
+        // the operand's inner type made nullable -- using it without a null
+        // check is rejected like any nullable.
+        let e = errs(
+            "fun find(s: string) -> int32? {\n    if s == \"a\" { return 1 }\n    return null\n}\nfun use_it() {\n    let v = find(\"a\")!\n    return v + 1\n}\nfun main() {\n    let bad: int32 = use_it()\n    println(bad)\n}\n",
+        );
         assert!(
             e.iter()
-                .any(|m| m
-                    .contains("error propagation cannot be used outside a function or closure")),
+                .any(|m| m.contains("nullable value must be checked for null before use")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_error_and_null_propagation_infers_nullable_result() {
+        // Bare returns + `error(...)` propagation + a nullable `!` in one body
+        // infer `Result<int32, string>?`: narrowing the outer `?` and matching
+        // `Ok`/`Err` consumes it without errors.
+        let e = errs(
+            "fun f(c: int32) {\n    if c == 0 {\n        return 1\n    } else if c == 1 {\n        error(\"a\")!\n    } else {\n        null!\n    }\n}\nfun main() {\n    let r = f(0)\n    if r {\n        match r {\n            Ok { value } => println(value),\n            Err { error } => println(error),\n        }\n    }\n}\n",
+        );
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn error_propagation_on_nullable_needs_nullable_return() {
+        // Outside `main`/top level, a nullable `!` needs a return the null
+        // can flow out of: an explicit non-nullable return rejects it.
+        let e = errs(
+            "fun find() -> int32? {\n    return null\n}\nfun f() -> int32 {\n    return find()!\n}\n",
+        );
+        assert!(
+            e.iter().any(|m| {
+                m.contains(
+                    "null propagation (`!` on a nullable) requires a nullable return type, found `int32`"
+                )
+            }),
             "{e:?}"
         );
     }
