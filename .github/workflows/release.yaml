@@ -46,7 +46,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: prepoly-${{ matrix.host }}
-          path: *.tar.gz
+          path: "*.tar.gz"
 
   github-release:
     name: Create A GitHub Release
@@ -69,13 +69,13 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: artifacts
-          pattern: prepoly-*
+          pattern: "prepoly-*"
           merge-multiple: true
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Release
         uses: softprops/action-gh-release@v3
         with:
-          files: artifacts/*
+          files: "artifacts/*"
           draft: true
           body_path: release.md
           prerelease: ${{ needs.meta.outputs.pre_release == 'true' }}
