@@ -785,7 +785,7 @@ fn analyze(main_label: &str, main_src: &str, root: &Path) -> Result<Checked, Vec
     let mut load_errors = Vec::new();
     // The main file's imports resolve relative to its own directory (`root`), so
     // its canonical base is empty.
-    for (target, span) in prepoly_resolve::canonicalize_imports(&[], &mut main_ast.imports) {
+    for (target, span) in prepoly_resolve::canonicalize_imports(&[], root, &mut main_ast.imports) {
         prepoly_resolve::load_module(
             &target,
             root,
@@ -818,6 +818,11 @@ fn analyze(main_label: &str, main_src: &str, root: &Path) -> Result<Checked, Vec
     let nested = prepoly_resolve::load_std_nested(&modules, &[], &mut sources);
     modules.extend(nested);
 
+    // Resolve qualified uses of module imports (`import a.b` + `b.name`),
+    // promoting the used names onto the imports so everything downstream sees
+    // name-based imports. Problems join the front-end diagnostics below.
+    let qualified_errors = prepoly_resolve::resolve_qualified_uses(&mut modules);
+
     // The spawn-ownership pass only matters for the JIT runtime (the REPL does not
     // execute concurrency); it lives in the LLVM crate, so it is feature-gated.
     // The pass may reject a `spawn` it cannot analyze; those diagnostics join the
@@ -833,6 +838,9 @@ fn analyze(main_label: &str, main_src: &str, root: &Path) -> Result<Checked, Vec
     tracing::debug!(modules = modules.len(), "lowering module graph to HIR");
     let (program, lower_errors) = lower(&modules);
     let mut errors: Vec<(String, Span)> = spawn_errors;
+    for e in qualified_errors {
+        errors.push((e.message, e.span));
+    }
     for e in lower_errors {
         errors.push((e.message, e.span));
     }
@@ -953,7 +961,13 @@ fn specialize_keyed(
             for (from_module, name) in imports {
                 m.ast.imports.push(prepoly_parser::ast::ImportDecl {
                     path: from_module,
-                    names: vec![name],
+                    names: vec![prepoly_parser::ast::ImportedName::plain(
+                        name,
+                        Span::new(0, 0),
+                    )],
+                    bare: false,
+                    alias: None,
+                    explicit_alias: false,
                     span: Span::new(0, 0),
                 });
             }

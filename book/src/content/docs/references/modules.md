@@ -12,12 +12,38 @@ declaration inside a file.
 ## Imports
 
 ```prepoly norun
-import geometry.vec.{ Vec2, dot }
+import geometry.vec.{ Vec2, dot }       // named imports (braced list)
+import geometry.vec.{ dot as vdot }    // name import with rename
+import geometry.vec.Vec2               // one name, same as .{ Vec2 }
+import geometry.vec                    // the whole module, used qualified
+import geometry.vec as g              // module import with a custom qualifier
 ```
 
-`import path.{ Name, ... }` is the only form: a dotted module path followed by
-a braced list of the names to import (trailing comma allowed). There is no
-bare `import path` form and no renaming (`as`).
+Three forms:
+
+- **`import path.{ Name, ... }`** brings the listed names into scope bare
+  (trailing comma allowed). `Name as Local` renames a name on import:
+  `import m.{ helper as h }` makes `h` available; `helper` is not in scope.
+- **`import path.Name`** brings the one trailing name into scope, exactly
+  like `import path.{ Name }`.
+- **`import path`** imports the module itself. Its exports are used
+  *qualified* by the path's **last segment**: `vec.dot(a, b)`, a type
+  position `vec.Vec2`, a record literal `vec.Vec2 { x: 1.0 }`, a static call
+  `vec.Vec2.new(...)`, a variant literal `vec.Shape.Circle { r: 1.0 }`, and
+  a match pattern `vec.Shape.Circle { r } =>` (a pattern's qualifier is
+  dropped; the variant resolves against the scrutinee).
+  The qualifier defaults to the last path segment; `import path as name`
+  overrides it (e.g. `import geometry.vec as g` uses `g.dot(..)`). Two
+  module imports whose qualifiers collide are rejected — rename one with
+  `as` or import names directly.
+
+The two brace-less forms are distinguished by what exists: if the whole path
+names a module, it is a module import; otherwise the last segment is a name
+imported from the module named by the rest. Qualified access disambiguates:
+`import c.{ X }` and `import a.b` may coexist, with bare `X` resolving to
+c's definition and `b.X` resolving to a.b's. A local binding shadows a
+qualifier (`let vec = ...` makes a later `vec.x` a field access), and a
+qualifier that collides with a declared or imported name is rejected.
 
 Import paths resolve **relative to the importing file's directory**: inside
 `app/main.pp`, `import geometry.vec.{...}` refers to `app/geometry/vec.pp`.
@@ -26,7 +52,12 @@ library instead of files on disk. Import cycles are detected and reported.
 
 Importing a type brings its methods with it — `import geometry.vec.{ Vec2 }`
 makes both `Vec2.new(...)` and `v.add(w)` available; methods are in scope
-wherever their type is.
+wherever their type is. The import also gates
+[anonymous-record dispatch](/references/types/#anonymous-record-method-dispatch):
+a literal like `{ x: 1.0, y: 2.0 }` only adopts a type the module declares or
+imports, while a value that already carries a nominal type — an imported
+function's return, say — dispatches its methods without the type's name being
+imported.
 
 ## Visibility
 

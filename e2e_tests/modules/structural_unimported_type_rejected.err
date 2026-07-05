@@ -1,0 +1,1 @@
+the anonymous structure satisfies `Person`, which declares `display`, but `Person` is not imported into this module

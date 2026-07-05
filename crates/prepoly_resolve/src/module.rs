@@ -6,8 +6,9 @@ use std::collections::{HashMap, HashSet};
 
 use prepoly_hir::LoadedModule;
 use prepoly_parser::Span;
-use prepoly_parser::ast::TopLevel;
+use prepoly_parser::ast::{Stmt, TopLevel};
 
+use crate::qualified::collect_pattern_names;
 use crate::visibility::is_public;
 
 #[derive(Clone, Debug)]
@@ -24,6 +25,37 @@ pub fn check_imports(modules: &[LoadedModule]) -> Vec<ResolveError> {
     let exports = collect_exports(modules);
     let mut errors = Vec::new();
     for m in modules {
+        // A rename whose local name is also declared in the importing module
+        // is rejected: resolution gives the rename precedence over the bare
+        // tables (see `resolve_qualified`), so letting it coexist with a local
+        // declaration would silently shadow that declaration.
+        let mut declared: HashSet<String> = HashSet::new();
+        for item in &m.ast.items {
+            match item {
+                TopLevel::Fun(f) => {
+                    declared.insert(f.name.clone());
+                }
+                TopLevel::Type(t) => {
+                    declared.insert(t.name.clone());
+                }
+                TopLevel::Stmt(Stmt::Let { pat, .. }) => collect_pattern_names(pat, &mut declared),
+                TopLevel::Stmt(_) => {}
+            }
+        }
+        for imp in &m.ast.imports {
+            for name in &imp.names {
+                if name.local != name.remote && declared.contains(&name.local) {
+                    errors.push(ResolveError {
+                        message: format!(
+                            "the imported name `{}` (renamed from `{}`) collides with a \
+                             declaration in this module; rename one of them",
+                            name.local, name.remote
+                        ),
+                        span: name.span,
+                    });
+                }
+            }
+        }
         // The same local name imported from two different modules is a local
         // ambiguity in the importing module: neither
         // origin wins, so a bare use cannot be resolved.
@@ -31,7 +63,7 @@ pub fn check_imports(modules: &[LoadedModule]) -> Vec<ResolveError> {
         for imp in &m.ast.imports {
             let key = imp.path.join(".");
             for name in &imp.names {
-                let seen = origins.entry(name.as_str()).or_default();
+                let seen = origins.entry(name.local.as_str()).or_default();
                 if !seen.contains(&key) {
                     seen.push(key.clone());
                 }
@@ -39,14 +71,15 @@ pub fn check_imports(modules: &[LoadedModule]) -> Vec<ResolveError> {
         }
         for imp in &m.ast.imports {
             for name in &imp.names {
-                if let Some(paths) = origins.get(name.as_str())
+                if let Some(paths) = origins.get(name.local.as_str())
                     && paths.len() > 1
                     && paths.first() == Some(&imp.path.join("."))
                 {
                     errors.push(ResolveError {
                         message: format!(
-                            "`{name}` is imported from multiple modules (`{}`); \
+                            "`{}` is imported from multiple modules (`{}`); \
                                  the import is ambiguous",
+                            name.local,
                             paths.join("`, `")
                         ),
                         span: imp.span,
@@ -57,16 +90,16 @@ pub fn check_imports(modules: &[LoadedModule]) -> Vec<ResolveError> {
         for imp in &m.ast.imports {
             let key = imp.path.join(".");
             for name in &imp.names {
-                if !is_public(name) {
+                if !is_public(&name.remote) {
                     errors.push(ResolveError {
-                        message: format!("cannot import private name `{name}`"),
+                        message: format!("cannot import private name `{}`", name.remote),
                         span: imp.span,
                     });
                     continue;
                 }
                 match exports.get(&key) {
-                    Some(names) if !names.contains(name) => errors.push(ResolveError {
-                        message: format!("module `{key}` has no exported name `{name}`"),
+                    Some(names) if !names.contains(&name.remote) => errors.push(ResolveError {
+                        message: format!("module `{key}` has no exported name `{}`", name.remote),
                         span: imp.span,
                     }),
                     Some(_) => {}
@@ -79,10 +112,11 @@ pub fn check_imports(modules: &[LoadedModule]) -> Vec<ResolveError> {
                         // reach private definitions of arbitrary modules.
                         let std_alias = format!("std.{key}");
                         match exports.get(std_alias.as_str()) {
-                            Some(names) if !names.contains(name) => {
+                            Some(names) if !names.contains(&name.remote) => {
                                 errors.push(ResolveError {
                                     message: format!(
-                                        "module `{key}` has no exported name `{name}`"
+                                        "module `{key}` has no exported name `{}`",
+                                        name.remote
                                     ),
                                     span: imp.span,
                                 });
@@ -103,7 +137,7 @@ pub fn check_imports(modules: &[LoadedModule]) -> Vec<ResolveError> {
 
 /// Public top-level type and function names exported by each loaded module,
 /// keyed by the module's dotted path.
-fn collect_exports(modules: &[LoadedModule]) -> HashMap<String, HashSet<String>> {
+pub(crate) fn collect_exports(modules: &[LoadedModule]) -> HashMap<String, HashSet<String>> {
     let mut exports: HashMap<String, HashSet<String>> = HashMap::new();
     for m in modules {
         let names = exports.entry(m.path.join(".")).or_default();

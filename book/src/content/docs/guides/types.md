@@ -209,13 +209,6 @@ run_with(ConsoleLogger { prefix: "APP" }, "task1")
 run_with(TaggedLogger { prefix: "APP", tag: "net" }, "task2")
 ```
 
-```
-[APP] starting task1
-[APP] done task1
-[APP/net] starting task2
-[APP/net] done task2
-```
-
 ## Anonymous records
 
 `{ field: value, ... }` is an anonymous structural record. When exactly one
@@ -234,6 +227,12 @@ fun Person.display(self) {
 let someone = { name: "Asimov" }
 someone.display()   // I am Asimov
 ```
+
+"In scope" is per module: an anonymous value only adopts a type declared in
+or imported into the module where the call appears. If `Person` lives in
+another module this one never imports, `someone.display()` is an error naming
+the missing import — while a `Person` returned by an imported function still
+dispatches `display()`, because its type is already known.
 
 You can also convert a value to a record type explicitly with `T.from(v)`,
 which yields `T?` — the record when `v` structurally has all of `T`'s fields,

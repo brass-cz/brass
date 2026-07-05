@@ -158,8 +158,16 @@ fn run_pipeline(
         ast: main,
     });
 
+    // Resolve qualified uses of module imports (`import a.b` + `b.name`)
+    // exactly as the driver does, so the editor reports the same programs
+    // valid with the same diagnostics.
+    let qualified_errors = prepoly_resolve::resolve_qualified_uses(&mut modules);
+
     let (program, lower_errors) = lower(&modules);
     let mut diags: Vec<(String, Span)> = Vec::new();
+    for e in qualified_errors {
+        diags.push((e.message, e.span));
+    }
     for e in lower_errors {
         diags.push((e.message, e.span));
     }

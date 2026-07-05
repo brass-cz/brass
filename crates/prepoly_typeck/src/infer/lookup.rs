@@ -64,16 +64,20 @@ impl<'a> Checker<'a> {
         qualifier: &str,
         method: &str,
     ) -> Option<ResolvedMethod> {
-        if let Some((sum, variant)) = qualifier.split_once('.') {
-            let symbol = self.resolve_type_symbol(sum)?;
+        // `Sum.Variant.method()`: only when the first segment is actually a
+        // type (not a module alias producing a marker like `"vec.Vec2"`).
+        if let Some((sum, variant)) = qualifier.split_once('.')
+            && let Some(symbol) = self.resolve_type_symbol(sum)
+        {
             let info = self.program.types.get(&symbol)?;
-            let method = info.variant(variant)?.methods.get(method)?;
-            return Some(ResolvedMethod {
-                qualifier: format!("{symbol}.{variant}"),
-                self_type: symbol.clone(),
-                signature: method.signature.clone(),
-                method: method.decl.as_ref().clone(),
-            });
+            if let Some(v_method) = info.variant(variant).and_then(|v| v.methods.get(method)) {
+                return Some(ResolvedMethod {
+                    qualifier: format!("{symbol}.{variant}"),
+                    self_type: symbol.clone(),
+                    signature: v_method.signature.clone(),
+                    method: v_method.decl.as_ref().clone(),
+                });
+            }
         }
         let type_name = self.resolve_self_name(qualifier);
         let symbol = self.resolve_type_symbol(&type_name)?;
@@ -151,10 +155,12 @@ impl<'a> Checker<'a> {
                     return None;
                 }
                 let resolved = self.resolve_self_name(type_name);
-                self.program
+                let info = self
+                    .program
                     .types
                     .get(&resolved)
-                    .and_then(|info| info.variant(variant))
+                    .or_else(|| self.program.resolve_type(&self.current_module, &resolved));
+                info.and_then(|i| i.variant(variant))
                     .map(|_| format!("{resolved}.{variant}"))
             }
             _ => None,
@@ -201,6 +207,23 @@ impl<'a> Checker<'a> {
     /// symbols, so resolution prefers this module's own definition, then the one
     /// brought in by an `import`.
     pub(super) fn lookup_function(&self, name: &str) -> Option<&prepoly_hir::FunInfo> {
+        // A dotted marker from the qualified-use rewrite: resolve through the
+        // alias table directly; visibility is already validated by the pass.
+        if name.contains('.') {
+            return self.program.resolve_function(&self.current_module, name);
+        }
+        // A renamed import: the local name is only this module's alias for the
+        // origin's remote name, so it must not fall through to the bare table,
+        // where an unrelated module's function of the same name would capture
+        // it. Renames colliding with local declarations are rejected upstream.
+        if let Some(remote) = self.import_remote(name) {
+            let origin = self.import_origin(name)?;
+            return self
+                .program
+                .functions
+                .get(&prepoly_hir::qualify(remote, origin))
+                .or_else(|| self.program.functions.get(remote));
+        }
         if let Some(info) = self.program.functions.get(name) {
             return self
                 .is_module_name_visible(&info.module, name)
@@ -228,22 +251,57 @@ impl<'a> Checker<'a> {
             .map(Vec::as_slice)
     }
 
+    /// The remote (original) name for an imported local name in the current
+    /// module, or `None` when there is no rename.
+    fn import_remote(&self, name: &str) -> Option<&str> {
+        self.program
+            .import_renames
+            .get(&self.current_module)
+            .and_then(|m| m.get(name))
+            .map(String::as_str)
+    }
+
     /// The per-module visibility rule shared by functions and types: a name
     /// declared in `defining` is visible from `current_module` when it is the
     /// same module, a compiler builtin (empty module path, e.g. `Result`), a
     /// public standard-library name (implicit prelude), or
-    /// explicitly imported into the current module.
-    fn is_module_name_visible(&self, defining: &[String], name: &str) -> bool {
+    /// explicitly imported into the current module FROM `defining` under this
+    /// very name. An import of the same name from a different module, or a
+    /// rename whose local happens to equal `name`, does not make this
+    /// definition visible.
+    pub(super) fn is_module_name_visible(&self, defining: &[String], name: &str) -> bool {
         if defining == self.current_module.as_slice() || defining.is_empty() {
             return true;
         }
         if defining.first().map(String::as_str) == Some("std") && !name.starts_with('_') {
             return true;
         }
-        self.program
-            .module_imports
-            .get(&self.current_module)
-            .is_some_and(|names| names.iter().any(|n| n == name))
+        self.import_remote(name).is_none()
+            && self
+                .import_origin(name)
+                .is_some_and(|origin| origin == defining)
+    }
+
+    /// Whether the nominal type declared in `defining` as `name` can be named
+    /// from the current module: same module, builtin, std prelude, or imported
+    /// under ANY local name -- an `as` rename still makes the type itself
+    /// nameable here, just under its local alias. Structural method dispatch
+    /// uses this: adoption is gated on the author having named the type in
+    /// this module, whatever they named it.
+    pub(super) fn is_nominal_visible(&self, defining: &[String], name: &str) -> bool {
+        if defining == self.current_module.as_slice() || defining.is_empty() {
+            return true;
+        }
+        if defining.first().map(String::as_str) == Some("std") && !name.starts_with('_') {
+            return true;
+        }
+        let Some(origins) = self.program.import_origins.get(&self.current_module) else {
+            return false;
+        };
+        origins.iter().any(|(local, origin)| {
+            origin.as_slice() == defining
+                && self.import_remote(local).unwrap_or(local.as_str()) == name
+        })
     }
 
     /// Switch `current_module` to the module chosen by `pick` for the duration
@@ -454,6 +512,20 @@ impl<'a> Checker<'a> {
     }
 
     pub(super) fn is_type_word(&self, name: &str) -> bool {
+        if name.contains('.') {
+            return self
+                .program
+                .resolve_type(&self.current_module, name)
+                .is_some();
+        }
+        // A renamed import (`import m.{ Vec2 as V }`): the local name appears
+        // in no type table; resolve it through the rename-aware lookup.
+        if self.import_remote(name).is_some() {
+            return self
+                .program
+                .resolve_type(&self.current_module, name)
+                .is_some();
+        }
         self.program.has_type_named(name)
             || self.program.type_aliases.contains_key(name)
             || self

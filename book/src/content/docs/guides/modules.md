@@ -63,6 +63,22 @@ a . b = 11.0
 The import path follows the directory layout relative to the importing file:
 `geometry.vec` is `geometry/vec.pp`. The braced list names what to import.
 
+Two shorter forms cover the other common needs. A single name can skip the
+braces, and importing the module itself makes its exports available
+qualified by the path's last segment. `as` overrides the qualifier:
+
+```prepoly norun
+import geometry.vec.dot     // one name, same as .{ dot }
+import geometry.vec         // whole module, used as vec.<name>
+import geometry.vec as g    // same, but used as g.<name>
+
+fun main() {
+    let a = vec.Vec2.new(3.0, 4.0)
+    let b = vec.Vec2 { x: 1.0, y: 2.0 }
+    println("a . b = {vec.dot(a, b)}")
+}
+```
+
 A few points worth noting:
 
 - A type's methods travel with it: importing `Vec2` makes `a.add(b)` and

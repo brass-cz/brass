@@ -60,9 +60,21 @@ pub fn qualify(local: &str, module: &[String]) -> String {
 pub fn resolve_qualified<'a, T>(
     table: &'a HashMap<String, T>,
     import_origins: &HashMap<Vec<String>, HashMap<String, Vec<String>>>,
+    import_renames: &HashMap<Vec<String>, HashMap<String, String>>,
     module: &[String],
     name: &str,
 ) -> Option<&'a T> {
+    // A renamed import (`import m.{ X as Y }`): the local name exists ONLY as
+    // this module's alias for the origin's remote name, so it must not fall
+    // through to the bare table -- an unrelated module's unique `Y` would
+    // capture it. A rename colliding with a local declaration is rejected by
+    // import checking, so resolving the rename first is safe.
+    if let Some(remote) = import_renames.get(module).and_then(|m| m.get(name)) {
+        let origin = import_origins.get(module)?.get(name)?;
+        return table
+            .get(&qualify(remote, origin))
+            .or_else(|| table.get(remote.as_str()));
+    }
     if let Some(v) = table.get(name) {
         return Some(v);
     }
@@ -273,6 +285,17 @@ pub struct Program {
     /// On an ambiguous import the first origin is kept; the ambiguity itself is
     /// reported separately.
     pub import_origins: HashMap<Vec<String>, HashMap<String, Vec<String>>>,
+    /// Per-module map from LOCAL imported name to its REMOTE (original) name,
+    /// for `import m.{ X as Y }` renames. Only populated for names where
+    /// `local != remote`; a missing entry means the local name IS the remote
+    /// name. Used by [`resolve_qualified`] to find the storage symbol.
+    pub import_renames: HashMap<Vec<String>, HashMap<String, String>>,
+    /// Per-module qualifiers from whole-module imports:
+    /// importing module -> alias -> imported module path.
+    pub module_aliases: HashMap<Vec<String>, HashMap<String, Vec<String>>>,
+    /// Fully-qualified form -> canonical storage symbol, for every top-level
+    /// item whose canonical symbol is the bare name (unique program-wide).
+    pub symbol_aliases: HashMap<String, String>,
     /// Methods the standard library implements on primitive/array types with
     /// `fun T.m(...)` (e.g. `fun string.split` / `fun infer[].map`). Keyed by
     /// `(dispatch class, method name)` -> the implementing function's storage
@@ -311,6 +334,24 @@ impl Program {
     /// the module it lives in. Used by validation passes that only need to know
     /// a name denotes some type (not which one), so they do not false-positive
     /// on a module-qualified symbol such as `Name@a.b`.
+    /// Resolve a dotted marker `"alias.bare"` against this module's alias
+    /// table. Returns `None` for non-marker names (no dot).
+    fn resolve_marker<'a, T>(
+        &'a self,
+        table: &'a HashMap<String, T>,
+        module: &[String],
+        name: &str,
+    ) -> Option<&'a T> {
+        let (alias, bare) = name.split_once('.')?;
+        let target = self.module_aliases.get(module)?.get(alias)?;
+        let qualified = qualify(bare, target);
+        table.get(&qualified).or_else(|| {
+            self.symbol_aliases
+                .get(&qualified)
+                .and_then(|c| table.get(c))
+        })
+    }
+
     pub fn has_type_named(&self, name: &str) -> bool {
         self.types.contains_key(name)
             || self
@@ -323,14 +364,32 @@ impl Program {
     /// own/unique symbol, this module's qualified definition, or the one imported
     /// into this module.
     pub fn resolve_type(&self, module: &[String], name: &str) -> Option<&TypeInfo> {
-        resolve_qualified(&self.types, &self.import_origins, module, name)
+        if let Some(v) = self.resolve_marker(&self.types, module, name) {
+            return Some(v);
+        }
+        resolve_qualified(
+            &self.types,
+            &self.import_origins,
+            &self.import_renames,
+            module,
+            name,
+        )
     }
 
     /// Resolve a bare free-function name to its definition as seen from `module`,
     /// by the same rule as [`Program::resolve_type`]. The canonical home for
     /// function resolution; back ends call this instead of re-deriving the symbol.
     pub fn resolve_function(&self, module: &[String], name: &str) -> Option<&FunInfo> {
-        resolve_qualified(&self.functions, &self.import_origins, module, name)
+        if let Some(v) = self.resolve_marker(&self.functions, module, name) {
+            return Some(v);
+        }
+        resolve_qualified(
+            &self.functions,
+            &self.import_origins,
+            &self.import_renames,
+            module,
+            name,
+        )
     }
 
     /// The storage symbol a bare function `name` resolves to from `module`, if any.

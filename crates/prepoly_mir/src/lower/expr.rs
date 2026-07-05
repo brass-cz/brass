@@ -651,7 +651,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
             }
             if let Expr::Ident(tname, _) = &**base
                 && self.lookup(tname).is_none()
-                && self.ctx.is_type_word(tname)
+                && self.ctx.is_type_word_in(&self.module, tname)
             {
                 let tn = self.resolve_self_name(tname);
                 // `T.from(v)` for a structure type `T`: a fallible structural

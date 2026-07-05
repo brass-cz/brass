@@ -217,9 +217,20 @@ impl<'p> ProgramCtx<'p> {
 
     /// Whether `name` denotes a type rather than a value: a user type, `Self`,
     /// the builtin `File`, or a primitive type word. Mirrors codegen's
-    /// `is_type_word` so `Type.method(...)` routes as a static call.
-    fn is_type_word(&self, name: &str) -> bool {
+    /// `is_type_word` so `Type.method(...)` routes as a static call. A dotted
+    /// marker (`alias.T`) and a renamed import (`import m.{ T as name }`)
+    /// appear in no table under `name` and resolve through the module-aware
+    /// lookup instead.
+    fn is_type_word_in(&self, module: &[String], name: &str) -> bool {
+        let renamed = |n: &str| {
+            self.program
+                .import_renames
+                .get(module)
+                .is_some_and(|m| m.contains_key(n))
+        };
         self.program.types.contains_key(name)
+            || ((name.contains('.') || renamed(name))
+                && self.program.resolve_type(module, name).is_some())
             || name == "Self"
             || name == "File"
             || prepoly_hir::IntKind::from_name(name).is_some()

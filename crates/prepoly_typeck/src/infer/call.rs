@@ -6,6 +6,22 @@
 
 use super::*;
 
+/// A record type declaring the method a structural (anonymous) receiver asked
+/// for, as seen from the call's module: whether the type is visible there and
+/// which of its fields the value fails to satisfy. Shared by candidate
+/// selection and the resolution-failure diagnostics.
+struct StructuralMethodType {
+    name: String,
+    symbol: String,
+    /// Declared in or imported into the current module (builtins and the
+    /// public std prelude count). Only visible types dispatch; a satisfied
+    /// but invisible type is reported as a missing import.
+    visible: bool,
+    /// Members of the declaring type the value does not provide; empty when
+    /// the value satisfies the type.
+    unsatisfied: Vec<String>,
+}
+
 impl<'a> Checker<'a> {
     pub(super) fn check_call(
         &mut self,
@@ -619,17 +635,18 @@ impl<'a> Checker<'a> {
             .unwrap_or_else(|| self.fresh_unknown())
     }
 
-    /// The in-scope record types that declare method `method` AND whose declared
-    /// fields the structural (anonymous) instance `record` satisfies, sorted by
-    /// name for deterministic diagnostics. "In scope" means the type's bare name
-    /// resolves from the current module to that type.
-    fn structural_method_candidates(
+    /// How every record type declaring `method` relates to the structural
+    /// (anonymous) receiver `record`: whether the type is visible from the
+    /// current module and which of its fields the value fails to provide.
+    /// Sorted by name for deterministic diagnostics. Only types whose bare
+    /// name resolves from the current module to that definition are listed,
+    /// so a name defined in several modules keeps its usual resolution.
+    fn structural_method_types(
         &mut self,
         record: &NominalType,
         method: &str,
-    ) -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = Vec::new();
-        let infos: Vec<(String, String)> = self
+    ) -> Vec<StructuralMethodType> {
+        let infos: Vec<(String, String, Vec<String>)> = self
             .program
             .types
             .values()
@@ -640,10 +657,11 @@ impl<'a> Checker<'a> {
                 if !methods.contains_key(method) {
                     return None;
                 }
-                Some((info.name.clone(), info.symbol.clone()))
+                Some((info.name.clone(), info.symbol.clone(), info.module.clone()))
             })
             .collect();
-        for (name, symbol) in infos {
+        let mut out: Vec<StructuralMethodType> = Vec::new();
+        for (name, symbol, module) in infos {
             if self.resolve_type_symbol(&name).as_deref() != Some(symbol.as_str()) {
                 continue;
             }
@@ -652,48 +670,71 @@ impl<'a> Checker<'a> {
             };
             let sup = info.type_ref();
             let Type::Record(sup_n) = &sup else { continue };
-            if crate::structural::record_satisfies_fields(self.program, record, sup_n).is_empty() {
-                out.push((name, symbol));
-            }
+            let unsatisfied =
+                crate::structural::record_satisfies_fields(self.program, record, sup_n);
+            let visible = self.is_nominal_visible(&module, &name);
+            out.push(StructuralMethodType {
+                name,
+                symbol,
+                visible,
+                unsatisfied,
+            });
         }
-        out.sort();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
 
-    /// A near-miss explanation for a failed structural method resolution: the
-    /// in-scope record types that declare `method` but whose fields the value
-    /// does NOT satisfy, with the unsatisfied members. `None` when no in-scope
-    /// type declares the method at all (the plain has-no-method error reads
-    /// better then).
+    /// The record types that declare method `method`, are visible from the
+    /// current module (declared in it or imported into it), AND whose declared
+    /// fields the structural (anonymous) instance `record` satisfies. A type
+    /// the module never imported must not capture an anonymous value, even
+    /// when the shape matches: the author has not named it here.
+    fn structural_method_candidates(
+        &mut self,
+        record: &NominalType,
+        method: &str,
+    ) -> Vec<(String, String)> {
+        self.structural_method_types(record, method)
+            .into_iter()
+            .filter(|t| t.visible && t.unsatisfied.is_empty())
+            .map(|t| (t.name, t.symbol))
+            .collect()
+    }
+
+    /// A near-miss explanation for a failed structural method resolution, in
+    /// preference order: a type the value satisfies exists but is not imported
+    /// into this module (the import is the fix), or in-scope types declare
+    /// `method` but the value lacks some of their members. `None` when no type
+    /// resolvable from here declares the method at all (the plain
+    /// has-no-method error reads better then).
     fn structural_near_miss(&mut self, record: &NominalType, method: &str) -> Option<String> {
-        let infos: Vec<(String, String)> = self
-            .program
-            .types
-            .values()
-            .filter_map(|info| {
-                let TypeKind::Record { methods, .. } = &info.kind else {
-                    return None;
-                };
-                if !methods.contains_key(method) {
-                    return None;
-                }
-                Some((info.name.clone(), info.symbol.clone()))
-            })
+        let types = self.structural_method_types(record, method);
+        let hidden: Vec<&str> = types
+            .iter()
+            .filter(|t| !t.visible && t.unsatisfied.is_empty())
+            .map(|t| t.name.as_str())
             .collect();
-        let mut misses: Vec<String> = Vec::new();
-        for (name, symbol) in infos {
-            if self.resolve_type_symbol(&name).as_deref() != Some(symbol.as_str()) {
-                continue;
+        match hidden.as_slice() {
+            [] => {}
+            [name] => {
+                return Some(format!(
+                    "the anonymous structure satisfies `{name}`, which declares \
+                     `{method}`, but `{name}` is not imported into this module"
+                ));
             }
-            let info = self.program.types.get(&symbol)?;
-            let sup = info.type_ref();
-            let Type::Record(sup_n) = &sup else { continue };
-            let issues = crate::structural::record_satisfies_fields(self.program, record, sup_n);
-            if !issues.is_empty() {
-                misses.push(format!("`{name}` (unsatisfied: {})", issues.join(", ")));
+            names => {
+                return Some(format!(
+                    "the anonymous structure satisfies `{}`, which all declare \
+                     `{method}`, but none of them is imported into this module",
+                    names.join("`, `")
+                ));
             }
         }
-        misses.sort();
+        let misses: Vec<String> = types
+            .iter()
+            .filter(|t| t.visible && !t.unsatisfied.is_empty())
+            .map(|t| format!("`{}` (unsatisfied: {})", t.name, t.unsatisfied.join(", ")))
+            .collect();
         if misses.is_empty() {
             return None;
         }
@@ -812,8 +853,7 @@ impl<'a> Checker<'a> {
         if method == "from" {
             let target = self
                 .program
-                .types
-                .get(qualifier)
+                .resolve_type(&self.current_module, qualifier)
                 .and_then(|info| match &info.kind {
                     TypeKind::Record { .. } => Some(info.type_ref()),
                     _ => None,

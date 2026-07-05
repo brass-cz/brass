@@ -583,3 +583,416 @@ fn bare_prelude_import_still_resolves() {
         "{out}"
     );
 }
+
+/// `import a.b` (no braces, path names a module) makes the module's exports
+/// usable qualified by the last path segment: functions, types in type
+/// position, record literals, and static calls.
+#[test]
+fn module_import_allows_qualified_use() {
+    let main = setup(
+        "module_import_qualified",
+        &[
+            (
+                "geometry/vec.pp",
+                "type Vec2 = {\n    x: float64\n    y: float64\n}\nfun Vec2.new(x: float64, y: float64) {\n    return Self { x: x, y: y }\n}\nfun dot(a: Vec2, b: Vec2) -> float64 {\n    return a.x * b.x + a.y * b.y\n}\n",
+            ),
+            (
+                "main.pp",
+                "import geometry.vec\nfun main() {\n    let a: vec.Vec2 = vec.Vec2.new(1.0, 2.0)\n    let b = vec.Vec2 { x: 3.0, y: 4.0 }\n    println(vec.dot(a, b))\n}\n",
+            ),
+        ],
+    );
+    let (ok, out) = check(&main);
+    assert!(ok, "expected success, got: {out}");
+}
+
+/// `import a.b.X` (no braces, path prefix names a module) imports the single
+/// name `X`, exactly like `import a.b.{ X }`.
+#[test]
+fn single_name_import_is_the_braced_form() {
+    let main = setup(
+        "single_name_import",
+        &[
+            ("lib/util.pp", "fun helper() -> int32 { return 7 }\n"),
+            (
+                "main.pp",
+                "import lib.util.helper\nfun main() { println(helper()) }\n",
+            ),
+        ],
+    );
+    let (ok, out) = check(&main);
+    assert!(ok, "expected success, got: {out}");
+}
+
+/// Two module imports whose paths end in the same segment cannot both be used
+/// qualified; the collision is reported at the second import.
+#[test]
+fn duplicate_qualifier_is_rejected() {
+    let main = setup(
+        "duplicate_qualifier",
+        &[
+            ("a/util.pp", "fun f() -> int32 { return 1 }\n"),
+            ("b/util.pp", "fun g() -> int32 { return 2 }\n"),
+            (
+                "main.pp",
+                "import a.util\nimport b.util\nfun main() { println(util.f()) }\n",
+            ),
+        ],
+    );
+    let (ok, out) = check(&main);
+    assert!(!ok, "expected failure");
+    assert!(
+        out.contains("two module imports share the qualifier `util`"),
+        "got: {out}"
+    );
+}
+
+/// A local binding shadows a module qualifier: `vec.x` after `let vec = ..`
+/// is a field access, and the program still checks.
+#[test]
+fn local_binding_shadows_the_qualifier() {
+    let main = setup(
+        "qualifier_shadowed",
+        &[
+            ("geometry/vec.pp", "fun dot() -> int32 { return 9 }\n"),
+            (
+                "main.pp",
+                "import geometry.vec\ntype P = { x: float64 }\nfun main() {\n    let vec = P { x: 7.5 }\n    println(vec.x)\n}\n",
+            ),
+        ],
+    );
+    let (ok, out) = check(&main);
+    assert!(ok, "expected success, got: {out}");
+}
+
+/// Qualified access to a private (`_`-prefixed) name is rejected at the use.
+#[test]
+fn qualified_private_access_is_rejected() {
+    let main = setup(
+        "qualified_private",
+        &[
+            ("geometry/vec.pp", "fun _helper() -> int32 { return 1 }\n"),
+            (
+                "main.pp",
+                "import geometry.vec\nfun main() {\n    println(vec._helper())\n}\n",
+            ),
+        ],
+    );
+    let (ok, out) = check(&main);
+    assert!(!ok, "expected failure");
+    assert!(
+        out.contains("cannot access private name `_helper`"),
+        "got: {out}"
+    );
+}
+
+/// A qualified use of a name the module does not export is reported against
+/// the module's export list (the same check a braced import gets).
+#[test]
+fn qualified_unknown_name_is_rejected() {
+    let main = setup(
+        "qualified_unknown",
+        &[
+            ("geometry/vec.pp", "fun dot() -> int32 { return 1 }\n"),
+            (
+                "main.pp",
+                "import geometry.vec\nfun main() {\n    println(vec.nosuch())\n}\n",
+            ),
+        ],
+    );
+    let (ok, out) = check(&main);
+    assert!(!ok, "expected failure");
+    assert!(out.contains("no exported name `nosuch`"), "got: {out}");
+}
+
+/// `alias.Sum.Variant { .. }` constructs a variant through a module import.
+#[test]
+fn qualified_variant_construction() {
+    let main = setup(
+        "qualified_variant",
+        &[
+            (
+                "shapes/lib.pp",
+                "\
+type Shape =
+    | Circle { r: float64 }
+    | Dot
+
+fun describe(s: Shape) -> string {
+    return match s {
+        Shape.Circle { r } => \"circle {r}\",
+        Shape.Dot => \"dot\",
+    }
+}
+",
+            ),
+            (
+                "main.pp",
+                "\
+import shapes.lib
+
+fun main() {
+    let c = lib.Shape.Circle { r: 2.5 }
+    println(lib.describe(c))
+}
+",
+            ),
+        ],
+    );
+    let (ok, out) = check(&main);
+    assert!(ok, "expected success, got: {out}");
+}
+
+/// Qualified variant construction produces correct output at runtime.
+#[test]
+fn qualified_variant_construction_runs() {
+    let main = setup(
+        "qualified_variant_run",
+        &[
+            (
+                "shapes/lib.pp",
+                "\
+type Shape =
+    | Circle { r: float64 }
+    | Dot
+
+fun describe(s: Shape) -> string {
+    return match s {
+        Shape.Circle { r } => \"circle {r}\",
+        Shape.Dot => \"dot\",
+    }
+}
+",
+            ),
+            (
+                "main.pp",
+                "\
+import shapes.lib
+
+fun main() {
+    let c = lib.Shape.Circle { r: 2.5 }
+    println(lib.describe(c))
+    println(lib.describe(lib.Shape.Dot))
+}
+",
+            ),
+        ],
+    );
+    let (ok, out) = run(&main);
+    assert!(ok, "expected success, got: {out}");
+    assert_eq!(out.trim(), "circle 2.5\ndot");
+}
+
+/// A shadowed qualifier prevents the qualified variant rewrite: `let lib = ..`
+/// then `lib.Shape.Circle { .. }` is a field chain, not a qualified variant.
+#[test]
+fn shadowed_qualifier_blocks_qualified_variant() {
+    let main = setup(
+        "qualified_variant_shadowed",
+        &[
+            (
+                "shapes/lib.pp",
+                "\
+type Shape =
+    | Circle { r: float64 }
+    | Dot
+",
+            ),
+            (
+                "main.pp",
+                "\
+import shapes.lib
+type P = { Shape: int32 }
+fun main() {
+    let lib = P { Shape: 1 }
+    println(lib.Shape)
+}
+",
+            ),
+        ],
+    );
+    let (ok, out) = run(&main);
+    assert!(ok, "expected success, got: {out}");
+    assert_eq!(out.trim(), "1");
+}
+
+/// `import a.util as au` renames the qualifier, resolving a duplicate.
+#[test]
+fn module_import_as_resolves_duplicate_qualifier() {
+    let main = setup(
+        "module_import_as",
+        &[
+            ("a/util.pp", "fun f() -> int32 { return 1 }\n"),
+            ("b/util.pp", "fun g() -> int32 { return 2 }\n"),
+            (
+                "main.pp",
+                "\
+import a.util as au
+import b.util as bu
+
+fun main() {
+    println(au.f())
+    println(bu.g())
+}
+",
+            ),
+        ],
+    );
+    let (ok, out) = run(&main);
+    assert!(ok, "expected success, got: {out}");
+    assert_eq!(out.trim(), "1\n2");
+}
+
+/// `import ... as` with the original last segment reused as a qualifier
+/// still works (no-op rename).
+#[test]
+fn module_import_as_same_name() {
+    let main = setup(
+        "module_import_as_same",
+        &[
+            ("geometry/vec.pp", "fun dot() -> int32 { return 42 }\n"),
+            (
+                "main.pp",
+                "\
+import geometry.vec as vec
+
+fun main() {
+    println(vec.dot())
+}
+",
+            ),
+        ],
+    );
+    let (ok, out) = run(&main);
+    assert!(ok, "expected success, got: {out}");
+    assert_eq!(out.trim(), "42");
+}
+
+/// `import a.b.{ X as Y }` renames a single imported name: `Y` is in scope,
+/// `X` is not. The remote name resolves correctly in the target module.
+#[test]
+fn name_import_as_renames_in_scope() {
+    let main = setup(
+        "name_import_as",
+        &[
+            ("lib/util.pp", "fun helper() -> int32 { return 42 }\n"),
+            (
+                "main.pp",
+                "\
+import lib.util.{ helper as h }
+
+fun main() {
+    println(h())
+}
+",
+            ),
+        ],
+    );
+    let (ok, out) = run(&main);
+    assert!(ok, "expected success, got: {out}");
+    assert_eq!(out.trim(), "42");
+}
+
+/// The original remote name is NOT in scope after a rename.
+#[test]
+fn name_import_as_hides_remote_name() {
+    let main = setup(
+        "name_import_as_hide",
+        &[
+            ("lib/util.pp", "fun helper() -> int32 { return 42 }\n"),
+            (
+                "main.pp",
+                "\
+import lib.util.{ helper as h }
+
+fun main() {
+    println(helper())
+}
+",
+            ),
+        ],
+    );
+    let (ok, out) = check(&main);
+    assert!(!ok, "expected failure, got: {out}");
+}
+
+/// `import a.b.X as Y` (bare single-name form with rename).
+#[test]
+fn bare_single_name_import_as() {
+    let main = setup(
+        "bare_single_name_as",
+        &[
+            ("lib/util.pp", "fun helper() -> int32 { return 99 }\n"),
+            (
+                "main.pp",
+                "\
+import lib.util.helper as h
+
+fun main() {
+    println(h())
+}
+",
+            ),
+        ],
+    );
+    let (ok, out) = run(&main);
+    assert!(ok, "expected success, got: {out}");
+    assert_eq!(out.trim(), "99");
+}
+
+/// Two renamed imports that collide on their LOCAL name are ambiguous.
+#[test]
+fn renamed_local_collision_is_ambiguous() {
+    let main = setup(
+        "renamed_local_collision",
+        &[
+            ("a/util.pp", "fun f() -> int32 { return 1 }\n"),
+            ("b/util.pp", "fun g() -> int32 { return 2 }\n"),
+            (
+                "main.pp",
+                "\
+import a.util.{ f as h }
+import b.util.{ g as h }
+
+fun main() {
+    println(h())
+}
+",
+            ),
+        ],
+    );
+    let (ok, out) = check(&main);
+    assert!(!ok, "expected failure");
+    assert!(
+        out.contains("is imported from multiple modules"),
+        "got: {out}"
+    );
+}
+
+/// `import c.{ X }` + `import a.b` + both `X` and `b.X` used — green, each
+/// resolving to its own definition (bare `X` is c's, `b.X` is a.b's).
+#[test]
+fn qualified_use_disambiguates_from_braced_import() {
+    let main = setup(
+        "qualified_disambiguates",
+        &[
+            ("c.pp", "fun X() -> int32 { return 1 }\n"),
+            ("a/b.pp", "fun X() -> int32 { return 2 }\n"),
+            (
+                "main.pp",
+                "\
+import c.{ X }
+import a.b
+
+fun main() {
+    println(X())
+    println(b.X())
+}
+",
+            ),
+        ],
+    );
+    let (ok, out) = run(&main);
+    assert!(ok, "expected success, got: {out}");
+    assert_eq!(out.trim(), "1\n2");
+}

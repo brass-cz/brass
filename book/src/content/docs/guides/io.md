@@ -22,13 +22,6 @@ type Point = { x: int32, y: int32 }
 println(Point { x: 1, y: 2 })
 ```
 
-```
-Point {
-    x: 1,
-    y: 2,
-}
-```
-
 ## Reading input
 
 `input()` reads one line from standard input, without the trailing newline.

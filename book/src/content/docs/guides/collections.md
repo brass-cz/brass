@@ -25,17 +25,6 @@ println("contains 8 = {nums.contains(8)}")
 println("slice 1..4 = {nums.slice(1, 4)}")
 ```
 
-```
-len      = 6
-sorted   = [1, 2, 3, 5, 8, 9]
-reversed = [2, 9, 1, 8, 3, 5]
-doubled  = [10, 6, 16, 2, 18, 4]
-evens    = [8, 2]
-sum      = 28
-contains 8 = true
-slice 1..4 = [3, 8, 1]
-```
-
 Arrays also support in-place editing:
 
 ```prepoly
@@ -69,15 +58,6 @@ println("upper  = {"hello".to_upper()}")
 println("trimmed = '{"   spaced   ".trim()}'")
 println("starts  = {"prepoly".starts_with("pre")}")
 println("replace = {"a-b-c".replace("-", "+")}")
-```
-
-```
-count  = 3
-joined = alice | bob | carol
-upper  = HELLO
-trimmed = 'spaced'
-starts  = true
-replace = a+b+c
 ```
 
 `s.find(sub)` returns the byte offset of a substring as `int64?` (`null` when

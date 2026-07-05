@@ -13,12 +13,44 @@ pub struct Module {
     pub items: Vec<TopLevel>,
 }
 
+/// One name in an import's braced list; `local` differs from `remote` when an
+/// `as` rename is present (`import m.{ X as Y }` -> remote "X", local "Y").
+#[derive(Clone, Debug)]
+pub struct ImportedName {
+    /// The name as it exists in the target module.
+    pub remote: String,
+    /// The name as it appears in the importing module's scope.
+    pub local: String,
+    pub span: Span,
+}
+
+impl ImportedName {
+    pub fn plain(name: String, span: Span) -> Self {
+        Self {
+            local: name.clone(),
+            remote: name,
+            span,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ImportDecl {
     /// Dotted module path, e.g. `math.vector` -> ["math", "vector"].
     pub path: Vec<String>,
     /// Names brought into scope from that module.
-    pub names: Vec<String>,
+    pub names: Vec<ImportedName>,
+    /// A brace-less `import a.b`: whether the path names a module (qualified
+    /// use via `alias`) or a module plus one trailing name is decided by the
+    /// loader, which knows which modules exist. `false` for `import a.{ .. }`.
+    pub bare: bool,
+    /// For a bare import resolved as a MODULE import: the qualifier the
+    /// program uses (`import geometry.vec` -> `vec.dot(..)`), the path's last
+    /// segment. Filled by the loader, or by the parser when `as` is present.
+    pub alias: Option<String>,
+    /// True when the user wrote `import ... as name` — the alias comes from
+    /// the source, not from the loader's last-segment default.
+    pub explicit_alias: bool,
     pub span: Span,
 }
 

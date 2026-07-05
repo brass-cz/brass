@@ -339,24 +339,60 @@ impl Parser {
     }
 
     /// `import a.b.{ Name, Name }`
+    /// `import a.b.{ Name, Name }` (braced names), `import a.b.Name` (one
+    /// name), or `import a.b` (the whole module, used qualified as `b.x`).
+    /// The two brace-less forms are syntactically identical; the loader, which
+    /// knows which modules exist, decides between them (`ImportDecl::bare`).
     fn parse_import(&mut self) -> PResult<ImportDecl> {
         let lo = self.expect(TokenKind::Import, "import")?.span;
         let mut path = Vec::new();
-        let (first, _) = self.ident()?;
+        let (first, mut hi) = self.ident()?;
         path.push(first);
         loop {
+            if !self.at_p(TokenKind::Dot) {
+                // Statement end: a bare module/single-name import.
+                // Check for `as alias` renaming.
+                let (alias, explicit_alias, hi) = if matches!(self.peek(), TokenKind::Ident(s) if s == "as")
+                {
+                    self.bump();
+                    let (a, aspan) = self.ident()?;
+                    (Some(a), true, aspan)
+                } else {
+                    (None, false, hi)
+                };
+                return Ok(ImportDecl {
+                    path,
+                    names: Vec::new(),
+                    bare: true,
+                    alias,
+                    explicit_alias,
+                    span: lo.merge(hi),
+                });
+            }
             self.expect(TokenKind::Dot, "'.'")?;
             if self.at_p(TokenKind::LBrace) {
                 break;
             }
-            let (seg, _) = self.ident()?;
+            let (seg, sspan) = self.ident()?;
+            hi = sspan;
             path.push(seg);
         }
         self.open(TokenKind::LBrace, "'{'")?;
         let mut names = Vec::new();
         while !self.at_p(TokenKind::RBrace) {
-            let (n, _) = self.ident()?;
-            names.push(n);
+            let (n, nspan) = self.ident()?;
+            let name = if matches!(self.peek(), TokenKind::Ident(s) if s == "as") {
+                self.bump();
+                let (local, lspan) = self.ident()?;
+                ImportedName {
+                    remote: n,
+                    local,
+                    span: nspan.merge(lspan),
+                }
+            } else {
+                ImportedName::plain(n, nspan)
+            };
+            names.push(name);
             if !self.eat(TokenKind::Comma) {
                 break;
             }
@@ -365,6 +401,9 @@ impl Parser {
         Ok(ImportDecl {
             path,
             names,
+            bare: false,
+            alias: None,
+            explicit_alias: false,
             span: lo.merge(hi),
         })
     }
@@ -961,6 +1000,18 @@ impl Parser {
                         e = Expr::VariantLit(tname.clone(), name, fields, tspan.merge(hi));
                         continue;
                     }
+                    // `qualifier.Type.Variant { fields }` — qualified variant.
+                    if self.at_p(TokenKind::LBrace)
+                        && !self.no_struct
+                        && let Expr::Field(base, mid, _) = &e
+                        && let Expr::Ident(q, qspan) = base.as_ref()
+                    {
+                        let dotted = format!("{q}.{mid}");
+                        let qspan = *qspan;
+                        let (fields, hi) = self.parse_field_inits()?;
+                        e = Expr::VariantLit(dotted, name, fields, qspan.merge(hi));
+                        continue;
+                    }
                     let span = e.span().merge(nspan);
                     e = Expr::Field(Box::new(e), name, span);
                 }
@@ -1244,14 +1295,15 @@ impl Parser {
                 if name == "_" {
                     return Ok(Pattern::Wildcard(span));
                 }
-                // A qualified variant pattern `T.A { ... }` / `T.A`: the variant
-                // name alone identifies it (its owning type is resolved later), so
-                // the `T.` qualifier is consumed and the variant name kept.
-                let name = if self.eat(TokenKind::Dot) {
-                    self.ident()?.0
-                } else {
-                    name
-                };
+                // A qualified variant pattern `T.A { ... }` / `T.A`, possibly
+                // module-qualified (`alias.T.A`): the variant name alone
+                // identifies it (its owning type is resolved later against the
+                // scrutinee), so every qualifier segment is consumed and the
+                // last name kept.
+                let mut name = name;
+                while self.eat(TokenKind::Dot) {
+                    name = self.ident()?.0;
+                }
                 if self.at_p(TokenKind::LBrace) {
                     let (fields, hi) = self.parse_field_pats()?;
                     Ok(Pattern::Record(name, fields, span.merge(hi)))
@@ -1490,6 +1542,19 @@ impl Parser {
                 }
                 let hi = self.close(TokenKind::RBrace, "'}'")?;
                 return Ok(TypeExpr::Anonymous(fields, span.merge(hi)));
+            }
+            // `alias.Type` -- a type of a module imported whole (`import
+            // geometry.vec` then `vec.Vec2`). Kept as a dotted name here; the
+            // qualified-use resolution pass rewrites it to the bare name.
+            let mut name = name;
+            let mut span = span;
+            if self.at_p(TokenKind::Dot)
+                && matches!(&self.tokens[self.pos + 1].kind, TokenKind::Ident(_))
+            {
+                self.bump();
+                let (seg, sspan) = self.ident()?;
+                name = format!("{name}.{seg}");
+                span = span.merge(sspan);
             }
             // `Base { field: T, ... }` -- refine nominal record `Base` by pinning
             // the named fields/slots. Gated by `allow_refine` so a return type's

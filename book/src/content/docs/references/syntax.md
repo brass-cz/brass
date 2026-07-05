@@ -282,13 +282,21 @@ and is not a new nominal.
 ### Imports
 
 ```prepoly norun
-import geometry.vec.{ Vec2, dot }
+import geometry.vec.{ Vec2, dot }           // named imports
+import geometry.vec.{ dot as vdot }        // rename a name
+import geometry.vec.Vec2                    // one name, same as .{ Vec2 }
+import geometry.vec                         // whole module: vec.dot(..), vec.Vec2
+import geometry.vec as g                   // module with custom qualifier: g.dot(..)
 import std.collections.hashmap.{ HashMap }
 ```
 
-The only form is `import path.{ Name, ... }` — a dotted module path followed
-by a braced name list. There is no bare `import path` and no aliasing. See
-[Modules](/references/modules/) for path resolution and visibility.
+`import path.{ Name, ... }` imports the listed names (`Name as Local` renames);
+`import path.Name` imports the one trailing name; a bare `import path` imports
+the module, whose exports are then used qualified by the path's last segment
+(`vec.Vec2`, `vec.dot(a, b)`). `import path as name` overrides the qualifier.
+See
+[Modules](/references/modules/) for how the brace-less forms are
+distinguished, path resolution, and visibility.
 
 ### Top level
 

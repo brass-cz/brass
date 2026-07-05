@@ -58,12 +58,6 @@ for n in [6, 7, 27] {
 }
 ```
 
-```
-collatz(6) = 8 steps
-collatz(7) = 16 steps
-collatz(27) = 111 steps
-```
-
 ## `for` over arrays and ranges
 
 `for x in xs` iterates the elements of an array. The bracket form `[lo..hi]`

@@ -115,6 +115,7 @@ pub(crate) fn resolve_type_decls(
         meta: &meta,
         nominal_by_symbol,
         import_origins: &program.import_origins,
+        import_renames: &program.import_renames,
         next_unknown,
         resolved: HashMap::new(),
         gray: HashSet::new(),
@@ -175,6 +176,7 @@ struct Resolver<'a> {
     meta: &'a HashMap<String, TypeMeta>,
     nominal_by_symbol: &'a HashMap<String, NominalInfo>,
     import_origins: &'a HashMap<Vec<String>, HashMap<String, Vec<String>>>,
+    import_renames: &'a HashMap<Vec<String>, HashMap<String, String>>,
     next_unknown: &'a mut u32,
     /// Memoized resolved field types, keyed by (owner symbol, field name).
     resolved: HashMap<(String, String), Type>,
@@ -194,6 +196,16 @@ impl Resolver<'_> {
     /// this module's qualified, or an imported definition). Mirrors
     /// [`crate::hir::resolve_qualified`] but returns the matched key.
     fn symbol_of(&self, module: &[String], name: &str) -> Option<String> {
+        // Rename first, as in `resolve_qualified`: a renamed local must not be
+        // captured by an unrelated module's unique definition of that name.
+        if let Some(remote) = self.import_renames.get(module).and_then(|m| m.get(name)) {
+            let origin = self.import_origins.get(module)?.get(name)?;
+            let qo = crate::hir::qualify(remote, origin);
+            if self.meta.contains_key(&qo) {
+                return Some(qo);
+            }
+            return self.meta.contains_key(remote).then(|| remote.clone());
+        }
         if self.meta.contains_key(name) {
             return Some(name.to_string());
         }
@@ -316,8 +328,14 @@ impl Resolver<'_> {
     }
 
     fn nominal_lookup(&self, module: &[String], name: &str) -> Option<NominalInfo> {
-        crate::hir::resolve_qualified(self.nominal_by_symbol, self.import_origins, module, name)
-            .copied()
+        crate::hir::resolve_qualified(
+            self.nominal_by_symbol,
+            self.import_origins,
+            self.import_renames,
+            module,
+            name,
+        )
+        .copied()
     }
 
     /// `Self.field` inside `owner`'s declaration: the referenced slot's variable,

@@ -24,11 +24,6 @@ fun dump(p: Point) {
 dump(Point { x: 3, y: 4 })
 ```
 
-```
-x = 3
-y = 4
-```
-
 The loop is unrolled once per field during type checking, so each iteration is
 ordinary typed code.
 

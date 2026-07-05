@@ -234,10 +234,13 @@ if x { println("first even {x}") }    // x is int32 inside the guard
 `{ field: value, ... }` is an anonymous structural record. Calling a method on
 it resolves structurally: if exactly ONE in-scope record type declares that
 method and the value satisfies its fields, that type's method dispatches with
-no annotation (`{ name: "A" }.display()` runs `Person.display`). Several
-satisfying types make the call ambiguous (a compile error at the value asking
-for an annotation); a missing field is reported at the value with the
-unsatisfied constraint. For a record type `T`, `T.from(v)` yields `T?`: the
+no annotation (`{ name: "A" }.display()` runs `Person.display`). In scope
+means declared in or imported into the current module — an anonymous value
+never adopts a type the module has not imported (a value already carrying a
+nominal type, e.g. an imported function's return, dispatches methods without
+importing the type name). Several satisfying types make the call ambiguous (a
+compile error at the value asking for an annotation); a missing field is
+reported at the value with the unsatisfied constraint. For a record type `T`, `T.from(v)` yields `T?`: the
 record value when `v` structurally has all of `T`'s fields (decided at that
 call site), else `null`. Pair it with `if let`:
 
@@ -347,11 +350,19 @@ annotation).
 
 One file is one module; the directory layout is the module path
 (`geometry/vec.pp` is the module `geometry.vec`). Import selected names with
-`import path.{ A, B }`; the path is relative to the importing file. A name
-beginning with `_` is private to its module and cannot be imported.
+`import path.{ A, B }`, one name with `import path.Name`, or the whole module
+with `import path` -- its exports are then used qualified by the path's last
+segment (`vec.dot(a, b)`, `vec.Vec2`, `vec.Shape.Circle { r: 1.0 }`).
+`import path as name` overrides the qualifier. The path is relative to the
+importing file. A name beginning with `_` is private to its module and cannot
+be imported or accessed qualified.
 
 ```
 import geometry.vec.{ Vec2, dot }
+import geometry.vec.{ dot as vdot }
+import geometry.vec.Vec2
+import geometry.vec
+import geometry.vec as g
 ```
 
 ## Standard library (implicit prelude, no import needed)

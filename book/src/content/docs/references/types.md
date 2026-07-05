@@ -180,12 +180,20 @@ parameter.
 
 ### Anonymous-record method dispatch
 
-Calling a method on a structural value resolves it against the in-scope record
-types: if **exactly one** in-scope record type declares that method and the
-value satisfies that type's fields, the call dispatches to it with no
-annotation. Zero candidates produce a near-miss diagnostic; several candidates
-make the call ambiguous — a compile error at the value asking for an
-annotation.
+Calling a method on a structural value resolves it against the **in-scope**
+record types — those declared in or imported into the calling module
+(builtins and the implicit prelude count): if **exactly one** such type
+declares that method and the value satisfies that type's fields, the call
+dispatches to it with no annotation. An anonymous value never adopts a type
+the module has not imported, even when its shape matches; the error names the
+satisfied type and the missing import. Zero candidates produce a near-miss
+diagnostic; several candidates make the call ambiguous — a compile error at
+the value asking for an annotation.
+
+This scoping gates only the adoption of a type by an anonymous value. A value
+whose nominal type is already known — the return of an imported function,
+say — dispatches its methods by that type; the type's name need not be
+imported.
 
 ### Structural conversion
 

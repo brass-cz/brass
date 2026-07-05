@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use prepoly_hir::LoadedModule;
-use prepoly_parser::ast::ImportDecl;
+use prepoly_parser::ast::{ImportDecl, ImportedName};
 use prepoly_parser::parse_with_base;
 use prepoly_parser::{Span, line_col};
 
@@ -220,17 +220,79 @@ fn relativize(base: &[String], imp_path: &[String]) -> Option<Vec<String>> {
     Some(canonical)
 }
 
+/// Classify a brace-less import (`import a.b` / `import a.b.X`) now that the
+/// importing file's directory is known: when the full path names a module -- a
+/// file under `root`, a prelude module, or an embedded nested std module -- it
+/// is a MODULE import, used qualified through its last segment (`import
+/// geometry.vec` -> `vec.dot(..)`); otherwise its last segment is a single
+/// name imported from the enclosing module (`import geometry.vec.dot` ==
+/// `import geometry.vec.{ dot }`). A path that names neither stays a module
+/// import so the load step reports the missing module at this import.
+fn classify_bare(base: &[String], root: &Path, imp: &mut ImportDecl) {
+    let module_exists = |path: &[String]| -> bool {
+        if is_prelude_path(path) {
+            return true;
+        }
+        if let Some(key) = nested_key(path) {
+            return STDLIB_NESTED.iter().any(|(k, _)| *k == key);
+        }
+        if path.first().is_some_and(|s| s == "std") {
+            return false; // `std.*` modules exist only as embedded sources
+        }
+        let mut file = root.to_path_buf();
+        for seg in base.iter().chain(path.iter()) {
+            file.push(seg);
+        }
+        file.set_extension("pp");
+        file.is_file()
+    };
+    if module_exists(&imp.path) {
+        // An explicit `as` alias takes precedence over the last-segment default.
+        if !imp.explicit_alias {
+            imp.alias = imp.path.last().cloned();
+        }
+        return;
+    }
+    if imp.path.len() >= 2 && module_exists(&imp.path[..imp.path.len() - 1]) {
+        let name = imp.path.pop().expect("checked len >= 2");
+        // `import a.b.X as Y`: the explicit alias renames the single name.
+        let imported = if imp.explicit_alias {
+            let local = imp.alias.take().unwrap_or_else(|| name.clone());
+            imp.explicit_alias = false;
+            ImportedName {
+                remote: name,
+                local,
+                span: imp.span,
+            }
+        } else {
+            ImportedName::plain(name, imp.span)
+        };
+        imp.names.push(imported);
+        imp.bare = false;
+        return;
+    }
+    // Unknown module — keep the path as-is for downstream error reporting.
+    if !imp.explicit_alias {
+        imp.alias = imp.path.last().cloned();
+    }
+}
+
 /// Rewrite each import's path from importer-relative to canonical
 /// (root-relative) form in place -- so the loaded modules and downstream name
 /// resolution share one path per file -- and return the canonical paths of the
 /// file modules to load, each with the span of the import that requested it
-/// (for error attribution).
+/// (for error attribution). Brace-less imports are classified against `root`
+/// first (see [`classify_bare`]).
 pub fn canonicalize_imports(
     base: &[String],
+    root: &Path,
     imports: &mut [ImportDecl],
 ) -> Vec<(Vec<String>, Span)> {
     let mut targets = Vec::new();
     for imp in imports.iter_mut() {
+        if imp.bare {
+            classify_bare(base, root, imp);
+        }
         if let Some(canonical) = relativize(base, &imp.path) {
             imp.path = canonical.clone();
             targets.push((canonical, imp.span));
@@ -317,7 +379,7 @@ pub fn load_module(
     let mut ast = ast;
     // This module's imports resolve relative to its own directory.
     let dir = path[..path.len() - 1].to_vec();
-    for (target, _) in canonicalize_imports(&dir, &mut ast.imports) {
+    for (target, _) in canonicalize_imports(&dir, root, &mut ast.imports) {
         load_module(
             &target,
             root,

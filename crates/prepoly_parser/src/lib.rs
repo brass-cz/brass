@@ -197,7 +197,12 @@ mod tests {
         let m = module("import math.vector.{ Vec2, Vec3 }\nimport config.{ Config }\n");
         assert_eq!(m.imports.len(), 2);
         assert_eq!(m.imports[0].path, vec!["math", "vector"]);
-        assert_eq!(m.imports[0].names, vec!["Vec2", "Vec3"]);
+        let local_names: Vec<&str> = m.imports[0]
+            .names
+            .iter()
+            .map(|n| n.local.as_str())
+            .collect();
+        assert_eq!(local_names, vec!["Vec2", "Vec3"]);
         assert_eq!(m.imports[1].path, vec!["config"]);
     }
 
@@ -366,5 +371,107 @@ mod tests {
         let src = "fun f() {\n    let x = )\n    let y = ]\n}\n";
         let e = crate::parse(src).unwrap_err();
         assert_eq!(e.span.lo, src.find("= )").unwrap() + 2);
+    }
+
+    #[test]
+    fn bare_imports_parse_with_the_flag() {
+        // `import a.b` and `import a.b.X` are syntactically one form; the
+        // loader classifies them. Braced imports stay non-bare.
+        let m =
+            module("import geometry.vec\nimport lib.util.helper\nimport a.b.{ X }\nprintln(1)\n");
+        assert_eq!(m.imports.len(), 3);
+        assert!(m.imports[0].bare);
+        assert_eq!(m.imports[0].path, vec!["geometry", "vec"]);
+        assert!(m.imports[1].bare);
+        assert_eq!(m.imports[1].path, vec!["lib", "util", "helper"]);
+        assert!(!m.imports[2].bare);
+        assert_eq!(m.imports[2].names.len(), 1);
+        assert_eq!(m.imports[2].names[0].local, "X");
+    }
+
+    #[test]
+    fn bare_import_with_as_renaming() {
+        let m = module("import geometry.vec as g\nprintln(1)\n");
+        assert_eq!(m.imports.len(), 1);
+        assert!(m.imports[0].bare);
+        assert_eq!(m.imports[0].path, vec!["geometry", "vec"]);
+        assert_eq!(m.imports[0].alias, Some("g".to_string()));
+        assert!(m.imports[0].explicit_alias);
+    }
+
+    #[test]
+    fn braced_import_with_as_renaming() {
+        let m = module("import a.b.{ X as Y, Z }\nprintln(1)\n");
+        assert_eq!(m.imports.len(), 1);
+        assert_eq!(m.imports[0].names.len(), 2);
+        assert_eq!(m.imports[0].names[0].remote, "X");
+        assert_eq!(m.imports[0].names[0].local, "Y");
+        assert_eq!(m.imports[0].names[1].remote, "Z");
+        assert_eq!(m.imports[0].names[1].local, "Z");
+    }
+
+    #[test]
+    fn as_is_a_valid_identifier() {
+        // `as` is contextual, not a keyword; it can be used as a variable name.
+        let m = module("fun main() {\n    let as = 1\n    println(as)\n}\n");
+        let TopLevel::Fun(f) = &m.items[0] else {
+            panic!("expected a function");
+        };
+        match &f.body.stmts[0] {
+            Stmt::Let {
+                pat: Pattern::Binding(name, _),
+                ..
+            } => assert_eq!(name, "as"),
+            other => panic!("expected let binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qualified_type_names_parse_dotted() {
+        let m = module("fun f(v: vec.Vec2) -> vec.Vec2 {\n    return v\n}\n");
+        let TopLevel::Fun(f) = &m.items[0] else {
+            panic!("expected a function");
+        };
+        assert!(matches!(&f.params[0].ty, Some(TypeExpr::Named(n, _)) if n == "vec.Vec2"));
+        assert!(matches!(&f.ret, Some(TypeExpr::Named(n, _)) if n == "vec.Vec2"));
+    }
+
+    #[test]
+    fn qualified_variant_literal_parses_dotted_ty() {
+        // `q.Shape.Circle { r: 1.0 }` -> VariantLit("q.Shape", "Circle", ..)
+        let m = module("fun main() {\n    let c = q.Shape.Circle { r: 1.0 }\n}\n");
+        let TopLevel::Fun(f) = &m.items[0] else {
+            panic!("expected a function");
+        };
+        match &f.body.stmts[0] {
+            Stmt::Let {
+                value: Some(Expr::VariantLit(t, v, fields, _)),
+                ..
+            } => {
+                assert_eq!(t, "q.Shape");
+                assert_eq!(v, "Circle");
+                assert_eq!(fields.len(), 1);
+            }
+            other => panic!("expected qualified variant literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_variant_literal_is_unchanged() {
+        // `Shape.Circle { r: 1.0 }` -> VariantLit("Shape", "Circle", ..)
+        let m = module("fun main() {\n    let c = Shape.Circle { r: 1.0 }\n}\n");
+        let TopLevel::Fun(f) = &m.items[0] else {
+            panic!("expected a function");
+        };
+        match &f.body.stmts[0] {
+            Stmt::Let {
+                value: Some(Expr::VariantLit(t, v, _, _)),
+                ..
+            } => {
+                assert_eq!(t, "Shape");
+                assert_eq!(v, "Circle");
+            }
+            other => panic!("expected variant literal, got {other:?}"),
+        }
     }
 }

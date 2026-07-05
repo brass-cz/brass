@@ -25,6 +25,8 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
     let mut inits = Vec::new();
     let mut module_imports: HashMap<Vec<String>, Vec<String>> = HashMap::new();
     let mut import_origins: HashMap<Vec<String>, HashMap<String, Vec<String>>> = HashMap::new();
+    let mut import_renames: HashMap<Vec<String>, HashMap<String, String>> = HashMap::new();
+    let mut module_aliases: HashMap<Vec<String>, HashMap<String, Vec<String>>> = HashMap::new();
     let mut errors = Vec::new();
     let mut next_id: i32 = 1; // 0 is reserved for Result
     // `fun T.m(...)` method implementations, resolved to their receiver type
@@ -59,14 +61,28 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
         // tell an imported cross-module name from an inaccessible one.
         let imported = module_imports.entry(m.path.clone()).or_default();
         for imp in &m.ast.imports {
-            imported.extend(imp.names.iter().cloned());
+            imported.extend(imp.names.iter().map(|n| n.local.clone()));
         }
         let origins = import_origins.entry(m.path.clone()).or_default();
+        let renames = import_renames.entry(m.path.clone()).or_default();
+        let aliases = module_aliases.entry(m.path.clone()).or_default();
+        for imp in &m.ast.imports {
+            if let Some(alias) = &imp.alias {
+                aliases
+                    .entry(alias.clone())
+                    .or_insert_with(|| imp.path.clone());
+            }
+        }
         for imp in &m.ast.imports {
             for name in &imp.names {
                 origins
-                    .entry(name.clone())
+                    .entry(name.local.clone())
                     .or_insert_with(|| imp.path.clone());
+                if name.local != name.remote {
+                    renames
+                        .entry(name.local.clone())
+                        .or_insert_with(|| name.remote.clone());
+                }
             }
         }
         let mut stmts = Vec::new();
@@ -151,12 +167,37 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
         &mut errors,
     );
 
+    // Build reverse-alias table: for items stored under their bare name
+    // (unique program-wide), record qualify(name, module) -> bare_name so
+    // marker-based resolution can reach them.
+    let mut symbol_aliases: HashMap<String, String> = HashMap::new();
+    for (symbol, info) in &types {
+        if symbol == &info.name && !info.module.is_empty() {
+            let qualified = crate::hir::qualify(&info.name, &info.module);
+            if qualified != *symbol {
+                symbol_aliases.insert(qualified, symbol.clone());
+            }
+        }
+    }
+    for (symbol, info) in &functions {
+        let bare_name = &info.signature.name;
+        if symbol == bare_name && !info.module.is_empty() {
+            let qualified = crate::hir::qualify(bare_name, &info.module);
+            if qualified != *symbol {
+                symbol_aliases.insert(qualified, symbol.clone());
+            }
+        }
+    }
+
     let mut program = Program {
         types,
         functions,
         inits,
         module_imports,
         import_origins,
+        import_renames,
+        module_aliases,
+        symbol_aliases,
         primitive_methods,
         type_aliases: HashMap::new(),
     };
@@ -540,12 +581,20 @@ fn resolve_program_annotations(
         })
         .collect();
     let import_origins = program.import_origins.clone();
+    let import_renames_snap = program.import_renames.clone();
     // Resolve a bare type name to its nominal info from a given module: its own
     // bare/unique symbol, this module's qualified definition, or the imported
     // one. Captures only the snapshots above, so it does not borrow
     // `program` and can run while the type/function tables are mutated.
     let resolve_nominal = |module: &[String], name: &str| -> Option<NominalInfo> {
-        crate::hir::resolve_qualified(&nominal_by_symbol, &import_origins, module, name).copied()
+        crate::hir::resolve_qualified(
+            &nominal_by_symbol,
+            &import_origins,
+            &import_renames_snap,
+            module,
+            name,
+        )
+        .copied()
     };
 
     // Records carry type slots, `Self.field` references, and refinements: resolve

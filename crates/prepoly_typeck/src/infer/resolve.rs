@@ -183,6 +183,7 @@ impl<'a> Checker<'a> {
         let alias = prepoly_hir::resolve_qualified(
             &self.program.type_aliases,
             &self.program.import_origins,
+            &self.program.import_renames,
             &self.current_module,
             name,
         )?;

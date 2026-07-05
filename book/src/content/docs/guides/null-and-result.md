@@ -62,12 +62,6 @@ for s in ["42", "-5", "abc"] {
 }
 ```
 
-```
-parsed 42 -> 42
-failed -5 -> negative number: -5
-failed abc -> cannot parse `abc` as integer
-```
-
 Two things are happening here:
 
 - The postfix **`!` operator** propagates errors: `expr!` unwraps an `Ok`

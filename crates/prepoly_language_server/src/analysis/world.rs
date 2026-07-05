@@ -86,7 +86,7 @@ pub fn build(main_path: &Path, main_src: &str) -> World {
     let mut load_errors = Vec::new();
     let mut visited = HashSet::new();
     let mut stack = HashSet::new();
-    for (target, span) in prepoly_resolve::canonicalize_imports(&[], &mut main_ast.imports) {
+    for (target, span) in prepoly_resolve::canonicalize_imports(&[], &root, &mut main_ast.imports) {
         prepoly_resolve::load_module(
             &target,
             &root,

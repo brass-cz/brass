@@ -33,6 +33,19 @@ impl<'a> Checker<'a> {
             fields: declared, ..
         } = &info.kind
         else {
+            // A sum type constructed directly. check_constructions already
+            // reports the direct-table (bare unique) spelling; report the
+            // forms only module-aware resolution can name -- a qualified
+            // marker (`alias.Sum`), a renamed local, a multi-module import --
+            // so the mistake does not surface as a span-less back-end error.
+            if !self.program.types.contains_key(&tn) {
+                self.errors.push(TypeError {
+                    message: format!(
+                        "`{tn}` is a sum type; construct a variant with `{tn}.Variant {{ ... }}`"
+                    ),
+                    span,
+                });
+            }
             return self.fresh_unknown();
         };
         let ret = info.type_ref();
@@ -176,7 +189,11 @@ impl<'a> Checker<'a> {
             return None;
         }
         let resolved = self.resolve_self_name(type_name);
-        let info = self.program.types.get(&resolved)?;
+        let info = self
+            .program
+            .types
+            .get(&resolved)
+            .or_else(|| self.program.resolve_type(&self.current_module, &resolved))?;
         let variant = info.variant(name)?;
         if variant.fields.is_empty() {
             Some(info.type_ref())
@@ -202,7 +219,11 @@ impl<'a> Checker<'a> {
             && !self.is_in_scope(base, scopes)
         {
             let resolved = self.resolve_self_name(tname);
-            if let Some(info) = self.program.types.get(&resolved)
+            if let Some(info) = self
+                .program
+                .types
+                .get(&resolved)
+                .or_else(|| self.program.resolve_type(&self.current_module, &resolved))
                 && info.is_sum()
             {
                 let message = match info.variant(name) {

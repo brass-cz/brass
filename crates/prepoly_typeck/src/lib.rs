@@ -21,7 +21,7 @@ mod walk;
 // inference); re-export it so `crate::solver` / `crate::unify` keep resolving.
 pub use prepoly_solver::{solver, unify};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use prepoly_hir::{MethodInfo, NominalInfo, Program, TypeKind, TypedProgram, resolve};
 use prepoly_parser::Span;
@@ -139,6 +139,11 @@ fn check_reserved_names(program: &Program) -> Vec<TypeError> {
 fn check_constructions(program: &Program) -> Vec<TypeError> {
     struct V<'a> {
         program: &'a Program,
+        /// Local names some module's import renames (`import m.{ X as Y }`
+        /// registers `Y`). This pass has no module context, so any renamed
+        /// local is deferred to module-aware inference, like a multi-module
+        /// name.
+        renamed: HashSet<&'a str>,
         errors: Vec<TypeError>,
     }
     impl walk::ExprVisitor for V<'_> {
@@ -150,25 +155,27 @@ fn check_constructions(program: &Program) -> Vec<TypeError> {
                 // and resolved precisely by module-aware inference.
                 // An empty name is an anonymous structure literal `{ f: v }`
                 // (a structural record), not a named-type construction.
-                Expr::TypeLit(name, _, span) if name != "Self" && !name.is_empty() => match self.program.types.get(name) {
+                Expr::TypeLit(name, _, span) if name != "Self" && !name.is_empty() && !name.contains('.') => match self.program.types.get(name) {
                     Some(info) if info.is_sum() => self.errors.push(TypeError {
                         message: format!("`{name}` is a sum type; construct a variant with `{name}.Variant {{ ... }}`"),
                         span: *span,
                     }),
                     Some(_) => {}
                     None if self.program.has_type_named(name) => {}
+                    None if self.renamed.contains(name.as_str()) => {}
                     None => self.errors.push(TypeError {
                         message: format!("unknown type `{name}`"),
                         span: *span,
                     }),
                 },
-                Expr::VariantLit(t, v, _, span) if t != "Self" => match self.program.types.get(t) {
+                Expr::VariantLit(t, v, _, span) if t != "Self" && !t.contains('.') => match self.program.types.get(t) {
                     Some(info) if info.variant(v).is_none() => self.errors.push(TypeError {
                         message: format!("`{t}` has no variant `{v}`"),
                         span: *span,
                     }),
                     Some(_) => {}
                     None if self.program.has_type_named(t) => {}
+                    None if self.renamed.contains(t.as_str()) => {}
                     None => self.errors.push(TypeError {
                         message: format!("unknown type `{t}`"),
                         span: *span,
@@ -180,6 +187,12 @@ fn check_constructions(program: &Program) -> Vec<TypeError> {
     }
     let mut v = V {
         program,
+        renamed: program
+            .import_renames
+            .values()
+            .flat_map(|m| m.keys())
+            .map(String::as_str)
+            .collect(),
         errors: Vec::new(),
     };
     walk::walk_program_exprs(program, &mut v);
@@ -209,13 +222,42 @@ fn resolve_annotations(program: &Program) -> Vec<TypeError> {
     // visibility so a public-but-not-imported type from another module does not
     // leak into annotations.
     let resolve_nominal = |module: &[String], name: &str| -> Option<NominalInfo> {
+        // Dotted marker from a qualified use — resolve via alias table.
+        if let Some((alias, bare)) = name.split_once('.')
+            && let Some(target) = program
+                .module_aliases
+                .get(module)
+                .and_then(|a| a.get(alias))
+        {
+            let qualified = prepoly_hir::qualify(bare, target);
+            return kinds.get(&qualified).copied().or_else(|| {
+                program
+                    .symbol_aliases
+                    .get(&qualified)
+                    .and_then(|c| kinds.get(c))
+                    .copied()
+            });
+        }
         if let Some(n) = kinds.get(&prepoly_hir::qualify(name, module)) {
             return Some(*n);
         }
-        if let Some(origin) = program.import_origins.get(module).and_then(|o| o.get(name))
-            && let Some(n) = kinds.get(&prepoly_hir::qualify(name, origin))
-        {
-            return Some(*n);
+        if let Some(origin) = program.import_origins.get(module).and_then(|o| o.get(name)) {
+            // A rename maps the local annotation name to the origin's remote
+            // name; the remote may be stored qualified or (unique) bare.
+            let remote = program
+                .import_renames
+                .get(module)
+                .and_then(|m| m.get(name))
+                .map(String::as_str);
+            let stored = remote.unwrap_or(name);
+            if let Some(n) = kinds.get(&prepoly_hir::qualify(stored, origin)) {
+                return Some(*n);
+            }
+            if let Some(remote) = remote
+                && let Some(n) = kinds.get(remote)
+            {
+                return Some(*n);
+            }
         }
         // A `type Alias = ..` name validates as its target's nominal kind (the
         // pure resolver only needs to know the name denotes some type; the
@@ -223,6 +265,7 @@ fn resolve_annotations(program: &Program) -> Vec<TypeError> {
         if let Some(alias) = prepoly_hir::resolve_qualified(
             &program.type_aliases,
             &program.import_origins,
+            &program.import_renames,
             module,
             name,
         ) {
@@ -234,13 +277,17 @@ fn resolve_annotations(program: &Program) -> Vec<TypeError> {
         }
         let info = program.types.get(name)?;
         let def = &info.module;
+        // As in the checker's is_module_name_visible: the import must come
+        // FROM the defining module under this very name (a rename's local
+        // never reaches here -- the origin path above resolved it).
         let visible = def == module
             || def.is_empty()
             || def.first().map(String::as_str) == Some("std")
             || program
-                .module_imports
+                .import_origins
                 .get(module)
-                .is_some_and(|names| names.iter().any(|n| n == name));
+                .and_then(|o| o.get(name))
+                .is_some_and(|origin| origin == def);
         visible.then(|| kinds.get(name).copied()).flatten()
     };
 

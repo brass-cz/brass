@@ -31,12 +31,6 @@ for s in [
 }
 ```
 
-```
-circle r=2.0
-rect 3.0x4.0
-a point
-```
-
 A variant pattern binds the variant's fields by name. Bind only some of them
 and omit the rest with `..`:
 

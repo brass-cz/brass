@@ -19,6 +19,9 @@ fn empty_program() -> Program {
         inits: Vec::new(),
         module_imports: HashMap::new(),
         import_origins: HashMap::new(),
+        import_renames: HashMap::new(),
+        module_aliases: HashMap::new(),
+        symbol_aliases: HashMap::new(),
         primitive_methods: HashMap::new(),
         type_aliases: HashMap::new(),
     }

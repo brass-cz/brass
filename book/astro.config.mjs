@@ -16,6 +16,12 @@ export default defineConfig({
   integrations: [
     starlight({
       title: "prepoly book",
+      head: [
+        {
+          tag: "meta",
+          attrs: { name: "twitter:card", content: "summary" },
+        },
+      ],
       social: [
         {
           icon: "github",

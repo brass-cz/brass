@@ -889,3 +889,18 @@ fn hover_survives_a_syntax_error_elsewhere() {
         "expected hover on `ok` despite the later error"
     );
 }
+
+/// A module import (`import a.b`) used qualified reports the same diagnostics
+/// as the driver: none when valid is impossible in this single-file test (the
+/// module file does not exist), so the collision case pins message parity.
+#[test]
+fn duplicate_module_qualifier_matches_the_driver_message() {
+    let src = "import a.util\nimport b.util\nfun main() {\n    println(1)\n}\n";
+    let diags = DocAnalyzer::new(path()).diagnostics(src);
+    assert!(
+        diags
+            .iter()
+            .any(|(m, _)| m.contains("two module imports share the qualifier `util`")),
+        "diags: {diags:?}"
+    );
+}
