@@ -1,18 +1,18 @@
 // UDP datagrams between two loopback sockets on ephemeral ports: the
 // Datagram record carries both the payload and the sender's address, so the
 // receiver can verify who sent it.
-import std.net.{ udp_bind, udp_send_to, udp_recv_from, socket_local_addr }
+import std.net.{ Udp, to_bytes, to_text }
 
-let a = udp_bind("127.0.0.1", 0)!
-let b = udp_bind("127.0.0.1", 0)!
-let b_port = int64.parse(socket_local_addr(b)!.split(":")[1])!
+let a = Udp.bind("127.0.0.1", 0)!
+let b = Udp.bind("127.0.0.1", 0)!
+let b_port = int64.parse(b.local_addr()!.split(":")[1])!
 
-let sent = udp_send_to(a, _string_bytes("ping over udp"), "127.0.0.1", b_port)!
+let sent = a.send_to(to_bytes("ping over udp"), "127.0.0.1", b_port)!
 println(sent)
 
-let d = udp_recv_from(b, 64)!
-println(_string_from_bytes(d.data)!)
-println(d.addr == socket_local_addr(a)!)
+let d = b.recv_from(64)!
+println(to_text(d.data)!)
+println(d.addr == a.local_addr()!)
 
 a.close()!
 b.close()!

@@ -398,15 +398,17 @@ import geometry.vec as g
   `get_or(k, default)`, `contains_key(k)`, `delete(k)`, `size()`,
   `is_empty()`, `keys()`, `values()`, `pairs()`, `clear()`, and
   `HashMap.from_pairs([[k, v], ...])`.
-- Networking: nested -- `import std.net.{ tcp_connect, tcp_listen, tcp_accept }`.
-  A socket IS a `File`: use `read`/`write`/`close` on it. `tcp_connect(host,
-  port) -> File!`, `tcp_listen(host, port) -> File!` (port 0 = ephemeral),
-  `tcp_accept(listener) -> File!`, `udp_bind`, `udp_send_to`,
-  `udp_recv_from(sock, max) -> Datagram!` (`{ data: uint8[], addr: string }`),
-  `socket_local_addr`/`socket_peer_addr -> string!`,
-  `socket_set_timeout(sock, ms)`, `to_bytes(string) -> uint8[]`,
-  `to_text(uint8[]) -> string!`. TCP is a byte stream (one read may return a
-  partial message). Networking does not run on `prepoly repl`.
+- Networking: nested -- `import std.net.{ Tcp, TcpListener, Udp }`.
+  `Tcp.connect(host, port) -> Tcp!`; `TcpListener.bind(host, port) ->
+  TcpListener!` (port 0 = ephemeral) then `listener.accept() -> Tcp!`;
+  `conn.read(max) -> uint8[]!`, `conn.write(data) -> int64!`,
+  `conn.local_addr()`/`conn.peer_addr() -> string!`, `conn.set_timeout(ms)`,
+  `conn.close()`. `Udp.bind(host, port) -> Udp!`, `sock.send_to(data, host,
+  port) -> int64!`, `sock.recv_from(max) -> Datagram!`
+  (`{ data: uint8[], addr: string }`). Convert bytes with
+  `to_bytes(string) -> uint8[]` and `to_text(uint8[]) -> string!`. TCP is a
+  byte stream (one read may return a partial message). Networking does not
+  run on `prepoly repl`.
 - JSON: also nested -- `import std.data.json.{ JsonValue, parse, stringify }`.
   `parse(text) -> JsonValue!`; accessors `get(key)`, `at(index)`, `as_bool()`,
   `as_number()`, `as_string()` (each fallible), `is_null()`; `stringify(v)` is

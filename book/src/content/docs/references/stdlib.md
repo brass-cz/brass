@@ -132,40 +132,57 @@ generic message.
 ## `std.net`
 
 ```prepoly norun
-import std.net.{ tcp_connect, tcp_listen, tcp_accept }
+import std.net.{ Tcp, TcpListener, Udp }
 ```
 
-TCP and UDP sockets. A socket **is a `File`** (an OS file descriptor), so an
-established connection is used with the same `read`/`write`/`close` methods
-as a file; `std.net` provides what byte I/O cannot express — establishing
-sockets, datagram addressing, socket addresses, and timeouts. Not in the
-prelude: import it explicitly.
+TCP and UDP sockets, as three record types — a connection cannot `accept`
+and a listener cannot `read`. Under the hood a socket is a `File` (an OS
+file descriptor) held privately by each record. Not in the prelude: import
+it explicitly.
 
-| Function                              | Signature                              | Behavior                                                 |
-| ------------------------------------- | -------------------------------------- | -------------------------------------------------------- |
-| `tcp_connect(host, port)`             | `(string, int64) -> File!`             | open a TCP connection; `host` is an IP or a DNS name     |
-| `tcp_listen(host, port)`              | `(string, int64) -> File!`             | bind and listen; port 0 picks an ephemeral port          |
-| `tcp_accept(listener)`                | `(File) -> File!`                      | block until a connection arrives                         |
-| `udp_bind(host, port)`                | `(string, int64) -> File!`             | bind a UDP socket                                        |
-| `udp_send_to(sock, data, host, port)` | `(File, uint8[], string, int64) -> int64!` | send one datagram, returning the bytes sent          |
-| `udp_recv_from(sock, max)`            | `(File, int64) -> Datagram!`           | block for one datagram of up to `max` bytes              |
-| `socket_local_addr(sock)`             | `(File) -> string!`                    | the socket's own `"ip:port"` (reads back an OS-picked port) |
-| `socket_peer_addr(sock)`              | `(File) -> string!`                    | the connected peer's `"ip:port"`                         |
-| `socket_set_timeout(sock, ms)`        | `(File, int64) -> void!`               | read/write timeout in ms; 0 clears it                    |
-| `to_bytes(s)`                         | `(string) -> uint8[]`                  | UTF-8 bytes for `write`                                  |
-| `to_text(bytes)`                      | `(uint8[]) -> string!`                 | decode `read` bytes as UTF-8                             |
+**`Tcp`** — a bidirectional byte-stream connection:
+
+| Method                     | Signature                  | Behavior                                             |
+| -------------------------- | -------------------------- | ----------------------------------------------------- |
+| `Tcp.connect(host, port)`  | `(string, int64) -> Tcp!`  | open a connection; `host` is an IP or a DNS name     |
+| `conn.read(max)`           | `(int64) -> uint8[]!`      | up to `max` bytes; fewer on a short read              |
+| `conn.write(data)`         | `(uint8[]) -> int64!`      | write all of `data`                                   |
+| `conn.local_addr()` / `conn.peer_addr()` | `() -> string!` | the `"ip:port"` of each end                          |
+| `conn.set_timeout(ms)`     | `(int64) -> void!`         | read/write timeout; 0 clears it                       |
+| `conn.close()`             | `() -> void!`              |                                                       |
+
+**`TcpListener`** — produces `Tcp` connections:
+
+| Method                          | Signature                          | Behavior                                        |
+| ------------------------------- | ---------------------------------- | ------------------------------------------------ |
+| `TcpListener.bind(host, port)`  | `(string, int64) -> TcpListener!`  | bind and listen; port 0 picks an ephemeral port |
+| `listener.accept()`             | `() -> Tcp!`                       | block until a connection arrives                 |
+| `listener.local_addr()`         | `() -> string!`                    | reads back an OS-picked port                     |
+| `listener.close()`              | `() -> void!`                      |                                                  |
+
+**`Udp`** — a datagram socket:
+
+| Method                              | Signature                              | Behavior                                    |
+| ----------------------------------- | -------------------------------------- | -------------------------------------------- |
+| `Udp.bind(host, port)`              | `(string, int64) -> Udp!`              | port 0 picks an ephemeral port              |
+| `sock.send_to(data, host, port)`    | `(uint8[], string, int64) -> int64!`   | send one datagram                            |
+| `sock.recv_from(max)`               | `(int64) -> Datagram!`                 | block for one datagram of up to `max` bytes |
+| `sock.local_addr()`                 | `() -> string!`                        |                                              |
+| `sock.set_timeout(ms)`              | `(int64) -> void!`                     |                                              |
+| `sock.close()`                      | `() -> void!`                          |                                              |
 
 `Datagram` is `{ data: uint8[], addr: string }` — one received datagram with
-its sender's address.
+its sender's address. The free functions `to_bytes(s) -> uint8[]` and
+`to_text(bytes) -> string!` convert between strings and socket bytes.
 
 ```prepoly norun
-import std.net.{ tcp_listen, tcp_connect, tcp_accept, socket_local_addr, to_bytes, to_text }
+import std.net.{ Tcp, TcpListener, to_bytes, to_text }
 
-let listener = tcp_listen("127.0.0.1", 0)!
-let port = int64.parse(socket_local_addr(listener)!.split(":")[1])!
+let listener = TcpListener.bind("127.0.0.1", 0)!
+let port = int64.parse(listener.local_addr()!.split(":")[1])!
 
-let client = tcp_connect("127.0.0.1", port)!
-let server = tcp_accept(listener)!
+let client = Tcp.connect("127.0.0.1", port)!
+let server = listener.accept()!
 client.write(to_bytes("hello"))!
 println(to_text(server.read(64)!)!)   // hello
 ```
@@ -173,9 +190,9 @@ println(to_text(server.read(64)!)!)   // hello
 Networking requires the native runtime; the REPL interpreter refuses it, like
 file I/O. Two practical notes for concurrent servers: a spawned closure
 should capture the **port** (a copied scalar), not the listener — a shared
-listener is auto-guarded by a cown lock that a blocking `tcp_accept` would
-then hold — and TCP is a byte stream: one `read` may return less than what
-the peer wrote, so frame messages or read in a loop.
+listener is auto-guarded by a cown lock that a blocking `accept` would then
+hold — and TCP is a byte stream: one `read` may return less than what the
+peer wrote, so frame messages or read in a loop.
 
 ## `std.collections.hashmap`
 

@@ -3,16 +3,16 @@
 // itself would auto-guard it with a cown lock that the blocking accept would
 // then hold, tripping the deadlock watchdog. Match-based error handling
 // keeps the closure non-fallible (a `!` inside a closure is unsupported).
-import std.net.{ tcp_listen, tcp_connect, tcp_accept, socket_local_addr }
+import std.net.{ Tcp, TcpListener, to_bytes, to_text }
 
 fun run_client(port: int64) {
-    match tcp_connect("127.0.0.1", port) {
+    match Tcp.connect("127.0.0.1", port) {
         Ok { value } => {
             let conn = value
-            let w = conn.write(_string_bytes("hi"))
+            let w = conn.write(to_bytes("hi"))
             match conn.read(64) {
                 Ok { value } => {
-                    match _string_from_bytes(value) {
+                    match to_text(value) {
                         Ok { value } => println("client got: {value}"),
                         Err { error } => println("client decode failed: {error}")
                     }
@@ -26,15 +26,15 @@ fun run_client(port: int64) {
 }
 
 fun main() {
-    let listener = tcp_listen("127.0.0.1", 0)!
-    let port = int64.parse(socket_local_addr(listener)!.split(":")[1])!
+    let listener = TcpListener.bind("127.0.0.1", 0)!
+    let port = int64.parse(listener.local_addr()!.split(":")[1])!
     spawn(() -> {
         run_client(port)
     })
-    let conn = tcp_accept(listener)!
+    let conn = listener.accept()!
     let req = conn.read(64)!
     // One write, so the client's single read sees the whole reply.
-    conn.write(_string_bytes("echo: " + _string_from_bytes(req)!))!
+    conn.write(to_bytes("echo: " + to_text(req)!))!
     conn.close()!
     sync()
     println("server done")
