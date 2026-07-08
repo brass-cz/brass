@@ -17,11 +17,11 @@ ppm new myapp
 
 This creates three things in the current directory:
 
-| Path            | Purpose                                        |
-| --------------- | ---------------------------------------------- |
-| `myapp/`        | Source directory for sub-modules                |
-| `myapp.pp`      | Package root file (your program's entry point)  |
-| `package.toml`  | Package manifest                                |
+| Path           | Purpose                                        |
+| -------------- | ---------------------------------------------- |
+| `myapp/`       | Source directory for sub-modules               |
+| `myapp.pp`     | Package root file (your program's entry point) |
+| `package.toml` | Package manifest                               |
 
 The generated `package.toml` looks like this:
 

@@ -365,7 +365,7 @@ type StringInts = Map { key: string, value: int64 }
   refined type is annotated.
 - Annotating a binding with the alias pins the container's types up front, so
   `let m: Counts = HashMap.new()` (with `type Counts = HashMap { key: string,
-  value: int64 }`) is a usable `string -> int64` map: subsequent stores are
+value: int64 }`) is a usable `string -> int64` map: subsequent stores are
   checked against the pinned value type, so a bare integer literal or an int32
   value stores as int64.
 

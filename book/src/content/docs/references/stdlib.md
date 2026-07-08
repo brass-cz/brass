@@ -56,14 +56,14 @@ Indexing is bounds-checked at runtime on both array kinds.
 `open(path, mode) -> File!` opens a file (`mode` as in C: `"r"`, `"w"`, ...).
 `File` methods, all Results:
 
-| Method                           | Signature             |
-| -------------------------------- | --------------------- |
-| `f.read(n)`                      | `(int64) -> uint8[]!` |
-| `f.write(bytes)`                 | `(uint8[]) -> int64!` |
-| `f.seek(pos)`                    | `-> void!`            |
-| `f.size()`                                        | `() -> int64!`      |
-| `f.close()`                                       | `() -> void!`       |
-| `File.stdin()` / `File.stdout()` / `File.stderr()` | static constructors |
+| Method                                             | Signature             |
+| -------------------------------------------------- | --------------------- |
+| `f.read(n)`                                        | `(int64) -> uint8[]!` |
+| `f.write(bytes)`                                   | `(uint8[]) -> int64!` |
+| `f.seek(pos)`                                      | `-> void!`            |
+| `f.size()`                                         | `() -> int64!`        |
+| `f.close()`                                        | `() -> void!`         |
+| `File.stdin()` / `File.stdout()` / `File.stderr()` | static constructors   |
 
 File I/O requires the native runtime; the REPL interpreter refuses it (see
 [Execution model](/references/execution/)).

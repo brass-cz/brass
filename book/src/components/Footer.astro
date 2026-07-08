@@ -1,11 +1,40 @@
 ---
-// Starlight Footer override: renders the default footer and additionally makes
-// every prepoly code block on the page executable (a Run button that feeds
-// the block to the wasm interpreter).
+// Starlight Footer override: renders the default footer, adds persistent
+// community links, and makes every prepoly code block executable.
 import Default from "@astrojs/starlight/components/Footer.astro";
+import { Icon } from "@astrojs/starlight/components";
 ---
 
 <Default><slot /></Default>
+
+<nav class="footer-links">
+  <a href="https://github.com/cordx56/prepoly">
+    <Icon name="github" /> Repository
+  </a>
+  <a href="https://prepoly.zulipchat.com/#narrow/channel/614491-announcement">
+    <Icon name="zulip" /> Community
+  </a>
+</nav>
+
+<style>
+  .footer-links {
+    display: flex;
+    gap: 1.5rem;
+    padding-block-start: 1rem;
+    border-block-start: 1px solid var(--sl-color-gray-5);
+  }
+  .footer-links a {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-2);
+    text-decoration: none;
+  }
+  .footer-links a:hover {
+    color: var(--sl-color-white);
+  }
+</style>
 
 <script>
   import { attachRunButtons } from "../playground/codeblocks";

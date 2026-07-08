@@ -27,7 +27,7 @@ Three forms:
 - **`import path.Name`** brings the one trailing name into scope, exactly
   like `import path.{ Name }`.
 - **`import path`** imports the module itself. Its exports are used
-  *qualified* by the path's **last segment**: `vec.dot(a, b)`, a type
+  _qualified_ by the path's **last segment**: `vec.dot(a, b)`, a type
   position `vec.Vec2`, a record literal `vec.Vec2 { x: 1.0 }`, a static call
   `vec.Vec2.new(...)`, a variant literal `vec.Shape.Circle { r: 1.0 }`, and
   a match pattern `vec.Shape.Circle { r } =>` (a pattern's qualifier is
