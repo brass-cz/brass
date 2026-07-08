@@ -3,7 +3,7 @@
 // `HashMap.new()` and populated with `string` keys and `int64` values unifies
 // with the refined `StringInts` type and is accepted where it is annotated.
 
-import std.collections.hashmap.{ HashMap }
+import std.collections.{ HashMap }
 
 type StringInts = HashMap {
     key: string,

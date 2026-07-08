@@ -5,12 +5,12 @@ description: "Every standard-library module and builtin, with signatures."
 
 The standard library has two layers:
 
-- **The implicit prelude** — the top-level `std` modules (`io`, `array`,
+- **The implicit prelude** — the modules under `std/prelude/` (`io`, `array`,
   `string`, `math`, `conv`, `assert`) plus the runtime builtins. Their public
   names are in scope in every program with no import.
-- **Nested modules** (`std.collections.hashmap`, `std.data.json`) — imported
-  explicitly, e.g. `import std.collections.hashmap.{ HashMap }`, and loaded on
-  demand.
+- **Import-only modules** — everything else under `std/` (`std.net`,
+  `std.collections`, `std.data.json`): imported explicitly, e.g.
+  `import std.collections.{ HashMap }`, and loaded on demand.
 
 Most of the library is written in prepoly itself, on top of a small set of
 runtime primitives. Identifiers beginning with `_` (e.g. `_string_bytes`,
@@ -194,10 +194,10 @@ listener is auto-guarded by a cown lock that a blocking `accept` would then
 hold — and TCP is a byte stream: one `read` may return less than what the
 peer wrote, so frame messages or read in a loop.
 
-## `std.collections.hashmap`
+## `std.collections`
 
 ```prepoly
-import std.collections.hashmap.{ HashMap }
+import std.collections.{ HashMap }
 ```
 
 An open-addressing (linear-probing) hash map. Keys may be of any type that

@@ -447,7 +447,7 @@ fn hover_method_call_shows_method_signature() {
 /// key/value via the call arguments -- rather than bare `unknown_N`.
 #[test]
 fn hover_method_call_specializes_unannotated_params() {
-    let src = "import std.collections.hashmap.{ HashMap }\nfun main() {\n    let m = HashMap.new()\n    m.set(\"a\", \"b\")\n}\n";
+    let src = "import std.collections.{ HashMap }\nfun main() {\n    let m = HashMap.new()\n    m.set(\"a\", \"b\")\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "set(", false);
     let h = hover::hover(&doc, &full, pos).expect("hover over the set call");
@@ -463,7 +463,7 @@ fn hover_method_call_specializes_unannotated_params() {
 /// being left as `unknown`.
 #[test]
 fn hover_method_call_resolves_return_from_receiver() {
-    let src = "import std.collections.hashmap.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    let v = map.get(\"a\")\n}\n";
+    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    let v = map.get(\"a\")\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "get(", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the get call"));
@@ -478,7 +478,7 @@ fn hover_method_call_resolves_return_from_receiver() {
 /// over them, so the LSP can resolve a method against a receiver instance.
 #[test]
 fn full_analysis_exposes_record_schemes() {
-    let src = "import std.collections.hashmap.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n}\n";
+    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n}\n";
     let full = full_analysis(src);
     let scheme = full.schemes.get("HashMap").expect("HashMap scheme");
     assert!(
@@ -496,7 +496,7 @@ fn full_analysis_exposes_record_schemes() {
 /// the value type taken from the instance's `entries` element, not the call.
 #[test]
 fn hover_method_return_resolved_from_instance_via_scheme() {
-    let src = "import std.collections.hashmap.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    let v = map.get(\"a\")\n}\n";
+    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    let v = map.get(\"a\")\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "get(", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover get"));
@@ -512,7 +512,7 @@ fn hover_method_return_resolved_from_instance_via_scheme() {
 /// implementation methods are hidden.
 #[test]
 fn hover_record_instance_shows_resolved_public_members() {
-    let src = "import std.collections.hashmap.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n}\n";
+    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "map.set", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the map value"));
@@ -530,7 +530,7 @@ fn hover_record_instance_shows_resolved_public_members() {
 /// Hovering a type name hides its `_`-prefixed implementation members.
 #[test]
 fn hover_type_name_hides_internal_members() {
-    let src = "import std.collections.hashmap.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n}\n";
+    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "HashMap.new", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the HashMap type"));
@@ -726,14 +726,14 @@ fn completion_offers_record_methods() {
     );
 }
 
-/// `HashMap` lives in the embedded prelude module `std.collections.hashmap`, and
+/// `HashMap` lives in the embedded prelude module `std.collections`, and
 /// its operations are `fun HashMap.m(...)` methods. The analysis must load that
 /// nested prelude module so `HashMap.new(...)` types to `HashMap` and `m.` offers
 /// its methods -- with no import.
 #[test]
 fn completion_offers_hashmap_prelude_methods() {
     let src = concat!(
-        "import std.collections.hashmap.{ HashMap }\n",
+        "import std.collections.{ HashMap }\n",
         "fun main() {\n",
         "    let m = HashMap.new()\n",
         "    m.\n",
@@ -824,7 +824,7 @@ fn hover_infers_for_loop_iterand_and_element() {
 #[test]
 fn hashmap_instance_type_mismatch_is_reported_at_the_call() {
     let mut a = DocAnalyzer::new(path());
-    let src = "import std.collections.hashmap.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    map.get(1)\n}\n";
+    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    map.get(1)\n}\n";
     let diags = a.diagnostics(src);
     assert!(
         diags

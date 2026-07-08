@@ -825,7 +825,7 @@ fn analyze(main_label: &str, main_src: &str, root: &Path) -> Result<Checked, Vec
         ast: main_ast,
     });
 
-    // Nested std modules (`std.collections.hashmap`, `std.data.json`) are not in
+    // Nested std modules (`std.collections`, `std.data.json`) are not in
     // the implicit prelude; load only the ones actually imported, transitively.
     let nested = prepoly_resolve::load_std_nested(&modules, &[], &mut sources);
     modules.extend(nested);

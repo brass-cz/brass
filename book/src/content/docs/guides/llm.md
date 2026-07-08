@@ -391,7 +391,7 @@ import geometry.vec as g
   `float64_parse`, `float64_from`, `string_from`), equivalent to the method
   forms above.
 - Collections: `HashMap` (open-addressing hash map) is in a NESTED std module
-  and needs an explicit `import std.collections.hashmap.{ HashMap }`.
+  and needs an explicit `import std.collections.{ HashMap }`.
   `let m = HashMap.new()` takes no arguments; the key/value types are inferred
   from the first `set` (so `let m = HashMap.new(); m.set("a", 1)` is a
   `string -> int32` map). Methods: `set(k, v)`, `get(k)` (nullable),

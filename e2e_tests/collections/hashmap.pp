@@ -1,4 +1,4 @@
-import std.collections.hashmap.{ HashMap }
+import std.collections.{ HashMap }
 
 // HashMap end-to-end: insert/update/get/delete, growth across the load-factor
 // resize, and a hashed key reused across operations (the string-alias path).

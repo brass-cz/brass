@@ -1,4 +1,4 @@
-import std.collections.hashmap.{ HashMap }
+import std.collections.{ HashMap }
 
 // Deletion leaves tombstones that probing passes through and insertion reuses;
 // growth drops them. Delete-then-reinsert must find the reinserted key, keys

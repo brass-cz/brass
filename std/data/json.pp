@@ -8,7 +8,7 @@
 // parallel `keys`/`vals` arrays rather than a `HashMap`: the typed back end
 // cannot lay a `HashMap` out inside a sum variant, and object field counts are
 // small, so an association list is the practical representation here (a
-// `HashMap` remains available to user code via `import std.collections.hashmap`).
+// `HashMap` remains available to user code via `import std.collections`).
 
 /**
  * A parsed JSON value, one variant per JSON kind. Obtain one with `parse`,

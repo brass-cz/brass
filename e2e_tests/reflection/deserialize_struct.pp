@@ -1,4 +1,4 @@
-import std.collections.hashmap.{ HashMap }
+import std.collections.{ HashMap }
 
 // Reflective deserialization: a struct is populated field by field from a
 // name-keyed map, using `fields()` to drive the field walk and `v[field]` to

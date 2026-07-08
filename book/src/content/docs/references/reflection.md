@@ -108,7 +108,7 @@ target's own field names drive the lookup, and a missing key is a decode error
 naming the field:
 
 ```prepoly
-import std.collections.hashmap.{ HashMap }
+import std.collections.{ HashMap }
 
 type Config = { width: int64, height: int64, depth: int64 }
 

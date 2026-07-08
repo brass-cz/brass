@@ -101,7 +101,7 @@ pub fn build(main_path: &Path, main_src: &str) -> World {
         );
     }
 
-    // Nested std modules (`std.collections.hashmap`, `std.data.json`) are not in
+    // Nested std modules (`std.collections`, `std.data.json`) are not in
     // the implicit prelude; load the ones imported by the document or a
     // dependency, transitively.
     let extra: Vec<Vec<String>> = main_ast

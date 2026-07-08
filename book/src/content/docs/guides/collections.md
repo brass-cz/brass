@@ -78,12 +78,12 @@ on byte positions, and a multibyte character counts as several bytes.
 ## HashMap
 
 `HashMap` lives in the nested standard-library module
-`std.collections.hashmap`, which — unlike the top-level prelude — must be
+`std.collections`, which — unlike the top-level prelude — must be
 imported explicitly. `HashMap.new()` takes no arguments; the key and value
 types are inferred from the first insertion:
 
 ```prepoly
-import std.collections.hashmap.{ HashMap }
+import std.collections.{ HashMap }
 
 let ages = HashMap.new()
 ages.set("alice", 30)

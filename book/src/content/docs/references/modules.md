@@ -72,12 +72,12 @@ There is no other visibility control.
 
 ## The standard library
 
-The top-level `std` modules (`io`, `array`, `string`, `math`, `conv`,
+The `std/prelude/` modules (`io`, `array`, `string`, `math`, `conv`,
 `assert`) form the **implicit prelude**: their public names are in scope
 everywhere without an import. They can also be imported explicitly by their
 bare name (`import io.{ ... }`) or `std` path.
 
-Nested standard-library modules — `std.collections.hashmap`,
+The other standard-library modules — `std.net`, `std.collections`,
 `std.data.json` — are **not** in the prelude. They are embedded in the
 compiler but loaded only when a module imports them (transitively: a nested
 std module may import another). See the

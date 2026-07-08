@@ -88,6 +88,6 @@ A few points worth noting:
 - The top-level standard library is an implicit prelude — `sqrt`, `println`,
   and the array/string helpers need no import. Nested standard-library
   modules are not in the prelude and are imported explicitly, e.g.
-  `import std.collections.hashmap.{ HashMap }`.
+  `import std.collections.{ HashMap }`.
 
 The full rules are in the [modules reference](/references/modules/).

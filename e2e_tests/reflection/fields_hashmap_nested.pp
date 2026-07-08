@@ -1,4 +1,4 @@
-import std.collections.hashmap.{ HashMap }
+import std.collections.{ HashMap }
 
 type Inner = { a: int64, b: int64 }
 type Outer = { label: string, inner: Inner }

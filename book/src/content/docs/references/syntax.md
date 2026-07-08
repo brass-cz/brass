@@ -335,7 +335,7 @@ import geometry.vec.{ dot as vdot }        // rename a name
 import geometry.vec.Vec2                    // one name, same as .{ Vec2 }
 import geometry.vec                         // whole module: vec.dot(..), vec.Vec2
 import geometry.vec as g                   // module with custom qualifier: g.dot(..)
-import std.collections.hashmap.{ HashMap }
+import std.collections.{ HashMap }
 ```
 
 `import path.{ Name, ... }` imports the listed names (`Name as Local` renames);

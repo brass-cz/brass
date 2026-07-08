@@ -4,7 +4,7 @@
 // the literal takes int64; an int32 variable widens at the call boundary. Both
 // store correctly rather than being rejected as an int32/int64 mismatch.
 
-import std.collections.hashmap.{ HashMap }
+import std.collections.{ HashMap }
 
 fun main() {
     let m = HashMap.new()

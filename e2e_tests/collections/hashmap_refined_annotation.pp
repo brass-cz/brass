@@ -5,7 +5,7 @@
 // value: an int64 variable, an int32 variable (widened), and a bare integer
 // literal (which would default to int32) all store as int64.
 
-import std.collections.hashmap.{ HashMap }
+import std.collections.{ HashMap }
 
 type Scores = HashMap {
     key: string,

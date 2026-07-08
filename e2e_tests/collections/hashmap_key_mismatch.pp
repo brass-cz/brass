@@ -1,4 +1,4 @@
-import std.collections.hashmap.{ HashMap }
+import std.collections.{ HashMap }
 
 // A HashMap's key/value types are fixed by use: `set("a", "b")` makes this a
 // `string -> string` map. Using it inconsistently -- `get` with an `int32` key --
