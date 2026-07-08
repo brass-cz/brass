@@ -39,7 +39,11 @@ author = ""
 license = "MIT"
 
 [dependencies]
+# mylib = { git = "https://github.com/user/mylib", hash = "<commit hash>" }
+# mylib = { path = "../mylib" }
 ```
+
+The commented lines show the two dependency forms, ready to fill in.
 
 ## Running and checking
 
@@ -56,18 +60,29 @@ file (`<package-name>.pp`).
 
 ## Adding dependencies
 
-Dependencies are Git repositories pinned to a commit hash. Add them to the
-`[dependencies]` section of `package.toml`:
+A dependency is either a Git repository pinned to a commit hash, or a local
+directory given by path. Add them to the `[dependencies]` section of
+`package.toml`:
 
 ```toml
 [dependencies]
 "geometry" = { git = "https://github.com/user/geometry-pp", hash = "a1b2c3d4e5f6" }
 "utils"    = { git = "https://github.com/user/utils-pp",    hash = "deadbeef1234" }
+"mylib"    = { path = "../mylib" }
 ```
 
-When you run `ppm run` or `ppm check`, each dependency is cloned to
+When you run `ppm run` or `ppm check`, each Git dependency is cloned to
 `~/.prepoly/packages/<name>-git-<hash>` if it is not already present, and
 then checked out at the pinned commit.
+
+A `path` dependency is used in place — nothing is copied or fetched. The
+path is resolved relative to the project root (the directory holding
+`package.toml`) and must point at the dependency project's root directory:
+the one containing its `<package-name>.pp` root file. Edits to the
+dependency are picked up on the next `ppm run`/`ppm check` with no extra
+step, which makes `path` the form to use while developing a library
+alongside its consumer; a dependency cannot combine `path` with
+`git`/`hash`.
 
 ## Importing from a dependency
 

@@ -6,7 +6,7 @@ use std::process::{Command, ExitCode};
 
 use clap::{Parser, Subcommand};
 
-use manifest::Manifest;
+use manifest::{Dependency, Manifest};
 
 #[derive(Parser)]
 #[command(name = "ppm", about = "Prepoly package manager")]
@@ -78,7 +78,15 @@ fn scaffold_project(dir: &Path, name: &str) -> ExitCode {
     let manifest_path = dir.join("package.toml");
     if !manifest_path.exists() {
         let content = format!(
-            "[package]\nname = \"{name}\"\nauthor = \"\"\nlicense = \"MIT\"\n\n[dependencies]\n"
+            r#"[package]
+name = "{name}"
+author = ""
+license = "MIT"
+
+[dependencies]
+# mylib = {{ git = "https://github.com/user/mylib", hash = "<commit hash>" }}
+# mylib = {{ path = "../mylib" }}
+"#
         );
         if let Err(e) = std::fs::write(&manifest_path, content) {
             eprintln!("error: cannot write `{}`: {e}", manifest_path.display());
@@ -98,52 +106,29 @@ fn resolve_packages() -> Result<String, ExitCode> {
         ExitCode::FAILURE
     })?;
 
-    let packages_dir = packages_root().map_err(|e| {
-        eprintln!("error: {e}");
-        ExitCode::FAILURE
-    })?;
+    // The shared cache is only needed (and created) for git dependencies.
+    let needs_cache = manifest
+        .dependencies
+        .values()
+        .any(|d| matches!(d, Dependency::Git { .. }));
+    let packages_dir = if needs_cache {
+        Some(packages_root().map_err(|e| {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        })?)
+    } else {
+        None
+    };
 
     let mut pkg_entries: BTreeMap<String, PathBuf> = BTreeMap::new();
     for (name, dep) in &manifest.dependencies {
-        let dir_name = format!("{name}-git-{}", &dep.hash);
-        let dest = packages_dir.join(&dir_name);
-        if !dest.exists() {
-            eprintln!(
-                "fetching {name} ({})...",
-                &dep.hash[..dep.hash.len().min(8)]
-            );
-            let status = Command::new("git")
-                .args(["clone", &dep.git, &dest.display().to_string()])
-                .status();
-            match status {
-                Ok(s) if s.success() => {}
-                Ok(s) => {
-                    eprintln!(
-                        "error: git clone failed for `{name}` (exit {})",
-                        s.code().unwrap_or(-1)
-                    );
-                    return Err(ExitCode::FAILURE);
-                }
-                Err(e) => {
-                    eprintln!("error: cannot run git: {e}");
-                    return Err(ExitCode::FAILURE);
-                }
+        let dest = match dep {
+            Dependency::Git { git, hash } => {
+                let cache = packages_dir.as_ref().expect("created for git dependencies");
+                fetch_git(name, git, hash, cache)?
             }
-            let status = Command::new("git")
-                .args(["-C", &dest.display().to_string(), "checkout", &dep.hash])
-                .status();
-            match status {
-                Ok(s) if s.success() => {}
-                Ok(_) => {
-                    eprintln!("error: git checkout `{}` failed for `{name}`", dep.hash);
-                    return Err(ExitCode::FAILURE);
-                }
-                Err(e) => {
-                    eprintln!("error: cannot run git: {e}");
-                    return Err(ExitCode::FAILURE);
-                }
-            }
-        }
+            Dependency::Path { path } => resolve_path_dep(name, path)?,
+        };
         pkg_entries.insert(name.clone(), dest);
     }
 
@@ -152,6 +137,71 @@ fn resolve_packages() -> Result<String, ExitCode> {
         .map(|(name, path)| format!("{name}={}", path.display()))
         .collect::<Vec<_>>()
         .join(":"))
+}
+
+/// Clone-and-checkout a git dependency into the shared cache (a no-op when the
+/// `name-git-hash` directory already exists) and return its directory.
+fn fetch_git(name: &str, git: &str, hash: &str, packages_dir: &Path) -> Result<PathBuf, ExitCode> {
+    let dir_name = format!("{name}-git-{hash}");
+    let dest = packages_dir.join(&dir_name);
+    if dest.exists() {
+        return Ok(dest);
+    }
+    eprintln!("fetching {name} ({})...", &hash[..hash.len().min(8)]);
+    let status = Command::new("git")
+        .args(["clone", git, &dest.display().to_string()])
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!(
+                "error: git clone failed for `{name}` (exit {})",
+                s.code().unwrap_or(-1)
+            );
+            return Err(ExitCode::FAILURE);
+        }
+        Err(e) => {
+            eprintln!("error: cannot run git: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+    }
+    let status = Command::new("git")
+        .args(["-C", &dest.display().to_string(), "checkout", hash])
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(_) => {
+            eprintln!("error: git checkout `{hash}` failed for `{name}`");
+            return Err(ExitCode::FAILURE);
+        }
+        Err(e) => {
+            eprintln!("error: cannot run git: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+    }
+    Ok(dest)
+}
+
+/// Resolve a `{ path = "..." }` dependency against the project root (the
+/// directory holding `package.toml`, which is the current directory for every
+/// ppm command). The result is canonicalized so the absolute path stays valid
+/// for whatever working directory the spawned tool ends up with.
+fn resolve_path_dep(name: &str, path: &str) -> Result<PathBuf, ExitCode> {
+    let dest = Path::new(path);
+    match std::fs::canonicalize(dest) {
+        Ok(p) if p.is_dir() => Ok(p),
+        Ok(p) => {
+            eprintln!(
+                "error: path dependency `{name}`: `{}` is not a directory",
+                p.display()
+            );
+            Err(ExitCode::FAILURE)
+        }
+        Err(e) => {
+            eprintln!("error: path dependency `{name}`: cannot resolve `{path}`: {e}");
+            Err(ExitCode::FAILURE)
+        }
+    }
 }
 
 /// Read `package.toml` in the current directory, fetch dependencies, set
