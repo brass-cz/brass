@@ -30,12 +30,14 @@ pub const STDLIB: &[(&str, &str)] = &[
     ("assert", include_str!("../../../std/assert.pp")),
 ];
 
-/// Embedded standard-library modules BELOW `std` (`std.collections.hashmap`,
-/// `std.data.json`). These are not in the implicit prelude: their names are in
-/// scope only after an explicit `import std.<path>.{ Name }`, at which point the
-/// module is loaded on demand ([`load_std_nested`]). Keyed by the module's
-/// dotted path relative to `std` (segments joined with `/`).
+/// Embedded standard-library modules BELOW `std` (`std.net`,
+/// `std.collections.hashmap`, `std.data.json`). These are not in the implicit
+/// prelude: their names are in scope only after an explicit
+/// `import std.<path>.{ Name }`, at which point the module is loaded on
+/// demand ([`load_std_nested`]). Keyed by the module's dotted path relative
+/// to `std` (segments joined with `/`).
 pub const STDLIB_NESTED: &[(&str, &str)] = &[
+    ("net", include_str!("../../../std/net.pp")),
     (
         "collections/hashmap",
         include_str!("../../../std/collections/hashmap.pp"),
@@ -61,11 +63,14 @@ pub fn is_prelude_path(path: &[String]) -> bool {
 }
 
 /// The `std/`-relative key of an embedded nested module for a canonical import
-/// path (`["std","collections","hashmap"]` -> `"collections/hashmap"`), or
-/// `None` if the path is not `std.<...>` with two or more segments below `std`.
+/// path (`["std","net"]` -> `"net"`, `["std","collections","hashmap"]` ->
+/// `"collections/hashmap"`), or `None` if the path does not start with `std`.
+/// A key with no match in [`STDLIB_NESTED`] is simply not loaded (and
+/// reported by `check_imports`), so prelude modules -- which are imported
+/// without the `std.` prefix -- never collide here.
 fn nested_key(path: &[String]) -> Option<String> {
     match path {
-        [first, rest @ ..] if first == "std" && rest.len() >= 2 => Some(rest.join("/")),
+        [first, rest @ ..] if first == "std" && !rest.is_empty() => Some(rest.join("/")),
         _ => None,
     }
 }

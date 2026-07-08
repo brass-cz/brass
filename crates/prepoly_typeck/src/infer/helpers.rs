@@ -51,6 +51,14 @@ pub(super) fn is_runtime_builtin_value(name: &str) -> bool {
             | "_array_pop"
             | "_array_insert"
             | "_array_remove"
+            | "_tcp_connect"
+            | "_tcp_listen"
+            | "_tcp_accept"
+            | "_udp_bind"
+            | "_udp_send_to"
+            | "_udp_recv_from"
+            | "_socket_addr"
+            | "_socket_set_timeout"
     )
 }
 

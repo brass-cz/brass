@@ -398,6 +398,15 @@ import geometry.vec as g
   `get_or(k, default)`, `contains_key(k)`, `delete(k)`, `size()`,
   `is_empty()`, `keys()`, `values()`, `pairs()`, `clear()`, and
   `HashMap.from_pairs([[k, v], ...])`.
+- Networking: nested -- `import std.net.{ tcp_connect, tcp_listen, tcp_accept }`.
+  A socket IS a `File`: use `read`/`write`/`close` on it. `tcp_connect(host,
+  port) -> File!`, `tcp_listen(host, port) -> File!` (port 0 = ephemeral),
+  `tcp_accept(listener) -> File!`, `udp_bind`, `udp_send_to`,
+  `udp_recv_from(sock, max) -> Datagram!` (`{ data: uint8[], addr: string }`),
+  `socket_local_addr`/`socket_peer_addr -> string!`,
+  `socket_set_timeout(sock, ms)`, `to_bytes(string) -> uint8[]`,
+  `to_text(uint8[]) -> string!`. TCP is a byte stream (one read may return a
+  partial message). Networking does not run on `prepoly repl`.
 - JSON: also nested -- `import std.data.json.{ JsonValue, parse, stringify }`.
   `parse(text) -> JsonValue!`; accessors `get(key)`, `at(index)`, `as_bool()`,
   `as_number()`, `as_string()` (each fallible), `is_null()`; `stringify(v)` is
@@ -407,8 +416,8 @@ import geometry.vec as g
 - `assert(cond, msg?)` aborts when `cond` is false (`msg` is optional).
 - Identifiers beginning with `_` (e.g. `_string_bytes`, `_panic`) are runtime
   internals -- do not call them directly; use the prelude wrappers above.
-- File I/O and concurrency run on the native runtime; `prepoly repl` does not
-  implement those runtime features.
+- File I/O, networking, and concurrency run on the native runtime;
+  `prepoly repl` does not implement those runtime features.
 
 ## Concurrency (experimental -- avoid unless asked)
 

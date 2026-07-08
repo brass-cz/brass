@@ -604,6 +604,11 @@ fn resolve_named(
         // in (e.g. `infer[]` is an array whose element type is inferred). The
         // placeholder id is freshened per occurrence by `freshen_infer`.
         "infer" => Type::Unknown(INFER_VAR),
+        // The builtin `File` (an fd-holding runtime record with no declared
+        // fields): id -1 everywhere, matching the checker's `type_by_name`
+        // fallback and the back end's `file_type()`, so annotations written in
+        // std/net.pp unify with the values `open`/`_tcp_connect` produce.
+        "File" => Type::Record(NominalType::new(-1, "File")),
         _ => match nominal_info(name) {
             Some(info) => match info.kind {
                 NominalKind::Record => Type::Record(NominalType::new(info.id, name)),

@@ -685,6 +685,16 @@ impl<'p, 'm> Interp<'p, 'm> {
                 Err("runtime type dispatch is not supported by the REPL runtime".into())
             }
             "open" => Err("file I/O is not supported by the REPL runtime".into()),
+            "_tcp_connect"
+            | "_tcp_listen"
+            | "_tcp_accept"
+            | "_udp_bind"
+            | "_udp_send_to"
+            | "_udp_recv_from"
+            | "_socket_addr"
+            | "_socket_set_timeout" => {
+                Err("networking is not supported by the REPL runtime".into())
+            }
             "_float_sqrt" | "_float_floor" | "_float_ceil" | "_float_pow" => {
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {

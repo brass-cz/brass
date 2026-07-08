@@ -2560,6 +2560,42 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
     fn file_close(&mut self, file: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
         self.call_rt_ptr("pp_file_close", &[file])
     }
+    fn net_call(
+        &mut self,
+        rt_name: &'static str,
+        args: &[BasicValueEnum<'ctx>],
+    ) -> BasicValueEnum<'ctx> {
+        // Parameter kinds follow the values: integers widen to the runtime's
+        // i64 slots (a port or count may arrive as a narrower literal, as in
+        // `file_read`); everything else is an object pointer.
+        let i64t = self.abi.i64t();
+        let mut ptys: Vec<inkwell::types::BasicMetadataTypeEnum> = Vec::with_capacity(args.len());
+        let mut av: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::with_capacity(args.len());
+        for a in args {
+            match a {
+                BasicValueEnum::IntValue(iv) => {
+                    let wide = if iv.get_type().get_bit_width() < 64 {
+                        self.builder.build_int_s_extend(*iv, i64t, "n64").unwrap()
+                    } else {
+                        *iv
+                    };
+                    ptys.push(i64t.into());
+                    av.push(wide.into());
+                }
+                other => {
+                    ptys.push(self.abi.ptr().into());
+                    av.push((*other).into());
+                }
+            }
+        }
+        let ty = self.abi.ptr().fn_type(&ptys, false);
+        let f = self.abi.runtime_fn(&self.module, rt_name, ty);
+        self.builder
+            .build_call(f, &av, "net")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+    }
 
     fn convert(
         &mut self,

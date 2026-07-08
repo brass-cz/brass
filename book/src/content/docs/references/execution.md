@@ -31,6 +31,7 @@ per function instance.
 | Engine                 | LLVM-based native code | tree-walking, pure Rust                                         |
 | Used by                | `prepoly file.pp`      | `prepoly repl`, wasm/playground, `--no-default-features` builds |
 | File I/O               | yes                    | refused at runtime                                              |
+| Networking             | yes                    | refused at runtime                                              |
 | Concurrency            | yes                    | refused at runtime                                              |
 | Runtime specialization | yes                    | refused at runtime                                              |
 

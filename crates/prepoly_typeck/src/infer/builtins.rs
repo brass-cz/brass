@@ -73,7 +73,41 @@ impl<'a> Checker<'a> {
             self.check_builtin_args_against("open", args, &[Type::Str, Type::Str], span, scopes);
             return Some(Type::result(self.type_by_name("File"), Type::Str));
         }
+        if let Some(ret) = self.net_builtin_type(name, args, span, scopes) {
+            return Some(ret);
+        }
         None
+    }
+
+    /// Static contracts for the network runtime primitives (see
+    /// `prepoly_runtime::net` and the `std/net.pp` wrappers). Sockets are
+    /// `File`s, so the socket-typed slots check against the builtin `File`
+    /// nominal exactly like `open`'s result.
+    fn net_builtin_type(
+        &mut self,
+        name: &str,
+        args: &[Arg],
+        span: prepoly_parser::Span,
+        scopes: &mut ScopeStack,
+    ) -> Option<Type> {
+        let i64_ty = Type::Int(IntKind::I64);
+        let bytes_ty = Type::Slice(Box::new(Type::Int(IntKind::U8)));
+        let file_ty = self.type_by_name("File");
+        let file_result = Type::result(file_ty.clone(), Type::Str);
+        let (params, ret) = match name {
+            "_tcp_connect" | "_tcp_listen" | "_udp_bind" => (vec![Type::Str, i64_ty], file_result),
+            "_tcp_accept" => (vec![file_ty], file_result),
+            "_udp_send_to" => (
+                vec![file_ty, bytes_ty, Type::Str, i64_ty.clone()],
+                Type::result(i64_ty, Type::Str),
+            ),
+            "_udp_recv_from" => (vec![file_ty, i64_ty], Type::result(bytes_ty, Type::Str)),
+            "_socket_addr" => (vec![file_ty, i64_ty], Type::result(Type::Str, Type::Str)),
+            "_socket_set_timeout" => (vec![file_ty, i64_ty], Type::result(Type::Void, Type::Str)),
+            _ => return None,
+        };
+        self.check_builtin_args_against(name, args, &params, span, scopes);
+        Some(ret)
     }
 
     /// Static contracts for the numeric runtime helpers. These
@@ -282,6 +316,16 @@ impl<'a> Checker<'a> {
     pub(super) fn builtin_function_type_light(&self, name: &str) -> Option<Type> {
         match name {
             "open" => Some(Type::result(self.type_by_name("File"), Type::Str)),
+            "_tcp_connect" | "_tcp_listen" | "_tcp_accept" | "_udp_bind" => {
+                Some(Type::result(self.type_by_name("File"), Type::Str))
+            }
+            "_udp_send_to" => Some(Type::result(Type::Int(IntKind::I64), Type::Str)),
+            "_udp_recv_from" => Some(Type::result(
+                Type::Slice(Box::new(Type::Int(IntKind::U8))),
+                Type::Str,
+            )),
+            "_socket_addr" => Some(Type::result(Type::Str, Type::Str)),
+            "_socket_set_timeout" => Some(Type::result(Type::Void, Type::Str)),
             "input" => Some(Type::result(Type::Str, Type::Str)),
             "len" => Some(Type::Int(IntKind::I64)),
             "print" | "println" | "assert" => Some(Type::Void),

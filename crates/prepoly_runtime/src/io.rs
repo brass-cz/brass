@@ -17,8 +17,9 @@ use crate::alloc::pp_typed_alloc;
 use crate::alloc::{pp_arr_new, typed_result, typed_result_err, typed_str};
 use crate::rt::Header;
 
-/// Build a `File` object holding descriptor `fd`.
-unsafe fn make_file(fd: RawFd) -> *mut Header {
+/// Build a `File` object holding descriptor `fd`. Shared with the network
+/// primitives (`crate::net`), which represent sockets as `File`s.
+pub(crate) unsafe fn make_file(fd: RawFd) -> *mut Header {
     unsafe {
         let h = pp_typed_alloc(24);
         *((h as *mut u8).offset(16) as *mut i64) = fd as i64;
@@ -27,7 +28,7 @@ unsafe fn make_file(fd: RawFd) -> *mut Header {
 }
 
 /// The descriptor a `File` object holds.
-unsafe fn file_fd(file: *mut Header) -> RawFd {
+pub(crate) unsafe fn file_fd(file: *mut Header) -> RawFd {
     unsafe { *((file as *mut u8).offset(16) as *mut i64) as RawFd }
 }
 

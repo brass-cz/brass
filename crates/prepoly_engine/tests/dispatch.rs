@@ -160,6 +160,14 @@ impl Codegen for TextBackend {
     fn file_close(&mut self, file: usize) -> usize {
         self.val(format!("file_close v{file}"))
     }
+    fn net_call(&mut self, rt_name: &'static str, args: &[usize]) -> usize {
+        let args = args
+            .iter()
+            .map(|a| format!("v{a}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.val(format!("{rt_name} {args}"))
+    }
     fn convert(&mut self, target: &Type, method: &str, _arg_ty: &Type, arg: usize) -> usize {
         self.val(format!("{}.{method}(v{arg})", target.display()))
     }

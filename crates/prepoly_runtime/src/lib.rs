@@ -12,6 +12,7 @@ pub mod conc;
 pub mod gc;
 pub mod io;
 pub mod mem;
+pub mod net;
 pub mod region;
 pub mod rt;
 
@@ -87,6 +88,14 @@ pub fn symbols() -> Vec<(&'static str, usize)> {
         io::pp_file_size,
         io::pp_file_seek,
         io::pp_file_close,
+        net::pp_tcp_connect,
+        net::pp_tcp_listen,
+        net::pp_tcp_accept,
+        net::pp_udp_bind,
+        net::pp_udp_send_to,
+        net::pp_udp_recv_from,
+        net::pp_socket_addr,
+        net::pp_socket_set_timeout,
         gc::pp_gc_register,
         gc::pp_gc_collect,
         gc::pp_freeze_deep,

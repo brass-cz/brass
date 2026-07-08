@@ -24,8 +24,8 @@ fn e2e_root() -> PathBuf {
 }
 
 /// Every `*.pp` under `dir`, recursively, in sorted order (so failures are stable).
-/// `concurrency/` is skipped without the `jit` feature: those cases need real
-/// threads that only the JIT back end provides.
+/// `concurrency/` and `net/` are skipped without the `jit` feature: those
+/// cases need real threads and sockets that only the JIT back end provides.
 fn collect_cases(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
@@ -34,7 +34,11 @@ fn collect_cases(dir: &Path, out: &mut Vec<PathBuf>) {
     entries.sort();
     for path in entries {
         if path.is_dir() {
-            if !cfg!(feature = "jit") && path.file_name().is_some_and(|n| n == "concurrency") {
+            if !cfg!(feature = "jit")
+                && path
+                    .file_name()
+                    .is_some_and(|n| n == "concurrency" || n == "net")
+            {
                 continue;
             }
             collect_cases(&path, out);

@@ -255,6 +255,12 @@ pub trait Codegen {
     fn file_seek(&mut self, file: Self::Value, pos: Self::Value) -> Self::Value;
     /// `file.close()`: a `Result<void, string>`.
     fn file_close(&mut self, file: Self::Value) -> Self::Value;
+    /// A network primitive call (`_tcp_connect` and friends): `rt_name` is the
+    /// runtime symbol; every argument is already in ABI form (an object
+    /// pointer, or an integer the back end widens to i64) and the result is a
+    /// typed `Result` object pointer. One hook covers the whole family because
+    /// the calls share that shape (see `prepoly_runtime::net`).
+    fn net_call(&mut self, rt_name: &'static str, args: &[Self::Value]) -> Self::Value;
     /// A numeric conversion `target.method(arg)` (`from`/`parse`): returns a
     /// typed `Result` for fallible cases, or the value for infallible `float.from`.
     fn convert(
@@ -1514,6 +1520,47 @@ pub trait Codegen {
                 let p = self.codegen_operand(program, f, &args[0], &Type::Str);
                 let m = self.codegen_operand(program, f, &args[1], &Type::Str);
                 self.file_open(p, m)
+            }
+            // Network primitives (`host, port` establishment forms): sockets
+            // are `File`s, so their results reuse the File Result shapes.
+            "_tcp_connect" | "_tcp_listen" | "_udp_bind" => {
+                let i64t = Type::Int(prepoly_hir::IntKind::I64);
+                let host = self.codegen_operand(program, f, &args[0], &Type::Str);
+                let port = self.codegen_operand(program, f, &args[1], &i64t);
+                let rt = match name {
+                    "_tcp_connect" => "pp_tcp_connect",
+                    "_tcp_listen" => "pp_tcp_listen",
+                    _ => "pp_udp_bind",
+                };
+                self.net_call(rt, &[host, port])
+            }
+            "_tcp_accept" => {
+                let aty = operand_type_of(&args[0], &f.local_types);
+                let l = self.codegen_operand(program, f, &args[0], &aty);
+                self.net_call("pp_tcp_accept", &[l])
+            }
+            "_udp_send_to" => {
+                let i64t = Type::Int(prepoly_hir::IntKind::I64);
+                let sty = operand_type_of(&args[0], &f.local_types);
+                let sock = self.codegen_operand(program, f, &args[0], &sty);
+                let bty = operand_type_of(&args[1], &f.local_types);
+                let bytes = self.codegen_operand(program, f, &args[1], &bty);
+                let host = self.codegen_operand(program, f, &args[2], &Type::Str);
+                let port = self.codegen_operand(program, f, &args[3], &i64t);
+                self.net_call("pp_udp_send_to", &[sock, bytes, host, port])
+            }
+            // The `(socket, i64)` forms: recv size, addr selector, timeout ms.
+            "_udp_recv_from" | "_socket_addr" | "_socket_set_timeout" => {
+                let i64t = Type::Int(prepoly_hir::IntKind::I64);
+                let sty = operand_type_of(&args[0], &f.local_types);
+                let sock = self.codegen_operand(program, f, &args[0], &sty);
+                let n = self.codegen_operand(program, f, &args[1], &i64t);
+                let rt = match name {
+                    "_udp_recv_from" => "pp_udp_recv_from",
+                    "_socket_addr" => "pp_socket_addr",
+                    _ => "pp_socket_set_timeout",
+                };
+                self.net_call(rt, &[sock, n])
             }
             // Integer width conversions: widen is infallible, narrow
             // returns a range-checked Result.
