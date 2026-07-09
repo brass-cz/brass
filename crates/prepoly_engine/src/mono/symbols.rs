@@ -33,8 +33,19 @@ pub fn instance_symbol(base: &str, type_args: &[Type]) -> String {
 /// type, so the symbol is unique per receiver layout; the method name keeps
 /// distinct methods apart. Derivable from types alone (no HIR program), so the
 /// monomorphizer and the back end agree.
+///
+/// A nullable receiver is keyed by its inner type: the checker only accepts a
+/// method call on a `T?` it has proven non-null, and the call boundary
+/// unwraps the cell (`codegen_operand` coerces to the instance's `self`
+/// type), so the narrowed and the plain receiver share one instance.
 pub fn method_symbol(method: &str, type_args: &[Type]) -> String {
-    instance_symbol(&format!("{SYNTH_SIGIL}m_{method}"), type_args)
+    let base = format!("{SYNTH_SIGIL}m_{method}");
+    if let Some(Type::Nullable(inner)) = type_args.first() {
+        let mut args = type_args.to_vec();
+        args[0] = (**inner).clone();
+        return instance_symbol(&base, &args);
+    }
+    instance_symbol(&base, type_args)
 }
 
 /// Instance symbol of a static call `Type.method(args)`.
@@ -82,8 +93,14 @@ pub fn prim_method_instance(
     name: &str,
     arg_types: &[Type],
 ) -> Option<String> {
-    let class = arg_types.first()?.primitive_class()?;
-    let sym = instance_symbol(&prepoly_hir::prim_method_symbol(class, name), arg_types);
+    // A narrowed nullable receiver dispatches as its inner class, exactly as
+    // in `method_symbol`.
+    let mut args = arg_types.to_vec();
+    if let Some(Type::Nullable(inner)) = args.first() {
+        args[0] = (**inner).clone();
+    }
+    let class = args.first()?.primitive_class()?;
+    let sym = instance_symbol(&prepoly_hir::prim_method_symbol(class, name), &args);
     program.lookup(&sym).map(|_| sym)
 }
 

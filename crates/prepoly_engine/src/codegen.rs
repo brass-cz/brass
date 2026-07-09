@@ -597,7 +597,10 @@ pub trait Codegen {
                     let arr = self.load_local(place.local);
                     let (arr, arr_ty) = self.unwrap_narrowed(arr, &raw_ty);
                     let elem_ty = element_type(&arr_ty);
-                    let iv = self.codegen_operand(program, f, idx, &index_type(idx, f));
+                    // Unwrap a narrowed-nullable index, as in the load path.
+                    let raw_ity = index_type(idx, f);
+                    let iv = self.codegen_operand(program, f, idx, &raw_ity);
+                    let (iv, _) = self.unwrap_narrowed(iv, &raw_ity);
                     let old = rc_managed(&elem_ty).then(|| self.load_index(arr, &arr_ty, iv));
                     let v = self.codegen_operand(program, f, op, &elem_ty);
                     self.store_index(arr, &arr_ty, iv, v);
@@ -1064,7 +1067,12 @@ pub trait Codegen {
                             .expect("tuple index must be a constant (checked by typeck)");
                         self.tuple_field(arr, elem_types, k)
                     } else {
-                        let iv = self.codegen_operand(program, f, idx, &index_type(idx, f));
+                        // The index may itself be a narrowed nullable
+                        // (`cs[i]` after `if !i { return }` with `i: int64?`);
+                        // unwrap its cell like the base's.
+                        let raw_ity = index_type(idx, f);
+                        let iv = self.codegen_operand(program, f, idx, &raw_ity);
+                        let (iv, _) = self.unwrap_narrowed(iv, &raw_ity);
                         self.load_index(arr, &arr_ty, iv)
                     }
                 }

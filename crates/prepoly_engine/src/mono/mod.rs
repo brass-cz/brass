@@ -1039,11 +1039,34 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 let expected = local_types[local.index()].clone();
                 let t =
                     self.rvalue_type(rv, cur_sym, module, local_types, cur_ret, expected.as_ref())?;
-                if local_types[local.index()].is_none()
-                    && let Some(t) = t
-                {
-                    local_types[local.index()] = Some(t);
-                    *changed = true;
+                match (expected, t) {
+                    (None, Some(t)) => {
+                        local_types[local.index()] = Some(t);
+                        *changed = true;
+                    }
+                    // A local first assigned `null` types as bare `never?`; a
+                    // later concrete assignment upgrades it to that type's
+                    // nullable (`let a: A? = null` then `a = A { .. }` makes
+                    // the local `A?`). Without the upgrade the stale `never`
+                    // element reaches codegen, where a nullable wrap of a
+                    // "never" payload skips the retain and double-frees.
+                    (Some(cur), Some(t)) if cur.is_null() && !t.is_null() => {
+                        local_types[local.index()] = Some(match t {
+                            t @ Type::Nullable(_) => t,
+                            other => Type::Nullable(Box::new(other)),
+                        });
+                        *changed = true;
+                    }
+                    // Symmetrically, assigning `null` into a local first typed
+                    // concrete makes it nullable, so the null representation
+                    // (a null cell pointer) matches the local's element type.
+                    (Some(cur), Some(t))
+                        if t.is_null() && !cur.is_null() && !matches!(cur, Type::Nullable(_)) =>
+                    {
+                        local_types[local.index()] = Some(Type::Nullable(Box::new(cur)));
+                        *changed = true;
+                    }
+                    _ => {}
                 }
                 Ok(())
             }
@@ -1430,9 +1453,16 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         cur_ret: &Option<Type>,
         local_types: &[Option<Type>],
     ) -> Result<Option<Type>, String> {
-        let Some(arg_types) = self.arg_types(args, local_types)? else {
+        let Some(mut arg_types) = self.arg_types(args, local_types)? else {
             return Ok(None);
         };
+        // A narrowed `T?` receiver dispatches as `T`: the checker only lets a
+        // method call through when a guard proved the receiver non-null, and
+        // the call boundary unwraps the cell, so the instance is created for
+        // the inner type (matching `method_symbol`'s keying).
+        if let Type::Nullable(inner) = &arg_types[0] {
+            arg_types[0] = (**inner).clone();
+        }
         // File I/O methods are runtime primitives over the builtin
         // `File` record, not user methods, so they return their Result directly with
         // no instance to monomorphize.
