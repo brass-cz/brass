@@ -59,6 +59,10 @@ pub(super) fn is_runtime_builtin_value(name: &str) -> bool {
             | "_udp_recv_from"
             | "_socket_addr"
             | "_socket_set_timeout"
+            | "_tls_connect"
+            | "_tls_read"
+            | "_tls_write"
+            | "_tls_close"
     )
 }
 

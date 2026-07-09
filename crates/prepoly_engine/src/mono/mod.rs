@@ -1246,6 +1246,16 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 ))),
                 "_socket_addr" => Ok(Some(result_type(Type::Str, Type::Str))),
                 "_socket_set_timeout" => Ok(Some(result_type(Type::Void, Type::Str))),
+                // TLS primitives: connections are int64 handles (see
+                // `prepoly_runtime::tls` and std/net/tls.pp).
+                "_tls_connect" | "_tls_write" => {
+                    Ok(Some(result_type(Type::Int(IntKind::I64), Type::Str)))
+                }
+                "_tls_read" => Ok(Some(result_type(
+                    Type::Slice(Box::new(Type::Int(IntKind::U8))),
+                    Type::Str,
+                ))),
+                "_tls_close" => Ok(Some(result_type(Type::Void, Type::Str))),
                 // `to_string` only has a typed conversion for scalars/strings;
                 // other arguments fall back so formatting stays correct.
                 "to_string" => match args.first() {

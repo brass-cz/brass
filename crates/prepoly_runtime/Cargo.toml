@@ -5,3 +5,21 @@ edition.workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+default = ["tls"]
+# TLS client primitives backed by rustls. Off (or on a wasm target), the
+# pp_tls_* symbols still exist but return an error Result, so a driver built
+# without TLS degrades to a runtime error instead of a link failure.
+tls = ["dep:rustls", "dep:webpki-roots"]
+
+# rustls does not build for wasm targets (its crypto provider is native-only);
+# the wasm interpreter refuses networking anyway, so the stub variant is used
+# there regardless of the feature.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+], optional = true }
+webpki-roots = { version = "1.0", optional = true }

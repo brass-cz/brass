@@ -104,6 +104,21 @@ impl<'a> Checker<'a> {
             "_udp_recv_from" => (vec![file_ty, i64_ty], Type::result(bytes_ty, Type::Str)),
             "_socket_addr" => (vec![file_ty, i64_ty], Type::result(Type::Str, Type::Str)),
             "_socket_set_timeout" => (vec![file_ty, i64_ty], Type::result(Type::Void, Type::Str)),
+            // TLS connections are int64 handles into the runtime's session
+            // table (see `prepoly_runtime::tls` and std/net/tls.pp).
+            "_tls_connect" => (
+                vec![Type::Str, i64_ty.clone()],
+                Type::result(i64_ty, Type::Str),
+            ),
+            "_tls_read" => (
+                vec![i64_ty.clone(), i64_ty],
+                Type::result(bytes_ty, Type::Str),
+            ),
+            "_tls_write" => (
+                vec![i64_ty.clone(), bytes_ty],
+                Type::result(i64_ty, Type::Str),
+            ),
+            "_tls_close" => (vec![i64_ty], Type::result(Type::Void, Type::Str)),
             _ => return None,
         };
         self.check_builtin_args_against(name, args, &params, span, scopes);
@@ -326,6 +341,12 @@ impl<'a> Checker<'a> {
             )),
             "_socket_addr" => Some(Type::result(Type::Str, Type::Str)),
             "_socket_set_timeout" => Some(Type::result(Type::Void, Type::Str)),
+            "_tls_connect" | "_tls_write" => Some(Type::result(Type::Int(IntKind::I64), Type::Str)),
+            "_tls_read" => Some(Type::result(
+                Type::Slice(Box::new(Type::Int(IntKind::U8))),
+                Type::Str,
+            )),
+            "_tls_close" => Some(Type::result(Type::Void, Type::Str)),
             "input" => Some(Type::result(Type::Str, Type::Str)),
             "len" => Some(Type::Int(IntKind::I64)),
             "print" | "println" | "assert" => Some(Type::Void),

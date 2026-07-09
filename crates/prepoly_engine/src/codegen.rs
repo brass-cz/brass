@@ -1562,6 +1562,32 @@ pub trait Codegen {
                 };
                 self.net_call(rt, &[sock, n])
             }
+            // TLS primitives share the network call shape; the connection is
+            // an int64 handle rather than a File.
+            "_tls_connect" => {
+                let i64t = Type::Int(prepoly_hir::IntKind::I64);
+                let host = self.codegen_operand(program, f, &args[0], &Type::Str);
+                let port = self.codegen_operand(program, f, &args[1], &i64t);
+                self.net_call("pp_tls_connect", &[host, port])
+            }
+            "_tls_read" => {
+                let i64t = Type::Int(prepoly_hir::IntKind::I64);
+                let h = self.codegen_operand(program, f, &args[0], &i64t);
+                let max = self.codegen_operand(program, f, &args[1], &i64t);
+                self.net_call("pp_tls_read", &[h, max])
+            }
+            "_tls_write" => {
+                let i64t = Type::Int(prepoly_hir::IntKind::I64);
+                let h = self.codegen_operand(program, f, &args[0], &i64t);
+                let bty = operand_type_of(&args[1], &f.local_types);
+                let bytes = self.codegen_operand(program, f, &args[1], &bty);
+                self.net_call("pp_tls_write", &[h, bytes])
+            }
+            "_tls_close" => {
+                let i64t = Type::Int(prepoly_hir::IntKind::I64);
+                let h = self.codegen_operand(program, f, &args[0], &i64t);
+                self.net_call("pp_tls_close", &[h])
+            }
             // Integer width conversions: widen is infallible, narrow
             // returns a range-checked Result.
             "_int_widen" | "_int_narrow" => {

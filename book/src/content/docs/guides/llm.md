@@ -410,8 +410,11 @@ import geometry.vec as g
   port) -> int64!`, `sock.recv_from(max) -> Datagram!`
   (`{ data: uint8[], addr: string }`). Convert bytes with
   `to_bytes(string) -> uint8[]` and `to_text(uint8[]) -> string!`. TCP is a
-  byte stream (one read may return a partial message). Networking does not
-  run on `prepoly repl`.
+  byte stream (one read may return a partial message). For HTTPS-grade
+  encryption: `import std.net.tls.{ TlsStream }`;
+  `TlsStream.connect(host, port) -> TlsStream!` verifies the certificate and
+  then mirrors `Tcp` (`read`/`write`/`close`). Networking does not run on
+  `prepoly repl`.
 - JSON: also nested -- `import std.data.json.{ JsonValue, parse, stringify }`.
   `parse(text) -> JsonValue!`; accessors `get(key)`, `at(index)`, `as_bool()`,
   `as_number()`, `as_string()` (each fallible), `is_null()`; `stringify(v)` is

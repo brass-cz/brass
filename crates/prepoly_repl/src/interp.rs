@@ -692,9 +692,11 @@ impl<'p, 'm> Interp<'p, 'm> {
             | "_udp_send_to"
             | "_udp_recv_from"
             | "_socket_addr"
-            | "_socket_set_timeout" => {
-                Err("networking is not supported by the REPL runtime".into())
-            }
+            | "_socket_set_timeout"
+            | "_tls_connect"
+            | "_tls_read"
+            | "_tls_write"
+            | "_tls_close" => Err("networking is not supported by the REPL runtime".into()),
             "_float_sqrt" | "_float_floor" | "_float_ceil" | "_float_pow" => {
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {

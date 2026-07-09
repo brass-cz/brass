@@ -194,6 +194,38 @@ listener is auto-guarded by a cown lock that a blocking `accept` would then
 hold — and TCP is a byte stream: one `read` may return less than what the
 peer wrote, so frame messages or read in a loop.
 
+## `std.net.tls`
+
+```prepoly norun
+import std.net.tls.{ TlsStream }
+```
+
+TLS **client** connections, backed by rustls built into the runtime.
+Certificate verification uses the bundled Mozilla root set with the server
+name taken from `host`; there are no configuration knobs (no custom CAs, no
+server side yet). `TlsStream` mirrors `Tcp`, so code written against
+`read`/`write` structurally accepts either:
+
+| Method                          | Signature                        | Behavior                                              |
+| ------------------------------- | -------------------------------- | ------------------------------------------------------ |
+| `TlsStream.connect(host, port)` | `(string, int64) -> TlsStream!`  | TCP connect + full handshake; certificate errors fail here |
+| `conn.read(max)`                | `(int64) -> uint8[]!`            | up to `max` decrypted bytes; empty at end-of-stream    |
+| `conn.write(data)`              | `(uint8[]) -> int64!`            | encrypt and send all of `data`                         |
+| `conn.close()`                  | `() -> void!`                    | sends the TLS close notification                       |
+
+```prepoly norun
+import std.net.tls.{ TlsStream }
+import std.net.{ to_bytes, to_text }
+
+let conn = TlsStream.connect("example.com", 443)!
+conn.write(to_bytes("GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"))!
+println(to_text(conn.read(16)!)!)   // HTTP/1.1 200 OK
+conn.close()!
+```
+
+A driver built without the `tls` cargo feature (and the wasm interpreter)
+keeps the same API but every call returns an error Result.
+
 ## `std.collections`
 
 ```prepoly

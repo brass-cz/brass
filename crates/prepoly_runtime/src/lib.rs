@@ -15,6 +15,7 @@ pub mod mem;
 pub mod net;
 pub mod region;
 pub mod rt;
+pub mod tls;
 
 /// Every C-ABI runtime primitive paired with its address, so the JIT can map
 /// the module's external declarations to these implementations directly
@@ -96,6 +97,10 @@ pub fn symbols() -> Vec<(&'static str, usize)> {
         net::pp_udp_recv_from,
         net::pp_socket_addr,
         net::pp_socket_set_timeout,
+        tls::pp_tls_connect,
+        tls::pp_tls_read,
+        tls::pp_tls_write,
+        tls::pp_tls_close,
         gc::pp_gc_register,
         gc::pp_gc_collect,
         gc::pp_freeze_deep,
