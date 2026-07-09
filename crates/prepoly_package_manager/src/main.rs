@@ -270,14 +270,33 @@ fn cmd_drive(mode: &str) -> ExitCode {
         cmd.env("PREPOLY_PACKAGES", &env_val);
     }
 
-    match cmd.status() {
+    child_exit(cmd.status(), "prepoly")
+}
+
+/// Map a spawned tool's exit status to ppm's own. A signal death (no exit
+/// code -- e.g. a SIGSEGV in JIT-compiled code) is reported explicitly:
+/// mapping it silently to exit 1 made crashes look like quiet failures.
+fn child_exit(status: std::io::Result<std::process::ExitStatus>, tool: &str) -> ExitCode {
+    match status {
         Ok(s) if s.success() => ExitCode::SUCCESS,
-        Ok(s) => {
-            let code: u8 = s.code().unwrap_or(1) as u8;
-            ExitCode::from(code)
-        }
+        Ok(s) => match s.code() {
+            Some(code) => ExitCode::from(code as u8),
+            None => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    match s.signal() {
+                        Some(sig) => eprintln!("error: {tool} terminated by signal {sig}"),
+                        None => eprintln!("error: {tool} terminated abnormally"),
+                    }
+                }
+                #[cfg(not(unix))]
+                eprintln!("error: {tool} terminated abnormally");
+                ExitCode::FAILURE
+            }
+        },
         Err(e) => {
-            eprintln!("error: cannot run prepoly: {e}");
+            eprintln!("error: cannot run {tool}: {e}");
             ExitCode::FAILURE
         }
     }
@@ -303,17 +322,7 @@ fn cmd_lsp() -> ExitCode {
         cmd.env("PREPOLY_PACKAGES", &env_val);
     }
 
-    match cmd.status() {
-        Ok(s) if s.success() => ExitCode::SUCCESS,
-        Ok(s) => {
-            let code: u8 = s.code().unwrap_or(1) as u8;
-            ExitCode::from(code)
-        }
-        Err(e) => {
-            eprintln!("error: cannot run prepoly-lsp: {e}");
-            ExitCode::FAILURE
-        }
-    }
+    child_exit(cmd.status(), "prepoly-lsp")
 }
 
 /// `$HOME/.prepoly/packages/`, created on demand.

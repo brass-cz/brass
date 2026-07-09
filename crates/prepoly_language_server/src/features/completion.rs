@@ -456,7 +456,7 @@ fn program_symbols(full: &FullAnalysis) -> Vec<CompletionItem> {
     let visible = |module: &[String], name: &str| {
         module.is_empty()
             || module == main_module.as_slice()
-            || module.first().map(|s| s == "std").unwrap_or(false)
+            || full.program.prelude_modules.contains(module)
             || imported.iter().any(|n| n == name)
     };
 

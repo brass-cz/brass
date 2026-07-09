@@ -1698,6 +1698,7 @@ mod tests {
     fn errors(src: &str) -> Vec<String> {
         let ast = prepoly_parser::parse(src).expect("parse");
         let (program, lerr) = prepoly_hir::lower(&[prepoly_hir::LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);

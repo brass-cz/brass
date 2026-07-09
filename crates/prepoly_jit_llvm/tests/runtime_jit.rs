@@ -21,6 +21,7 @@ fn compiles_and_runs_an_instance_after_finalize() {
                fun main() {\n  let x = triple(7)\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errs) = prepoly_hir::lower(&[prepoly_hir::LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -59,6 +60,7 @@ fn on_demand_monomorphize_and_compile_for_a_runtime_type() {
                fun main() {\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errs) = prepoly_hir::lower(&[prepoly_hir::LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -115,6 +117,7 @@ fn deferred_monomorphization_end_to_end() {
                fun main() {\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errs) = prepoly_hir::lower(&[prepoly_hir::LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -179,6 +182,7 @@ fn prepoly_program_triggers_deferred_dispatch() {
                fun main() {\n  let seed = Person { age: 0 }\n  let _ = run_it(seed)\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errs) = prepoly_hir::lower(&[prepoly_hir::LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);

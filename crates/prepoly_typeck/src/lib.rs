@@ -287,7 +287,7 @@ fn resolve_annotations(program: &Program) -> Vec<TypeError> {
         // never reaches here -- the origin path above resolved it).
         let visible = def == module
             || def.is_empty()
-            || def.first().map(String::as_str) == Some("std")
+            || program.prelude_modules.contains(def)
             || program
                 .import_origins
                 .get(module)
@@ -520,6 +520,7 @@ mod tests {
     fn errs(src: &str) -> Vec<String> {
         let ast = parse(src).expect("parse");
         let (prog, lerr) = lower(&[LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);
@@ -530,6 +531,7 @@ mod tests {
     fn analysis(src: &str) -> Analysis {
         let ast = parse(src).expect("parse");
         let (prog, lerr) = lower(&[LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);

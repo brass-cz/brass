@@ -1988,6 +1988,7 @@ mod tests {
                    fun main() {\n  let p = Point { x: 1, y: 2 }\n  let s = add(p.x, p.y)\n  println(string.from(s))\n}\n";
         let ast = prepoly_parser::parse(src).expect("parse");
         let (program, errs) = prepoly_hir::lower(&[prepoly_hir::LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);
@@ -2007,6 +2008,7 @@ mod tests {
                    fun main() {\n  let r = checked(5)\n}\n";
         let ast = prepoly_parser::parse(src).expect("parse");
         let (program, errs) = prepoly_hir::lower(&[prepoly_hir::LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);
@@ -2029,6 +2031,7 @@ mod tests {
                    fun main() {\n  let r = read_text(\"/tmp/missing\")\n}\n";
         let ast = prepoly_parser::parse(src).expect("parse");
         let (program, errs) = prepoly_hir::lower(&[prepoly_hir::LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);

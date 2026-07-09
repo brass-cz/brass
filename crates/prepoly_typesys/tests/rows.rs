@@ -8,6 +8,7 @@ use prepoly_typesys::{Presence, RowInfo, RowTy, check_row};
 fn analyze(src: &str) -> (prepoly_hir::Program, RowInfo) {
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];

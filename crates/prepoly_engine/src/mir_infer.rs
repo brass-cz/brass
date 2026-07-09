@@ -655,6 +655,7 @@ mod tests {
             prepoly_parser::parse("fun add(a: int32, b: int32) -> int32 {\n  return a + b\n}\n")
                 .expect("parse");
         let (program, errs) = prepoly_hir::lower(&[prepoly_hir::LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);
@@ -696,6 +697,7 @@ mod tests {
                    fun get_x(p: Point) -> int32 {\n  return p.x\n}\n";
         let ast = prepoly_parser::parse(src).expect("parse");
         let (program, errs) = prepoly_hir::lower(&[prepoly_hir::LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);
@@ -745,6 +747,7 @@ mod tests {
                    fun caller(n: int32) -> string {\n  return helper(n)\n}\n";
         let ast = prepoly_parser::parse(src).expect("parse");
         let (program, errs) = prepoly_hir::lower(&[prepoly_hir::LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);
@@ -789,6 +792,7 @@ mod tests {
         let src = "fun describe(p) {\n  let next = p.age + 1\n  let l = p.label\n}\n";
         let ast = prepoly_parser::parse(src).expect("parse");
         let (program, errs) = prepoly_hir::lower(&[prepoly_hir::LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);

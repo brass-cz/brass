@@ -154,6 +154,7 @@ fn run_pipeline(
 ) {
     let mut modules = context.to_vec();
     modules.push(LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast: main,
     });

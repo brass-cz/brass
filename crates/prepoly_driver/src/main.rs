@@ -821,6 +821,7 @@ fn analyze(main_label: &str, main_src: &str, root: &Path) -> Result<Checked, Vec
     }
     modules.extend(deps);
     modules.push(LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast: main_ast,
     });

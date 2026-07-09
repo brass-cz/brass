@@ -95,7 +95,11 @@ pub fn load_std_nested(
         for imp in &ast.imports {
             work.push(imp.path.clone());
         }
-        out.push(LoadedModule { path, ast });
+        out.push(LoadedModule {
+            is_prelude: false,
+            path,
+            ast,
+        });
     }
     out
 }
@@ -203,7 +207,11 @@ pub fn parse_stdlib(sources: &mut SourceMap) -> Result<Vec<LoadedModule>, String
         })?;
         let mut path = vec!["std".to_string()];
         path.extend(name.split('/').map(str::to_string));
-        modules.push(LoadedModule { path, ast });
+        modules.push(LoadedModule {
+            is_prelude: true,
+            path,
+            ast,
+        });
     }
     Ok(modules)
 }
@@ -428,6 +436,7 @@ pub fn load_module(
     stack.remove(&key);
     visited.insert(key.clone());
     out.push(LoadedModule {
+        is_prelude: false,
         path: path.to_vec(),
         ast,
     });

@@ -236,13 +236,39 @@ impl<'a> Checker<'a> {
     /// Combine the inferred normal (Ok) and error (Err) return payloads into a
     /// single return type. A function that only ever returns via `error(..)` /
     /// propagation still has an inferred `Ok` payload as a fresh unknown.
+    ///
+    /// A normal payload that is itself a `Result` is forwarded whole, never
+    /// nested: the back ends Ok-wrap only bare return values (an
+    /// already-fallible value passes through), so a nested
+    /// `Result<Result<T>>` here would describe a value the program never
+    /// builds -- the mismatch surfaces as a double-`!` unwrap that
+    /// reinterprets the payload record as a Result (type confusion). This
+    /// mirrors the annotated-return path, which flows `Result`-typed values
+    /// whole (see `check_return`).
     pub(super) fn result_from_payloads(
         &mut self,
         normal_ty: Option<Type>,
         err_ty: Option<Type>,
     ) -> Type {
         match (normal_ty, err_ty) {
-            (Some(ok), Some(err)) => Type::result(ok, err),
+            (Some(ok), Some(err)) => {
+                let resolved = self.resolve(&ok);
+                if let Some((fwd_ok, fwd_err)) = resolved.result_payloads() {
+                    // The forwarded Result's error payload and the body's own
+                    // error sites must describe one type; prefer the concrete
+                    // side when only one is known. (Two concrete but
+                    // different payloads keep the forwarded one -- the same
+                    // first-wins policy `reconcile_error_payloads` applies.)
+                    let merged = if fwd_err.is_unknown() {
+                        err
+                    } else {
+                        fwd_err.clone()
+                    };
+                    Type::result(fwd_ok.clone(), merged)
+                } else {
+                    Type::result(ok, err)
+                }
+            }
             (Some(ty), None) => ty,
             (None, Some(err)) => Type::result(self.fresh_error_only_ok(), err),
             (None, None) => Type::Void,

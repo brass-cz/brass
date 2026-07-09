@@ -273,7 +273,10 @@ impl<'a> Checker<'a> {
         if defining == self.current_module.as_slice() || defining.is_empty() {
             return true;
         }
-        if defining.first().map(String::as_str) == Some("std") && !name.starts_with('_') {
+        // Only the implicit-prelude modules are visible with no import; the
+        // nested standard-library modules (`std.net`, ...) follow the same
+        // import rule as user modules.
+        if self.program.prelude_modules.contains(defining) && !name.starts_with('_') {
             return true;
         }
         self.import_remote(name).is_none()
@@ -292,7 +295,8 @@ impl<'a> Checker<'a> {
         if defining == self.current_module.as_slice() || defining.is_empty() {
             return true;
         }
-        if defining.first().map(String::as_str) == Some("std") && !name.starts_with('_') {
+        // Prelude only, as in `is_module_name_visible`.
+        if self.program.prelude_modules.contains(defining) && !name.starts_with('_') {
             return true;
         }
         let Some(origins) = self.program.import_origins.get(&self.current_module) else {

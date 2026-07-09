@@ -25,6 +25,7 @@ const DISPLAY: &str = "fun display(obj) -> string {\n\
 fn three_shapes_collapse_to_one_display_instance() {
     let ast = prepoly_parser::parse(DISPLAY).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];

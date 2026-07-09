@@ -164,6 +164,7 @@ mod tests {
 
     fn module(path: &[&str], src: &str) -> LoadedModule {
         LoadedModule {
+            is_prelude: false,
             path: path.iter().map(|s| s.to_string()).collect(),
             ast: parse(src).expect("parse"),
         }

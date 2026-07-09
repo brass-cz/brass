@@ -73,6 +73,7 @@ fn engine_jits_unboxed_typed_instances() {
 
     let ast = prepoly_parser::parse(SRC).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -129,6 +130,7 @@ fun use_flt() {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -187,6 +189,7 @@ fun fdemo() {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -249,6 +252,7 @@ fun demo_mutate() {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -296,6 +300,7 @@ fun rect_area() {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -343,6 +348,7 @@ fun nested_field() {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -384,6 +390,7 @@ fun text_len() {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -430,6 +437,7 @@ fun eq_len() {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -482,6 +490,7 @@ fun sum_loop() {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -535,6 +544,7 @@ fun count_built() {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -587,6 +597,7 @@ fun pop_empty_is_null() -> int32 {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -642,6 +653,7 @@ fun rendered_len() -> int64 {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -685,6 +697,7 @@ fun adder() {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -729,6 +742,7 @@ fun via_run() {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -766,6 +780,7 @@ fun main() {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -826,6 +841,7 @@ fun unwrap_or_zero() -> int32 {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -878,6 +894,7 @@ fun err_val() {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -935,6 +952,7 @@ fun err_case() {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -985,6 +1003,7 @@ fun byte_overflow() {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -1049,6 +1068,7 @@ fun result() -> int32 {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -1087,6 +1107,7 @@ fun scaled() {
 ";
     let ast = prepoly_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }];
@@ -1125,6 +1146,7 @@ fn sync_makes_spawned_results_observable() {
                fun main() {\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -1156,6 +1178,7 @@ fn rc_reclaims_string_temporaries() {
                fun main() {\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -1193,6 +1216,7 @@ fn rc_reclaims_loop_string_temporaries() {
                fun main() {\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -1232,6 +1256,7 @@ fn rc_balances_string_interpolation() {
                fun main() {\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -1269,6 +1294,7 @@ fn rc_reclaims_record_temporaries() {
                fun main() {\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -1303,6 +1329,7 @@ fn rc_recursive_destructor_releases_record_fields() {
                fun main() {\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -1341,6 +1368,7 @@ fn rc_reclaims_array_and_sum() {
                fun main() {\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -1388,6 +1416,7 @@ fn rc_releases_overwritten_field_element_and_global() {
                fun main() {\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -1423,6 +1452,7 @@ fn rc_recursive_array_releases_string_elements() {
                fun main() {\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -1457,6 +1487,7 @@ fn rc_recursive_sum_releases_variant_fields() {
                fun main() {\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -1493,6 +1524,7 @@ fn rc_reclaims_spawned_closures() {
                fun main() {\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -1528,6 +1560,7 @@ fn rc_spawned_closure_releases_heap_capture() {
                fun main() {\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -1561,6 +1594,7 @@ fn array_renders_as_bracketed_list() {
                fun main() {\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -1592,6 +1626,7 @@ fn trailing_nullable_param_is_optional() {
                fun main() {\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -1624,6 +1659,7 @@ fn captured_mutated_local_is_a_shared_cell() {
                fun main() {\n}\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -1654,6 +1690,7 @@ fn cycle_collector_reclaims_record_cycle() {
                }\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -1685,6 +1722,7 @@ fn cycle_collector_reclaims_two_node_cycle() {
                }\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);
@@ -1716,6 +1754,7 @@ fn cycle_collector_reclaims_data_owned_by_cycle() {
                }\n";
     let ast = prepoly_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
         path: vec!["main".into()],
         ast,
     }]);

@@ -5,7 +5,7 @@
 //! and end-to-end checks run the full HIR lowering so call routing, types, and
 //! `error(...)` resolve as they do in the real pipeline.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use prepoly_hir::{LoadedModule, Program};
 use prepoly_mir::{MirBody, body_to_string, lower_body, lower_program, program_to_string};
@@ -17,6 +17,7 @@ fn empty_program() -> Program {
         types: HashMap::new(),
         functions: HashMap::new(),
         inits: Vec::new(),
+        prelude_modules: HashSet::new(),
         module_imports: HashMap::new(),
         import_origins: HashMap::new(),
         import_renames: HashMap::new(),
@@ -51,6 +52,7 @@ fn lower_first(src: &str) -> (MirBody, Vec<prepoly_mir::MirClosure>) {
 fn lower_whole(src: &str) -> String {
     let ast = prepoly_parser::parse(src).expect("source parses");
     let modules = [LoadedModule {
+        is_prelude: false,
         path: vec!["main".to_string()],
         ast,
     }];

@@ -154,6 +154,7 @@ mod tests {
         let src = "fun main() {\n  let x = 1 + 2\n}\n";
         let ast = prepoly_parser::parse(src).expect("parse");
         let (program, errs) = prepoly_hir::lower(&[prepoly_hir::LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);

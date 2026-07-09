@@ -172,7 +172,10 @@ fn non_imported_public_name_is_invisible() {
     );
     let (ok, out) = check(&main);
     assert!(!ok, "expected failure");
-    assert!(out.contains("unknown function `hidden_public`"), "{out}");
+    assert!(
+        out.contains("`hidden_public` is defined in module `lib.util` but not imported here"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -192,7 +195,10 @@ fn private_name_is_invisible_by_direct_use_from_another_module() {
     );
     let (ok, out) = check(&main);
     assert!(!ok, "expected failure");
-    assert!(out.contains("unknown function `_secret`"), "{out}");
+    assert!(
+        out.contains("`_secret` is private to module `lib.util`"),
+        "{out}"
+    );
 }
 
 #[test]

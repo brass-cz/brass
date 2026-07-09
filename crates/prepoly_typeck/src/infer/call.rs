@@ -177,10 +177,20 @@ impl<'a> Checker<'a> {
             // other name is undeclared and reported here rather than collapsing
             // to a fresh unknown.
             if !self.is_resolvable_free_name(name) && !self.is_type_word(name) {
-                self.errors.push(TypeError {
-                    message: format!("unknown function `{name}`"),
-                    span,
-                });
+                // A function that exists but is not visible here gets a
+                // pointed hint: an import for a public name; privacy for a
+                // `_` name (which cannot be imported, so no import hint).
+                let message = match self.program.functions.get(name) {
+                    Some(f) if !f.module.is_empty() && name.starts_with('_') => {
+                        format!("`{name}` is private to module `{}`", f.module.join("."))
+                    }
+                    Some(f) if !f.module.is_empty() => format!(
+                        "`{name}` is defined in module `{}` but not imported here",
+                        f.module.join(".")
+                    ),
+                    _ => format!("unknown function `{name}`"),
+                };
+                self.errors.push(TypeError { message, span });
                 for a in args {
                     self.check_expr(&a.expr, scopes);
                 }

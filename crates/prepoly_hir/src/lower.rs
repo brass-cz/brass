@@ -193,6 +193,11 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
         types,
         functions,
         inits,
+        prelude_modules: modules
+            .iter()
+            .filter(|m| m.is_prelude)
+            .map(|m| m.path.clone())
+            .collect(),
         module_imports,
         import_origins,
         import_renames,
@@ -866,6 +871,7 @@ mod tests {
     fn lower_messages(src: &str) -> Vec<String> {
         let ast = parse(src).expect("parse");
         let (_, errors) = lower(&[LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);
@@ -876,6 +882,7 @@ mod tests {
         let loaded: Vec<LoadedModule> = modules
             .iter()
             .map(|(path, src)| LoadedModule {
+                is_prelude: false,
                 path: path.iter().map(|s| s.to_string()).collect(),
                 ast: parse(src).expect("parse"),
             })
@@ -911,6 +918,7 @@ mod tests {
         let loaded: Vec<LoadedModule> = modules
             .iter()
             .map(|(path, src)| LoadedModule {
+                is_prelude: false,
                 path: path.iter().map(|s| s.to_string()).collect(),
                 ast: parse(src).expect("parse"),
             })
@@ -930,6 +938,7 @@ mod tests {
         let loaded: Vec<LoadedModule> = modules
             .iter()
             .map(|(path, src)| LoadedModule {
+                is_prelude: false,
                 path: path.iter().map(|s| s.to_string()).collect(),
                 ast: parse(src).expect("parse"),
             })
@@ -1103,6 +1112,7 @@ mod tests {
         )
         .expect("parse");
         let (program, errors) = lower(&[LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);
@@ -1155,6 +1165,7 @@ mod tests {
         )
         .expect("parse");
         let (program, errors) = lower(&[LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);
@@ -1189,6 +1200,7 @@ mod tests {
         )
         .expect("parse");
         let (program, errors) = lower(&[LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);
@@ -1216,6 +1228,7 @@ mod tests {
     fn assigns_stable_unknowns_to_unannotated_interface_method_signatures() {
         let ast = parse("type Consumer = {\n    consume(self, value)\n}\n").expect("parse");
         let (program, errors) = lower(&[LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);
@@ -1248,6 +1261,7 @@ mod tests {
         )
         .expect("parse");
         let (program, errors) = lower(&[LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);
@@ -1288,6 +1302,7 @@ mod tests {
         )
         .expect("parse");
         let (program, errors) = lower(&[LoadedModule {
+            is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);
