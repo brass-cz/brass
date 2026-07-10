@@ -506,10 +506,11 @@ fn hover_method_return_resolved_from_instance_via_scheme() {
     );
 }
 
-/// Hovering a record value shows the type's full member list with this instance's
-/// field types resolved: `entries` shows the concrete element type the map was
-/// built with (not `unknown`), every public member is listed, and the `_`-prefixed
-/// implementation methods are hidden.
+/// Hovering a record value shows the type's full member list with this
+/// instance's types resolved: the map's `key`/`value` type slots show the
+/// concrete types it was built with (not `unknown`), the public methods are
+/// listed, and the `_`-prefixed implementation fields and methods are hidden --
+/// a `HashMap` reads as just its slots and operations.
 #[test]
 fn hover_record_instance_shows_resolved_public_members() {
     let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n}\n";
@@ -517,27 +518,97 @@ fn hover_record_instance_shows_resolved_public_members() {
     let (doc, pos) = position(src, "map.set", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the map value"));
     assert!(
-        text.contains("entries: _Entry<key=string, value=string>?[]"),
-        "entries must show its resolved element type: {text}"
+        text.contains("key: string") && text.contains("value: string"),
+        "the slots must show this instance's key/value types: {text}"
     );
-    assert!(text.contains("fun set("), "public methods listed: {text}");
+    // Method signatures resolve against this instance through the scheme: the
+    // stored value type flows into parameters and returns, a value-or-null
+    // return is nullable, and a constructor returns `Self`.
+    assert!(
+        text.contains("fun set(self, key: string, value: string) -> void"),
+        "set must specialize to the instance: {text}"
+    );
+    assert!(
+        text.contains("fun get(self, key: unknown_0) -> string?"),
+        "get must return the nullable value type: {text}"
+    );
+    assert!(
+        text.contains("fun keys(self) -> string[]"),
+        "keys must return the key array: {text}"
+    );
+    assert!(
+        text.contains("fun new() -> Self"),
+        "a constructor's own type shows as Self: {text}"
+    );
+    assert!(
+        !text.contains("_entries") && !text.contains("_cap") && !text.contains("_states"),
+        "`_`-prefixed implementation fields must be hidden: {text}"
+    );
     assert!(
         !text.contains("_find") && !text.contains("_insert") && !text.contains("_hash"),
         "`_`-prefixed implementation methods must be hidden: {text}"
     );
 }
 
-/// Hovering a type name hides its `_`-prefixed implementation members.
+/// Hovering the name of a record with `slot: type` type parameters lists the
+/// slots ahead of the fields, as declared: the slot as `slot: type` and a field
+/// written over it as `Self.slot`, not as an anonymous `unknown_N`.
+#[test]
+fn hover_type_name_shows_type_slots() {
+    let src = "type Box = {\n    item: type\n    data: Self.item[]\n}\n\nfun Box.new(seed) {\n    let arr = [seed]\n    return Self { data: arr }\n}\n\nfun main() {\n    let boxed = Box.new(42)\n    println(boxed.data[0])\n}\n";
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "Box", false);
+    let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the type name"));
+    assert!(text.contains("item: type"), "the slot is listed: {text}");
+    assert!(
+        text.contains("data: Self.item[]"),
+        "a field over the slot renders it by name: {text}"
+    );
+}
+
+/// Hovering a value of a slotted record shows each slot pinned to the concrete
+/// type this instance carries, recovered from the instance's field types.
+#[test]
+fn hover_record_instance_shows_pinned_type_slots() {
+    let src = "type Box = {\n    item: type\n    data: Self.item[]\n}\n\nfun Box.new(seed) {\n    let arr = [seed]\n    return Self { data: arr }\n}\n\nfun main() {\n    let boxed = Box.new(42)\n    println(boxed.data[0])\n}\n";
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "boxed = Box.new", false);
+    let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the instance"));
+    assert!(
+        text.contains("item: int32"),
+        "the slot shows the instance's pinned type: {text}"
+    );
+    assert!(
+        text.contains("data: int32[]"),
+        "the field shows the instance's concrete type: {text}"
+    );
+}
+
+/// Hovering a type name hides its `_`-prefixed implementation members and shows
+/// its open type slots as declared.
 #[test]
 fn hover_type_name_hides_internal_members() {
     let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "HashMap.new", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the HashMap type"));
-    assert!(text.contains("fun set("), "public methods shown: {text}");
+    // With no instance, method types are expressed over the declaration's own
+    // slots (`Self.key`/`Self.value`), not anonymous unknowns.
+    assert!(
+        text.contains("fun set(self, key: Self.key, value: Self.value) -> void"),
+        "set must be expressed over the slots: {text}"
+    );
+    assert!(
+        text.contains("key: type") && text.contains("value: type"),
+        "the open slots are shown as declared: {text}"
+    );
     assert!(
         !text.contains("_hash") && !text.contains("_find"),
         "internal methods must be hidden: {text}"
+    );
+    assert!(
+        !text.contains("_entries") && !text.contains("_cap"),
+        "internal fields must be hidden: {text}"
     );
 }
 
@@ -620,6 +691,50 @@ fn completion_offers_types_and_functions() {
         labels.contains(&"int32".to_string()),
         "builtin type: {labels:?}"
     );
+}
+
+/// A native plugin module surfaces through the LSP like a `.pp` module:
+/// hover on an imported plugin function shows its annotated signature and the
+/// Rust doc comment, and the import brace list offers the dylib's exposed
+/// functions.
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn plugin_functions_hover_and_complete() {
+    let lib = prepoly_plugin_host::fixture::build_testlib();
+    let root = PathBuf::from("/tmp/prepoly_lsp_plugin_test");
+    let plugins = root.join("plugins");
+    std::fs::create_dir_all(&plugins).expect("create plugin dir");
+    let target = plugins.join(format!("mathx{}", std::env::consts::DLL_SUFFIX));
+    std::fs::copy(&lib, &target).expect("place the plugin library");
+    let main = root.join("main.pp");
+
+    // Hover carries the synthesized signature and the plugin's Rust doc.
+    let src =
+        "import plugins.mathx.{ add }\nfun main() {\n    let v = add(1, 2)\n    println(v)\n}\n";
+    let full = DocAnalyzer::new(main.clone())
+        .analyze_full(src)
+        .expect("analyze a program importing a plugin");
+    let (doc, pos) = position(src, "add(1", false);
+    let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the plugin function"));
+    assert!(
+        text.contains("fun add(a: int64, b: int64) -> int64"),
+        "signature from the manifest: {text}"
+    );
+    assert!(
+        text.contains("Adds two integers."),
+        "Rust doc comment: {text}"
+    );
+
+    // The import brace list enumerates the dylib's functions.
+    let brace_src = "import plugins.mathx.{  }\n";
+    let analyzer = DocAnalyzer::new(main.clone());
+    let doc = Document::new(brace_src.to_string(), 1);
+    let off = brace_src.find('{').unwrap() + 2;
+    let items = completion::completion(&doc, &analyzer, &main, doc.position_at(off));
+    let labels = labels(&items);
+    assert!(labels.contains(&"add".to_string()), "{labels:?}");
+    assert!(labels.contains(&"checked_div".to_string()), "{labels:?}");
+    assert!(labels.contains(&"undocumented".to_string()), "{labels:?}");
 }
 
 /// In `import |`, the prelude module names and the `std` namespace are offered.

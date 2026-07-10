@@ -10,6 +10,11 @@ use super::*;
 /// loaded (for example in typeck unit tests), so name resolution must not
 /// reject them. Keep this list in sync with the runtime dispatcher.
 pub(super) fn is_runtime_builtin_value(name: &str) -> bool {
+    // The native-plugin dispatch family (`_plugin_call_i` etc., emitted by
+    // the loader's synthesized plugin modules) is decoded by suffix.
+    if prepoly_hir::plugin_builtin_return(name).is_some() {
+        return true;
+    }
     matches!(
         name,
         "print"
@@ -27,6 +32,7 @@ pub(super) fn is_runtime_builtin_value(name: &str) -> bool {
             | "read_file"
             | "write_file"
             | "open"
+            | "_file_from_fd"
             | "error"
             | "_string_concat"
             | "_string_slice"

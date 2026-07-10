@@ -1,0 +1,17 @@
+# In-repo fixture plugin used by the workspace's plugin tests. Not part of the
+# default build set; test suites build it on demand (see
+# prepoly_plugin_host::fixture).
+[package]
+name = "prepoly_plugin_testlib"
+description = "Fixture Prepoly plugin exercised by the workspace tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+prepoly_plugin = { workspace = true }

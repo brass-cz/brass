@@ -1,0 +1,14 @@
+[package]
+name = "prepoly_plugin"
+description = "Author native Prepoly plugins: implement PrepolyLib, export functions, build a cdylib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+# Intentionally dependency-free: this crate is the only thing a plugin author
+# needs, and it must build anywhere a cdylib builds.
+[dependencies]

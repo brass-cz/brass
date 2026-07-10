@@ -9,3 +9,7 @@ path = "src/lib.rs"
 [dependencies]
 prepoly_parser.workspace = true
 prepoly_hir.workspace = true
+prepoly_plugin_host.workspace = true
+
+[dev-dependencies]
+prepoly_plugin_host = { workspace = true, features = ["fixture"] }

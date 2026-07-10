@@ -245,6 +245,8 @@ pub trait Codegen {
     /// A standard stream as a `File`: `which` is 0 = stdin, 1 = stdout, 2 = stderr
     /// (`File.stdin`/`File.stdout`/`File.stderr`).
     fn file_std(&mut self, which: u8) -> Self::Value;
+    /// `_file_from_fd(fd)`: adopt an already-open descriptor as a `File`.
+    fn file_from_fd(&mut self, fd: Self::Value) -> Self::Value;
     /// `file.read(n)`: a `Result<uint8[], string>` of up to `n` bytes.
     fn file_read(&mut self, file: Self::Value, n: Self::Value) -> Self::Value;
     /// `file.write(bytes)`: a `Result<int64, string>` (bytes written).
@@ -261,6 +263,21 @@ pub trait Codegen {
     /// typed `Result` object pointer. One hook covers the whole family because
     /// the calls share that shape (see `prepoly_runtime::net`).
     fn net_call(&mut self, rt_name: &'static str, args: &[Self::Value]) -> Self::Value;
+    /// A native-plugin call (`_plugin_[f]call_<t>`): `rt_name` is one of the
+    /// `pp_plugin_call_{int,float,obj}` runtime symbols, picked by return
+    /// class. `strings` are the path/name/sig string objects; `args` are the
+    /// payload values with their MIR types, packed by the back end into i64
+    /// slots (floats bit-cast, objects as addresses) and passed as an array,
+    /// since the arity is per-plugin-function. The raw runtime return (i64 /
+    /// f64 / object pointer) is coerced to `ret` (see
+    /// `prepoly_runtime::plugin`).
+    fn plugin_call(
+        &mut self,
+        rt_name: &'static str,
+        strings: [Self::Value; 3],
+        args: &[(Self::Value, Type)],
+        ret: &Type,
+    ) -> Self::Value;
     /// A numeric conversion `target.method(arg)` (`from`/`parse`): returns a
     /// typed `Result` for fallible cases, or the value for infallible `float.from`.
     fn convert(
@@ -1529,6 +1546,11 @@ pub trait Codegen {
                 let m = self.codegen_operand(program, f, &args[1], &Type::Str);
                 self.file_open(p, m)
             }
+            "_file_from_fd" => {
+                let i64t = Type::Int(prepoly_hir::IntKind::I64);
+                let fd = self.codegen_operand(program, f, &args[0], &i64t);
+                self.file_from_fd(fd)
+            }
             // Network primitives (`host, port` establishment forms): sockets
             // are `File`s, so their results reuse the File Result shapes.
             "_tcp_connect" | "_tcp_listen" | "_udp_bind" => {
@@ -1609,6 +1631,35 @@ pub trait Codegen {
                 } else {
                     self.int_narrow(x, from, to, signed)
                 }
+            }
+            // Native-plugin dispatch: three leading string operands (library
+            // path, function name, encoded signature) then the payload
+            // arguments, whose MIR types drive the slot packing. The runtime
+            // symbol is picked by return class: scalars come back in an i64
+            // (void/bool/int), floats in an f64, and strings/byte arrays/
+            // Results as object pointers.
+            n if prepoly_hir::plugin_builtin_return(n).is_some() => {
+                let ret = prepoly_hir::plugin_builtin_return(n).expect("checked in guard");
+                let strings = [
+                    self.codegen_operand(program, f, &args[0], &Type::Str),
+                    self.codegen_operand(program, f, &args[1], &Type::Str),
+                    self.codegen_operand(program, f, &args[2], &Type::Str),
+                ];
+                let payload: Vec<(Self::Value, Type)> = args[3..]
+                    .iter()
+                    .map(|a| {
+                        let t = operand_type_of(a, &f.local_types);
+                        (self.codegen_operand(program, f, a, &t), t)
+                    })
+                    .collect();
+                let rt = match &ret {
+                    Type::Float(_) => "pp_plugin_call_float",
+                    Type::Void | Type::Bool | Type::Int(_) => "pp_plugin_call_int",
+                    // Strings, byte arrays, and every fallible call (a Result
+                    // is a heap object).
+                    _ => "pp_plugin_call_obj",
+                };
+                self.plugin_call(rt, strings, &payload, &ret)
             }
             // Every builtin the front end accepts has an arm above; MIR lowering
             // turns any unresolved name into `Callee::Builtin`, so a name landing
@@ -2073,6 +2124,10 @@ fn builtin_result_type(name: &str, args: &[Operand], local_types: &[Type]) -> Op
         "_string_cmp" => Some(Type::Int(prepoly_hir::IntKind::I32)),
         "_int_to_string" | "_float_to_string" => Some(Type::Str),
         "_int_to_float" => Some(Type::Float(prepoly_hir::FloatKind::F64)),
+        // Native-plugin dispatch: the result shape is in the name's suffix.
+        n if prepoly_hir::plugin_builtin_return(n).is_some() => {
+            prepoly_hir::plugin_builtin_return(n)
+        }
         _ => None,
     }
 }

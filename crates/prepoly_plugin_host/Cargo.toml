@@ -1,0 +1,28 @@
+[package]
+name = "prepoly_plugin_host"
+description = "Host side of Prepoly's native plugin ABI: load a plugin cdylib, read its manifest, call its functions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Test-only helper that builds the in-repo fixture plugin
+# (`prepoly_plugin_testlib`) and returns the built library's path. Enabled by
+# the test suites of crates that exercise real plugin loading.
+fixture = []
+
+[dependencies]
+prepoly_plugin = { workspace = true }
+
+# Dynamic loading is native-only; the wasm build compiles stub loaders that
+# report plugins as unsupported (mirroring the runtime's tls/process gating).
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+libloading = "0.9"
+
+# The crate's own integration tests exercise the fixture helper.
+[dev-dependencies]
+prepoly_plugin_host = { workspace = true, features = ["fixture"] }

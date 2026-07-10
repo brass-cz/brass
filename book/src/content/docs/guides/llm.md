@@ -415,6 +415,15 @@ import geometry.vec as g
   `TlsStream.connect(host, port) -> TlsStream!` verifies the certificate and
   then mirrors `Tcp` (`read`/`write`/`close`). Networking does not run on
   `prepoly repl`.
+- Processes: a LIBRARY, not `std` -- its native half is a plugin. Build it with
+  `libraries/build.sh`, set `PREPOLY_PACKAGES=process=<repo>/libraries`, then
+  `import process.{ Command, Stdio }`. `Command.new(prog)`
+  then chained builder methods `arg(s)`/`args(ss)`/`stdin/stdout/stderr(Stdio)`
+  (`Stdio` is `| Inherit | Pipe | Null`), then `spawn() -> Child!`. On a
+  `Child`: `stdin()/stdout()/stderr() -> File!` (each requires that stream be
+  `Stdio.Pipe`), `wait() -> int32!` (exit code). A piped stream is a `File`,
+  so drive it with `read`/`write`/`close` and convert bytes with
+  `to_bytes`/`to_text`. The stream accessors need the native runtime.
 - JSON: also nested -- `import std.data.json.{ JsonValue, parse, stringify }`.
   `parse(text) -> JsonValue!`; accessors `get(key)`, `at(index)`, `as_bool()`,
   `as_number()`, `as_string()` (each fallible), `is_null()`; `stringify(v)` is

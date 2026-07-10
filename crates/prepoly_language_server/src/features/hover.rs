@@ -5,9 +5,12 @@
 //! `unknown_N` (see [`crate::render`]), which is the contract for displaying a
 //! function type that inference has left partly open.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use prepoly_hir::{CallableSignature, NominalType, Type, TypeKind, TypeScheme, TypedExprKind};
+use prepoly_hir::{
+    CallableSignature, NominalType, Substitution, Type, TypeInfo, TypeKind, TypeScheme,
+    TypedExprKind, collapse_nullable, substitute_vars,
+};
 use prepoly_parser::Span;
 use tower_lsp_server::ls_types::{
     Hover, HoverContents, MarkupContent, MarkupKind, Position, Range,
@@ -17,7 +20,7 @@ use crate::analysis::FullAnalysis;
 use crate::document::Document;
 use crate::features::nav;
 use crate::render::{
-    UnknownNamer, render_signature_into, render_type, render_type_def, render_type_def_with,
+    UnknownNamer, match_type_vars, render_signature_into, render_type, render_type_def_with,
 };
 
 /// Build the hover response for `pos` in `doc`, using the full analysis.
@@ -81,8 +84,12 @@ pub fn hover(doc: &Document, full: &FullAnalysis, pos: Position) -> Option<Hover
             return Some(function_hover(full, f, call_args, Some(doc.range_of(span))));
         }
         if let Some(t) = full.program.resolve_type(&module, &name) {
+            // The declaration view: no instance, so slots stay open and method
+            // types resolve against the declaration itself (`Self.<slot>`).
+            let empty = Substitution::empty();
+            let resolved = typedef_method_signatures(full, t, &empty);
             return Some(markup_with_doc(
-                render_type_def(t),
+                render_type_def_with(t, &empty, &resolved),
                 t.doc.as_deref(),
                 Some(doc.range_of(span)),
             ));
@@ -101,10 +108,10 @@ pub fn hover(doc: &Document, full: &FullAnalysis, pos: Position) -> Option<Hover
 }
 
 /// Hover for a value named `name` with resolved type `ty`. A record value shows
-/// the type's full member list (fields and methods, `_`-prefixed ones omitted)
-/// with this instance's field types resolved -- so `map`'s `entries` shows the
-/// concrete element type it was constructed with, and every member is visible.
-/// Any other value shows the compact `name: type` form.
+/// the type's full member list (slots, fields, and methods, `_`-prefixed ones
+/// omitted) with this instance's types resolved -- so a `HashMap` shows the
+/// `key`/`value` types it was constructed with. Any other value shows the
+/// compact `name: type` form.
 fn value_hover(full: &FullAnalysis, name: &str, ty: &Type, range: Option<Range>) -> Hover {
     let mut core = ty;
     while let Type::ConstOf(i) | Type::Mut(i) | Type::Ref(i) | Type::Nullable(i) = core {
@@ -113,8 +120,9 @@ fn value_hover(full: &FullAnalysis, name: &str, ty: &Type, range: Option<Range>)
     if let Type::Record(n) = core
         && let Some(info) = full.program.type_by_id(n.id)
     {
+        let resolved = typedef_method_signatures(full, info, &n.substitution);
         return markup_with_doc(
-            render_type_def_with(info, &n.substitution),
+            render_type_def_with(info, &n.substitution, &resolved),
             info.doc.as_deref(),
             range,
         );
@@ -231,11 +239,87 @@ fn scheme_resolved_signature(
     let mut out = sig.clone();
     for p in &mut out.params {
         if let Some(t) = p.resolved_ty.as_ref() {
-            p.resolved_ty = Some(apply_param_map(t, &map));
+            p.resolved_ty = Some(substitute_vars(t, &map));
         }
     }
-    out.ret_ty = Some(apply_param_map(&method.ret, &map));
+    out.ret_ty = Some(substitute_vars(&method.ret, &map));
     out
+}
+
+/// Pre-resolve each method's signature for the type-definition view (the
+/// member list a type-name or record-value hover shows). Parameter and return
+/// types come from the type's scheme -- the co-checked signatures expressed
+/// over the type's inferred parameters -- with each scheme parameter mapped to
+/// the concrete type the instance `substitution` pins, or, when open, to the
+/// declaration's own slot variable so it renders as `Self.<slot>`. The type's
+/// own nominal in a parameter or return shows as `Self`. A type without a
+/// scheme (or a method the scheme does not know) keeps its stored signature.
+fn typedef_method_signatures(
+    full: &FullAnalysis,
+    info: &TypeInfo,
+    substitution: &Substitution,
+) -> HashMap<String, CallableSignature> {
+    let mut out = HashMap::new();
+    let Some(scheme) = full.schemes.get(&info.name) else {
+        return out;
+    };
+    let TypeKind::Record { fields, methods } = &info.kind else {
+        return out;
+    };
+    // Scheme parameter -> display type, layered: the declaration pass aligns
+    // each scheme parameter with the declared field position it generalizes (a
+    // slot variable, or a declared type); the instance pass then replaces the
+    // ones this value pins with their concrete types.
+    let mut map: BTreeMap<u32, Type> = BTreeMap::new();
+    for (fname, fty) in &scheme.fields {
+        let declared = fields
+            .iter()
+            .find(|f| f.name == *fname)
+            .and_then(|f| f.resolved_ty.as_ref());
+        if let Some(declared) = declared {
+            match_type_vars(fty, declared, &scheme.params, &mut map);
+        }
+    }
+    for (fname, fty) in &scheme.fields {
+        if let Some(actual) = substitution.get(fname) {
+            match_type_vars(fty, actual, &scheme.params, &mut map);
+        }
+    }
+    for (name, m) in methods {
+        let Some(sm) = scheme.methods.get(name) else {
+            continue;
+        };
+        let mut sig = m.signature.clone();
+        // The scheme's parameters are positional with the signature's (both
+        // carry a leading `self` for instance methods). `self` is left bare.
+        // Instantiation can nest a nullable (`?`-wrapped return over a
+        // variable pinned to a nullable type); collapse it for display.
+        let instantiated =
+            |t: &Type| self_ify(collapse_nullable(&substitute_vars(t, &map)), info.id);
+        for (i, p) in sig.params.iter_mut().enumerate() {
+            if p.name == "self" {
+                continue;
+            }
+            if let Some((_, t)) = sm.params.get(i) {
+                p.resolved_ty = Some(instantiated(t));
+            }
+        }
+        sig.ret_ty = Some(instantiated(&sm.ret));
+        out.insert(name.clone(), sig);
+    }
+    out
+}
+
+/// Show the type's own nominal as `Self` in its member signatures, seeing
+/// through the wrappers a member position can carry.
+fn self_ify(ty: Type, own_id: i32) -> Type {
+    match ty {
+        Type::Record(n) if n.id == own_id => Type::SelfType,
+        Type::Nullable(i) => Type::Nullable(Box::new(self_ify(*i, own_id))),
+        Type::Slice(i) => Type::Slice(Box::new(self_ify(*i, own_id))),
+        Type::Array(i, n) => Type::Array(Box::new(self_ify(*i, own_id)), n),
+        other => other,
+    }
 }
 
 /// The receiver's record nominal and its type's scheme, seeing through
@@ -258,76 +342,16 @@ fn receiver_scheme<'a>(
 
 /// Map each scheme parameter to the receiver instance's concrete type, by
 /// matching the scheme's field types against the receiver's resolved field
-/// substitution (`entries : _Entry<K, V>[]` vs `entries : _Entry<string,
+/// substitution (`_entries : _Entry<K, V>[]` vs `_entries : _Entry<string,
 /// string>[]` gives `K -> string`, `V -> string`).
-fn instance_param_map(scheme: &TypeScheme, recv: &NominalType) -> HashMap<u32, Type> {
-    let mut map = HashMap::new();
+fn instance_param_map(scheme: &TypeScheme, recv: &NominalType) -> BTreeMap<u32, Type> {
+    let mut map = BTreeMap::new();
     for (fname, fty) in &scheme.fields {
         if let Some(actual) = recv.substitution.get(fname) {
-            match_scheme_param(fty, actual, &scheme.params, &mut map);
+            match_type_vars(fty, actual, &scheme.params, &mut map);
         }
     }
     map
-}
-
-/// Record `param -> actual` where a scheme parameter variable aligns with a
-/// concrete position in the receiver's field type, recursing structurally.
-fn match_scheme_param(
-    scheme_ty: &Type,
-    actual: &Type,
-    params: &[u32],
-    map: &mut HashMap<u32, Type>,
-) {
-    match (scheme_ty, actual) {
-        (Type::Unknown(id), a) if params.contains(id) => {
-            map.entry(*id).or_insert_with(|| a.clone());
-        }
-        (Type::Slice(s), Type::Slice(a))
-        | (Type::Slice(s), Type::Array(a, _))
-        | (Type::Array(s, _), Type::Slice(a))
-        | (Type::Array(s, _), Type::Array(a, _))
-        | (Type::Nullable(s), Type::Nullable(a))
-        | (Type::Ref(s), Type::Ref(a))
-        | (Type::Mut(s), Type::Mut(a))
-        | (Type::ConstOf(s), Type::ConstOf(a)) => match_scheme_param(s, a, params, map),
-        (Type::Record(sn), Type::Record(an)) | (Type::Sum(sn), Type::Sum(an)) => {
-            for (k, sv) in sn.substitution.iter() {
-                if let Some(av) = an.substitution.get(k) {
-                    match_scheme_param(sv, av, params, map);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Substitute scheme parameters with their concrete types throughout a type.
-fn apply_param_map(ty: &Type, map: &HashMap<u32, Type>) -> Type {
-    match ty {
-        Type::Unknown(id) => map.get(id).cloned().unwrap_or_else(|| ty.clone()),
-        Type::Slice(e) => Type::Slice(Box::new(apply_param_map(e, map))),
-        Type::Array(e, n) => Type::Array(Box::new(apply_param_map(e, map)), *n),
-        Type::Nullable(e) => Type::Nullable(Box::new(apply_param_map(e, map))),
-        Type::Ref(e) => Type::Ref(Box::new(apply_param_map(e, map))),
-        Type::Mut(e) => Type::Mut(Box::new(apply_param_map(e, map))),
-        Type::ConstOf(e) => Type::ConstOf(Box::new(apply_param_map(e, map))),
-        Type::Fun(ps, r) => Type::Fun(
-            ps.iter().map(|p| apply_param_map(p, map)).collect(),
-            Box::new(apply_param_map(r, map)),
-        ),
-        Type::Tuple(es) => Type::Tuple(es.iter().map(|e| apply_param_map(e, map)).collect()),
-        Type::Record(n) => Type::Record(map_nominal(n, map)),
-        Type::Sum(n) => Type::Sum(map_nominal(n, map)),
-        other => other.clone(),
-    }
-}
-
-fn map_nominal(n: &NominalType, map: &HashMap<u32, Type>) -> NominalType {
-    let mut subst = prepoly_hir::Substitution::empty();
-    for (k, v) in n.substitution.iter() {
-        subst.insert(k, apply_param_map(v, map));
-    }
-    NominalType::with_substitution(n.id, n.name().to_string(), subst)
 }
 
 /// A copy of `sig` with each unannotated (still-`unknown`) parameter resolved to

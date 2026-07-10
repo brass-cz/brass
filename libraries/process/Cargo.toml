@@ -1,0 +1,20 @@
+# The process library's native half: a Prepoly plugin (cdylib) loaded by
+# `libraries/process.pp`. Build and install it with `libraries/build.sh`, which
+# places the cdylib next to this manifest as `process.<dll suffix>`.
+[package]
+name = "prepoly_lib_process"
+description = "Prepoly plugin: spawn and control OS processes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+# The library file name is the module name Prepoly imports
+# (`import process.process.{ .. }`).
+name = "process"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+prepoly_plugin = { workspace = true }

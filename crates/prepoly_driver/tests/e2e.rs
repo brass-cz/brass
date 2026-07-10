@@ -24,8 +24,9 @@ fn e2e_root() -> PathBuf {
 }
 
 /// Every `*.pp` under `dir`, recursively, in sorted order (so failures are stable).
-/// `concurrency/` and `net/` are skipped without the `jit` feature: those
-/// cases need real threads and sockets that only the JIT back end provides.
+/// `concurrency/`, `net/`, and `process/` are skipped without the `jit`
+/// feature: those cases need real threads, sockets, and child processes that
+/// only the JIT back end provides.
 fn collect_cases(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
@@ -37,7 +38,7 @@ fn collect_cases(dir: &Path, out: &mut Vec<PathBuf>) {
             if !cfg!(feature = "jit")
                 && path
                     .file_name()
-                    .is_some_and(|n| n == "concurrency" || n == "net")
+                    .is_some_and(|n| n == "concurrency" || n == "net" || n == "process")
             {
                 continue;
             }
@@ -48,9 +49,29 @@ fn collect_cases(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The in-repo `libraries/` directory, whose modules are reachable as
+/// packages (`process=<libraries>` makes `import process.{ .. }` resolve).
+fn libraries_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../libraries")
+}
+
+/// Run a case, exposing `libraries/` as packages so a case may import a
+/// library (`process/` does). Cases that import nothing from there are
+/// unaffected.
+fn run_case(bin: &str, pp: &Path) -> std::process::Output {
+    Command::new(bin)
+        .arg(pp)
+        .env(
+            "PREPOLY_PACKAGES",
+            format!("process={}", libraries_root().display()),
+        )
+        .output()
+        .expect("spawn prepoly")
+}
+
 /// Run a success case: the program must exit zero and print exactly `expected`.
 fn check_success(bin: &str, pp: &Path, expected: &str) {
-    let out = Command::new(bin).arg(pp).output().expect("spawn prepoly");
+    let out = run_case(bin, pp);
     assert!(
         out.status.success(),
         "{} failed to run (status {:?})\nstderr:\n{}",
@@ -70,7 +91,7 @@ fn check_success(bin: &str, pp: &Path, expected: &str) {
 /// every line of `expected` (trimmed) as a substring, so the diagnostic is pinned
 /// without coupling to the absolute source path the driver prints.
 fn check_error(bin: &str, pp: &Path, expected: &str) {
-    let out = Command::new(bin).arg(pp).output().expect("spawn prepoly");
+    let out = run_case(bin, pp);
     assert!(
         !out.status.success(),
         "{} was expected to fail but succeeded\nstdout:\n{}",
@@ -90,6 +111,15 @@ fn check_error(bin: &str, pp: &Path, expected: &str) {
 #[test]
 fn e2e_cases_produce_expected_output() {
     let bin = env!("CARGO_BIN_EXE_prepoly");
+    // The `process/` cases import the process library, whose native half is a
+    // plugin; install it as `libraries/build.sh` would. Those cases only run
+    // with the JIT back end (the interpreter has no file I/O for the pipes).
+    #[cfg(feature = "jit")]
+    prepoly_plugin_host::fixture::install_plugin(
+        "prepoly_lib_process",
+        "process",
+        &libraries_root().join("process"),
+    );
     let root = e2e_root();
     let mut cases = Vec::new();
     collect_cases(&root, &mut cases);

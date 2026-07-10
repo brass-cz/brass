@@ -1257,6 +1257,8 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 "_float_to_int" => Ok(Some(result_type(Type::Int(IntKind::I64), Type::Str))),
                 // `open(path, mode) -> File!`; a runtime primitive.
                 "open" => Ok(Some(result_type(file_type(), Type::Str))),
+                // `_file_from_fd(fd) -> File`: adopt an open descriptor.
+                "_file_from_fd" => Ok(Some(file_type())),
                 // Network primitives: sockets are `File`s (see
                 // `prepoly_runtime::net` and std/net.pp).
                 "_tcp_connect" | "_tcp_listen" | "_tcp_accept" | "_udp_bind" => {
@@ -1279,6 +1281,11 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                     Type::Str,
                 ))),
                 "_tls_close" => Ok(Some(result_type(Type::Void, Type::Str))),
+                // Native-plugin dispatch (`_plugin_[f]call_<t>`): the return
+                // is encoded in the name's suffix; see the shared decoder.
+                n if prepoly_hir::plugin_builtin_return(n).is_some() => {
+                    Ok(prepoly_hir::plugin_builtin_return(n))
+                }
                 // `to_string` only has a typed conversion for scalars/strings;
                 // other arguments fall back so formatting stays correct.
                 "to_string" => match args.first() {

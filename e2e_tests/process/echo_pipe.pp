@@ -1,0 +1,14 @@
+// The Command builder chain: run `echo` with arguments, capturing stdout on a
+// pipe, then read it back and check the exit code. `echo` is a POSIX utility
+// present everywhere, so this stays portable.
+import process.{ Command, Stdio }
+import std.net.{ to_text }
+
+const child = Command.new("echo")
+    .args(["hello", "from", "process"])
+    .stdout(Stdio.Pipe)
+    .spawn()!
+
+const out = child.stdout()!
+print(to_text(out.read(256)!)!)
+println("exit: {child.wait()!}")

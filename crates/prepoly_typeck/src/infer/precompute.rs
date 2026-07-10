@@ -122,22 +122,36 @@ impl<'a> Checker<'a> {
             .collect();
         entries.sort();
         for (qualifier, self_type, method) in entries {
-            let ty = self.infer_method_return(&qualifier, &self_type, &method);
+            let (ty, has_props) = self.infer_method_return(&qualifier, &self_type, &method);
+            if has_props {
+                self.method_return_props
+                    .insert((qualifier.clone(), method.clone()));
+            }
             self.method_returns.insert((qualifier, method), ty);
         }
     }
 
-    fn infer_method_return(&mut self, qualifier: &str, self_type: &str, method: &str) -> Type {
+    /// The light-pass return type of a method, plus whether its body carries
+    /// propagation sites (`error(...)` / nullable `!`) -- when it does, the
+    /// light assembly (`Result`/`?` wrapping) is the only correct return shape,
+    /// so the co-check's plain reconciliation must not replace it (see the
+    /// method-body loop in `infer_program`).
+    fn infer_method_return(
+        &mut self,
+        qualifier: &str,
+        self_type: &str,
+        method: &str,
+    ) -> (Type, bool) {
         let Some(resolved) = self.method_for_qualifier(qualifier, method) else {
-            return self.fresh_unknown();
+            return (self.fresh_unknown(), false);
         };
         if let Some(ty) = resolved.signature.ret_ty.clone() {
-            return ty;
+            return (ty, false);
         }
         let signature_params = resolved.signature.params.clone();
         let decl = resolved.method;
         let Some(body) = &decl.body else {
-            return Type::Void;
+            return (Type::Void, false);
         };
         let saved = self.self_type.replace(self_type.to_string());
         let saved_variant = self.self_variant.clone();
@@ -155,10 +169,11 @@ impl<'a> Checker<'a> {
         self.infer_returns_block(body, &mut env, &mut normal, &mut props);
         self.self_type = saved;
         self.self_variant = saved_variant;
+        let has_props = !props.errors.is_empty() || !props.nulls.is_empty();
         let normal_ty = self.reconcile_return_types(&normal, true);
         let err_ty = self.reconcile_error_payloads(&props.errors, true);
         let base = self.result_from_payloads(normal_ty, err_ty);
-        wrap_null_propagated_return(base, &props.nulls)
+        (wrap_null_propagated_return(base, &props.nulls), has_props)
     }
 
     /// Generalize every record type into a [`TypeScheme`]. Run after the per-type
@@ -204,9 +219,16 @@ impl<'a> Checker<'a> {
                 params.extend(self.solver.free_vars(&ty));
                 ps.push((p.name.clone(), ty));
             }
+            // Prefer the return the co-check reconciled in the shared
+            // environment: unlike the precomputed light-pass type, it is
+            // expressed over the same variables as the fields (a `get` that
+            // returns a stored value types as `V?`, not a detached unknown).
+            // Absent for propagating bodies, whose `Result`/`?` shape only the
+            // light assembly builds -- those keep the precomputed type.
             let ret = self
-                .method_returns
+                .co_method_returns
                 .get(&(info.name.clone(), name.clone()))
+                .or_else(|| self.method_returns.get(&(info.name.clone(), name.clone())))
                 .map(|t| self.resolve(t))
                 .or_else(|| resolved(self, method.signature.ret_ty.as_ref()))
                 .unwrap_or(Type::Void);

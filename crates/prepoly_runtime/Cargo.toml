@@ -13,6 +13,11 @@ default = ["tls"]
 # without TLS degrades to a runtime error instead of a link failure.
 tls = ["dep:rustls", "dep:webpki-roots"]
 
+# Native-plugin dispatch (`pp_plugin_call_*`). The host crate stubs itself on
+# wasm targets, so the dependency is unconditional.
+[dependencies]
+prepoly_plugin_host.workspace = true
+
 # rustls does not build for wasm targets (its crypto provider is native-only);
 # the wasm interpreter refuses networking anyway, so the stub variant is used
 # there regardless of the feature.

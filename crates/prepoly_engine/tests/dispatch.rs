@@ -145,6 +145,9 @@ impl Codegen for TextBackend {
     fn file_std(&mut self, which: u8) -> usize {
         self.val(format!("file_std {which}"))
     }
+    fn file_from_fd(&mut self, fd: usize) -> usize {
+        self.val(format!("file_from_fd v{fd}"))
+    }
     fn file_read(&mut self, file: usize, n: usize) -> usize {
         self.val(format!("file_read v{file} v{n}"))
     }
@@ -167,6 +170,21 @@ impl Codegen for TextBackend {
             .collect::<Vec<_>>()
             .join(" ");
         self.val(format!("{rt_name} {args}"))
+    }
+    fn plugin_call(
+        &mut self,
+        rt_name: &'static str,
+        strings: [usize; 3],
+        args: &[(usize, Type)],
+        _ret: &Type,
+    ) -> usize {
+        let strings = strings.map(|s| format!("v{s}")).join(" ");
+        let args = args
+            .iter()
+            .map(|(a, _)| format!("v{a}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.val(format!("{rt_name} {strings} [{args}]"))
     }
     fn convert(&mut self, target: &Type, method: &str, _arg_ty: &Type, arg: usize) -> usize {
         self.val(format!("{}.{method}(v{arg})", target.display()))

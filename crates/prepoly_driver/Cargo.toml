@@ -32,3 +32,7 @@ inkwell = { workspace = true, optional = true }
 [features]
 default = ["jit"]
 jit = ["dep:prepoly_jit_llvm", "dep:inkwell"]
+
+# The plugin e2e test builds and loads the in-repo fixture plugin.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+prepoly_plugin_host = { workspace = true, features = ["fixture"] }

@@ -11,3 +11,6 @@ prepoly_parser.workspace = true
 prepoly_hir.workspace = true
 prepoly_mir.workspace = true
 prepoly_engine.workspace = true
+# Native-plugin dispatch; self-stubbing on wasm, where the interpreter
+# reports plugin calls as unsupported.
+prepoly_plugin_host.workspace = true

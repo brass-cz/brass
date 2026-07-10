@@ -73,7 +73,30 @@ impl<'a> Checker<'a> {
             self.check_builtin_args_against("open", args, &[Type::Str, Type::Str], span, scopes);
             return Some(Type::result(self.type_by_name("File"), Type::Str));
         }
+        if name == "_file_from_fd" {
+            // `_file_from_fd(fd: int64) -> File`: adopt an open descriptor.
+            let i64_ty = Type::Int(IntKind::I64);
+            self.check_builtin_args_against("_file_from_fd", args, &[i64_ty], span, scopes);
+            return Some(self.type_by_name("File"));
+        }
         if let Some(ret) = self.net_builtin_type(name, args, span, scopes) {
+            return Some(ret);
+        }
+        if let Some(ret) = prepoly_hir::plugin_builtin_return(name) {
+            // `_plugin_[f]call_<t>(path, name, sig, payload...)`: the loader
+            // synthesizes these with three leading string literals; the
+            // payload arguments are checked against the wrapper's annotated
+            // parameters at its own call sites, so here each argument is
+            // simply visited. The return is fixed by the name's suffix.
+            if args.len() < 3 {
+                self.errors.push(TypeError {
+                    message: format!("`{name}` expects at least 3 arguments (path, name, sig)"),
+                    span,
+                });
+            }
+            for a in args {
+                self.check_expr(&a.expr, scopes);
+            }
             return Some(ret);
         }
         None
@@ -329,8 +352,12 @@ impl<'a> Checker<'a> {
     }
 
     pub(super) fn builtin_function_type_light(&self, name: &str) -> Option<Type> {
+        if let Some(ret) = prepoly_hir::plugin_builtin_return(name) {
+            return Some(ret);
+        }
         match name {
             "open" => Some(Type::result(self.type_by_name("File"), Type::Str)),
+            "_file_from_fd" => Some(self.type_by_name("File")),
             "_tcp_connect" | "_tcp_listen" | "_tcp_accept" | "_udp_bind" => {
                 Some(Type::result(self.type_by_name("File"), Type::Str))
             }

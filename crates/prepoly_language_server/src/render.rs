@@ -7,7 +7,7 @@
 //! has each unannotated slot shown as a distinct `unknown_N`, numbered in the
 //! order the parameters (then the return) occur.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use prepoly_hir::{
     CallableSignature, FieldInfo, Substitution, Type, TypeInfo, TypeKind, VariantInfo,
@@ -22,12 +22,36 @@ pub struct UnknownNamer {
     /// variable renders identically wherever it recurs.
     by_id: HashMap<u32, usize>,
     next: usize,
+    /// Display names fixed up front for specific variables, overriding the
+    /// `unknown_N` numbering -- a record's type-slot variables render as
+    /// `Self.<slot>` inside the record's own field types.
+    fixed: HashMap<u32, String>,
 }
 
 impl UnknownNamer {
+    /// Fix the display name of inference variable `id` (e.g. to a type slot's
+    /// `Self.<name>` form) instead of numbering it `unknown_N`.
+    fn fix(&mut self, id: u32, name: String) {
+        self.fixed.insert(id, name);
+    }
+
+    /// A namer sharing this one's fixed names but with fresh `unknown_N`
+    /// numbering -- each member of a type's member list numbers its own open
+    /// variables from zero while slot variables keep their `Self.<slot>` names.
+    fn fresh_child(&self) -> Self {
+        Self {
+            by_id: HashMap::new(),
+            next: 0,
+            fixed: self.fixed.clone(),
+        }
+    }
+
     /// The name for inference variable `id`, allocating a fresh number the first
     /// time the id is seen.
     fn named(&mut self, id: u32) -> String {
+        if let Some(name) = self.fixed.get(&id) {
+            return name.clone();
+        }
         let next = self.next;
         let n = *self.by_id.entry(id).or_insert_with(|| {
             // `next` was captured before the borrow; only commit it on insert.
@@ -188,25 +212,57 @@ pub fn render_signature_into(
     format!("fun {}({params}) -> {ret}", sig.name)
 }
 
-/// Render a type definition for hover over a type *name*: a record's fields and
-/// methods, or a sum type's variants. Field types come from the declaration.
-pub fn render_type_def(info: &TypeInfo) -> String {
-    render_type_def_with(info, &Substitution::empty())
-}
-
-/// Render a type definition, taking each record field's type from `substitution`
-/// when it carries one. An instance hover passes the value's substitution so a
-/// field whose declared type is open (`HashMap`'s `entries`) shows the concrete
-/// type that instance pinned (e.g. `_Entry<...>[]`), while a bare type-name hover
-/// passes an empty substitution and shows the declaration.
+/// Render a type definition: a record's slots, fields, and methods, or a sum
+/// type's variants, taking each record field's type from `substitution` when it
+/// carries one. An instance hover passes the value's substitution so a field
+/// whose declared type is open shows the concrete type that instance pinned,
+/// while a bare type-name hover passes an empty substitution and shows the
+/// declaration.
+///
+/// Type slots (`slot: type` type parameters) are listed first: as the declared
+/// `slot: type` marker when open, or as `slot: <concrete>` when the instance has
+/// pinned them. A slot variable occurring in a field's or method's type renders
+/// as `Self.<slot>`, as the declaration wrote it.
+///
+/// `resolved_methods` overrides a method's stored signature (annotations only)
+/// with one whose types are already resolved -- against the scheme and the
+/// instance (see `hover::typedef_method_signatures`); a method without an entry
+/// falls back to its stored signature.
 ///
 /// Members whose name begins with `_` are implementation details, not part of the
 /// type's surface, and are omitted.
-pub fn render_type_def_with(info: &TypeInfo, substitution: &Substitution) -> String {
+pub fn render_type_def_with(
+    info: &TypeInfo,
+    substitution: &Substitution,
+    resolved_methods: &HashMap<String, CallableSignature>,
+) -> String {
     let mut namer = UnknownNamer::default();
     match &info.kind {
         TypeKind::Record { fields, methods } => {
+            for (name, var) in &info.slots {
+                namer.fix(*var, format!("Self.{name}"));
+            }
+            // The substitution is keyed by field, with any slot pins embedded in
+            // the field types; recover each slot's own type by matching the
+            // declared field types -- which contain the slot variables -- against
+            // the instance's structurally.
+            let slot_vars: Vec<u32> = info.slots.iter().map(|(_, v)| *v).collect();
+            let mut pins: BTreeMap<u32, Type> = BTreeMap::new();
+            for f in fields {
+                if let (Some(declared), Some(actual)) =
+                    (f.resolved_ty.as_ref(), substitution.get(&f.name))
+                {
+                    match_type_vars(declared, actual, &slot_vars, &mut pins);
+                }
+            }
             let mut body = String::new();
+            for (name, var) in info.slots.iter().filter(|(n, _)| is_public_member(n)) {
+                let line = match pins.get(var) {
+                    Some(t) if !t.is_unknown() => format!("{name}: {}", render_type(t, &mut namer)),
+                    _ => format!("{name}: type"),
+                };
+                body.push_str(&format!("    {line}\n"));
+            }
             for f in fields.iter().filter(|f| is_public_member(&f.name)) {
                 let resolved = substitution.get(&f.name).or(f.resolved_ty.as_ref());
                 let line = match resolved {
@@ -218,8 +274,14 @@ pub fn render_type_def_with(info: &TypeInfo, substitution: &Substitution) -> Str
             let mut names: Vec<&String> = methods.keys().filter(|n| is_public_member(n)).collect();
             names.sort();
             for name in names {
-                let sig = render_signature(&methods[name].signature);
-                body.push_str(&format!("    {sig}\n"));
+                let sig = resolved_methods
+                    .get(name.as_str())
+                    .unwrap_or(&methods[name].signature);
+                // A child namer keeps slot variables rendering as `Self.<slot>`
+                // inside method types while each method numbers the variables
+                // its scheme leaves open from `unknown_0`.
+                let line = render_signature_into(sig, &[], None, None, &mut namer.fresh_child());
+                body.push_str(&format!("    {line}\n"));
             }
             format!("type {} = {{\n{body}}}", info.name)
         }
@@ -240,6 +302,58 @@ pub fn render_type_def_with(info: &TypeInfo, substitution: &Substitution) -> Str
 /// hover and the type view omit.
 fn is_public_member(name: &str) -> bool {
     !name.starts_with('_')
+}
+
+/// Record `var -> actual` where one of `vars` (an inference variable standing
+/// for a type parameter) aligns with a concrete position in `actual`, recursing
+/// through structurally matching shapes. The most informative pin wins: a
+/// concrete match replaces an earlier still-unknown one, and an unknown never
+/// replaces an entry (so several passes can layer, e.g. a declaration pass then
+/// an instance pass).
+pub(crate) fn match_type_vars(
+    pattern: &Type,
+    actual: &Type,
+    vars: &[u32],
+    map: &mut BTreeMap<u32, Type>,
+) {
+    match (pattern, actual) {
+        (Type::Unknown(id), a) if vars.contains(id) => {
+            let replace = match map.get(id) {
+                None => true,
+                Some(cur) => cur.is_unknown() && !a.is_unknown(),
+            };
+            if replace {
+                map.insert(*id, a.clone());
+            }
+        }
+        (Type::Slice(s), Type::Slice(a))
+        | (Type::Slice(s), Type::Array(a, _))
+        | (Type::Array(s, _), Type::Slice(a))
+        | (Type::Array(s, _), Type::Array(a, _))
+        | (Type::Nullable(s), Type::Nullable(a))
+        | (Type::Ref(s), Type::Ref(a))
+        | (Type::Mut(s), Type::Mut(a))
+        | (Type::ConstOf(s), Type::ConstOf(a)) => match_type_vars(s, a, vars, map),
+        (Type::Record(sn), Type::Record(an)) | (Type::Sum(sn), Type::Sum(an)) => {
+            for (k, sv) in sn.substitution.iter() {
+                if let Some(av) = an.substitution.get(k) {
+                    match_type_vars(sv, av, vars, map);
+                }
+            }
+        }
+        (Type::Tuple(ss), Type::Tuple(aa)) => {
+            for (s, a) in ss.iter().zip(aa) {
+                match_type_vars(s, a, vars, map);
+            }
+        }
+        (Type::Fun(sp, sr), Type::Fun(ap, ar)) => {
+            for (s, a) in sp.iter().zip(ap) {
+                match_type_vars(s, a, vars, map);
+            }
+            match_type_vars(sr, ar, vars, map);
+        }
+        _ => {}
+    }
 }
 
 fn render_field(f: &FieldInfo, namer: &mut UnknownNamer) -> String {

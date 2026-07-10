@@ -280,7 +280,13 @@ fn classify_bare(base: &[String], root: &Path, imp: &mut ImportDecl, packages: &
             file.push(seg);
         }
         file.set_extension("pp");
-        file.is_file()
+        if file.is_file() {
+            return true;
+        }
+        // A native plugin library also names a module (`import plugins.math`
+        // with `plugins/math.so` on disk).
+        let full: Vec<String> = full.iter().map(|s| s.to_string()).collect();
+        crate::plugin::plugin_library_for(effective_root, &full).is_some()
     };
     if module_exists(&imp.path) {
         // An explicit `as` alias takes precedence over the last-segment default.
@@ -395,6 +401,23 @@ pub fn load_module(
     let src = match std::fs::read_to_string(&file) {
         Ok(s) => s,
         Err(_) => {
+            // Not a `.pp` module: a native plugin library may serve the path
+            // instead (`plugins/math.so` for `import plugins.math`), as a
+            // module synthesized from the plugin's manifest.
+            if let Some(lib) = crate::plugin::plugin_library_for(effective_root, path) {
+                match crate::plugin::synthesize_plugin_module(&lib) {
+                    Ok(src) => {
+                        load_synthesized(&lib, src, path, sources, out, trigger_span, errors)
+                    }
+                    Err(message) => errors.push(LoadError {
+                        message,
+                        span: trigger_span,
+                    }),
+                }
+                stack.remove(&key);
+                visited.insert(key);
+                return;
+            }
             errors.push(LoadError {
                 message: format!("cannot find module `{key}` (expected `{}`)", file.display()),
                 span: trigger_span,
@@ -440,4 +463,34 @@ pub fn load_module(
         path: path.to_vec(),
         ast,
     });
+}
+
+/// Parse a module synthesized from a plugin manifest and push it. The source
+/// is generated, so a parse failure is a synthesis bug, reported (with the
+/// offending text's label) rather than crashing the front end.
+fn load_synthesized(
+    lib: &Path,
+    src: String,
+    path: &[String],
+    sources: &mut SourceMap,
+    out: &mut Vec<LoadedModule>,
+    trigger_span: Span,
+    errors: &mut Vec<LoadError>,
+) {
+    let label = format!("<plugin:{}>", lib.display());
+    let base = sources.add(None, label.clone(), src.clone());
+    match parse_with_base(&src, base) {
+        Ok(ast) => out.push(LoadedModule {
+            is_prelude: false,
+            path: path.to_vec(),
+            ast,
+        }),
+        Err(e) => errors.push(LoadError {
+            message: format!(
+                "internal: synthesized plugin module `{label}` failed to parse: {}",
+                e.message
+            ),
+            span: trigger_span,
+        }),
+    }
 }

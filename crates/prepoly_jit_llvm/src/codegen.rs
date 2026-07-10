@@ -2514,6 +2514,18 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
         };
         self.call_rt_ptr(name, &[])
     }
+    fn file_from_fd(&mut self, fd: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        // `pp_file_from_fd(i64) -> ptr`: the descriptor is an integer, not the
+        // object pointer `call_rt_ptr` would declare it as.
+        let i64t = self.abi.i64t();
+        let ty = self.abi.ptr().fn_type(&[i64t.into()], false);
+        let f = self.abi.runtime_fn(&self.module, "pp_file_from_fd", ty);
+        self.builder
+            .build_call(f, &[fd.into()], "fromfd")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+    }
     fn file_read(
         &mut self,
         file: BasicValueEnum<'ctx>,
@@ -2595,6 +2607,98 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
             .unwrap()
             .try_as_basic_value()
             .unwrap_basic()
+    }
+
+    fn plugin_call(
+        &mut self,
+        rt_name: &'static str,
+        strings: [BasicValueEnum<'ctx>; 3],
+        args: &[(BasicValueEnum<'ctx>, Type)],
+        ret: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let i64t = self.abi.i64t();
+        // Pack the payload into 8-byte stack slots the runtime decodes per the
+        // signature string: integers widen to i64 (bools zero-extend), floats
+        // store their bits, heap objects their address.
+        let arr_ty = i64t.array_type(args.len() as u32);
+        let slots = self.builder.build_alloca(arr_ty, "plugin_args").unwrap();
+        for (i, (v, t)) in args.iter().enumerate() {
+            let slot = unsafe {
+                self.builder
+                    .build_in_bounds_gep(i64t, slots, &[self.i64c(i as i64)], "pslot")
+                    .unwrap()
+            };
+            match v {
+                BasicValueEnum::IntValue(iv) => {
+                    let wide = if iv.get_type().get_bit_width() < 64 {
+                        if matches!(t, Type::Bool) {
+                            self.builder.build_int_z_extend(*iv, i64t, "pb").unwrap()
+                        } else {
+                            self.builder.build_int_s_extend(*iv, i64t, "pn").unwrap()
+                        }
+                    } else {
+                        *iv
+                    };
+                    self.builder.build_store(slot, wide).unwrap();
+                }
+                // An f64 occupies the slot's 8 bytes verbatim; the runtime
+                // reinterprets per the signature.
+                BasicValueEnum::FloatValue(fv) => {
+                    self.builder.build_store(slot, *fv).unwrap();
+                }
+                BasicValueEnum::PointerValue(pv) => {
+                    let addr = self.builder.build_ptr_to_int(*pv, i64t, "pp").unwrap();
+                    self.builder.build_store(slot, addr).unwrap();
+                }
+                other => panic!("unsupported plugin argument value {other:?}"),
+            }
+        }
+        // pp_plugin_call_{int,float,obj}(path, name, sig, argv, argc).
+        let ptys: Vec<inkwell::types::BasicMetadataTypeEnum> = vec![
+            self.abi.ptr().into(),
+            self.abi.ptr().into(),
+            self.abi.ptr().into(),
+            self.abi.ptr().into(),
+            i64t.into(),
+        ];
+        let fn_ty = match rt_name {
+            "pp_plugin_call_int" => i64t.fn_type(&ptys, false),
+            "pp_plugin_call_float" => self.ctx.f64_type().fn_type(&ptys, false),
+            _ => self.abi.ptr().fn_type(&ptys, false),
+        };
+        let f = self.abi.runtime_fn(&self.module, rt_name, fn_ty);
+        let argc = self.i64c(args.len() as i64);
+        let raw = self
+            .builder
+            .build_call(
+                f,
+                &[
+                    strings[0].into(),
+                    strings[1].into(),
+                    strings[2].into(),
+                    slots.into(),
+                    argc.into(),
+                ],
+                "plugin",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic();
+        // Shape the raw scalar to the builtin's typed result.
+        match ret {
+            Type::Void => self.unit(),
+            Type::Bool => self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::NE,
+                    raw.into_int_value(),
+                    i64t.const_zero(),
+                    "pbool",
+                )
+                .unwrap()
+                .into(),
+            _ => raw,
+        }
     }
 
     fn convert(

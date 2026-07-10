@@ -13,6 +13,7 @@ pub mod gc;
 pub mod io;
 pub mod mem;
 pub mod net;
+pub mod plugin;
 pub mod region;
 pub mod rt;
 pub mod tls;
@@ -81,6 +82,7 @@ pub fn symbols() -> Vec<(&'static str, usize)> {
         region::pp_region_unborrow,
         region::pp_region_close,
         io::pp_file_open,
+        io::pp_file_from_fd,
         io::pp_file_stdin,
         io::pp_file_stdout,
         io::pp_file_stderr,
@@ -101,6 +103,9 @@ pub fn symbols() -> Vec<(&'static str, usize)> {
         tls::pp_tls_read,
         tls::pp_tls_write,
         tls::pp_tls_close,
+        plugin::pp_plugin_call_int,
+        plugin::pp_plugin_call_float,
+        plugin::pp_plugin_call_obj,
         gc::pp_gc_register,
         gc::pp_gc_collect,
         gc::pp_freeze_deep,

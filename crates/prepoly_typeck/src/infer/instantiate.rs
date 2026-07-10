@@ -138,7 +138,9 @@ impl<'a> Checker<'a> {
         let scheme = self.schemes.get(&info.name)?;
         let scheme_method = scheme.methods.get(method)?;
         let map = scheme_instance_map(scheme, &nominal);
-        let ret = apply_scheme_param_map(&scheme_method.ret, &map);
+        // Instantiating a `?`-wrapped scheme return with a nullable value type
+        // nests the nullable; collapse it (there is one `null`).
+        let ret = prepoly_hir::collapse_nullable(&apply_scheme_param_map(&scheme_method.ret, &map));
         // Only adopt the instantiated return when it is fully resolved; an open
         // variable means the instance did not constrain it, so the re-elaborated
         // return (which can still defer) is the safer choice.

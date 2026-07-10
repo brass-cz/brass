@@ -17,6 +17,18 @@ use crate::alloc::pp_typed_alloc;
 use crate::alloc::{pp_arr_new, typed_result, typed_result_err, typed_str};
 use crate::rt::Header;
 
+/// `_file_from_fd(fd) -> File`: adopt an already-open descriptor as a `File`,
+/// so the ordinary read/write/close methods drive it. Where the descriptor
+/// came from -- a pipe handed back by a spawned child, an inherited stream --
+/// is the caller's business, which keeps that knowledge out of the runtime.
+///
+/// # Safety
+/// `fd` must be an open descriptor the `File` may own: closing the `File`
+/// closes it.
+pub unsafe extern "C-unwind" fn pp_file_from_fd(fd: i64) -> *mut Header {
+    unsafe { make_file(fd as RawFd) }
+}
+
 /// Build a `File` object holding descriptor `fd`. Shared with the network
 /// primitives (`crate::net`), which represent sockets as `File`s.
 pub(crate) unsafe fn make_file(fd: RawFd) -> *mut Header {

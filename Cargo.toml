@@ -18,6 +18,10 @@ members = [
     "crates/prepoly_language_server",
     "crates/prepoly_formatter",
     "crates/prepoly_package_manager",
+    "crates/prepoly_plugin",
+    "crates/prepoly_plugin_host",
+    "crates/prepoly_plugin_testlib",
+    "libraries/process",
 ]
 # The default set includes the command-line driver. On native targets the driver
 # enables its `jit` feature by default, so a plain `cargo build` may need LLVM;
@@ -38,6 +42,8 @@ default-members = [
     "crates/prepoly_engine",
     "crates/prepoly_repl",
     "crates/prepoly_driver",
+    "crates/prepoly_plugin",
+    "crates/prepoly_plugin_host",
 ]
 
 [workspace.package]
@@ -60,6 +66,8 @@ prepoly_jit_llvm = { path = "crates/prepoly_jit_llvm" }
 prepoly_engine = { path = "crates/prepoly_engine" }
 prepoly_repl = { path = "crates/prepoly_repl" }
 prepoly_formatter = { path = "crates/prepoly_formatter" }
+prepoly_plugin = { path = "crates/prepoly_plugin" }
+prepoly_plugin_host = { path = "crates/prepoly_plugin_host" }
 
 # LLVM bindings. Native builds link the local LLVM 22.1.0 statically.
 inkwell = { version = "0.9", features = ["llvm22-1"] }

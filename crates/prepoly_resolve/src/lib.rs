@@ -3,6 +3,7 @@
 
 pub mod loader;
 pub mod module;
+pub mod plugin;
 pub mod qualified;
 pub mod scope;
 pub mod visibility;

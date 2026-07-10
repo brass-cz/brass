@@ -226,6 +226,57 @@ conn.close()!
 A driver built without the `tls` cargo feature (and the wasm interpreter)
 keeps the same API but every call returns an error Result.
 
+## `process` (a library, not `std`)
+
+```prepoly norun
+import process.{ Command, Stdio }
+```
+
+Spawn and control child processes. Unlike the modules above this is not part
+of `std`: its native half is a Rust plugin (a `cdylib` built against the
+`prepoly_plugin` crate) rather than a runtime builtin, so it ships as a
+library under `libraries/`. Build the plugin once with `libraries/build.sh`
+and point `PREPOLY_PACKAGES` at that directory:
+
+```
+PREPOLY_PACKAGES=process=/path/to/prepoly/libraries
+```
+
+`Command` is a builder — each method mutates the command and returns it, so
+calls chain — and `spawn` starts the process. A standard stream configured as
+`Stdio.Pipe` is reachable through the `Child` as a `File`
+(`read`/`write`/`close`); `Inherit` (the default) shares this process's stream
+and `Null` discards it.
+
+| Method / function              | Signature                     | Behavior                                     |
+| ------------------------------ | ----------------------------- | -------------------------------------------- |
+| `Command.new(program)`         | `(string) -> Command`         | `program` is looked up on `PATH`             |
+| `cmd.arg(value)`               | `(string) -> Command`         | append one argument                          |
+| `cmd.args(values)`             | `(string[]) -> Command`       | append several arguments                     |
+| `cmd.stdin/stdout/stderr(mode)`| `(Stdio) -> Command`          | connect a stream (`Inherit`/`Pipe`/`Null`)   |
+| `cmd.spawn()`                  | `() -> Child!`                | start the process                            |
+| `child.stdin/stdout/stderr()`  | `() -> File!`                 | a piped stream (requires `Stdio.Pipe`)       |
+| `child.wait()`                 | `() -> int32!`                | block for exit; returns the exit code        |
+
+`Stdio` is `| Inherit | Pipe | Null`. Piped streams are `File`s, so the byte
+helpers `to_bytes`/`to_text` from `std.net` convert their contents.
+
+```prepoly norun
+import process.{ Command, Stdio }
+import std.net.{ to_text }
+
+let child = Command.new("git")
+    .args(["init"])
+    .stdout(Stdio.Pipe)
+    .spawn()!
+print(to_text(child.stdout()!.read(4096)!)!)
+println("exit: {child.wait()!}")
+```
+
+Spawning and waiting work on either back end, but a piped stream is a `File`,
+and file I/O requires the native runtime — so the REPL interpreter refuses the
+stream accessors, like the rest of I/O.
+
 ## `std.collections`
 
 ```prepoly

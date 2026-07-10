@@ -432,6 +432,45 @@ impl<'p, 'm> Interp<'p, 'm> {
         }
     }
 
+    /// `_plugin_[f]call_<t>`: a native-plugin call. The three leading
+    /// operands are the library path, the plugin function name, and the
+    /// encoded signature; the payload operands evaluate and convert per the
+    /// signature's parameter types, and the call marshals through the shared
+    /// plugin host. A fallible call shapes into a `Result` value; a failing
+    /// infallible call is a runtime error like the other unsupported paths.
+    fn eval_plugin_call(
+        &mut self,
+        f: &MonoFunction,
+        frame: &mut Frame,
+        args: &[Operand],
+    ) -> Result<Value, String> {
+        if args.len() < 3 {
+            return Err("malformed plugin call".into());
+        }
+        let path = self.eval_operand(f, frame, &args[0], &Type::Str)?;
+        let name = self.eval_operand(f, frame, &args[1], &Type::Str)?;
+        let sig = self.eval_operand(f, frame, &args[2], &Type::Str)?;
+        let (params, _, fallible) = prepoly_plugin_host::parse_sig(sig.as_str())?;
+        let mut plugin_args = Vec::with_capacity(params.len());
+        for (t, op) in params.iter().zip(&args[3..]) {
+            let v = self.eval_operand(f, frame, op, &plugin_param_type(t))?;
+            plugin_args.push(to_plugin_value(t, &v)?);
+        }
+        let outcome = prepoly_plugin_host::call(
+            std::path::Path::new(path.as_str()),
+            name.as_str(),
+            &plugin_args,
+        );
+        match outcome {
+            Ok(v) => {
+                let value = from_plugin_value(v);
+                Ok(if fallible { result_ok(value) } else { value })
+            }
+            Err(fail) if fallible => Ok(result_err(fail.message())),
+            Err(fail) => Err(fail.message().to_string()),
+        }
+    }
+
     fn eval_operand(
         &mut self,
         f: &MonoFunction,
@@ -684,7 +723,7 @@ impl<'p, 'm> Interp<'p, 'm> {
             "__rt_dispatch" => {
                 Err("runtime type dispatch is not supported by the REPL runtime".into())
             }
-            "open" => Err("file I/O is not supported by the REPL runtime".into()),
+            "open" | "_file_from_fd" => Err("file I/O is not supported by the REPL runtime".into()),
             "_tcp_connect"
             | "_tcp_listen"
             | "_tcp_accept"
@@ -697,6 +736,14 @@ impl<'p, 'm> Interp<'p, 'm> {
             | "_tls_read"
             | "_tls_write"
             | "_tls_close" => Err("networking is not supported by the REPL runtime".into()),
+            // Native-plugin dispatch (`_plugin_[f]call_<t>(path, name, sig,
+            // payload...)`): evaluate per the encoded signature, marshal
+            // through the shared plugin host, and shape the result. On a
+            // platform without plugin support the host's failure surfaces
+            // like the other unsupported primitives.
+            n if prepoly_hir::plugin_builtin_return(n).is_some() => {
+                self.eval_plugin_call(f, frame, args)
+            }
             "_float_sqrt" | "_float_floor" | "_float_ceil" | "_float_pow" => {
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
@@ -1250,6 +1297,65 @@ fn make_variant(variant: &str, fields: &[(&str, Value)]) -> Value {
         variant: variant.to_string(),
         fields: RefCell::new(m),
     }))
+}
+
+/// The MIR type a plugin parameter of `t` evaluates at.
+fn plugin_param_type(t: &prepoly_plugin_host::ValueType) -> Type {
+    use prepoly_plugin_host::ValueType as VT;
+    match t {
+        VT::Void => Type::Void,
+        VT::Bool => Type::Bool,
+        VT::Int => Type::Int(IntKind::I64),
+        VT::Float => Type::Float(FloatKind::F64),
+        VT::Str => Type::Str,
+        VT::Bytes => Type::Slice(Box::new(Type::Int(IntKind::U8))),
+        VT::Array(elem) => Type::Slice(Box::new(plugin_param_type(elem))),
+    }
+}
+
+/// An interpreter value as the plugin boundary value the signature declares.
+fn to_plugin_value(
+    t: &prepoly_plugin_host::ValueType,
+    v: &Value,
+) -> Result<prepoly_plugin_host::Value, String> {
+    use prepoly_plugin_host::Value as PV;
+    use prepoly_plugin_host::ValueType as VT;
+    Ok(match (t, v) {
+        (VT::Bool, Value::Bool(b)) => PV::Bool(*b),
+        (VT::Int, Value::Int(i)) => PV::Int(*i),
+        (VT::Float, Value::Float(fl)) => PV::Float(*fl),
+        (VT::Str, Value::Str(s)) => PV::Str(s.to_string()),
+        (VT::Bytes, Value::Array(a)) => {
+            PV::Bytes(a.borrow().iter().map(|e| e.as_int() as u8).collect())
+        }
+        (VT::Array(elem), Value::Array(a)) => PV::Array(
+            a.borrow()
+                .iter()
+                .map(|e| to_plugin_value(elem, e))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        (want, _) => {
+            return Err(format!("plugin argument type mismatch: expected {want:?}"));
+        }
+    })
+}
+
+/// A plugin boundary value as an interpreter value.
+fn from_plugin_value(v: prepoly_plugin_host::Value) -> Value {
+    use prepoly_plugin_host::Value as PV;
+    match v {
+        PV::Void => Value::Void,
+        PV::Bool(b) => Value::Bool(b),
+        PV::Int(i) => Value::Int(i),
+        PV::Float(f) => Value::Float(f),
+        PV::Str(s) => Value::str(s),
+        PV::Bytes(b) => Value::Array(Rc::new(RefCell::new(
+            b.into_iter().map(|x| Value::Int(x as i64)).collect(),
+        ))),
+        PV::Array(items) => Value::Array(Rc::new(RefCell::new(
+            items.into_iter().map(from_plugin_value).collect(),
+        ))),
+    }
 }
 
 /// The byte substring `[start, end)`, clamped to the string's bounds and snapped

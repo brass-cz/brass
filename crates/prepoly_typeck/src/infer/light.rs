@@ -350,7 +350,7 @@ impl<'a> Checker<'a> {
         }
         // Resolve the base before matching: an indexed element or other
         // intermediate may still be an open inference variable that the solver has
-        // since pinned to a record (e.g. `self.entries[idx]` is the map's entry
+        // since pinned to a record (e.g. `self._entries[idx]` is the map's entry
         // type once a `push` fixed it). Without resolving, the match falls through
         // and the field type is lost as a fresh unknown.
         let base_ty = self.infer_expr_light(base, env, props);

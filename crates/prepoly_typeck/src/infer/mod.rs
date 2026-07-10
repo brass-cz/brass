@@ -186,7 +186,19 @@ pub fn analyze(program: &Program) -> Inference {
                     if let Some(body) = &m.decl.body {
                         let mut scopes = checker.signature_scopes(&m.signature.params);
                         let ret = m.signature.ret_ty.clone();
-                        checker.check_block_with_self(body, &mut scopes, ret.as_ref(), &t.name);
+                        let full =
+                            checker.check_block_with_self(body, &mut scopes, ret.as_ref(), &t.name);
+                        // Keep the return the full check reconciled here, in the
+                        // shared per-type environment, for scheme generalization
+                        // (see `co_method_returns`). A propagating body's shape
+                        // (`Result`/`?`) only the light assembly builds, so it
+                        // keeps its precomputed type.
+                        let key = (t.name.clone(), m.signature.name.clone());
+                        if let Some(full) = full
+                            && !checker.method_return_props.contains(&key)
+                        {
+                            checker.co_method_returns.insert(key, full);
+                        }
                     }
                 }
             }
@@ -287,6 +299,17 @@ struct Checker<'a> {
     /// (method qualifier, method name) -> return type.
     /// Record qualifiers are the type name; variant qualifiers are `Type.Variant`.
     method_returns: HashMap<(String, String), Type>,
+    /// Methods whose `method_returns` entry carries propagation (`error(...)` /
+    /// nullable `!`) wrapping from the light assembly; the co-check's plain
+    /// return reconciliation must not replace those (see `co_method_returns`).
+    method_return_props: HashSet<(String, String)>,
+    /// (record type name, method name) -> the return type the full co-check of
+    /// the method bodies reconciled in the shared per-type environment. Unlike
+    /// the light-pass `method_returns`, these are expressed over the same
+    /// variables as the record's fields, so scheme generalization ties a
+    /// method's return to the type's parameters (`get -> V?`). Only recorded
+    /// for inferred-return, non-propagating record methods.
+    co_method_returns: HashMap<(String, String), Type>,
     instantiating: HashSet<String>,
     /// Deferred structural constraints on inference variables, keyed by the
     /// variable's `Unknown` id. Recorded while checking a body that uses an
@@ -380,6 +403,8 @@ impl<'a> Checker<'a> {
             global_scope: HashMap::new(),
             function_returns: HashMap::new(),
             method_returns: HashMap::new(),
+            method_return_props: HashSet::new(),
+            co_method_returns: HashMap::new(),
             instantiating: HashSet::new(),
             shape_constraints: HashMap::new(),
             solver: Solver::new(),
@@ -434,14 +459,17 @@ impl<'a> Checker<'a> {
         Type::Unknown(id)
     }
 
+    /// Check a method body with `self` bound to the bare type. For an
+    /// inferred-return body, returns the reconciled return type like
+    /// [`Self::check_block_root`].
     fn check_block_with_self(
         &mut self,
         b: &Block,
         scopes: &mut ScopeStack,
         ret: Option<&Type>,
         self_type: &str,
-    ) {
-        self.check_block_with_self_context(b, scopes, ret, self_type, None);
+    ) -> Option<Type> {
+        self.check_block_with_self_context(b, scopes, ret, self_type, None)
     }
 
     fn check_block_with_self_variant(
@@ -462,16 +490,17 @@ impl<'a> Checker<'a> {
         ret: Option<&Type>,
         self_type: &str,
         variant: Option<&str>,
-    ) {
+    ) -> Option<Type> {
         let saved = self.self_type.replace(self_type.to_string());
         let saved_variant = self.self_variant.clone();
         self.self_variant = variant.map(|v| (self_type.to_string(), v.to_string()));
         if let Some(scope) = scopes.last_mut() {
             scope.insert("self".to_string(), self.type_by_name(self_type));
         }
-        self.check_block_root(b, scopes, ret);
+        let full = self.check_block_root(b, scopes, ret);
         self.self_type = saved;
         self.self_variant = saved_variant;
+        full
     }
 
     /// Check a function/method body. For an inferred-return body (`ret` is `None`)
@@ -502,7 +531,23 @@ impl<'a> Checker<'a> {
         self.narrowed_bindings = saved_narrowed;
         self.const_scopes = saved;
         if ret.is_none() {
-            self.reconcile_return_types(&collected, false)
+            let common = self.reconcile_return_types(&collected, false);
+            // The join helper leaves an open variable bare when joined with a
+            // literal `return null` (eager wrapping could nest once the
+            // variable resolves to a nullable type), which understates a
+            // generic body's return (`get`'s value-or-null is `V?`, not `V`).
+            // Re-wrap here: a body with a null return is nullable. Consumers
+            // collapse a nested `T??` to `T?` after instantiation (see
+            // `prepoly_hir::collapse_nullable`).
+            match common {
+                Some(t) if collected.iter().any(|(r, _)| r.is_null()) => {
+                    Some(match self.resolve(&t) {
+                        resolved @ Type::Nullable(_) => resolved,
+                        other => Type::Nullable(Box::new(other)),
+                    })
+                }
+                other => other,
+            }
         } else {
             None
         }
@@ -949,7 +994,7 @@ impl<'a> Checker<'a> {
     /// Run once after all checking, so a type recorded before one of its
     /// variables was pinned still reflects the solved type. `resolve` is deep --
     /// it follows variables nested inside arrays, function types, and a nominal's
-    /// substitution (so a `HashMap`'s `entries` element pinned by a later `push`
+    /// substitution (so a `HashMap`'s `_entries` element pinned by a later `push`
     /// shows its concrete type) -- and preserves the `ConstOf` wrapper, so
     /// constness is unchanged.
     fn finalize_typed(&mut self) {

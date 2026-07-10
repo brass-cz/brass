@@ -304,15 +304,20 @@ impl NominalType {
                 .join(", ");
             return format!("anonymous {{ {fields} }}");
         }
-        if self.substitution.is_empty() {
-            return self.name.clone();
-        }
+        // `_`-prefixed members are implementation details (the language's `_`
+        // privacy convention), so they are omitted from the rendered
+        // substitution; a type whose visible surface is only its `_` internals
+        // reads as its bare name.
         let entries = self
             .substitution
             .iter()
+            .filter(|(key, _)| !key.starts_with('_'))
             .map(|(key, ty)| format!("{key}={}", ty.display_with(unknown)))
             .collect::<Vec<_>>()
             .join(", ");
+        if entries.is_empty() {
+            return self.name.clone();
+        }
         format!("{}<{entries}>", self.name)
     }
 }
@@ -759,6 +764,90 @@ pub fn substitute_vars(ty: &Type, map: &BTreeMap<u32, Type>) -> Type {
     }
 }
 
+/// The return type of a `_plugin_call_<code>` / `_plugin_fcall_<code>`
+/// builtin (the native-plugin dispatch calls the loader synthesizes; see
+/// `prepoly_resolve::plugin`), or `None` when `name` is not one. The suffix is
+/// the plugin value-type code -- one letter per leaf type, with an `a` prefix
+/// per array level (`as` is `string[]`), so it stays a valid identifier
+/// fragment. The `_fcall_` family is fallible and returns `Result<T, string>`.
+/// One decoder shared by the checker (full and light passes) and the back
+/// ends, so the contract cannot drift.
+pub fn plugin_builtin_return(name: &str) -> Option<Type> {
+    let (code, fallible) = if let Some(rest) = name.strip_prefix("_plugin_call_") {
+        (rest, false)
+    } else if let Some(rest) = name.strip_prefix("_plugin_fcall_") {
+        (rest, true)
+    } else {
+        return None;
+    };
+    let mut chars = code.chars();
+    let payload = plugin_type_code(&mut chars)?;
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(if fallible {
+        Type::result(payload, Type::Str)
+    } else {
+        payload
+    })
+}
+
+/// Decode one plugin value-type code from the front of `chars`.
+fn plugin_type_code(chars: &mut std::str::Chars<'_>) -> Option<Type> {
+    Some(match chars.next()? {
+        'v' => Type::Void,
+        'b' => Type::Bool,
+        'i' => Type::Int(IntKind::I64),
+        'f' => Type::Float(FloatKind::F64),
+        's' => Type::Str,
+        // `uint8[]` is its own code: the boundary's only integer is `int64`,
+        // so a byte buffer is not `Array(int)`.
+        'y' => Type::Slice(Box::new(Type::Int(IntKind::U8))),
+        'a' => Type::Slice(Box::new(plugin_type_code(chars)?)),
+        _ => return None,
+    })
+}
+
+/// Collapse nested nullability (`T??` -> `T?`) throughout a type. A nested
+/// nullable carries no extra meaning (there is one `null`), and can arise when
+/// a return wrapped in `?` over an open variable is instantiated with a type
+/// that is itself nullable.
+pub fn collapse_nullable(ty: &Type) -> Type {
+    match ty {
+        Type::Nullable(inner) => {
+            let mut inner = collapse_nullable(inner);
+            if let Type::Nullable(i) = inner {
+                inner = *i;
+            }
+            Type::Nullable(Box::new(inner))
+        }
+        Type::Array(inner, n) => Type::Array(Box::new(collapse_nullable(inner)), *n),
+        Type::Slice(inner) => Type::Slice(Box::new(collapse_nullable(inner))),
+        Type::ConstOf(inner) => Type::ConstOf(Box::new(collapse_nullable(inner))),
+        Type::Mut(inner) => Type::Mut(Box::new(collapse_nullable(inner))),
+        Type::Ref(inner) => Type::Ref(Box::new(collapse_nullable(inner))),
+        Type::Tuple(elems) => Type::Tuple(elems.iter().map(collapse_nullable).collect()),
+        Type::Fun(ps, r) => Type::Fun(
+            ps.iter().map(collapse_nullable).collect(),
+            Box::new(collapse_nullable(r)),
+        ),
+        Type::Record(n) => Type::Record(collapse_nullable_nominal(n)),
+        Type::Sum(n) => Type::Sum(collapse_nullable_nominal(n)),
+        other => other.clone(),
+    }
+}
+
+fn collapse_nullable_nominal(n: &NominalType) -> NominalType {
+    if n.substitution.is_empty() {
+        return n.clone();
+    }
+    let mut subst = Substitution::empty();
+    for (k, v) in n.substitution.iter() {
+        subst.insert(k.to_string(), collapse_nullable(v));
+    }
+    NominalType::with_substitution(n.id, n.name.clone(), subst)
+}
+
 fn substitute_vars_nominal(n: &NominalType, map: &BTreeMap<u32, Type>) -> NominalType {
     if n.substitution.is_empty() {
         return n.clone();
@@ -851,7 +940,10 @@ mod tests {
     use prepoly_parser::Span;
     use prepoly_parser::ast::TypeExpr;
 
-    use super::{IntKind, NominalInfo, NominalType, Substitution, Type, resolve};
+    use super::{
+        IntKind, NominalInfo, NominalType, Substitution, Type, collapse_nullable,
+        plugin_builtin_return, resolve,
+    };
 
     #[test]
     fn resolves_sum_nominal_kind() {
@@ -888,6 +980,28 @@ mod tests {
         assert_eq!(wrapper.to_string(), "Wrapper<item=string>");
     }
 
+    /// `_`-prefixed substitution entries are implementation details and stay out
+    /// of the rendered type; a nominal whose entries are all hidden displays as
+    /// its bare name (identity still uses every entry).
+    #[test]
+    fn hidden_substitution_entries_stay_out_of_display() {
+        let mixed = NominalType::with_substitution(1, "Table", {
+            let mut subst = Substitution::empty();
+            subst.insert("_entries", Type::Slice(Box::new(Type::Str)));
+            subst.insert("size", Type::Int(IntKind::I64));
+            subst
+        });
+        assert_eq!(mixed.to_string(), "Table<size=int64>");
+
+        let all_hidden = NominalType::with_substitution(1, "Table", {
+            let mut subst = Substitution::empty();
+            subst.insert("_entries", Type::Slice(Box::new(Type::Str)));
+            subst
+        });
+        assert_eq!(all_hidden.to_string(), "Table");
+        assert!(!all_hidden.same_nominal(&NominalType::new(1, "Table")));
+    }
+
     #[test]
     fn result_constructor_uses_substituted_sum_type() {
         let ty = Type::result(Type::Int(IntKind::I32), Type::Str);
@@ -909,5 +1023,49 @@ mod tests {
 
         assert!(ty.is_null());
         assert_eq!(ty.display(), "never?");
+    }
+
+    /// `T??` collapses to `T?` at any depth and inside composites; an already
+    /// flat type is unchanged.
+    #[test]
+    fn nested_nullable_collapses() {
+        let t = Type::Nullable(Box::new(Type::Nullable(Box::new(Type::Str))));
+        assert_eq!(collapse_nullable(&t), Type::Nullable(Box::new(Type::Str)));
+
+        let deep = Type::Slice(Box::new(Type::Nullable(Box::new(Type::Nullable(
+            Box::new(Type::Int(IntKind::I32)),
+        )))));
+        assert_eq!(
+            collapse_nullable(&deep),
+            Type::Slice(Box::new(Type::Nullable(Box::new(Type::Int(IntKind::I32)))))
+        );
+
+        let flat = Type::Nullable(Box::new(Type::Str));
+        assert_eq!(collapse_nullable(&flat), flat);
+    }
+
+    /// The plugin dispatch builtins carry their return type in the name: one
+    /// letter per leaf, an `a` per array level, and the `_fcall_` family wraps
+    /// in `Result`. A name that is not one of them, or carries a malformed
+    /// code, decodes to nothing.
+    #[test]
+    fn plugin_builtin_names_decode_their_return_type() {
+        let bytes = Type::Slice(Box::new(Type::Int(IntKind::U8)));
+        assert_eq!(
+            plugin_builtin_return("_plugin_call_i"),
+            Some(Type::Int(IntKind::I64))
+        );
+        assert_eq!(plugin_builtin_return("_plugin_call_y"), Some(bytes));
+        assert_eq!(
+            plugin_builtin_return("_plugin_call_aas"),
+            Some(Type::Slice(Box::new(Type::Slice(Box::new(Type::Str)))))
+        );
+        assert_eq!(
+            plugin_builtin_return("_plugin_fcall_s"),
+            Some(Type::result(Type::Str, Type::Str))
+        );
+        assert_eq!(plugin_builtin_return("_plugin_call_a"), None);
+        assert_eq!(plugin_builtin_return("_plugin_call_si"), None);
+        assert_eq!(plugin_builtin_return("_tls_connect"), None);
     }
 }

@@ -166,7 +166,14 @@ fn module_public_symbols(module: &[String], doc_path: &Path) -> Vec<(String, Com
                 file.push(seg);
             }
             file.set_extension("pp");
-            std::fs::read_to_string(file).ok()
+            match std::fs::read_to_string(file) {
+                Ok(src) => Some(src),
+                // A native plugin library also names a module: list its
+                // functions from the synthesized wrapper source, exactly as
+                // the loader will build it.
+                Err(_) => prepoly_resolve::plugin::plugin_library_for(&doc_dir(doc_path), module)
+                    .and_then(|lib| prepoly_resolve::plugin::synthesize_plugin_module(&lib).ok()),
+            }
         }
     };
     let Some(src) = src else {
@@ -210,6 +217,16 @@ fn dir_module_names(dir: &Path, exclude: Option<&str>) -> Vec<String> {
             && Some(stem) != exclude
         {
             names.push(stem.to_string());
+        } else if path.extension().and_then(|s| s.to_str()) == Some(std::env::consts::DLL_EXTENSION)
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        {
+            // A native plugin library is importable by its module name: the
+            // file stem, minus the platform `lib` prefix a cdylib build adds.
+            let name = stem
+                .strip_prefix(std::env::consts::DLL_PREFIX)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(stem);
+            names.push(name.to_string());
         }
     }
     names
