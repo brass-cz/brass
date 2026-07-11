@@ -1,0 +1,28 @@
+// Helpers for scanning a string as an array of characters.
+//
+// `string.find` reports UTF-8 byte offsets and prepoly has no string slicing,
+// so the parser works on the `string[]` produced by `chars()` and turns index
+// ranges back into strings here.
+
+/** The characters `cs[lo..hi)` joined back into a string. Bounds are clamped. */
+fun substr(cs: string[], lo: int64, hi: int64) -> string {
+    let start = lo
+    if start < 0 { start = 0 }
+    let end = hi
+    if end > len(cs) { end = len(cs) }
+    if start >= end { return "" }
+    return cs.slice(start, end).join("")
+}
+
+/** Index of the first `c` in `cs[from..to)`, or null when there is none. */
+fun index_of(cs: string[], c: string, from: int64, to: int64) -> int64? {
+    let i = from
+    if i < 0 { i = 0 }
+    let end = to
+    if end > len(cs) { end = len(cs) }
+    while i < end {
+        if cs[i] == c { return i }
+        i += 1
+    }
+    return null
+}

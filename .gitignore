@@ -4,6 +4,8 @@ Cargo.lock
 llvm/
 .tooling/
 
+*.tar.gz
+
 # Native plugins built by libraries/build.sh, installed beside their module.
 libraries/**/*.so
 libraries/**/*.dylib
