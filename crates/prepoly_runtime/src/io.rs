@@ -10,8 +10,26 @@ use std::io::Read;
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
 
-use crate::alloc::{pp_arr_new, typed_result, typed_result_err};
+use crate::alloc::{pp_arr_new, pp_str_const, typed_result, typed_result_err};
 use crate::rt::Header;
+
+/// `_argv() -> string[]`: the program's argument vector -- the program file
+/// as written on the driver's command line, then everything after it -- as
+/// published by the driver through `prepoly_utils::set_program_argv`. Empty
+/// when none was published (an interactive REPL session, or an embedder).
+/// The primitive behind the env library's `args()`.
+pub extern "C-unwind" fn pp_argv() -> *mut Header {
+    let argv = prepoly_utils::program_argv();
+    unsafe {
+        // A string[]: one pointer-sized slot per element.
+        let arr = pp_arr_new(8, argv.len() as i64);
+        let data = *((arr as *mut u8).offset(32) as *mut *mut *mut Header);
+        for (i, a) in argv.iter().enumerate() {
+            *data.add(i) = pp_str_const(a.as_ptr(), a.len() as i64);
+        }
+        arr
+    }
+}
 
 /// `_stdin_read(n) -> uint8[]!`: up to `n` bytes from standard input (fewer
 /// at end-of-input). The primitive behind the prelude's `input()`, so reading

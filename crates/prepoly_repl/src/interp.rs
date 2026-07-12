@@ -756,6 +756,15 @@ impl<'p, 'm> Interp<'p, 'm> {
                 }
                 Ok(Value::Void)
             }
+            // The program's argument vector, published by the driver (empty in
+            // an interactive session).
+            "_argv" => {
+                let argv: Vec<Value> = prepoly_utils::program_argv()
+                    .iter()
+                    .map(|a| Value::Str(Rc::from(a.as_str())))
+                    .collect();
+                Ok(Value::Array(Rc::new(RefCell::new(argv))))
+            }
             "_stdin_read" => {
                 let n = self
                     .eval_operand(f, frame, &args[0], &Type::Int(IntKind::I64))?

@@ -1,0 +1,20 @@
+# The env library's native half: a prepoly plugin (cdylib) loaded by
+# `libraries/env.pp`. Build and install it with `libraries/build.sh`, which
+# places the cdylib next to the wrapper as `libenv.<dll suffix>`.
+[package]
+name = "prepoly_lib_env"
+description = "prepoly plugin: process environment queries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+# The cdylib is installed as `libraries/libenv.so`, and the wrapper module
+# imports it by that file name (`import libenv.{ .. }`).
+name = "env"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+prepoly_plugin = { workspace = true }

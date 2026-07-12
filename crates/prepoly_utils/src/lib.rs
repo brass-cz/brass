@@ -1,6 +1,25 @@
-//! Cross-crate utilities. Currently the single shared piece is the tracing
-//! initialization every prepoly binary (driver, language server) uses, so the
-//! log environment variables behave identically everywhere.
+//! Cross-crate utilities: the tracing initialization every prepoly binary
+//! (driver, language server) uses, and the program argument vector shared
+//! between the driver and both back ends' `_argv` builtin.
+
+use std::sync::OnceLock;
+
+/// The running program's argument vector: the program file as it was written
+/// on the driver's command line, then everything after it. Set once by the
+/// driver before the program runs; both back ends' `_argv` builtin reads it.
+static PROGRAM_ARGV: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Publish the program's argument vector (see [`program_argv`]). Later calls
+/// are ignored: the vector describes this process's one program invocation.
+pub fn set_program_argv(argv: Vec<String>) {
+    let _ = PROGRAM_ARGV.set(argv);
+}
+
+/// The program's argument vector, or empty when none was published -- an
+/// interactive REPL session, or an embedder that never set one.
+pub fn program_argv() -> &'static [String] {
+    PROGRAM_ARGV.get().map(Vec::as_slice).unwrap_or(&[])
+}
 
 /// Initialize the tracing subscriber for a prepoly binary.
 ///

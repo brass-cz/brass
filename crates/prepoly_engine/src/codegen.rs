@@ -243,6 +243,9 @@ pub trait Codegen {
     /// `_stdin_read(n)`: a `Result<uint8[], string>` of up to `n` bytes from
     /// standard input.
     fn stdin_read(&mut self, n: Self::Value) -> Self::Value;
+    /// `_argv()`: the program's argument vector, a `string[]` (the program
+    /// file, then everything after it on the driver's command line).
+    fn argv(&mut self) -> Self::Value;
     /// A native-plugin call (`_plugin_[f]call_<t>`): `rt_name` is one of the
     /// `pp_plugin_call_{int,float,obj}` runtime symbols, picked by return
     /// class. `strings` are the path/name/sig string objects; `args` are the
@@ -1569,6 +1572,7 @@ pub trait Codegen {
                 let n = self.codegen_operand(program, f, &args[0], &i64t);
                 self.stdin_read(n)
             }
+            "_argv" => self.argv(),
             // Integer width conversions: widen is infallible, narrow
             // returns a range-checked Result.
             "_int_widen" | "_int_narrow" => {

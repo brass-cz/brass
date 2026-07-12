@@ -2499,6 +2499,9 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
     fn string_from_bytes(&mut self, bytes: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
         self.call_rt_ptr("pp_str_from_bytes", &[bytes])
     }
+    fn argv(&mut self) -> BasicValueEnum<'ctx> {
+        self.call_rt_ptr("pp_argv", &[])
+    }
     fn stdin_read(&mut self, n: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
         // `pp_stdin_read(i64) -> ptr`: the count is an integer; widen a
         // narrower literal so every call site declares one signature.

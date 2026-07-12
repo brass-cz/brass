@@ -285,6 +285,36 @@ program is JIT-compiled or interpreted, so the old "the REPL refuses file
 I/O" rule is gone (only `spawn` remains JIT-only). The playground has no
 filesystem, so the examples here are not runnable in it.
 
+## `env` (a library, not `std`)
+
+```prepoly norun
+import env.{ args, var, vars, current_dir }
+```
+
+The process environment: command-line arguments, environment variables, and
+the working directory. A plugin under `libraries/`, with the same setup as
+the others — automatic for a distributed toolchain, `libraries/build.sh` +
+`PREPOLY_INCLUDE` from a repo checkout. Not runnable in the playground.
+
+| Function        | Signature          | Behavior                                          |
+| --------------- | ------------------ | ------------------------------------------------- |
+| `args()`        | `() -> string[]`   | the program file, then everything written after it |
+| `var(name)`     | `(string) -> string!` | an unset variable is an error, not `""`        |
+| `vars()`        | `() -> HashMap`    | every variable, as a `string -> string` map       |
+| `current_dir()` | `() -> Path!`      | the working directory, as a `path` `Path`         |
+
+Everything after the program file on the command line belongs to the
+program, verbatim — flags included, no separator needed:
+
+```sh
+prepoly main.pp --verbose input.txt
+```
+
+gives `args() == ["main.pp", "--verbose", "input.txt"]` — the program file
+as written, then the arguments (index `0` is the program, as in C's `argv`).
+The same holds for `prepoly repl main.pp ...`. In an interactive REPL
+session, or under an embedder that passes no arguments, `args()` is empty.
+
 ## `net` (a library, not `std`)
 
 ```prepoly norun

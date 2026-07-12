@@ -84,6 +84,13 @@ impl<'a> Checker<'a> {
                 Type::Str,
             ));
         }
+        if name == "_argv" {
+            // `_argv() -> string[]`: the program's argument vector (the
+            // program file, then everything after it on the command line).
+            // The primitive behind the env library's `args()`.
+            self.check_arg_count(name, 0, args.len(), span);
+            return Some(Type::Slice(Box::new(Type::Str)));
+        }
         if let Some(ret) = prepoly_hir::plugin_builtin_return(name) {
             self.check_plugin_call(name, args, span, scopes);
             return Some(ret);
@@ -369,6 +376,7 @@ impl<'a> Checker<'a> {
                 Type::Slice(Box::new(Type::Int(IntKind::U8))),
                 Type::Str,
             )),
+            "_argv" => Some(Type::Slice(Box::new(Type::Str))),
             "input" => Some(Type::result(Type::Str, Type::Str)),
             "len" => Some(Type::Int(IntKind::I64)),
             "print" | "println" | "assert" => Some(Type::Void),

@@ -10,3 +10,5 @@ path = "src/lib.rs"
 # wasm targets, so the dependency is unconditional.
 [dependencies]
 prepoly_plugin_host.workspace = true
+# The driver-published program argument vector `pp_argv` answers with.
+prepoly_utils.workspace = true

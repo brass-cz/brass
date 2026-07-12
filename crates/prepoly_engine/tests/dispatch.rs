@@ -142,6 +142,9 @@ impl Codegen for TextBackend {
     fn stdin_read(&mut self, n: usize) -> usize {
         self.val(format!("stdin_read v{n}"))
     }
+    fn argv(&mut self) -> usize {
+        self.val("argv".to_string())
+    }
     fn plugin_call(
         &mut self,
         rt_name: &'static str,

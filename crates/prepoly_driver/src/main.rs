@@ -39,6 +39,11 @@ struct Cli {
     /// the REPL interpreter). With neither a file nor a subcommand, the
     /// interactive REPL starts instead.
     file: Option<String>,
+    /// Everything after the program file, passed through to the program
+    /// verbatim (flags included): the env library's `args()` returns the
+    /// program file followed by these.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -48,7 +53,13 @@ enum Command {
     /// Type-check a program without running it.
     Check { file: String },
     /// Start the interactive REPL, or run a file through the REPL interpreter.
-    Repl { file: Option<String> },
+    Repl {
+        file: Option<String>,
+        /// Everything after the program file, passed through to the program
+        /// verbatim (see the env library's `args()`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 /// Which back end / phase `drive` runs after the front end produces a checked
@@ -94,13 +105,41 @@ fn run_cli() -> ExitCode {
         // A bare file argument is type-checked and run; with neither a file nor a
         // subcommand, start an interactive REPL session.
         None => match cli.file {
-            Some(file) => exit_code(drive(Mode::Run, &file)),
-            None => repl_interactive(),
+            Some(file) => {
+                set_program_args(Some(&file), &cli.args);
+                exit_code(drive(Mode::Run, &file))
+            }
+            None => {
+                set_program_args(None, &cli.args);
+                repl_interactive()
+            }
         },
         Some(Command::Check { file }) => exit_code(drive(Mode::Check, &file)),
-        Some(Command::Repl { file: None }) => repl_interactive(),
-        Some(Command::Repl { file: Some(file) }) => exit_code(drive(Mode::Repl, &file)),
+        Some(Command::Repl { file: None, args }) => {
+            set_program_args(None, &args);
+            repl_interactive()
+        }
+        Some(Command::Repl {
+            file: Some(file),
+            args,
+        }) => {
+            set_program_args(Some(&file), &args);
+            exit_code(drive(Mode::Repl, &file))
+        }
     }
+}
+
+/// Publish the program's argument vector -- the program file as written on
+/// the command line, then everything after it -- for the `_argv` builtin
+/// (behind the env library's `args()`) to answer with. Empty for an
+/// interactive REPL session.
+fn set_program_args(file: Option<&str>, args: &[String]) {
+    let argv = file
+        .iter()
+        .map(|f| f.to_string())
+        .chain(args.iter().cloned())
+        .collect();
+    prepoly_utils::set_program_argv(argv);
 }
 
 fn exit_code(r: Result<(), u8>) -> ExitCode {

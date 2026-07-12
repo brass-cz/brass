@@ -1286,6 +1286,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                     Type::Slice(Box::new(Type::Int(IntKind::U8))),
                     Type::Str,
                 ))),
+                "_argv" => Ok(Some(Type::Slice(Box::new(Type::Str)))),
                 // `to_string` only has a typed conversion for scalars/strings;
                 // other arguments fall back so formatting stays correct.
                 "to_string" => match args.first() {

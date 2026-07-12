@@ -1,0 +1,10 @@
+// Under the driver, `args()` is the program file followed by the arguments
+// after `--`. The harness passes none, so only the file is present; its
+// value is the path the harness used, so only the stable tail is printed.
+import env.{ args }
+
+fun main() {
+    let a = args()
+    println(len(a))
+    println(a[0].ends_with("args.pp"))
+}
