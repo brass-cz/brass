@@ -601,7 +601,7 @@ impl<'p> Hm<'p> {
                 self.infer_block(body);
             }
             Stmt::For {
-                var, iter, body, ..
+                pat, iter, body, ..
             } => {
                 // A fields-loop is expanded and fully checked per field by the
                 // infer pass; its body does not type as ordinary code (the loop
@@ -617,7 +617,7 @@ impl<'p> Hm<'p> {
                 let elem = prepoly_hir::index_element(&self.solver.resolve(&iter_ty))
                     .unwrap_or_else(|| self.solver.fresh(InferenceVarKind::Source));
                 self.scopes.push(HashMap::new());
-                self.bind_mono(var, elem);
+                self.bind_pattern(pat, &elem);
                 for stmt in &body.stmts {
                     self.infer_stmt(stmt);
                 }
@@ -1260,7 +1260,18 @@ impl<'p> Hm<'p> {
                     .map(|a| self.infer_expr(&a.expr))
                     .unwrap_or(Type::Void);
                 self.reconcile_err(&xt, span);
-                return Type::result(self.ok.clone(), self.err.clone());
+                // The Ok payload is FRESH per call, not this function's own `ok`.
+                // An `error(..)` produces no Ok value, so its payload is whatever
+                // the position it flows into requires -- `return error(..)` unifies
+                // the fresh variable with this function's `ok` through the return
+                // check, and an argument position unifies it with the parameter's.
+                // Sharing `self.ok` made every `error(..)` in one body the SAME
+                // type, so two arguments needing different payloads clashed:
+                // `unwrap_or(error("a"), -1)` then `describe(error("b"))` reported
+                // "cannot use `Result<int32, string>` where `Result<string, ?>` is
+                // required" on the second.
+                let ok = self.solver.fresh(InferenceVarKind::Source);
+                return Type::result(ok, self.err.clone());
             }
             // Built-in `_string_*` primitives have fixed string-argument contracts.
             if let Some(ret) = self.string_builtin_call(name, args, span) {
@@ -1561,11 +1572,22 @@ impl<'p> Hm<'p> {
                     for (p, ety) in pats.iter().zip(elems) {
                         self.bind_pattern(p, ety);
                     }
-                } else {
-                    let elem = prepoly_hir::index_element(&resolved)
-                        .unwrap_or_else(|| self.solver.fresh(InferenceVarKind::Source));
+                } else if let Some(elem) = prepoly_hir::index_element(&resolved) {
+                    // An array: every position is the element type.
                     for p in pats {
                         self.bind_pattern(p, &elem);
+                    }
+                } else {
+                    // The subject's shape is not modelled here (this pass leaves a
+                    // method call's result open, so `m.pairs()` arrives as a bare
+                    // variable). Each position gets its OWN variable: coupling them
+                    // to one would make `for [k, v] in m.pairs()` claim `k` and `v`
+                    // are the same type, and whichever the body constrained first
+                    // would reject the other. The `infer` pass, which does resolve
+                    // the call, checks them for real.
+                    for p in pats {
+                        let fresh = self.solver.fresh(InferenceVarKind::Source);
+                        self.bind_pattern(p, &fresh);
                     }
                 }
             }

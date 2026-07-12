@@ -422,9 +422,7 @@ fn collect_local_bindings(stmts: &[Stmt], out: &mut HashSet<String>) {
     for stmt in stmts {
         match stmt {
             Stmt::Let { pat, .. } => collect_pattern_bindings(pat, out),
-            Stmt::For { var, .. } => {
-                out.insert(var.clone());
-            }
+            Stmt::For { pat, .. } => collect_pattern_bindings(pat, out),
             _ => {}
         }
         nested_block_stmts(stmt, &mut |inner| collect_local_bindings(inner, out));

@@ -77,11 +77,13 @@ fn collect_stmt_refs(
             collect_block_refs(body, globals, bound, out);
         }
         Stmt::For {
-            var, iter, body, ..
+            pat, iter, body, ..
         } => {
             collect_expr_refs(iter, globals, bound, out);
             let mut inner = bound.clone();
-            inner.insert(var.clone());
+            for n in pat.bound_names() {
+                inner.insert(n.to_string());
+            }
             collect_block_refs(body, globals, &inner, out);
         }
         Stmt::Return(Some(e), _) => collect_expr_refs(e, globals, bound, out),

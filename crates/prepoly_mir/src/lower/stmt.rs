@@ -138,14 +138,18 @@ impl FnLower<'_, '_> {
             Stmt::Expr(e) => self.lower_expr_stmt(e),
             Stmt::While { cond, body, .. } => self.lower_while(cond, body),
             Stmt::For {
-                var,
+                pat,
                 iter,
                 body,
                 span,
             } => {
                 // A fields-loop the checker approved unrolls into one copy per
-                // field; the copies are the same expansion the checker typed.
-                if let Some(fields) = self.ctx.fields_loops.get(span) {
+                // field; the copies are the same expansion the checker typed. Only
+                // a plain loop variable can be a fields-loop (see
+                // `fields_loop_target`), so its name is available here.
+                if let Some(fields) = self.ctx.fields_loops.get(span)
+                    && let Pattern::Binding(var, _) = pat
+                {
                     let fields = fields.clone();
                     for (i, field) in fields.iter().enumerate() {
                         let expanded = prepoly_hir::expand_fields_body(body, var, field, i);
@@ -160,7 +164,7 @@ impl FnLower<'_, '_> {
                     }
                     return;
                 }
-                self.lower_for(var, iter, body)
+                self.lower_for(pat, iter, body)
             }
             Stmt::Return(opt, _) => {
                 let v = match opt {
@@ -478,8 +482,12 @@ impl FnLower<'_, '_> {
     ///
     /// A literal range iterable never escapes the loop, so it skips the array
     /// materialization entirely and counts in place.
-    fn lower_for(&mut self, var: &str, iter: &Expr, body: &Block) {
-        if let Expr::Range(lo, hi, span) = iter {
+    fn lower_for(&mut self, pat: &Pattern, iter: &Expr, body: &Block) {
+        // A range counts through a single variable; the checker rejects a
+        // destructuring pattern over one.
+        if let Expr::Range(lo, hi, span) = iter
+            && let Pattern::Binding(var, _) = pat
+        {
             return self.lower_for_range(var, lo, hi, *span, body);
         }
         let arr = self.lower_expr(iter);
@@ -518,14 +526,26 @@ impl FnLower<'_, '_> {
             arr,
             vec![Projection::Index(Operand::Local(i))],
         )));
-        self.bind_value(var, elem);
-        // A loop body that reassigns the loop variable (`e *= 2`, `e = ...`)
-        // means the element is bound by reference: the new value is written back
-        // into the slot so the array is mutated in place. (A managed element
-        // mutated through its own fields aliases the slot already, so only a
-        // bare reassignment needs this.) The write-back is carried on the loop
-        // frame so `continue`/`break` edges emit it too.
-        let writeback = reassigns_var(body, var).then(|| (arr, i, var.to_string()));
+        // A plain loop variable is bound by reference: a body that reassigns it
+        // (`e *= 2`, `e = ...`) writes the new value back into the slot, so the
+        // array is mutated in place. (A managed element mutated through its own
+        // fields aliases the slot already, so only a bare reassignment needs this.)
+        // The write-back is carried on the loop frame so `continue`/`break` edges
+        // emit it too.
+        //
+        // A DESTRUCTURING pattern binds the element's parts, which are values of
+        // their own -- there is no single binding to write back through.
+        let writeback = match pat {
+            Pattern::Binding(var, _) => {
+                self.bind_value(var, elem);
+                reassigns_var(body, var).then(|| (arr, i, var.to_string()))
+            }
+            _ => {
+                let el = self.b.make_local(elem);
+                self.lower_pattern_bind(pat, el);
+                None
+            }
+        };
         self.loops.push(crate::lower::LoopFrame {
             cont: incr_bb,
             brk: end_bb,
@@ -631,7 +651,9 @@ fn stmt_reassigns_var(stmt: &Stmt, var: &str) -> bool {
         Stmt::Assign { target, .. } => matches!(target, Expr::Ident(n, _) if n == var),
         Stmt::While { body, .. } => reassigns_var(body, var),
         // A nested `for` that rebinds the same name shadows it, so stop there.
-        Stmt::For { var: v, body, .. } => v != var && reassigns_var(body, var),
+        Stmt::For { pat, body, .. } => {
+            !pat.bound_names().contains(&var) && reassigns_var(body, var)
+        }
         Stmt::Expr(e) | Stmt::Return(Some(e), _) => expr_reassigns_var(e, var),
         Stmt::Let { value, .. } => value.as_ref().is_some_and(|v| expr_reassigns_var(v, var)),
         _ => false,

@@ -206,7 +206,7 @@ impl Specializer<'_> {
             // is unreachable; but a non-record key only reaches here in an arm
             // that also folds elsewhere, so this stays a faithful unroll.
             Stmt::For {
-                var,
+                pat: Pattern::Binding(var, _),
                 iter,
                 body,
                 span,
@@ -263,12 +263,12 @@ impl Specializer<'_> {
                 span: *span,
             }],
             Stmt::For {
-                var,
+                pat,
                 iter,
                 body,
                 span,
             } => vec![Stmt::For {
-                var: var.clone(),
+                pat: pat.clone(),
                 iter: self.expr(iter, binds),
                 body: self.block_in(body, binds),
                 span: *span,

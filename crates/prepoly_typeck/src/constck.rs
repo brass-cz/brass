@@ -240,7 +240,7 @@ impl ConstChecker<'_> {
                 self.check_block(body, scopes);
             }
             Stmt::For {
-                var, iter, body, ..
+                pat, iter, body, ..
             } => {
                 self.check_expr(iter, scopes);
                 // The loop variable is a reference into each element, so its
@@ -255,7 +255,13 @@ impl ConstChecker<'_> {
                 } else {
                     Binding::Mutable
                 };
-                scopes.push(HashMap::from([(var.clone(), binding)]));
+                // Every name a destructuring loop variable binds takes the same
+                // constness: they are all parts of the one element.
+                let mut frame = HashMap::new();
+                for n in pat.bound_names() {
+                    frame.insert(n.to_string(), binding.clone());
+                }
+                scopes.push(frame);
                 self.check_block(body, scopes);
                 scopes.pop();
             }

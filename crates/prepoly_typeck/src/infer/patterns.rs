@@ -101,21 +101,31 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            Pattern::Array(pats, _) => {
-                if let Type::Tuple(elems) = self.resolve(ty) {
-                    // Tuple destructuring binds each position to its element type.
+            Pattern::Array(pats, _) => match self.resolve(ty) {
+                // Tuple destructuring binds each position to its element type.
+                Type::Tuple(elems) => {
                     for (p, ety) in pats.iter().zip(elems) {
                         self.bind_pattern(p, &ety, scopes);
                     }
-                } else {
-                    let elem = match self.resolve(ty) {
-                        Type::Array(inner, _) | Type::Slice(inner) => *inner,
-                        _ => self.fresh_unknown(),
-                    };
-                    pats.iter()
-                        .for_each(|p| self.bind_pattern(p, &elem, scopes));
                 }
-            }
+                // An array: every position is the element type.
+                Type::Array(inner, _) | Type::Slice(inner) => {
+                    for p in pats {
+                        self.bind_pattern(p, &inner, scopes);
+                    }
+                }
+                // The subject's shape is not known here. Each position gets its OWN
+                // variable rather than sharing one: the positions of a destructuring
+                // are independent values, and coupling them would make `[k, v]` claim
+                // `k` and `v` are the same type -- whichever the body constrained
+                // first would then reject the other.
+                _ => {
+                    for p in pats {
+                        let elem = self.fresh_unknown();
+                        self.bind_pattern(p, &elem, scopes);
+                    }
+                }
+            },
             Pattern::Wildcard(_) | Pattern::Literal(_, _) => {}
         }
     }

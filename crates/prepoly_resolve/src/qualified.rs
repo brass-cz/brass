@@ -252,11 +252,13 @@ impl Rewriter<'_> {
                 self.block(body);
             }
             Stmt::For {
-                var, iter, body, ..
+                pat, iter, body, ..
             } => {
                 self.expr(iter);
                 self.push();
-                self.bind(var);
+                for n in pat.bound_names() {
+                    self.bind(n);
+                }
                 self.block(body);
                 self.pop();
             }

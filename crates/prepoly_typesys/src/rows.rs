@@ -520,11 +520,12 @@ impl ParamScan<'_> {
                 active
             }
             Stmt::For {
-                var, iter, body, ..
+                pat, iter, body, ..
             } => {
                 self.walk_value(iter, active, None);
-                let inner_active = active && var != self.param;
-                self.walk_block(body, inner_active);
+                // A loop variable that shadows the parameter hides it in the body.
+                let shadows = pat.bound_names().contains(&self.param);
+                self.walk_block(body, active && !shadows);
                 active
             }
             Stmt::Expr(e) => {

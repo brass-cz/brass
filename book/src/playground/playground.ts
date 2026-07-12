@@ -92,10 +92,13 @@ export const mountPlayground = async (root: HTMLElement) => {
 
   monaco.languages.register({ id: "prepoly" });
 
+  const url = new URL(location.href);
+  const program = url.searchParams.get("code") || SAMPLE_PROGRAM;
+
   const editor = monaco.editor.create(container, {
     language: "prepoly",
     theme: "vs-dark",
-    value: SAMPLE_PROGRAM,
+    value: program,
     // Pull semantic tokens from the registered provider below.
     "semanticHighlighting.enabled": true,
     fontSize: 18,
@@ -138,12 +141,19 @@ const wireLanguageFeatures = (
 
   // Diagnostics are pushed by the server, not pulled, so we recompute them on
   // edit (debounced) and on load, publishing them as model markers.
-  const refreshDiagnostics = debounce(async () => {
-    const diagnostics = await lsp.diagnostics(model.getValue());
+  const refreshCode = debounce(async () => {
+    const program = model.getValue();
+    if (program != SAMPLE_PROGRAM) {
+      const url = new URL(location.href);
+      url.searchParams.set("code", program);
+      window.history.replaceState(null, "", url.toString());
+    }
+
+    const diagnostics = await lsp.diagnostics(program);
     monaco.editor.setModelMarkers(model, "prepoly", diagnostics.map(toMarker));
   }, 300);
-  model.onDidChangeContent(refreshDiagnostics);
-  refreshDiagnostics();
+  model.onDidChangeContent(refreshCode);
+  refreshCode();
 
   monaco.languages.registerHoverProvider("prepoly", {
     provideHover: async (model, position) => {

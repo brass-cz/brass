@@ -137,11 +137,13 @@ fn free_block(b: &Block, bound: &mut HashSet<String>, free: &mut HashSet<String>
                 free_block(body, bound, free);
             }
             Stmt::For {
-                var, iter, body, ..
+                pat, iter, body, ..
             } => {
                 free_expr(iter, bound, free);
                 let mut inner = bound.clone();
-                inner.insert(var.clone());
+                for n in pat.bound_names() {
+                    inner.insert(n.to_string());
+                }
                 free_block(body, &mut inner, free);
             }
             Stmt::Return(Some(e), _) => free_expr(e, bound, free),

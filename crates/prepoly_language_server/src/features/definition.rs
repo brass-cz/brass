@@ -155,14 +155,16 @@ fn collect_stmt_bindings(s: &Stmt, f: &mut impl FnMut(&str, Span)) {
         Stmt::Expr(e) => collect_expr_bindings(e, f),
         Stmt::While { body, .. } => collect_block_bindings(body, f),
         Stmt::For {
-            var,
+            pat,
             iter,
             body,
             span,
         } => {
-            // The loop variable has no standalone span; attribute it to the loop
-            // header so it precedes uses inside the body.
-            f(var, Span::new(span.lo, span.lo));
+            // A loop variable has no standalone span; attribute every name the
+            // pattern binds to the loop header so they precede uses in the body.
+            for n in pat.bound_names() {
+                f(n, Span::new(span.lo, span.lo));
+            }
             collect_expr_bindings(iter, f);
             collect_block_bindings(body, f);
         }

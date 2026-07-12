@@ -1344,6 +1344,16 @@ pub trait Codegen {
             "array_len" => {
                 let ty = operand_type_of(&args[0], &f.local_types);
                 let ty = unwrap_nullable(&ty).clone();
+                // A tuple's arity is fixed by its type, and it carries no length
+                // field to read: answer from the type. `[k, v]` destructuring
+                // lowers to an array pattern, whose match test is a length check,
+                // so without this a `match`/`for` over tuples never matched (the
+                // interpreter, which reads the value's own length, always did --
+                // the two back ends disagreed).
+                if let Type::Tuple(elems) = &ty {
+                    let n = elems.len() as i64;
+                    return self.const_int(n, &Type::Int(prepoly_hir::IntKind::I64));
+                }
                 let v = self.codegen_operand(program, f, &args[0], &ty);
                 self.array_len(v)
             }

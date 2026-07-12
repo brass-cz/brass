@@ -686,20 +686,25 @@ fn scan_stmt(stmt: &Stmt, roots: &mut Roots, sink: &mut impl PlaceSink) -> bool 
             scan_expr(cond, roots, sink) || scan_block(body, roots, sink)
         }
         Stmt::For {
-            var, iter, body, ..
+            pat, iter, body, ..
         } => {
             if scan_expr(iter, roots, sink) {
                 return true;
             }
             let mut inner = roots.clone();
+            let names = pat.bound_names();
             if tracked_root(iter, roots).is_some() {
                 // Iterating a tracked place binds each element by reference of
                 // the array's kind, so writing back through the loop variable
                 // (`e = ..`, `e.f = ..`, `e.push(..)`) writes the tracked value.
-                inner.insert(var.clone(), true);
+                for n in &names {
+                    inner.insert((*n).to_string(), true);
+                }
             } else {
                 // The loop variable shadows a like-named tracked binding.
-                inner.remove(var);
+                for n in &names {
+                    inner.remove(*n);
+                }
             }
             body.stmts.iter().any(|s| scan_stmt(s, &mut inner, sink))
         }

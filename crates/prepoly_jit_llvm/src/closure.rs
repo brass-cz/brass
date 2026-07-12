@@ -24,8 +24,8 @@ fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
     match s {
         Stmt::Let { pat, .. } => collect_pat_names(pat, out),
         Stmt::While { body, .. } => collect_bound_block(body, out),
-        Stmt::For { var, body, .. } => {
-            out.insert(var.clone());
+        Stmt::For { pat, body, .. } => {
+            collect_pat_names(pat, out);
             collect_bound_block(body, out);
         }
         _ => {}

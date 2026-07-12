@@ -968,6 +968,22 @@ impl<'a> Checker<'a> {
             .map(|(e, t)| numeric_literal_repr(e).unwrap_or_else(|| self.resolve(t)))
             .collect();
         let (first, rest) = reps.split_first()?;
+        // Two DISTINCT unresolved variables would "unify" -- but only by coupling
+        // two values nothing says are related. An array's elements must all be the
+        // same type; independent unknowns are not known to be, so the literal is a
+        // tuple and each position keeps its own type. This is what `[e.key,
+        // e.value]` inside `HashMap.pairs` needs: its two halves are the map's
+        // separate key and value slots, and typing them as one array element made
+        // the method's scheme return `key[]` -- so `for [k, v] in m.pairs()` saw
+        // both halves as the key's type.
+        let distinct_unknowns = reps.iter().all(|t| matches!(t, Type::Unknown(_)))
+            && reps
+                .iter()
+                .enumerate()
+                .any(|(i, t)| reps.iter().skip(i + 1).any(|u| t != u));
+        if distinct_unknowns {
+            return Some(elem_tys.iter().map(|t| self.resolve(t)).collect());
+        }
         let snap = self.solver.snapshot();
         let unifiable = rest.iter().all(|t| self.solver.unify(first, t).is_ok());
         self.solver.rollback(snap);

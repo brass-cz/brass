@@ -1,0 +1,1 @@
+error: `Dims.from` builds `Dims` from the fields of a record, but `Shape` is not a record

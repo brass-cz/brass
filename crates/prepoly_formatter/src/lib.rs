@@ -5,7 +5,7 @@
 //! resolves escapes and radix prefixes, so the AST alone cannot reproduce
 //! them); blank lines between elements are preserved, collapsed to one.
 //!
-//! Layout: 4-space indentation and a 60-column target width. Block constructs
+//! Layout: 4-space indentation and an 80-column target width. Block constructs
 //! (`fun`, `if`, `while`, `for`, `match`) always put their bodies on indented
 //! lines; expressions that overflow the width break by construct-specific
 //! rules -- see the `expr` module docs.
@@ -59,6 +59,17 @@ mod tests {
         );
     }
 
+    /// A `for` loop variable is a pattern, so a destructuring one round-trips as
+    /// written rather than decaying to a name.
+    #[test]
+    fn for_destructuring_pattern_round_trips() {
+        let src = "fun main(){for [ k,v ] in m.pairs(){println(k)}}";
+        assert_eq!(
+            roundtrip(src),
+            "fun main() {\n    for [k, v] in m.pairs() {\n        println(k)\n    }\n}\n"
+        );
+    }
+
     #[test]
     fn if_blocks_always_break() {
         let src = "fun f(a: int32) -> int32 { if a > 0 { return a } else { return -a } }";
@@ -70,11 +81,10 @@ mod tests {
 
     #[test]
     fn long_method_chain_breaks_every_segment() {
-        let src =
-            "fun main() {\n    let r = items.filter((x) -> x > 0).map((x) -> x * 2).sum()\n}\n";
+        let src = "fun main() {\n    let result = collection_of_values.filter((x) -> x > 0).map((x) -> x * 2).sum()\n}\n";
         assert_eq!(
             roundtrip(src),
-            "fun main() {\n    let r = items\n        .filter((x) -> x > 0)\n        .map((x) -> x * 2)\n        .sum()\n}\n"
+            "fun main() {\n    let result = collection_of_values\n        .filter((x) -> x > 0)\n        .map((x) -> x * 2)\n        .sum()\n}\n"
         );
     }
 
@@ -89,31 +99,31 @@ mod tests {
 
     #[test]
     fn long_array_breaks_one_element_per_line() {
-        let src =
-            "fun main() {\n    let a = [aaaaaaaaaaa, bbbbbbbbbbb, ccccccccccc, ddddddddddd]\n}\n";
+        let src = "fun main() {\n    let a = [aaaaaaaaaaa, bbbbbbbbbbb, ccccccccccc, ddddddddddd, eeeeeeeeeee, fffffffffff]\n}\n";
         assert_eq!(
             roundtrip(src),
-            "fun main() {\n    let a = [\n        aaaaaaaaaaa,\n        bbbbbbbbbbb,\n        ccccccccccc,\n        ddddddddddd,\n    ]\n}\n"
+            "fun main() {\n    let a = [\n        aaaaaaaaaaa,\n        bbbbbbbbbbb,\n        ccccccccccc,\n        ddddddddddd,\n        eeeeeeeeeee,\n        fffffffffff,\n    ]\n}\n"
         );
     }
 
     #[test]
-    fn width_sixty_exactly_stays_flat() {
-        // 4 + 56 characters: the limit is "no more than 60", inclusive.
-        let src = "fun main() {\n    configure(first_option, second_option, third_option, xy)\n}\n";
+    fn width_eighty_exactly_stays_flat() {
+        // 4 + 76 characters: the limit is "no more than 80", inclusive. One
+        // character more (see below) and the same call breaks.
+        let src = "fun main() {\n    configure(first_option, second_option, third_option, fourth_option, xyzwvuq)\n}\n";
         assert_eq!(
             roundtrip(src),
-            "fun main() {\n    configure(first_option, second_option, third_option, xy)\n}\n"
+            "fun main() {\n    configure(first_option, second_option, third_option, fourth_option, xyzwvuq)\n}\n"
         );
     }
 
     #[test]
     fn long_call_breaks_after_the_paren() {
-        let src =
-            "fun main() {\n    configure(first_option, second_option, third_option, xyz)\n}\n";
+        // One character past the width the flat form above fits in exactly.
+        let src = "fun main() {\n    configure(first_option, second_option, third_option, fourth_option, xyzwvuqr)\n}\n";
         assert_eq!(
             roundtrip(src),
-            "fun main() {\n    configure(\n        first_option,\n        second_option,\n        third_option,\n        xyz,\n    )\n}\n"
+            "fun main() {\n    configure(\n        first_option,\n        second_option,\n        third_option,\n        fourth_option,\n        xyzwvuqr,\n    )\n}\n"
         );
     }
 
@@ -216,19 +226,20 @@ mod tests {
 
     #[test]
     fn long_binary_chain_breaks_after_operators() {
-        let src = "fun main() {\n    let ok = first_condition && second_condition && third_condition\n}\n";
+        let src = "fun main() {\n    let ok = first_condition && second_condition && third_condition && fourth_condition\n}\n";
         assert_eq!(
             roundtrip(src),
-            "fun main() {\n    let ok = first_condition &&\n        second_condition &&\n        third_condition\n}\n"
+            "fun main() {\n    let ok = first_condition &&\n        second_condition &&\n        third_condition &&\n        fourth_condition\n}\n"
         );
     }
 
     #[test]
     fn imports_break_when_long() {
-        let src = "import some.very.long.module.path.{ FirstName, SecondName, ThirdName }\n";
+        let src =
+            "import some.very.long.module.path.{ FirstName, SecondName, ThirdName, FourthName }\n";
         assert_eq!(
             roundtrip(src),
-            "import some.very.long.module.path.{\n    FirstName,\n    SecondName,\n    ThirdName,\n}\n"
+            "import some.very.long.module.path.{\n    FirstName,\n    SecondName,\n    ThirdName,\n    FourthName,\n}\n"
         );
     }
 
@@ -257,11 +268,12 @@ mod tests {
 
     #[test]
     fn nested_break_inside_broken_args() {
-        // An argument that cannot fit breaks recursively inside the arg list.
-        let src = "fun main() {\n    register(compute(alpha_value, beta_value, gamma_value, delta), name)\n}\n";
+        // An argument that cannot fit breaks recursively inside the arg list:
+        // `compute(..)` overflows even at the indent the outer break gives it.
+        let src = "fun main() {\n    register(compute(alpha_value, beta_value, gamma_value, delta_value, epsilon_value), name)\n}\n";
         assert_eq!(
             roundtrip(src),
-            "fun main() {\n    register(\n        compute(\n            alpha_value,\n            beta_value,\n            gamma_value,\n            delta,\n        ),\n        name,\n    )\n}\n"
+            "fun main() {\n    register(\n        compute(\n            alpha_value,\n            beta_value,\n            gamma_value,\n            delta_value,\n            epsilon_value,\n        ),\n        name,\n    )\n}\n"
         );
     }
 }

@@ -830,13 +830,15 @@ impl Parser {
 
     fn parse_for(&mut self) -> PResult<Stmt> {
         let lo = self.bump().span;
-        let (var, _) = self.ident()?;
+        // A pattern, not just a name: `for [k, v] in map.pairs()` destructures each
+        // element the way a `let` does.
+        let pat = self.parse_pattern()?;
         self.expect(TokenKind::In, "'in'")?;
         let iter = self.parse_cond()?;
         let body = self.parse_block()?;
         Ok(Stmt::For {
             span: lo.merge(body.span),
-            var,
+            pat,
             iter,
             body,
         })

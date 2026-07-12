@@ -16,7 +16,7 @@ use crate::comments::{self, Comment};
 
 /// Target maximum line width, in characters. Lines that no breaking rule
 /// applies to (single atoms, long signatures inside type bodies) may exceed it.
-pub const MAX_WIDTH: usize = 60;
+pub const MAX_WIDTH: usize = 80;
 /// Spaces per indentation level.
 pub const INDENT: usize = 4;
 
@@ -431,9 +431,10 @@ impl<'a> Printer<'a> {
                 self.line("}");
             }
             Stmt::For {
-                var, iter, body, ..
+                pat, iter, body, ..
             } => {
-                self.expr_lines(format!("for {var} in "), iter, " {", true);
+                let pat = self.pattern_flat(pat);
+                self.expr_lines(format!("for {pat} in "), iter, " {", true);
                 self.block_body(body);
                 self.line("}");
             }

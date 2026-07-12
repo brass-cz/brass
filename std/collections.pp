@@ -279,7 +279,14 @@ fun HashMap.values(self) {
     return result
 }
 
-/** The live pairs as `[key, value]` tuples, in the same order as `keys`. */
+/**
+ * The live pairs as `[key, value]` tuples, in the same order as `keys`. A `for`
+ * loop variable is a pattern, so each pair destructures in the loop header:
+ *
+ *     for [key, value] in m.pairs() {
+ *         println("{key} = {value}")
+ *     }
+ */
 fun HashMap.pairs(self) {
     let result = []
     let i: int64 = 0

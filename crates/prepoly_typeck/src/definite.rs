@@ -264,7 +264,7 @@ impl<'p, 'e> Walker<'p, 'e> {
                 self.state = snapshot;
             }
             Stmt::For {
-                var, iter, body, ..
+                pat, iter, body, ..
             } => {
                 // A fields-loop runs exactly once per field, so an
                 // unconditional `x[f] = ...` in its body assigns EVERY field:
@@ -288,7 +288,12 @@ impl<'p, 'e> Walker<'p, 'e> {
                 }
                 self.walk_expr(iter);
                 let snapshot = self.state.clone();
-                self.scopes.push(HashMap::from([(var.clone(), None)]));
+                let frame = pat
+                    .bound_names()
+                    .into_iter()
+                    .map(|n| (n.to_string(), None))
+                    .collect();
+                self.scopes.push(frame);
                 self.walk_block(body);
                 self.scopes.pop();
                 self.state = snapshot;

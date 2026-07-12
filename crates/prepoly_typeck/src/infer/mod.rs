@@ -874,7 +874,7 @@ impl<'a> Checker<'a> {
                 self.check_block(body, scopes);
             }
             Stmt::For {
-                var, iter, body, ..
+                pat, iter, body, ..
             } => {
                 if prepoly_hir::fields_loop_target(s).is_some() {
                     self.check_fields_loop(s, scopes);
@@ -894,8 +894,13 @@ impl<'a> Checker<'a> {
                     });
                     self.fresh_unknown()
                 });
-                scopes.push(HashMap::from([(var.clone(), item_ty)]));
+                scopes.push(HashMap::new());
                 self.const_scopes.push(HashSet::new());
+                // Check the loop variable's pattern against the element type, so a
+                // destructuring of the wrong arity is a diagnostic here rather than
+                // an out-of-bounds tuple read in the back end.
+                self.check_pattern_against(&item_ty, pat);
+                self.bind_pattern(pat, &item_ty, scopes);
                 self.check_block(body, scopes);
                 self.const_scopes.pop();
                 scopes.pop();

@@ -173,7 +173,9 @@ pub enum Stmt {
         span: Span,
     },
     For {
-        var: String,
+        /// The loop variable, or a destructuring of each element: `for [k, v] in
+        /// map.pairs()` binds both halves of each `[key, value]` tuple.
+        pat: Pattern,
         iter: Expr,
         body: Block,
         span: Span,
@@ -340,6 +342,33 @@ impl Pattern {
             | Pattern::Literal(_, s)
             | Pattern::Record(_, _, s)
             | Pattern::Array(_, s) => *s,
+        }
+    }
+
+    /// The names this pattern binds, in source order. A `Record` field with no
+    /// sub-pattern is the shorthand `{ name }`, which binds the field to its own
+    /// name. A `Literal` and a `Wildcard` bind nothing; a `Binding` that names a
+    /// unit variant is a test rather than a binding, but that is only known once
+    /// types are resolved, so it is reported here and filtered by the caller.
+    pub fn bound_names(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        self.collect_bound_names(&mut out);
+        out
+    }
+
+    fn collect_bound_names<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            Pattern::Wildcard(_) | Pattern::Literal(..) => {}
+            Pattern::Binding(name, _) => out.push(name),
+            Pattern::Array(pats, _) => pats.iter().for_each(|p| p.collect_bound_names(out)),
+            Pattern::Record(_, fields, _) => {
+                for f in fields {
+                    match &f.pat {
+                        Some(p) => p.collect_bound_names(out),
+                        None => out.push(&f.name),
+                    }
+                }
+            }
         }
     }
 }

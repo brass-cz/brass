@@ -68,7 +68,30 @@ impl<'a> Checker<'a> {
                     .first()
                     .map(|a| self.check_expr(&a.expr, scopes))
                     .unwrap_or(Type::Void);
-                return Type::result(self.fresh_unknown(), err_ty);
+                // The Ok payload of an `error(..)` is a value no path produces, so
+                // nothing in the expression itself can constrain it -- only the
+                // position it flows into. Take it from the expectation when there
+                // is one (`call_expected` is set for a call in a required
+                // position), so the recorded type is FULLY KNOWN.
+                //
+                // That matters beyond neatness: only a fully-known type is seeded
+                // onto the MIR local, and without a seed the back end types a bare
+                // `Result` construction from the ENCLOSING callable's return type.
+                // `println(g(error("x")))` inside a fallible `main` therefore typed
+                // the argument as main's `Result<void, string>`, instantiated `g`
+                // at that, and returned its `void` Ok payload from a function
+                // declared `int32` -- `ret i1 false`, caught only by the LLVM
+                // verifier.
+                let ok_ty = call_expected
+                    .as_ref()
+                    .and_then(|want| {
+                        self.resolve(want)
+                            .result_payloads()
+                            .map(|(ok, _)| ok.clone())
+                    })
+                    .filter(prepoly_hir::is_fully_known)
+                    .unwrap_or_else(|| self.fresh_unknown());
+                return Type::result(ok_ty, err_ty);
             }
             if let Some(ret) = self.builtin_function_type(name, args, span, scopes) {
                 return ret;
@@ -891,9 +914,10 @@ impl<'a> Checker<'a> {
                 // Every argument is still type-checked (an undeclared name in a
                 // trailing argument must surface), and the conversion's arity is
                 // exactly one.
-                for arg in args {
-                    self.check_expr(&arg.expr, scopes);
-                }
+                let arg_tys: Vec<Type> = args
+                    .iter()
+                    .map(|arg| self.check_expr(&arg.expr, scopes))
+                    .collect();
                 if args.len() != 1 {
                     self.errors.push(TypeError {
                         message: format!(
@@ -902,6 +926,27 @@ impl<'a> Checker<'a> {
                         ),
                         span,
                     });
+                }
+                // The conversion reads the argument's FIELDS. A fully-known
+                // argument that is not a record has none, so this could only ever
+                // produce null -- a program the checker accepts but that always
+                // takes its failure path at run time. Reject it here. An argument
+                // whose type is still open belongs to a generic body and is left to
+                // monomorphization, where the field set is known per instance.
+                if let (Some(arg), Some(got)) = (args.first(), arg_tys.first()) {
+                    let got = self.resolve(got);
+                    let base = prepoly_hir::types::peel_modes(&got);
+                    if prepoly_hir::is_fully_known(base) && !matches!(base, Type::Record(_)) {
+                        self.errors.push(TypeError {
+                            message: format!(
+                                "`{qualifier}.from` builds `{qualifier}` from the fields of a \
+                                 record, but `{}` is not a record: the conversion can never \
+                                 produce a value",
+                                got.display()
+                            ),
+                            span: arg.expr.span(),
+                        });
+                    }
                 }
                 return Type::Nullable(Box::new(ty));
             }

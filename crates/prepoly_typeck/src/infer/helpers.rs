@@ -478,9 +478,7 @@ pub(super) fn block_rebinds(block: &Block, var: &str) -> bool {
         Stmt::Let { pat, value, .. } => {
             pat_binds(pat, var) || value.as_ref().is_some_and(|v| expr_rebinds(v, var))
         }
-        Stmt::For {
-            var: v, body: b, ..
-        } => v == var || block_rebinds(b, var),
+        Stmt::For { pat, body: b, .. } => pat.bound_names().contains(&var) || block_rebinds(b, var),
         Stmt::While { body: b, .. } => block_rebinds(b, var),
         Stmt::Expr(e) | Stmt::Return(Some(e), _) => expr_rebinds(e, var),
         Stmt::Assign { value, .. } => expr_rebinds(value, var),

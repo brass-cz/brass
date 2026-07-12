@@ -41,13 +41,13 @@ impl<'a> Checker<'a> {
                     self.infer_returns_block(body, &mut env.clone(), normal, props);
                 }
                 Stmt::For {
-                    var, iter, body, ..
+                    pat, iter, body, ..
                 } => {
                     let iter_ty = self.infer_expr_light(iter, env, props);
                     let item_ty = prepoly_hir::index_element(&iter_ty)
                         .unwrap_or_else(|| self.fresh_unknown());
                     let mut inner = env.clone();
-                    inner.insert(var.clone(), item_ty);
+                    self.bind_pattern_light(pat, &item_ty, &mut inner);
                     self.infer_returns_block(body, &mut inner, normal, props);
                 }
                 Stmt::Return(Some(expr), _) => {

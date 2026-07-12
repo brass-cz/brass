@@ -28,6 +28,16 @@ use crate::types::{
     resolve, substitute_vars,
 };
 
+/// Static metadata about one `type Alias = <type expr>` declaration. An alias is
+/// not a nominal, so it has no [`TypeMeta`]; it is expanded on demand wherever
+/// its name appears.
+struct AliasMeta {
+    name: String,
+    module: Vec<String>,
+    texpr: TypeExpr,
+    span: Span,
+}
+
 /// Static metadata about one type, gathered before resolution so a refinement
 /// can read its base's fields/slots without a mutable borrow of the type table.
 struct TypeMeta {
@@ -111,14 +121,33 @@ pub(crate) fn resolve_type_decls(
         );
     }
 
+    let alias_meta: HashMap<String, AliasMeta> = aliases
+        .iter()
+        .filter_map(|(symbol, module, td)| {
+            let TypeBody::Alias(texpr) = &td.body else {
+                return None;
+            };
+            let m = AliasMeta {
+                name: td.name.clone(),
+                module: module.clone(),
+                texpr: texpr.clone(),
+                span: td.span,
+            };
+            Some((symbol.clone(), m))
+        })
+        .collect();
+
     let mut resolver = Resolver {
         meta: &meta,
+        alias_meta: &alias_meta,
         nominal_by_symbol,
         import_origins: &program.import_origins,
         import_renames: &program.import_renames,
         next_unknown,
         resolved: HashMap::new(),
+        alias_resolved: HashMap::new(),
         gray: HashSet::new(),
+        alias_gray: HashSet::new(),
         errors: Vec::new(),
     };
 
@@ -137,15 +166,17 @@ pub(crate) fn resolve_type_decls(
         }
     }
 
-    // Resolve each `type Alias = <type expr>` in its own module (no enclosing
-    // type, so `Self.field` is not available there).
+    // Resolve each `type Alias = <type expr>`. A record field naming an alias
+    // already expanded it above, so this mostly reads the memo back out.
+    let alias_syms: Vec<String> = alias_meta.keys().cloned().collect();
     let mut alias_results: Vec<(String, Vec<String>, Type, Span)> = Vec::new();
-    for (symbol, module, td) in aliases {
-        let TypeBody::Alias(te) = &td.body else {
-            continue;
+    for symbol in &alias_syms {
+        let (module, span) = {
+            let m = &alias_meta[symbol];
+            (m.module.clone(), m.span)
         };
-        let ty = resolver.resolve_texpr(None, module, te);
-        alias_results.push((symbol.clone(), module.clone(), ty, td.span));
+        let ty = resolver.resolve_alias(symbol);
+        alias_results.push((symbol.clone(), module, ty, span));
     }
 
     errors.append(&mut resolver.errors);
@@ -174,14 +205,19 @@ pub(crate) fn resolve_type_decls(
 
 struct Resolver<'a> {
     meta: &'a HashMap<String, TypeMeta>,
+    alias_meta: &'a HashMap<String, AliasMeta>,
     nominal_by_symbol: &'a HashMap<String, NominalInfo>,
     import_origins: &'a HashMap<Vec<String>, HashMap<String, Vec<String>>>,
     import_renames: &'a HashMap<Vec<String>, HashMap<String, String>>,
     next_unknown: &'a mut u32,
     /// Memoized resolved field types, keyed by (owner symbol, field name).
     resolved: HashMap<(String, String), Type>,
+    /// Memoized alias expansions, keyed by alias symbol.
+    alias_resolved: HashMap<String, Type>,
     /// Fields currently being resolved: revisiting one is a circular type.
     gray: HashSet<(String, String)>,
+    /// Aliases currently being expanded: revisiting one is a circular alias.
+    alias_gray: HashSet<String>,
     errors: Vec<crate::lower::LowerError>,
 }
 
@@ -192,30 +228,74 @@ impl Resolver<'_> {
         v
     }
 
-    /// The unique symbol a type NAME resolves to from `module` (its own/unique,
-    /// this module's qualified, or an imported definition). Mirrors
-    /// [`crate::hir::resolve_qualified`] but returns the matched key.
+    /// The unique symbol a NOMINAL type name resolves to from `module`.
     fn symbol_of(&self, module: &[String], name: &str) -> Option<String> {
+        self.symbol_in(module, name, |s| self.meta.contains_key(s))
+    }
+
+    /// The unique symbol a `type Alias = ..` name resolves to from `module`.
+    fn alias_symbol_of(&self, module: &[String], name: &str) -> Option<String> {
+        self.symbol_in(module, name, |s| self.alias_meta.contains_key(s))
+    }
+
+    /// The unique symbol a type NAME resolves to from `module` (its own/unique,
+    /// this module's qualified, or an imported definition), searching whichever
+    /// table `in_table` answers for. Mirrors [`crate::hir::resolve_qualified`]
+    /// but returns the matched key, which the memo and cycle sets are keyed by.
+    fn symbol_in(
+        &self,
+        module: &[String],
+        name: &str,
+        in_table: impl Fn(&str) -> bool,
+    ) -> Option<String> {
         // Rename first, as in `resolve_qualified`: a renamed local must not be
         // captured by an unrelated module's unique definition of that name.
         if let Some(remote) = self.import_renames.get(module).and_then(|m| m.get(name)) {
             let origin = self.import_origins.get(module)?.get(name)?;
             let qo = crate::hir::qualify(remote, origin);
-            if self.meta.contains_key(&qo) {
+            if in_table(&qo) {
                 return Some(qo);
             }
-            return self.meta.contains_key(remote).then(|| remote.clone());
+            return in_table(remote).then(|| remote.clone());
         }
-        if self.meta.contains_key(name) {
+        if in_table(name) {
             return Some(name.to_string());
         }
         let q = crate::hir::qualify(name, module);
-        if self.meta.contains_key(&q) {
+        if in_table(&q) {
             return Some(q);
         }
         let origin = self.import_origins.get(module)?.get(name)?;
         let qo = crate::hir::qualify(name, origin);
-        self.meta.contains_key(&qo).then_some(qo)
+        in_table(&qo).then_some(qo)
+    }
+
+    /// Expand `type Alias = <type expr>` by symbol, memoized.
+    ///
+    /// An alias has no nominal of its own, so its name must be replaced by the
+    /// type it stands for wherever it appears -- including in a record field,
+    /// which is why this is resolved on demand rather than in a pass of its own.
+    /// An alias that reaches itself has no finite expansion; that is the same
+    /// occurs-check failure a self-referential field is, and is reported once.
+    fn resolve_alias(&mut self, sym: &str) -> Type {
+        if let Some(t) = self.alias_resolved.get(sym) {
+            return t.clone();
+        }
+        let (name, module, texpr, span) = {
+            let m = &self.alias_meta[sym];
+            (m.name.clone(), m.module.clone(), m.texpr.clone(), m.span)
+        };
+        if !self.alias_gray.insert(sym.to_string()) {
+            self.errors.push(crate::lower::LowerError {
+                message: format!("type `{name}` is circular (it refers to itself)"),
+                span,
+            });
+            return Type::Unknown(self.fresh());
+        }
+        let t = self.resolve_texpr(None, &module, &texpr);
+        self.alias_gray.remove(sym);
+        self.alias_resolved.insert(sym.to_string(), t.clone());
+        t
     }
 
     /// Resolve one record field's type, memoized. A field referenced while it is
@@ -319,7 +399,26 @@ impl Resolver<'_> {
                 });
                 Type::Unknown(self.fresh())
             }
-            // `Named`/`typeof` and the leaf forms go through the pure resolver.
+            // A `type Alias = ..` name stands for the type it expands to. It is
+            // consulted before the nominal table (an alias is not a nominal, so
+            // leaving it to the pure resolver made the annotation silently open).
+            TypeExpr::Named(name, span) => {
+                if let Some(sym) = self.alias_symbol_of(module, name) {
+                    return self.resolve_alias(&sym);
+                }
+                let nominal = |n: &str| self.nominal_lookup(module, n);
+                match resolve(te, nominal) {
+                    Ok(t) => t,
+                    Err(message) => {
+                        self.errors.push(crate::lower::LowerError {
+                            message,
+                            span: *span,
+                        });
+                        Type::Unknown(self.fresh())
+                    }
+                }
+            }
+            // `typeof` and the leaf forms go through the pure resolver.
             other => {
                 let nominal = |name: &str| self.nominal_lookup(module, name);
                 resolve(other, nominal).unwrap_or(Type::Unknown(INFER_VAR))

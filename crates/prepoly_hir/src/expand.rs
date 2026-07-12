@@ -28,9 +28,14 @@ pub const SPAN_SHIFT_UNIT: usize = 1 << 24;
 /// marks the arm-killing bail-out once `fields` can fail per instance).
 pub fn fields_loop_target(stmt: &Stmt) -> Option<(&str, &Expr, &Block)> {
     let Stmt::For {
-        var, iter, body, ..
+        pat, iter, body, ..
     } = stmt
     else {
+        return None;
+    };
+    // A fields-loop names one variable: the field name each expanded copy is
+    // substituted with. A destructuring loop variable has no such name.
+    let Pattern::Binding(var, _) = pat else {
         return None;
     };
     let call = match iter {
@@ -124,12 +129,12 @@ impl Expander<'_> {
                 span: self.span(*span),
             },
             Stmt::For {
-                var,
+                pat,
                 iter,
                 body,
                 span,
             } => Stmt::For {
-                var: var.clone(),
+                pat: pat.clone(),
                 iter: self.expr(iter),
                 body: self.block(body),
                 span: self.span(*span),
