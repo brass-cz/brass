@@ -552,6 +552,9 @@ println(to_text(out.stdout)!)
   `.spawn() -> Child!`
 - `.env` ADDS to the inherited environment (or overrides one entry); the child
   always inherits this process's variables, and there is no way to unset one
+- `exit(code: int64)` -- ends THIS process (not a child) with that code and
+  never returns; stdout/stderr are flushed first, so a pending `print` is not
+  lost. Only the low 8 bits reach the caller (`exit(256)` reports 0).
 - `child.output() -> Output!` -- drains the piped streams while waiting, then
   returns `{ code, stdout, stderr }`; cannot deadlock. Prefer this.
 - `child.wait() -> int32!` -- the exit code; DEADLOCKS if a `Pipe` stream

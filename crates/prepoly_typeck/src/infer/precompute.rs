@@ -138,11 +138,25 @@ impl<'a> Checker<'a> {
     /// the light-pass inference when there is none, and -- for a `T!`, which names
     /// only the OK payload -- the annotation with its Err side completed.
     fn function_return_entry(&mut self, info: &FunInfo) -> Type {
+        // The light pass resolves names -- a module-qualified call
+        // (`percent.decode`), a renamed import, a global -- against the CURRENT
+        // module, so the function's own must be current or the lookup misses and
+        // the caller loses whatever the callee would have told it.
+        let saved = std::mem::replace(&mut self.current_module, info.module.clone());
+        let ty = self.function_return_entry_inner(info);
+        self.current_module = saved;
+        ty
+    }
+
+    fn function_return_entry_inner(&mut self, info: &FunInfo) -> Type {
         match &info.signature.ret_ty {
             Some(declared) if prepoly_hir::is_fully_known(declared) => declared.clone(),
             Some(declared) => {
                 let declared = declared.clone();
-                let err = self.body_error_payload(&info.signature.params, &info.decl.body);
+                let (err, any) = self.body_error_payload(&info.signature.params, &info.decl.body);
+                if any {
+                    self.error_sites.insert(format!("fn:{}", info.symbol));
+                }
                 self.complete_open_error(&declared, err)
             }
             None => self.infer_function_return(&info.signature.params, &info.decl.body),
@@ -157,7 +171,7 @@ impl<'a> Checker<'a> {
     /// synthesized plugin wrapper does), and the Err it hands back is its own. An
     /// OPEN Err carries no information, so it is dropped rather than allowed to win
     /// the reconciliation against a concrete one.
-    fn body_error_payload(&mut self, params: &[ParamInfo], body: &Block) -> Option<Type> {
+    fn body_error_payload(&mut self, params: &[ParamInfo], body: &Block) -> (Option<Type>, bool) {
         let mut env = self.signature_param_env(params);
         let mut normal = Vec::new();
         let mut props = LightProps::default();
@@ -165,9 +179,19 @@ impl<'a> Checker<'a> {
         self.error_payload_of(&normal, &props)
     }
 
-    /// The Err payload of a body whose light pass produced `normal` and `props`.
-    /// See [`Self::body_error_payload`].
-    fn error_payload_of(&mut self, normal: &[(Type, Span)], props: &LightProps) -> Option<Type> {
+    /// The Err payload of a body whose light pass produced `normal` and `props`,
+    /// and whether the body had ANY error site at all. See
+    /// [`Self::body_error_payload`].
+    ///
+    /// The two answers differ, and the difference is what makes an unusable `T!`
+    /// detectable: NO site is fine (a `T!` whose body never fails still Ok-wraps its
+    /// returns, and nothing ever reads the Err), while sites that all come back
+    /// UNKNOWN mean the body does propagate an error whose type nothing determines.
+    fn error_payload_of(
+        &mut self,
+        normal: &[(Type, Span)],
+        props: &LightProps,
+    ) -> (Option<Type>, bool) {
         let mut sites = props.errors.clone();
         for (ty, span) in normal {
             let resolved = self.resolve(ty);
@@ -175,12 +199,13 @@ impl<'a> Checker<'a> {
                 sites.push((err.clone(), *span));
             }
         }
-        let sites: Vec<(Type, Span)> = sites
+        let any = !sites.is_empty();
+        let known: Vec<(Type, Span)> = sites
             .into_iter()
             .map(|(ty, span)| (self.resolve(&ty), span))
             .filter(|(ty, _)| !ty.is_unknown())
             .collect();
-        self.reconcile_error_payloads(&sites, false)
+        (self.reconcile_error_payloads(&known, false), any)
     }
 
     /// Fill the open Err payload of a `T!` return with `err`.
@@ -190,6 +215,118 @@ impl<'a> Checker<'a> {
     /// is what a caller reading the signature table, and the editor rendering it,
     /// were left with (`Result<TomlValue, unknown_0>`). Only an OPEN Err is filled,
     /// so an annotation that already names one is never overridden.
+    /// Tie the PRECOMPUTED return of an unannotated function to what the full
+    /// check inferred for its body.
+    ///
+    /// Every CALL SITE reads the precomputed entry, and shares its variables. The
+    /// light pass that built it cannot do the receiver-scheme parameter pinning the
+    /// full check does, so a body that builds a `HashMap.new()` and `set`s into it
+    /// leaves the precomputed map's key/value OPEN while the full check pins them.
+    /// A recursive function is where that shows: its own body reads the precomputed
+    /// entry for the recursive call, and a method called on the map it hands back
+    /// (`collect(..)!.pairs()`) then monomorphizes at an open type, which the typed
+    /// back end refuses -- a program the checker accepted.
+    ///
+    /// Only the OK payloads are linked. The `Result`/`?` wrapping is the light
+    /// assembly's; the full check's reconciliation does not rebuild it, so unifying
+    /// the whole types would fight over the shape rather than fill in the payload.
+    /// A conflict is ignored: this only ever REFINES an open variable, and a
+    /// genuine disagreement is the light pass's approximation, not a program error.
+    pub(super) fn link_inferred_return(&mut self, precomputed: &Type, inferred: &Type) {
+        let want = Self::ok_payload(&self.resolve(precomputed));
+        let got = Self::ok_payload(&self.resolve(inferred));
+        // A body that only ever errors has no Ok value: its payload is a variable no
+        // path produces, and unifying with it would say nothing.
+        if got.is_unknown() {
+            return;
+        }
+        let _ = self.solver.unify(&want, &got);
+    }
+
+    /// A `Result`'s Ok payload, or the type itself when it is not one.
+    fn ok_payload(ty: &Type) -> Type {
+        ty.result_payloads()
+            .map(|(ok, _)| ok.clone())
+            .unwrap_or_else(|| ty.clone())
+    }
+
+    /// Reject a `T!` whose error type nothing in the body determines.
+    ///
+    /// `T!` names only the OK payload; the Err type is INFERRED, from the body's
+    /// `error(..)` sites and from the `Result`s it forwards. A body with neither
+    /// gives inference nothing to work with -- including one whose ONLY propagation
+    /// is its own recursive `!`, whose error type is the very variable being
+    /// inferred. Left open, the variable reaches the back end, which has no type to
+    /// lay the payload out at ("cannot infer the type of an expression temporary").
+    /// That is a type error, and it belongs here rather than there.
+    ///
+    /// Read from the RETURN TABLE, after the passes that fill it: an entry whose Err
+    /// is still open is one `complete_open_error` found nothing for. A keyed
+    /// `-> infer!` template is exempt -- it has no fixed type at all, being
+    /// specialized per call site from the caller's expectation.
+    pub(super) fn report_uninferable_error_types(&mut self) {
+        let mut open: Vec<Span> = Vec::new();
+        for f in self.program.functions.values() {
+            let Some(ret) = self.function_returns.get(&f.symbol) else {
+                continue;
+            };
+            if f.signature.ret_ty.is_some()
+                && self.error_sites.contains(&format!("fn:{}", f.symbol))
+                && let Some(span) = self.open_error_span(ret, f.decl.ret.as_ref())
+            {
+                open.push(span);
+            }
+        }
+        for info in self.program.types.values() {
+            let mut method = |qualifier: &str, name: &String, m: &prepoly_hir::MethodInfo| {
+                if prepoly_hir::keyed_return(m.decl.ret.as_ref()) || m.signature.ret_ty.is_none() {
+                    return;
+                }
+                if !self.error_sites.contains(&format!("m:{qualifier}.{name}")) {
+                    return;
+                }
+                let key = (qualifier.to_string(), name.clone());
+                if let Some(ret) = self.method_returns.get(&key)
+                    && let Some(span) = self.open_error_span(ret, m.decl.ret.as_ref())
+                {
+                    open.push(span);
+                }
+            };
+            match &info.kind {
+                TypeKind::Record { methods, .. } => {
+                    for (name, m) in methods {
+                        method(&info.name, name, m);
+                    }
+                }
+                TypeKind::Sum { variants } => {
+                    for v in variants {
+                        for (name, m) in &v.methods {
+                            method(&format!("{}.{}", info.name, v.name), name, m);
+                        }
+                    }
+                }
+            }
+        }
+        for span in open {
+            self.errors.push(TypeError {
+                message: "cannot infer the error type of `!`: this body propagates an error \
+whose type nothing determines -- the only error it forwards is its own. Raise an `error(..)`, \
+or drop the `!`"
+                    .to_string(),
+                span,
+            });
+        }
+    }
+
+    /// The span to report a still-open Err payload at, if `ret` has one.
+    fn open_error_span(&self, ret: &Type, decl_ret: Option<&TypeExpr>) -> Option<Span> {
+        let (_, err) = ret.result_payloads()?;
+        if !matches!(err, Type::Unknown(_)) {
+            return None;
+        }
+        Some(decl_ret?.span())
+    }
+
     fn complete_open_error(&mut self, declared: &Type, err: Option<Type>) -> Type {
         let Some(err) = err else {
             return declared.clone();
@@ -205,14 +342,21 @@ impl<'a> Checker<'a> {
     }
 
     pub(super) fn precompute_method_returns(&mut self) {
-        let mut entries: Vec<(String, String, String)> = self
+        let mut entries: Vec<(String, String, String, Vec<String>)> = self
             .program
             .types
             .values()
             .flat_map(|info| match &info.kind {
                 TypeKind::Record { methods, .. } => methods
                     .keys()
-                    .map(|m| (info.name.clone(), info.name.clone(), m.clone()))
+                    .map(|m| {
+                        (
+                            info.name.clone(),
+                            info.name.clone(),
+                            m.clone(),
+                            info.module.clone(),
+                        )
+                    })
                     .collect::<Vec<_>>(),
                 TypeKind::Sum { variants } => variants
                     .iter()
@@ -222,6 +366,7 @@ impl<'a> Checker<'a> {
                                 format!("{}.{}", info.name, variant.name),
                                 info.name.clone(),
                                 m.clone(),
+                                info.module.clone(),
                             )
                         })
                     })
@@ -229,8 +374,12 @@ impl<'a> Checker<'a> {
             })
             .collect();
         entries.sort();
-        for (qualifier, self_type, method) in entries {
+        for (qualifier, self_type, method, module) in entries {
+            // As in `function_return_entry`: the light pass resolves names against
+            // the current module, which here is the TYPE's.
+            let saved = std::mem::replace(&mut self.current_module, module);
             let (ty, has_props) = self.infer_method_return(&qualifier, &self_type, &method);
+            self.current_module = saved;
             if has_props {
                 self.method_return_props
                     .insert((qualifier.clone(), method.clone()));
@@ -290,7 +439,10 @@ impl<'a> Checker<'a> {
         self.self_type = saved;
         self.self_variant = saved_variant;
         if complete_error {
-            let err_ty = self.error_payload_of(&normal, &props);
+            let (err_ty, any) = self.error_payload_of(&normal, &props);
+            if any {
+                self.error_sites.insert(format!("m:{qualifier}.{method}"));
+            }
             let declared = declared.unwrap_or(Type::Void);
             // The annotation still governs the shape, so this is not a
             // light-assembled return: `has_props` stays false, as for any

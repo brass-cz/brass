@@ -1296,6 +1296,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                     Type::Str,
                 ))),
                 "_argv" => Ok(Some(Type::Slice(Box::new(Type::Str)))),
+                "_flush" => Ok(Some(Type::Void)),
                 // `to_string` only has a typed conversion for scalars/strings;
                 // other arguments fall back so formatting stays correct.
                 "to_string" => match args.first() {

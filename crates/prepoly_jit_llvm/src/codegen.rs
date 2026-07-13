@@ -2510,6 +2510,12 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
     fn argv(&mut self) -> BasicValueEnum<'ctx> {
         self.call_rt_ptr("pp_argv", &[])
     }
+
+    fn flush(&mut self) {
+        let fty = self.ctx.void_type().fn_type(&[], false);
+        let f = self.abi.runtime_fn(&self.module, "pp_flush", fty);
+        self.builder.build_call(f, &[], "").unwrap();
+    }
     fn stdin_read(&mut self, n: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
         // `pp_stdin_read(i64) -> ptr`: the count is an integer; widen a
         // narrower literal so every call site declares one signature.

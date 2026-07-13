@@ -81,6 +81,7 @@ pub fn symbols() -> Vec<(&'static str, usize)> {
         region::pp_region_close,
         io::pp_stdin_read,
         io::pp_argv,
+        io::pp_flush,
         plugin::pp_plugin_call_int,
         plugin::pp_plugin_call_float,
         plugin::pp_plugin_call_obj,

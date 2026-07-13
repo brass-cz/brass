@@ -672,9 +672,19 @@ impl<'a> Checker<'a> {
         if let Some(nullable) = common_nullable_type(&left, &right) {
             return nullable;
         }
-        if self.can_unify(&left, &right)
-            || crate::structural::types_compatible(self.program, &left, &right)
-        {
+        if self.can_unify(&left, &right) {
+            // COMMIT the unification, do not merely probe it. A branch whose type
+            // nothing else constrains -- `else { error("..")! }`, whose Ok payload
+            // is a fresh variable no path produces -- would otherwise stay open,
+            // and the back end, which defaults an unresolved local to `void`, then
+            // has that branch assign a void into the `if`'s rc-managed slot:
+            // `pp_retain(i1 false)`, an LLVM type mismatch. Both branches of one
+            // `if` yield one type, so binding them together is what the expression
+            // means anyway.
+            let _ = self.solver.unify(&left, &right);
+            return left;
+        }
+        if crate::structural::types_compatible(self.program, &left, &right) {
             return left;
         }
         if !matches!(left, Type::Unknown(_)) && !matches!(right, Type::Unknown(_)) {

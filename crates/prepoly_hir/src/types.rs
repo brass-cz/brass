@@ -823,6 +823,14 @@ pub fn freshen_unknowns(ty: &Type, fresh: &mut impl FnMut() -> Type) -> Type {
 
 /// Every inference variable occurring in `ty`, including inside a nominal's
 /// payload substitution.
+pub fn type_vars(ty: &Type) -> BTreeSet<u32> {
+    let mut out = BTreeSet::new();
+    collect_unknowns(ty, &mut out);
+    out
+}
+
+/// Every inference variable occurring in `ty`, including inside a nominal's
+/// payload substitution.
 fn collect_unknowns(ty: &Type, out: &mut BTreeSet<u32>) {
     match ty {
         Type::Unknown(v) => {

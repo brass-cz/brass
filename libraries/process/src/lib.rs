@@ -160,6 +160,22 @@ export! {
         Ok(handle)
     }
 
+    /// End THIS process with exit code `code` (0 = success, by convention).
+    ///
+    /// The call does not return, so the declared `Void` result is never
+    /// produced. Nothing on the way out is cleaned up: no destructor runs, no
+    /// spawned child is waited for, and no buffered output is flushed by this
+    /// crate -- see `libraries/process.pp`'s `exit` on what that means for a
+    /// pending `print`.
+    ///
+    /// Only the low 8 bits of `code` survive on Unix (the shell sees `code &
+    /// 0xff`), and a negative code wraps: `exit(-1)` is reported as 255.
+    fn process_exit(code: i64) {
+        // Truncating is what the OS does anyway; doing it here keeps the value
+        // the caller sees in `$?` predictable rather than platform-defined.
+        std::process::exit((code & 0xff) as i32)
+    }
+
     /// Take the child's piped standard stream `which` (0 = stdin, 1 = stdout,
     /// 2 = stderr) and return its raw descriptor. Available once, and only
     /// when that stream was configured as a pipe -- but also after `wait`,
@@ -276,6 +292,7 @@ struct ProcessLib;
 impl PrepolyLib for ProcessLib {
     fn entry(reg: &mut Registry) {
         reg.export(decl!(process_spawn));
+        reg.export(decl!(process_exit));
         reg.export(decl!(process_stream));
         reg.export(decl!(process_wait));
         reg.export(decl!(process_wait_captured));

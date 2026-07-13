@@ -16,10 +16,40 @@
 import fs.{ File }
 import libprocess.{
     process_spawn,
+    process_exit,
     process_stream,
     process_wait,
     process_wait_captured,
     process_take_captured,
+}
+
+/**
+ * End THIS process with exit code `code`: 0 is success by convention, and a
+ * non-zero code reports failure to whatever ran the program.
+ *
+ *     if !ok {
+ *         println("that did not work")
+ *         exit(1)
+ *     }
+ *
+ * The call never returns, so nothing after it runs, and nothing is cleaned up
+ * on the way out: no spawned child is waited for (an unwaited child is
+ * reparented and keeps running), and an open `File`'s own buffer is not written
+ * out for it. What the program has PRINTED is safe, though -- standard output
+ * and error are flushed first, so a `print` with no trailing newline is not
+ * swallowed by the exit.
+ *
+ * Only the low 8 bits reach the caller on Unix: `exit(256)` reports 0, and
+ * `exit(-1)` reports 255. Keep to `0..=255`.
+ */
+fun exit(code: int64) {
+    // Standard output is buffered by line, and the plugin cannot reach that
+    // buffer (it is the runtime's, in another dynamic object), so the flush has
+    // to happen on this side of the call -- otherwise a `print` still waiting
+    // for its newline would be lost exactly when a program reports why it is
+    // giving up.
+    _flush()
+    process_exit(code)
 }
 
 /**

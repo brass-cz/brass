@@ -32,7 +32,7 @@ pub use types::{
     STRUCTURAL_RECORD_NAME, Substitution, Type, collapse_nullable, freshen_infer, freshen_unknowns,
     index_element, int_literal_kind, is_fully_known, mismatch_display, peel_modes,
     prim_method_symbol, primitive_kind_conflict, resolve, structural_record, substitute_vars,
-    type_key,
+    type_key, type_vars,
 };
 
 /// Re-exported so back ends can name source spans (e.g. typed-literal codegen

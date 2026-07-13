@@ -66,8 +66,11 @@ impl<'a> Checker<'a> {
         let key = format!("fn:{symbol}");
         if !self.instantiating.insert(key.clone()) {
             // Recursive call: re-checking the body again would not terminate, so
-            // fall back to the declared/precomputed return type.
+            // fall back to the declared/precomputed return type. Remember that it
+            // happened -- the fallback is the SHARED table entry, and only a body
+            // that read it needs its variables tied to the real return.
             tracing::debug!(symbol = %symbol, "recursive call, using fallback return type");
+            self.recursed.insert(key);
             return fallback_ret;
         }
         if !self.elaboration_allowed(symbol, span) {
@@ -88,7 +91,23 @@ impl<'a> Checker<'a> {
         let full_ret = self.check_block_root(body, &mut scopes, declared_ret.as_ref());
         let ret = match declared_ret {
             Some(ret) => ret,
-            None => self.prefer_full_return(full_ret, body, frame),
+            None => {
+                let ret = self.prefer_full_return(full_ret, body, frame);
+                // A RECURSIVE call inside this body could only read the PRECOMPUTED
+                // return -- the full one is what we just computed -- and it shares
+                // that entry's variables. Tie the two together, so a container the
+                // body pins (a `HashMap.new()` filled by `set`) is no longer OPEN
+                // where the recursion hands it back: a method called on it
+                // (`collect(..)!.pairs()`) would otherwise monomorphize at an open
+                // type, which the typed back end refuses -- a program the checker
+                // accepted. Only a body that actually recursed: the entry is shared
+                // by every call site, so pinning it for a function that never reads
+                // it back would fix a generic callee at its first call.
+                if self.recursed.remove(&key) {
+                    self.link_inferred_return(&fallback_ret, &ret);
+                }
+                ret
+            }
         };
         self.current_module = saved_module;
         self.instantiating.remove(&key);
@@ -120,7 +139,19 @@ impl<'a> Checker<'a> {
         let light = super::precompute::wrap_null_propagated_return(base, &props.nulls);
         match full_ret {
             Some(t) if !has_props => t,
-            _ => light,
+            // A propagating body's `Result`/`?` WRAPPING is the light assembly's --
+            // the full check's reconciliation does not rebuild it -- but its Ok
+            // PAYLOAD is the full check's. The light pass cannot re-elaborate a
+            // method's body, so a container the body fills (`HashMap.new()` then
+            // `set`) keeps OPEN element types there while the full check pins them.
+            // Take the light shape and fill it from what the body really returns, or
+            // a `collect(..)!.pairs()` monomorphizes at an open type and the typed
+            // back end refuses it.
+            Some(full) => {
+                self.link_inferred_return(&light, &full);
+                light
+            }
+            None => light,
         }
     }
 
@@ -429,7 +460,7 @@ impl<'a> Checker<'a> {
 /// the scheme's field types against the receiver's resolved field substitution
 /// (`entries : _Entry<K, V>[]` vs `entries : _Entry<string, string>[]` gives `K
 /// -> string`, `V -> string`). Used to instantiate a method's scheme at a call.
-fn scheme_instance_map(scheme: &TypeScheme, recv: &NominalType) -> HashMap<u32, Type> {
+pub(super) fn scheme_instance_map(scheme: &TypeScheme, recv: &NominalType) -> HashMap<u32, Type> {
     let mut map = HashMap::new();
     for (fname, fty) in &scheme.fields {
         if let Some(actual) = recv.substitution.get(fname) {
@@ -471,7 +502,7 @@ fn match_scheme_param(
 }
 
 /// Substitute scheme parameters with their concrete types throughout a type.
-fn apply_scheme_param_map(ty: &Type, map: &HashMap<u32, Type>) -> Type {
+pub(super) fn apply_scheme_param_map(ty: &Type, map: &HashMap<u32, Type>) -> Type {
     match ty {
         Type::Unknown(id) => map.get(id).cloned().unwrap_or_else(|| ty.clone()),
         Type::Slice(e) => Type::Slice(Box::new(apply_scheme_param_map(e, map))),

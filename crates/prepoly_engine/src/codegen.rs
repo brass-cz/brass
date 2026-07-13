@@ -246,6 +246,8 @@ pub trait Codegen {
     /// `_argv()`: the program's argument vector, a `string[]` (the program
     /// file, then everything after it on the driver's command line).
     fn argv(&mut self) -> Self::Value;
+    /// `_flush()`: push buffered output to the operating system.
+    fn flush(&mut self);
     /// A native-plugin call (`_plugin_[f]call_<t>`): `rt_name` is one of the
     /// `pp_plugin_call_{int,float,obj}` runtime symbols, picked by return
     /// class. `strings` are the path/name/sig string objects; `args` are the
@@ -1575,6 +1577,10 @@ pub trait Codegen {
                 self.stdin_read(n)
             }
             "_argv" => self.argv(),
+            "_flush" => {
+                self.flush();
+                self.unit()
+            }
             // Integer width conversions: widen is infallible, narrow
             // returns a range-checked Result.
             "_int_widen" | "_int_narrow" => {

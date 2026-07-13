@@ -33,6 +33,7 @@ pub(super) fn is_runtime_builtin_value(name: &str) -> bool {
             | "_println_str"
             | "_stdin_read"
             | "_argv"
+            | "_flush"
             | "error"
             | "_string_concat"
             | "_string_slice"

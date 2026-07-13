@@ -752,6 +752,12 @@ impl<'p, 'm> Interp<'p, 'm> {
                 }
                 Ok(Value::Void)
             }
+            // Push buffered output out before something that is not a normal
+            // return ends the program or reads the terminal.
+            "_flush" => {
+                let _ = self.out.flush();
+                Ok(Value::Void)
+            }
             // The program's argument vector, published by the driver (empty in
             // an interactive session).
             "_argv" => {

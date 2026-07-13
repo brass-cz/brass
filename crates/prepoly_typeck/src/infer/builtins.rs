@@ -84,6 +84,11 @@ impl<'a> Checker<'a> {
                 Type::Str,
             ));
         }
+        if name == "_flush" {
+            // `_flush()`: push buffered output to the operating system.
+            self.check_arg_count(name, 0, args.len(), span);
+            return Some(Type::Void);
+        }
         if name == "_argv" {
             // `_argv() -> string[]`: the program's argument vector (the
             // program file, then everything after it on the command line).
@@ -377,6 +382,7 @@ impl<'a> Checker<'a> {
                 Type::Str,
             )),
             "_argv" => Some(Type::Slice(Box::new(Type::Str))),
+            "_flush" => Some(Type::Void),
             "input" => Some(Type::result(Type::Str, Type::Str)),
             "len" => Some(Type::Int(IntKind::I64)),
             "print" | "println" | "assert" => Some(Type::Void),

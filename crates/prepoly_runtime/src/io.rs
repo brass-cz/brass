@@ -13,6 +13,21 @@ use std::os::fd::FromRawFd;
 use crate::alloc::{pp_arr_new, pp_str_const, typed_result, typed_result_err};
 use crate::rt::Header;
 
+/// `_flush()`: push whatever the program has written but not yet handed to the
+/// operating system out to it.
+///
+/// Standard output is buffered by line, so a `println` is already on its way
+/// out but a `print` with no trailing newline is not. That only matters when
+/// something other than a normal return ends the program (`process.exit`) or
+/// reads the terminal next (a prompt printed without a newline), which is why
+/// this exists rather than flushing on every write: those callers flush, and a
+/// print-heavy loop keeps its batching.
+pub extern "C-unwind" fn pp_flush() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+}
+
 /// `_argv() -> string[]`: the program's argument vector -- the program file
 /// as written on the driver's command line, then everything after it -- as
 /// published by the driver through `prepoly_utils::set_program_argv`. Empty

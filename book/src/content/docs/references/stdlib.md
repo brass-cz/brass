@@ -153,10 +153,19 @@ and `Null` discards it.
 | `child.stdin/stdout/stderr()`  | `() -> File!`                 | a piped stream (requires `Stdio.Pipe`)       |
 | `child.wait()`                 | `() -> int32!`                | block for exit; returns the exit code        |
 | `child.output()`               | `() -> Output!`               | drain the piped streams, then wait           |
+| `exit(code)`                   | `(int64) -> void`             | end THIS process; never returns              |
 
 `Stdio` is `| Inherit | Pipe | Null`. Piped streams are `File`s, so the
 prelude byte helpers `to_bytes`/`to_text` convert their contents. The
 accessors may be called repeatedly: each hands back the same `File`.
+
+`exit(code)` ends the running program itself rather than a child: it never
+returns, so nothing after it runs. Standard output and error are flushed on the
+way out, so a `print` still waiting for its newline is not swallowed — but
+nothing else is cleaned up (a spawned child is not waited for, and an open
+`File`'s own buffer is not written for it). On Unix only the low 8 bits reach
+the caller: `exit(256)` reports 0 and `exit(-1)` reports 255, so keep to
+`0..=255`.
 
 The child **inherits this process's environment**, and `env` adds to it (or
 overrides one entry of it) rather than replacing it; setting the same name

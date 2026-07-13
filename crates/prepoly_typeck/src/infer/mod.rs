@@ -279,8 +279,12 @@ pub fn analyze(program: &Program) -> Inference {
     // method pass needs theirs, so it cannot go first), which leaves a function
     // whose value flows OUT of a method call with nothing to read: `http`'s
     // `fetch` returns `client.fetch(path)`. Re-infer them now that the methods
-    // have converged.
+    // have converged -- and re-run the methods once more over the result, so a
+    // method reading a function that only just resolved (`QueryPair.parse_all`
+    // propagating `_decode_form`, which propagates `percent.decode`) sees it.
     checker.refresh_function_returns();
+    checker.precompute_method_returns();
+    checker.precompute_method_returns();
     // Check each type's method bodies, then generalize each record type into a
     // scheme. Generalizing before the function bodies are checked makes the
     // schemes available at call sites (a function instantiates a method's scheme
@@ -339,6 +343,7 @@ pub fn analyze(program: &Program) -> Inference {
     // every recorded type against the final substitution so the typed program
     // reflects the fully solved types -- which hover and the other LSP features
     // read directly.
+    checker.report_uninferable_error_types();
     checker.finalize_typed();
     let function_returns: HashMap<String, Type> = checker
         .function_returns
@@ -443,6 +448,17 @@ struct Checker<'a> {
     /// factorially in the variant count and a wide sum's self-recursive method
     /// effectively hung the compiler.
     instantiating: HashSet<String>,
+    /// Symbols whose RECURSIVE call fell back to the precomputed return during an
+    /// elaboration in progress. Only those need their shared table entry tied back
+    /// to what the body really returns (see `link_inferred_return`); doing it for
+    /// every function would pin a GENERIC one's shared entry to whichever call site
+    /// ran first, and every other call would then conflict with it.
+    recursed: HashSet<String>,
+    /// Callables whose body has at least one error site (an `error(..)`, an `expr!`
+    /// propagation, or a forwarded `Result`). A `T!` with NO site is fine -- nothing
+    /// ever reads its Err -- but one whose sites all came back with an unknown error
+    /// type has nothing to infer it from, and is reported.
+    error_sites: HashSet<String>,
     /// How many callable bodies have been re-elaborated at call sites so far, and
     /// whether the budget below has already been reported. Inference that fails to
     /// converge must not hang the compiler: it stops re-elaborating and says so.
@@ -575,6 +591,8 @@ impl<'a> Checker<'a> {
             current_co_method: None,
             co_return_links: HashMap::new(),
             instantiating: HashSet::new(),
+            recursed: HashSet::new(),
+            error_sites: HashSet::new(),
             elaborations: 0,
             elaboration_budget_reported: false,
             shape_constraints: HashMap::new(),

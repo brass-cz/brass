@@ -1,0 +1,1 @@
+error: cannot infer the error type of `!`: this body propagates an error whose type nothing determines

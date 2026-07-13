@@ -145,6 +145,9 @@ impl Codegen for TextBackend {
     fn argv(&mut self) -> usize {
         self.val("argv".to_string())
     }
+    fn flush(&mut self) {
+        self.line("flush".to_string());
+    }
     fn plugin_call(
         &mut self,
         rt_name: &'static str,

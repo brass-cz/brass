@@ -301,7 +301,18 @@ impl<'a> Checker<'a> {
                 });
                 return ret;
             }
-            if let Some(ret) = self.function_returns.get(name).cloned() {
+            // The table is keyed by SYMBOL. A bare unique name is its own symbol, but
+            // a module-qualified call (`percent.decode`, which the resolve pass
+            // rewrote to a dotted marker) and a renamed import are not -- and a
+            // missed lookup here costs the caller its whole error type: the `!` on
+            // the call records an unknown Err, so `url`'s `path_segments` inferred no
+            // error type at all despite propagating one.
+            let symbol = self
+                .function_returns
+                .contains_key(name)
+                .then(|| name.clone())
+                .or_else(|| self.lookup_function(name).map(|f| f.symbol.clone()));
+            if let Some(ret) = symbol.and_then(|s| self.function_returns.get(&s).cloned()) {
                 args.iter().for_each(|arg| {
                     self.infer_expr_light(&arg.expr, env, props);
                 });
@@ -351,7 +362,23 @@ impl<'a> Checker<'a> {
                                 let ty = self.resolve(&ty);
                                 self.freshen(&ty)
                             });
-                            from_table.or(declared)
+                            // A CONSTRUCTOR (`HashMap.new()`) is rebuilt from the
+                            // type's SCHEME rather than taken from the table. The
+                            // light pass infers the constructor's body without the
+                            // scheme, so its `Self { .. }` carries the field types it
+                            // could see there (`_entries: never?[]`, from a slot array
+                            // sized with `null`) rather than the ones the scheme
+                            // expresses over the type's parameters
+                            // (`_Entry<key, value>?[]`). That shape is not merely
+                            // imprecise, it is a DIFFERENT type: nothing can pin the
+                            // element types through it, and it does not even unify
+                            // with what the full check builds. A fresh scheme instance
+                            // is what the full check hands back.
+                            let instance = from_table
+                                .as_ref()
+                                .map(|ty| self.resolve(ty))
+                                .and_then(|ty| self.fresh_scheme_instance(&ty));
+                            instance.or(from_table).or(declared)
                         }
                     };
                     if let Some(ret) = ret {
@@ -388,6 +415,45 @@ impl<'a> Checker<'a> {
             self.infer_expr_light(&arg.expr, env, props);
         });
         self.fresh_unknown()
+    }
+
+    /// A fresh instance of `ty`'s nominal built from its SCHEME: every scheme
+    /// parameter takes its own variable, and each field is the scheme's field type
+    /// over them. `None` when `ty` is not a record with a scheme.
+    ///
+    /// Restricted to a record with declared type SLOTS (`key: type`). Those are the
+    /// witness-free containers whose element types a use has to pin, and whose
+    /// constructor the light pass gets wrong. Every other record's fields are
+    /// whatever its constructor built, and the scheme's view of them -- a
+    /// generalization over the co-checked bodies -- is not the same thing: rebuilding
+    /// an `HttpClient` from it replaces the closure its `_connect` field actually
+    /// holds.
+    fn fresh_scheme_instance(&mut self, ty: &Type) -> Option<Type> {
+        let Type::Record(n) = ty else {
+            return None;
+        };
+        let info = self.program.type_by_id(n.id)?;
+        if info.slots.is_empty() {
+            return None;
+        }
+        let scheme = self.schemes.get(n.name())?.clone();
+        let mut map: HashMap<u32, Type> = HashMap::new();
+        for p in &scheme.params {
+            let fresh = self.fresh_unknown();
+            map.insert(*p, fresh);
+        }
+        let mut subst = prepoly_hir::Substitution::empty();
+        for (name, fty) in &scheme.fields {
+            subst.insert(
+                name.clone(),
+                super::instantiate::apply_scheme_param_map(fty, &map),
+            );
+        }
+        Some(Type::Record(prepoly_hir::NominalType::with_substitution(
+            n.id,
+            n.name().to_string(),
+            subst,
+        )))
     }
 
     fn infer_field_light(
@@ -599,20 +665,30 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            Pattern::Array(pats, _) => {
-                if let Type::Tuple(elems) = ty {
-                    for (pat, ety) in pats.iter().zip(elems) {
+            Pattern::Array(pats, _) => match self.resolve(ty) {
+                Type::Tuple(elems) => {
+                    for (pat, ety) in pats.iter().zip(&elems) {
                         self.bind_pattern_light(pat, ety, env);
                     }
-                } else {
-                    let elem = match ty {
-                        Type::Array(inner, _) | Type::Slice(inner) => &**inner,
-                        _ => ty,
-                    };
-                    pats.iter()
-                        .for_each(|pat| self.bind_pattern_light(pat, elem, env));
                 }
-            }
+                Type::Array(inner, _) | Type::Slice(inner) => {
+                    for pat in pats {
+                        self.bind_pattern_light(pat, &inner, env);
+                    }
+                }
+                // The subject's shape is not known here. Each position gets its OWN
+                // variable, rather than the subject itself: the positions of a
+                // destructuring are independent values, and binding every one to the
+                // whole subject makes `[k, v]` claim that `k` and `v` each ARE the
+                // pair -- so a `m.set(k, v)` pins the map's key and value to the
+                // pair, and the map's element types come out as tuples.
+                _ => {
+                    for pat in pats {
+                        let elem = self.fresh_unknown();
+                        self.bind_pattern_light(pat, &elem, env);
+                    }
+                }
+            },
             _ => {}
         }
     }
