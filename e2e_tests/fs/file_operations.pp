@@ -1,0 +1,82 @@
+// Copying, moving, and removing a file. Each takes a string or a `Path`, like
+// every other path in this library.
+//
+// The destructive halves are what the case is really for: a copy and a move
+// both REPLACE an existing target (no silent refusal), a move leaves nothing
+// behind, and removing something that is not a plain file -- a directory, or
+// nothing at all -- is an ERROR rather than a quiet success, so a typo cannot
+// read as "done".
+import fs.{
+    read_file,
+    write_file,
+    create_dir,
+    remove_dir,
+    remove_file,
+    copy_file,
+    move_file,
+}
+import path.{ Path }
+
+fun main() {
+    const root = Path.parse("/tmp/prepoly_e2e_fs_file_operations")
+    if root.is_dir() {
+        remove_dir(root)!
+    }
+    create_dir(root)!
+
+    const a = root.join("a.txt")
+    write_file(a, "content A")!
+
+    // Copy: both files exist afterwards, with the same contents.
+    const b = root.join("b.txt")
+    copy_file(a, b)!
+    println("{a.is_file()} {b.is_file()} {read_file(b)!}")
+
+    // A copy onto an existing target replaces it.
+    write_file(b, "stale")!
+    copy_file(a, b)!
+    println(read_file(b)!)
+
+    // Move: the source is gone, the target has the contents. (String paths
+    // here, to show the two forms are interchangeable.)
+    const c = "{root.to_string()}/c.txt"
+    move_file(b, c)!
+    println("{b.exists()} {read_file(c)!}")
+
+    // A move onto an existing target replaces it too.
+    write_file(b, "newer")!
+    move_file(b, c)!
+    println("{b.exists()} {read_file(c)!}")
+
+    // Remove.
+    remove_file(c)!
+    println(Path.parse(c).exists())
+
+    // A file that is not there cannot be removed.
+    match remove_file("{root.to_string()}/never_existed.txt") {
+        Ok { value } => println("BUG: removing a missing file succeeded"),
+        Err { error } => println("missing file rejected"),
+    }
+
+    // A directory is not a file: `remove_dir` is the call that takes a tree.
+    match remove_file(root) {
+        Ok { value } => println("BUG: removed a directory as a file"),
+        Err { error } => println("directory rejected by remove_file"),
+    }
+
+    // A directory is refused by `move_file` too -- moving one would work on a
+    // single filesystem and fail across two, so the name would be lying.
+    match move_file(root, "{root.to_string()}_moved") {
+        Ok { value } => println("BUG: moved a directory"),
+        Err { error } => println("directory rejected by move_file"),
+    }
+
+    // A copy needs its target's directory to exist (`create_dir` makes one).
+    match copy_file(a, "{root.to_string()}/no_such_dir/x.txt") {
+        Ok { value } => println("BUG: copied into a missing directory"),
+        Err { error } => println("missing target directory rejected"),
+    }
+
+    remove_dir(root)!
+    println(root.exists())
+}

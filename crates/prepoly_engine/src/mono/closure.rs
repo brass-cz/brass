@@ -8,6 +8,8 @@
 
 use super::*;
 
+use crate::mono::scan::{resolve_alias, use_aliases};
+
 impl Monomorphizer<'_, '_> {
     /// The declared parameter types of record `ty`'s field `field` when the
     /// field is annotated with a concrete function type -- the typing source for
@@ -213,7 +215,9 @@ impl Monomorphizer<'_, '_> {
     /// Recover the parameter types of a closure passed to free function `base` as
     /// argument `idx`: seed the callee's other parameters from the call's
     /// arguments, lightly infer its local types, and read what the closure
-    /// parameter is called with inside the callee. `None` if not yet resolvable.
+    /// parameter is called with inside the callee -- following, when the callee
+    /// only FORWARDS the parameter, the call it forwards it into. `None` if not
+    /// yet resolvable.
     fn probe_callee_param_types(
         &self,
         base: &str,
@@ -221,13 +225,27 @@ impl Monomorphizer<'_, '_> {
         idx: usize,
         caller_local_types: &[Option<Type>],
     ) -> Result<Option<Vec<Type>>, String> {
+        // The hop budget bounds a forwarding CHAIN (`g` hands the closure to `h`
+        // hands it to `f`); mutual recursion between forwarders would otherwise
+        // never terminate. Real chains are short, so a small budget loses nothing.
+        self.probe_callee_param_types_within(base, pass_args, idx, caller_local_types, 8)
+    }
+
+    fn probe_callee_param_types_within(
+        &self,
+        base: &str,
+        pass_args: &[Operand],
+        idx: usize,
+        caller_local_types: &[Option<Type>],
+        hops: u32,
+    ) -> Result<Option<Vec<Type>>, String> {
         // `base` is the callee name. For a stdlib primitive/array method passed a
         // closure (`arr.map(f)`), its body lives under the class-qualified symbol;
         // for a user METHOD (`iter.map_lazy(f)`) it lives in the method table
         // keyed by the receiver's type symbol. Both are recovered from the
         // receiver argument (the first call operand).
-        let body = match self.by_fn.get(base) {
-            Some(f) => &f.body,
+        let (body, callee_module) = match self.by_fn.get(base) {
+            Some(f) => (&f.body, f.module.as_slice()),
             None => {
                 let recv_ty = pass_args
                     .first()
@@ -241,7 +259,7 @@ impl Monomorphizer<'_, '_> {
                             .get(&(class.to_string(), base.to_string()))
                     })
                     .and_then(|s| self.by_fn.get(s.as_str()))
-                    .map(|f| &f.body);
+                    .map(|f| (&f.body, f.module.as_slice()));
                 let user = recv_ty
                     .as_ref()
                     .map(unwrap_nullable)
@@ -250,7 +268,7 @@ impl Monomorphizer<'_, '_> {
                         _ => None,
                     })
                     .and_then(|info| self.by_method.get(&(info.symbol.as_str(), base)))
-                    .map(|m| &m.body);
+                    .map(|m| (&m.body, m.module.as_slice()));
                 match prim.or(user) {
                     Some(b) => b,
                     None => return Ok(None),
@@ -271,10 +289,60 @@ impl Monomorphizer<'_, '_> {
             return Ok(None);
         };
         let indirect = collect_indirect_args(body);
-        let Some(call_sites) = indirect.get(p_local) else {
+        if let Some(call_sites) = indirect.get(p_local) {
+            return self.joined_arg_types(call_sites, &lt);
+        }
+        // The callee never calls the parameter itself. If it FORWARDS it to
+        // another function or method (`fun g(handler) { f(handler) }`), the call
+        // contract lives one call further on: recurse into that callee, with the
+        // forwarding call's arguments typed by this body's lightly-inferred
+        // locals. Without the hop, a merely-forwarding wrapper left the closure
+        // with no parameter types at all.
+        if hops == 0 {
             return Ok(None);
-        };
-        self.joined_arg_types(call_sites, &lt)
+        }
+        let alias = use_aliases(body);
+        for block in &body.blocks {
+            for stmt in &block.stmts {
+                let (MirStmt::Assign(_, rv) | MirStmt::Eval(rv)) = stmt else {
+                    continue;
+                };
+                match rv {
+                    Rvalue::Call(Callee::Free(next) | Callee::Method(next), args) => {
+                        for (i, a) in args.iter().enumerate() {
+                            let Operand::Local(g) = a else { continue };
+                            if resolve_alias(&alias, *g) != *p_local {
+                                continue;
+                            }
+                            if let Some(pt) =
+                                self.probe_callee_param_types_within(next, args, i, &lt, hops - 1)?
+                            {
+                                return Ok(Some(pt));
+                            }
+                        }
+                    }
+                    // The callee STORES the parameter into a record field
+                    // (`register` builds `RequestHandler { handler: handler }`):
+                    // the field's declared function type is the call contract, the
+                    // same source a closure stored into a literal directly takes
+                    // (`record_field_closures`) -- just one call boundary away.
+                    Rvalue::Record { ty, fields } | Rvalue::Variant { ty, fields, .. } => {
+                        for (fname, op) in fields {
+                            let Operand::Local(g) = op else { continue };
+                            if resolve_alias(&alias, *g) != *p_local {
+                                continue;
+                            }
+                            if let Some(pt) = self.record_field_fun_params(callee_module, ty, fname)
+                            {
+                                return Ok(Some(pt));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// The type of each parameter position across the call sites: one closure
@@ -388,6 +456,13 @@ impl Monomorphizer<'_, '_> {
             .get(&id)
             .ok_or_else(|| format!("unknown closure {}", id.index()))?;
         let sym = closure_symbol(id, capture_types, param_types);
+        tracing::debug!(
+            closure = id.index(),
+            captures = ?capture_types.iter().map(|t| t.display()).collect::<Vec<_>>(),
+            params = ?param_types.iter().map(|t| t.display()).collect::<Vec<_>>(),
+            declared_captures = self.by_closure.get(&id).map(|c| c.captures.len()),
+            "instantiating closure"
+        );
         if let Some(inst) = self.instances.get(&sym) {
             return Ok(inst.ret.clone());
         }

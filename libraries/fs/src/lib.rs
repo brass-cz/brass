@@ -34,6 +34,58 @@ fn borrow_fd<R>(fd: i64, op: impl FnOnce(&mut File) -> R) -> R {
     op(&mut file)
 }
 
+/// Copy the tree rooted at `source` into `target`, which the caller has checked
+/// does not exist yet.
+///
+/// A symbolic link inside the tree is RECREATED as a link rather than followed.
+/// That is what POSIX's `cp -R` does, and it is also what keeps the walk finite:
+/// following a link that points at an ancestor would recurse forever.
+fn copy_tree(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(&from)?, &to)?;
+        } else if kind.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Check the invariants both directory operations share, and answer the pair of
+/// paths to work with: `source` must be a directory, `target` must not exist at
+/// all (see `libraries/fs.pp` on why an existing target is refused rather than
+/// replaced), and `target` must not lie INSIDE `source` -- copying a tree into
+/// itself would never terminate.
+fn checked_dirs(source: &str, target: &str) -> Result<(), String> {
+    let meta = std::fs::metadata(source).map_err(|e| format!("{source}: {e}"))?;
+    if !meta.is_dir() {
+        return Err(format!("{source} is not a directory"));
+    }
+    if std::path::Path::new(target).exists() {
+        return Err(format!("{target} already exists"));
+    }
+    // Compare the source's real location with the target's would-be one: the
+    // target does not exist, so only its parent can be canonicalized.
+    let src = std::fs::canonicalize(source).map_err(|e| format!("{source}: {e}"))?;
+    let dst_parent = std::path::Path::new(target)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let dst = std::fs::canonicalize(dst_parent)
+        .map_err(|e| format!("{}: {e}", dst_parent.display()))?
+        .join(std::path::Path::new(target).file_name().unwrap_or_default());
+    if dst.starts_with(&src) {
+        return Err(format!("{target} is inside {source}"));
+    }
+    Ok(())
+}
+
 export! {
     /// Open the file at `path` and give up its descriptor. Modes: `r` read,
     /// `w` truncate+create write, `a` append+create. The prepoly side owns
@@ -93,6 +145,85 @@ export! {
         Ok(())
     }
 
+    /// Delete the file at `path`. A symbolic link is removed as the LINK (what
+    /// it points at is untouched). A `path` that is a directory is an error --
+    /// `dir_remove` is the call that takes a tree -- and so is one that is not
+    /// there, so a typo in a destructive call cannot read as done.
+    fn file_remove(path: String) -> Result<(), String> {
+        std::fs::remove_file(&path).map_err(|e| format!("{path}: {e}"))
+    }
+
+    /// Copy the contents and permission bits of `source` onto `target`,
+    /// replacing `target` when it already exists. `target`'s parent directory
+    /// must exist (`dir_create` makes one); a directory as either side is an
+    /// error.
+    fn file_copy(source: String, target: String) -> Result<(), String> {
+        std::fs::copy(&source, &target)
+            .map(|_| ())
+            .map_err(|e| format!("{source} -> {target}: {e}"))
+    }
+
+    /// Move the file at `source` to `target`, replacing `target` when it
+    /// already exists.
+    ///
+    /// A rename is atomic but cannot cross filesystems, and a temporary
+    /// directory very often IS another filesystem -- so a plain rename would
+    /// fail exactly where "move the file I just built in /tmp into place" is
+    /// the point. On that one error the move falls back to a copy followed by a
+    /// delete: no longer atomic, and `source` survives if the delete fails, but
+    /// it does what the caller asked. Every other error is reported as it is.
+    fn file_move(source: String, target: String) -> Result<(), String> {
+        // A directory would be renamed happily on one filesystem and fail the
+        // copy fallback on another; refuse it here so the name does not lie
+        // about what it moves.
+        if std::fs::metadata(&source)
+            .map_err(|e| format!("{source}: {e}"))?
+            .is_dir()
+        {
+            return Err(format!("{source} is a directory, not a file"));
+        }
+        match std::fs::rename(&source, &target) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                std::fs::copy(&source, &target)
+                    .map_err(|e| format!("{source} -> {target}: {e}"))?;
+                std::fs::remove_file(&source).map_err(|e| {
+                    format!("{source} was copied to {target} but could not be removed: {e}")
+                })
+            }
+            Err(e) => Err(format!("{source} -> {target}: {e}")),
+        }
+    }
+
+    /// Copy the directory tree at `source` to `target`, which must not exist.
+    /// A symbolic link inside the tree is recreated as a link, not followed.
+    fn dir_copy(source: String, target: String) -> Result<(), String> {
+        checked_dirs(&source, &target)?;
+        copy_tree(std::path::Path::new(&source), std::path::Path::new(&target))
+            .map_err(|e| format!("{source} -> {target}: {e}"))
+    }
+
+    /// Move the directory tree at `source` to `target`, which must not exist.
+    ///
+    /// A rename when the two sit on one filesystem (atomic, and nothing is
+    /// read); a copy of the tree followed by its removal when they do not,
+    /// since a rename cannot cross filesystems. The fallback is not atomic, and
+    /// `source` survives if the removal fails -- the error says so.
+    fn dir_move(source: String, target: String) -> Result<(), String> {
+        checked_dirs(&source, &target)?;
+        match std::fs::rename(&source, &target) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                copy_tree(std::path::Path::new(&source), std::path::Path::new(&target))
+                    .map_err(|e| format!("{source} -> {target}: {e}"))?;
+                std::fs::remove_dir_all(&source).map_err(|e| {
+                    format!("{source} was copied to {target} but could not be removed: {e}")
+                })
+            }
+            Err(e) => Err(format!("{source} -> {target}: {e}")),
+        }
+    }
+
     /// Create the directory at `path` along with every missing parent, as
     /// `mkdir -p` does. An existing directory is not an error (the requested
     /// state already holds); a `path` that exists as a file is.
@@ -120,6 +251,11 @@ impl PrepolyLib for FsLib {
         reg.export(decl!(fd_write));
         reg.export(decl!(fd_seek));
         reg.export(decl!(fd_close));
+        reg.export(decl!(file_remove));
+        reg.export(decl!(file_copy));
+        reg.export(decl!(file_move));
+        reg.export(decl!(dir_copy));
+        reg.export(decl!(dir_move));
         reg.export(decl!(dir_create));
         reg.export(decl!(dir_remove));
     }

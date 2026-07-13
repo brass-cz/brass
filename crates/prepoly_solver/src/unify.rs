@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use prepoly_hir::{NominalType, Substitution, Type};
+use prepoly_hir::{NominalType, Substitution, Type, passing_modes_match, split_passing_mode};
 
 #[derive(Default)]
 pub struct Subst {
@@ -105,6 +105,25 @@ impl Subst {
         NominalType::with_substitution(n.id, n.name.clone(), substitution)
     }
 
+    /// Unify a type nested in a function signature without erasing its calling
+    /// convention. Direct calls may match `T` against `ref(T)` because the call
+    /// creates the reference, but two function values are interchangeable only
+    /// when their parameter and result conventions agree.
+    fn unify_function_part(&mut self, a: &Type, b: &Type) -> Result<(), String> {
+        let a = self.resolve(a);
+        let b = self.resolve(b);
+        if !passing_modes_match(&a, &b) {
+            return Err(format!(
+                "function passing mode mismatch between `{}` and `{}`",
+                a.display(),
+                b.display()
+            ));
+        }
+        let (_, a) = split_passing_mode(&a);
+        let (_, b) = split_passing_mode(&b);
+        self.unify(a, b)
+    }
+
     /// Unify two types, extending the substitution. Returns an error message on
     /// a concrete-vs-concrete conflict.
     pub fn unify(&mut self, a: &Type, b: &Type) -> Result<(), String> {
@@ -163,9 +182,9 @@ impl Subst {
             (Type::Array(x, n), Type::Array(y, m)) if n == m => self.unify(x, y),
             (Type::Fun(p1, r1), Type::Fun(p2, r2)) if p1.len() == p2.len() => {
                 for (x, y) in p1.iter().zip(p2) {
-                    self.unify(x, y)?;
+                    self.unify_function_part(x, y)?;
                 }
-                self.unify(r1, r2)
+                self.unify_function_part(r1, r2)
             }
             (Type::Tuple(xs), Type::Tuple(ys)) if xs.len() == ys.len() => {
                 for (x, y) in xs.iter().zip(ys) {

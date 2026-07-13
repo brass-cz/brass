@@ -1,0 +1,10 @@
+true true content A
+content A
+false content A
+false newer
+false
+missing file rejected
+directory rejected by remove_file
+directory rejected by move_file
+missing target directory rejected
+false

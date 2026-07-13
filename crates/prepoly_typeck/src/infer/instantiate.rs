@@ -137,22 +137,38 @@ impl<'a> Checker<'a> {
         let err_ty = self.reconcile_error_payloads(&props.errors, false);
         let base = self.result_from_payloads(normal_ty, err_ty);
         let light = super::precompute::wrap_null_propagated_return(base, &props.nulls);
-        match full_ret {
-            Some(t) if !has_props => t,
-            // A propagating body's `Result`/`?` WRAPPING is the light assembly's --
-            // the full check's reconciliation does not rebuild it -- but its Ok
-            // PAYLOAD is the full check's. The light pass cannot re-elaborate a
-            // method's body, so a container the body fills (`HashMap.new()` then
-            // `set`) keeps OPEN element types there while the full check pins them.
-            // Take the light shape and fill it from what the body really returns, or
-            // a `collect(..)!.pairs()` monomorphizes at an open type and the typed
-            // back end refuses it.
-            Some(full) => {
-                self.link_inferred_return(&light, &full);
-                light
-            }
-            None => light,
+        let collected = std::mem::take(&mut self.last_returns);
+        if let Some(t) = full_ret
+            && !has_props
+        {
+            return t;
         }
+        // A propagating body's `Result`/`?` WRAPPING is the light assembly's -- the
+        // full check's reconciliation does not rebuild it -- but its Ok PAYLOAD is
+        // the full check's. The light pass cannot re-elaborate a method's body, so a
+        // container the body fills (`HashMap.new()` then `set`) keeps OPEN element
+        // types there while the full check pins them. Take the light shape and fill
+        // it from what the body really returns, or the map reaches the back end with
+        // its element types unset.
+        //
+        // Reconciled HERE rather than taken from `full_ret`: an `error(..)` return
+        // carries no Ok value (its payload is a variable no path produces), and
+        // reconciled in it wins and leaves the payload open.
+        let mut values = Vec::with_capacity(collected.len());
+        for (ty, span) in collected {
+            let resolved = self.resolve(&ty);
+            if resolved
+                .result_payloads()
+                .is_some_and(|(ok, _)| ok.is_unknown())
+            {
+                continue;
+            }
+            values.push((ty, span));
+        }
+        if let Some(ok) = self.reconcile_return_types(&values, false) {
+            self.link_inferred_return(&light, &ok);
+        }
+        light
     }
 
     /// Type a method call's result by instantiating the method's scheme against
@@ -346,6 +362,19 @@ impl<'a> Checker<'a> {
         match (self.resolve(annotated), actual) {
             // A bare `infer` parameter takes the argument's type.
             (Type::Unknown(_), have) => have,
+            // Passing wrappers belong to the annotated signature, while the
+            // actual argument is matched by its underlying value type. Recurse
+            // under every wrapper so a generic record does not lose its field
+            // substitution merely because it is borrowed or copied.
+            (Type::ConstOf(want), have) => {
+                Type::ConstOf(Box::new(self.instantiate_annotated_type(&want, &have)))
+            }
+            (Type::Mut(want), have) => {
+                Type::Mut(Box::new(self.instantiate_annotated_type(&want, &have)))
+            }
+            (Type::Ref(want), have) => {
+                Type::Ref(Box::new(self.instantiate_annotated_type(&want, &have)))
+            }
             // A generic container parameter (`infer[]`, `infer[]?`, ...) is
             // instantiated element-wise, so e.g. `slice(arr: infer[])` applied to
             // an `int32[]` returns an `int32[]` rather than an unconstrained `?[]`.
@@ -358,16 +387,47 @@ impl<'a> Checker<'a> {
             (Type::Nullable(want), Type::Nullable(have)) => {
                 Type::Nullable(Box::new(self.instantiate_annotated_type(&want, &have)))
             }
+            // A non-null actual is promoted to the annotated nullable after its
+            // inner generic positions have been instantiated.
+            (Type::Nullable(want), have) => {
+                Type::Nullable(Box::new(self.instantiate_annotated_type(&want, &have)))
+            }
+            (Type::Tuple(want), Type::Tuple(have)) if want.len() == have.len() => Type::Tuple(
+                want.iter()
+                    .zip(&have)
+                    .map(|(want, have)| self.instantiate_annotated_type(want, have))
+                    .collect(),
+            ),
+            (Type::Fun(want_params, want_ret), Type::Fun(have_params, have_ret))
+                if want_params.len() == have_params.len() =>
+            {
+                Type::Fun(
+                    want_params
+                        .iter()
+                        .zip(&have_params)
+                        .map(|(want, have)| self.instantiate_annotated_type(want, have))
+                        .collect(),
+                    Box::new(self.instantiate_annotated_type(&want_ret, &have_ret)),
+                )
+            }
             (Type::Record(want), Type::Record(have)) => {
                 let mut substitution = want.substitution.clone();
+                for (key, _) in want.substitution.iter() {
+                    if let Some(have_ty) = have.substitution.get(key) {
+                        substitution.insert(key, have_ty.clone());
+                    }
+                }
                 if let Some(TypeKind::Record { fields, .. }) =
                     self.program.type_by_id(want.id).map(|info| &info.kind)
                 {
                     for field in fields {
-                        if field.resolved_ty.as_ref().is_some_and(Type::is_unknown)
-                            && let Some(actual_ty) = self.record_field_type(&have, &field.name)
+                        if field
+                            .resolved_ty
+                            .as_ref()
+                            .is_some_and(|ty| !prepoly_hir::is_fully_known(ty))
+                            && let Some(have_ty) = self.record_field_type(&have, &field.name)
                         {
-                            substitution.insert(field.name.clone(), actual_ty);
+                            substitution.insert(field.name.clone(), have_ty);
                         }
                     }
                 }
@@ -397,17 +457,17 @@ impl<'a> Checker<'a> {
                             if want_param
                                 .resolved_ty
                                 .as_ref()
-                                .is_some_and(Type::is_unknown)
+                                .is_some_and(|ty| !prepoly_hir::is_fully_known(ty))
                             {
                                 let key =
                                     method_param_substitution_key(method_name, &want_param.name);
-                                if let Some(actual_ty) = have
+                                if let Some(have_ty) = have
                                     .substitution
                                     .get(&key)
                                     .cloned()
                                     .or_else(|| have_param.resolved_ty.clone())
                                 {
-                                    substitution.insert(key, actual_ty);
+                                    substitution.insert(key, have_ty);
                                 }
                             }
                         }
@@ -415,10 +475,10 @@ impl<'a> Checker<'a> {
                             .signature
                             .ret_ty
                             .as_ref()
-                            .is_some_and(Type::is_unknown)
+                            .is_some_and(|ty| !prepoly_hir::is_fully_known(ty))
                         {
                             let key = method_return_substitution_key(method_name);
-                            let actual_ret = have
+                            let have_ret = have
                                 .substitution
                                 .get(&key)
                                 .cloned()
@@ -428,13 +488,40 @@ impl<'a> Checker<'a> {
                                         .get(&(have.name().to_string(), method_name.clone()))
                                         .cloned()
                                 });
-                            if let Some(actual_ret) = actual_ret {
-                                substitution.insert(key, actual_ret);
+                            if let Some(have_ret) = have_ret {
+                                substitution.insert(key, have_ret);
                             }
                         }
                     }
                 }
                 apply_nominal_substitution(Type::Record(want), substitution)
+            }
+            (Type::Sum(want), Type::Sum(have)) => {
+                let mut substitution = want.substitution.clone();
+                for (key, _) in want.substitution.iter() {
+                    if let Some(have_ty) = have.substitution.get(key) {
+                        substitution.insert(key, have_ty.clone());
+                    }
+                }
+                if let Some(TypeKind::Sum { variants }) =
+                    self.program.type_by_id(want.id).map(|info| &info.kind)
+                {
+                    for variant in variants {
+                        for field in &variant.fields {
+                            let Some(want_ty) = field.resolved_ty.as_ref() else {
+                                continue;
+                            };
+                            if prepoly_hir::is_fully_known(want_ty) {
+                                continue;
+                            }
+                            let key = field_substitution_key(Some(&variant.name), &field.name);
+                            if let Some(have_ty) = have.substitution.get(&key) {
+                                substitution.insert(key, have_ty.clone());
+                            }
+                        }
+                    }
+                }
+                apply_nominal_substitution(Type::Sum(want), substitution)
             }
             _ => annotated.clone(),
         }
@@ -443,8 +530,7 @@ impl<'a> Checker<'a> {
     fn record_field_type(&self, record: &NominalType, field: &str) -> Option<Type> {
         record.substitution.get(field).cloned().or_else(|| {
             self.program
-                .types
-                .get(record.name())
+                .type_by_id(record.id)
                 .and_then(|info| match &info.kind {
                     TypeKind::Record { fields, .. } => fields
                         .iter()

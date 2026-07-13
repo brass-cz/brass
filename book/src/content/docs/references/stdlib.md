@@ -289,6 +289,13 @@ toolchain, `libraries/build.sh` + `PREPOLY_INCLUDE` from a repo checkout.
 | `File.open(path, mode)`     | `(string or Path, string) -> File!` | `"r"` read, `"w"` truncate+create, `"a"` append |
 | `read_file(path)`           | `(string or Path) -> string!` | whole file as text                               |
 | `write_file(path, content)` | `(string or Path, string) -> void!` | write text, truncating                     |
+| `copy_file(source, target)` | `(string or Path, string or Path) -> void!` | replaces an existing target        |
+| `move_file(source, target)` | `(string or Path, string or Path) -> void!` | rename, or copy+delete across filesystems |
+| `remove_file(path)`         | `(string or Path) -> void!` | a missing file is an error                         |
+| `copy_dir(source, target)`  | `(string or Path, string or Path) -> void!` | the whole tree; target must not exist |
+| `move_dir(source, target)`  | `(string or Path, string or Path) -> void!` | the whole tree; target must not exist |
+| `copy(source, target)`      | `(string or Path, string or Path) -> void!` | file or directory, by what `source` is |
+| `move(source, target)`      | `(string or Path, string or Path) -> void!` | file or directory, by what `source` is |
 | `create_dir(path)`          | `(string or Path) -> void!` | recursive, like `mkdir -p`                         |
 | `remove_dir(path)`          | `(string or Path) -> void!` | recursive, like `rm -r`                            |
 | `f.read(n)`                 | `(int64) -> uint8[]!`       | up to `n` bytes; fewer at end-of-file              |
@@ -310,6 +317,30 @@ sockets to the ordinary read/write/close methods.
 built with the `path` library needs no `to_string()` on the way in. (The arm
 that fits the argument is the only one compiled, so neither form costs the
 other anything.)
+
+`copy_file` and `move_file` both **replace** an existing target. A move within
+one filesystem is a rename (atomic, the contents are never read); across
+filesystems — and a temporary directory very often _is_ another filesystem —
+a rename cannot work, so it falls back to a copy followed by a delete, which is
+not atomic. A directory is refused by both `move_file` and `remove_file`: a
+tree is `remove_dir`'s business, and a directory move would succeed on one
+filesystem and fail across two.
+
+Removing a file that is not there is an **error**, not a quiet success — a typo
+in a destructive call must not read as "done". `remove_file` on a symbolic link
+removes the _link_; what it points at is untouched.
+
+The directory forms part ways with the file forms on one point: `copy_dir` and
+`move_dir` **refuse an existing target** rather than replacing it. Replacing a
+tree would delete files the copy never mentioned — not something a copy should
+do behind your back; call `remove_dir` first if that is what you want. A target
+_inside_ the source is refused too (the walk would never finish), and a symbolic
+link in the tree is recreated as a link rather than followed, as `cp -R` does.
+
+`copy` and `move` take **either kind**, dispatching on what `source` turns out
+to be — handy when the caller does not know or does not care. Each half keeps
+its own rule about an existing target (a file is replaced, a tree is refused),
+so reach for the specific call when it matters which one you are doing.
 
 `create_dir` and `remove_dir` are both recursive: `create_dir` makes every missing parent
 and treats an existing directory as success, while `remove_dir` takes the whole

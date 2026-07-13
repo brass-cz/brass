@@ -394,6 +394,9 @@ struct Checker<'a> {
     /// light pass -- a witness-free constructor's nullable slot element resolves
     /// here. Consumed by `check_block_root` for an inferred-return body.
     return_values: Vec<Vec<(Type, prepoly_parser::Span)>>,
+    /// The `return` types the last [`Self::check_block_root`] collected, so a
+    /// caller can reconcile them itself (see `prefer_full_return`).
+    last_returns: Vec<(Type, prepoly_parser::Span)>,
     /// Top-level bindings keyed by their DEFINING module. Globals are per-module
     /// (the back end keys their storage that way too), so two modules' same-named
     /// `const`s are two different globals with two different types -- a single
@@ -581,6 +584,7 @@ impl<'a> Checker<'a> {
             self_variant: None,
             return_contexts: Vec::new(),
             return_values: Vec::new(),
+            last_returns: Vec::new(),
             global_defs: HashMap::new(),
             global_scopes: HashMap::new(),
             function_returns: HashMap::new(),
@@ -738,6 +742,7 @@ impl<'a> Checker<'a> {
         self.return_values.push(Vec::new());
         self.check_block(b, scopes);
         let collected = self.return_values.pop().unwrap_or_default();
+        self.last_returns = collected.clone();
         self.return_contexts.pop();
         self.closure_write_targets = saved_closure_writes;
         self.narrowed_bindings = saved_narrowed;
@@ -946,7 +951,7 @@ impl<'a> Checker<'a> {
                         span: *span,
                     });
                 }
-                self.check_pattern_against(&binding_ty, pat);
+                self.check_let_pattern_against(&binding_ty, pat, value);
                 self.bind_pattern(pat, &binding_ty, scopes);
                 if *is_const {
                     self.record_expr_type_with(value, &binding_ty, Constness::Const);
@@ -975,7 +980,8 @@ impl<'a> Checker<'a> {
                         let value_ty = self.check_expr(value, scopes);
                         self.expect_element_assignable(&value_ty, &target_ty, value);
                     } else {
-                        self.check_expr_against(value, &target_ty, scopes);
+                        let value_ty = self.check_expr_against(value, &target_ty, scopes);
+                        self.constrain_stored_value(&value_ty, &target_ty);
                     }
                 } else {
                     let value_ty = self.check_expr(value, scopes);

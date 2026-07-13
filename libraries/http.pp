@@ -133,6 +133,29 @@ fun HttpResponse.parse(raw: string) {
     }
 }
 
+/**
+ * Serializes this response into raw bytes, as a server writes them onto the
+ * connection: the status line, the headers, a blank line, then the body.
+ *
+ * The headers are written exactly as they stand -- nothing is added, so a
+ * `Content-Length` (or a `Transfer-Encoding`) is the caller's business, as it
+ * is for `HttpRequest.serialize`. Parsing the result yields an equal response.
+ *
+ * The status line keeps the space before the reason phrase even when the reason
+ * is empty (`HTTP/1.1 204 `): the grammar asks for it, and it is what lets
+ * `parse` read the line back.
+ */
+fun HttpResponse.serialize(self) -> uint8[] {
+    let text = "{self.version} {self.status} {self.reason}\r\n"
+    for h in self.headers {
+        text = "{text}{h.name}: {h.value}\r\n"
+    }
+    text = "{text}\r\n"
+    let bytes = to_bytes(text)
+    for b in self.body { bytes.push(b) }
+    return bytes
+}
+
 /** Returns the response body decoded as a UTF-8 string. */
 fun HttpResponse.body_text(self) {
     return to_text(self.body)

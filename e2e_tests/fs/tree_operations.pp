@@ -1,0 +1,75 @@
+// Copying and moving a directory tree, and the kind-dispatching `copy`/`move`
+// that take either a file or a directory.
+//
+// Two guards are what this case is really for. A directory target that already
+// exists is REFUSED (replacing a tree would delete files the copy never
+// mentioned), and a target INSIDE the source is refused too (copying a tree into
+// itself would never finish). A symbolic link in the tree is recreated as a
+// link, never followed -- which is also what keeps the walk finite when one
+// points back at an ancestor.
+import fs.{
+    read_file,
+    write_file,
+    create_dir,
+    remove_dir,
+    copy_dir,
+    move_dir,
+    copy,
+    move,
+}
+import path.{ Path }
+
+fun main() {
+    const root = Path.parse("/tmp/prepoly_e2e_fs_tree_operations")
+    if root.is_dir() {
+        remove_dir(root)!
+    }
+    const src = root.join("src")
+    create_dir(src.join("nested"))!
+    write_file(src.join("a.txt"), "A")!
+    write_file(src.join(["nested", "b.txt"]), "B")!
+
+    // The tree is copied whole, and the original stays.
+    const copied = root.join("copied")
+    copy_dir(src, copied)!
+    println(read_file(copied.join("a.txt"))!)
+    println(read_file(copied.join(["nested", "b.txt"]))!)
+    println(src.is_dir())
+
+    // An existing target is refused, not replaced.
+    match copy_dir(src, copied) {
+        Ok { value } => println("BUG: replaced an existing tree"),
+        Err { error } => println("existing target refused"),
+    }
+
+    // A target inside the source would never terminate.
+    match copy_dir(src, src.join("inner")) {
+        Ok { value } => println("BUG: copied a tree into itself"),
+        Err { error } => println("target inside source refused"),
+    }
+
+    // Moving leaves nothing behind.
+    const moved = root.join("moved")
+    move_dir(copied, moved)!
+    println("{copied.exists()} {read_file(moved.join("a.txt"))!}")
+
+    // `copy` and `move` take either kind, dispatching on what the source IS.
+    copy(src.join("a.txt"), root.join("file.txt"))!
+    println(read_file(root.join("file.txt"))!)
+    copy(src, root.join("tree"))!
+    println(read_file(root.join(["tree", "nested", "b.txt"]))!)
+    move(root.join("file.txt"), root.join("file2.txt"))!
+    println("{root.join("file.txt").exists()} {read_file(root.join("file2.txt"))!}")
+    move(root.join("tree"), root.join("tree2"))!
+    println("{root.join("tree").exists()} {read_file(root.join(["tree2", "a.txt"]))!}")
+
+    // A source that is not there goes to the file half, whose error names the
+    // missing file rather than telling a story about directories.
+    match copy("{root.to_string()}/never_existed", root.join("x")) {
+        Ok { value } => println("BUG: copied a missing source"),
+        Err { error } => println("missing source rejected"),
+    }
+
+    remove_dir(root)!
+    println(root.exists())
+}

@@ -28,11 +28,11 @@ pub use mutation::{
 pub use plugin::{plugin_builtin_code, plugin_builtin_return, plugin_sig_types, plugin_type_code};
 pub use typed::{Constness, Ownership, RegionId, TypedExpr, TypedExprKind, TypedProgram};
 pub use types::{
-    FloatKind, INFER_VAR, IntKind, NominalInfo, NominalKind, NominalType, STRUCTURAL_RECORD_ID,
-    STRUCTURAL_RECORD_NAME, Substitution, Type, collapse_nullable, freshen_infer, freshen_unknowns,
-    index_element, int_literal_kind, is_fully_known, mismatch_display, peel_modes,
-    prim_method_symbol, primitive_kind_conflict, resolve, structural_record, substitute_vars,
-    type_key, type_vars,
+    FloatKind, INFER_VAR, IntKind, NominalInfo, NominalKind, NominalType, PassingMode,
+    STRUCTURAL_RECORD_ID, STRUCTURAL_RECORD_NAME, Substitution, Type, collapse_nullable,
+    freshen_infer, freshen_unknowns, index_element, int_literal_kind, is_fully_known,
+    mismatch_display, passing_modes_match, peel_modes, prim_method_symbol, primitive_kind_conflict,
+    resolve, split_passing_mode, structural_record, substitute_vars, type_key, type_vars,
 };
 
 /// Re-exported so back ends can name source spans (e.g. typed-literal codegen

@@ -44,7 +44,8 @@ without executing it, use `prepoly check`:
 prepoly check hello.pp
 ```
 
-It prints `ok` when the program is well-typed, or the type errors otherwise.
+It prints nothing when the program is well-typed, and exits 0; otherwise it
+prints the type errors and exits non-zero.
 Running `prepoly` with no arguments starts an interactive REPL.
 
 ## Running as a script

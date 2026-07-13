@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "prepoly-fmt"
+name = "ppfmt"
 path = "src/main.rs"
 
 [dependencies]

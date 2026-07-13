@@ -9,7 +9,7 @@ description: "The compilation pipeline, the two back ends, and runtime behavior 
 transitively (plus the embedded standard library), lower, and **type-check the
 whole program**. Only when no diagnostics remain is anything executed —
 diagnostics go to stderr and the process exits non-zero. `prepoly check`
-stops after this stage and prints `ok`.
+stops after this stage; it prints nothing when the program is well-typed.
 
 Execution then instantiates every reachable function at the concrete types it
 is used with (**monomorphization**) and runs the program:

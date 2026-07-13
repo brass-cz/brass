@@ -82,10 +82,15 @@ impl<'a> Checker<'a> {
                     span: *span,
                 });
             }
-            for (item, ety) in items.iter().zip(&elems) {
-                self.check_expr_against(item, ety, scopes);
-            }
-            let ty = Type::Tuple(elems);
+            let instantiated = items
+                .iter()
+                .zip(&elems)
+                .map(|(item, expected)| {
+                    let actual = self.check_expr_against(item, expected, scopes);
+                    self.instantiate_annotated_type(expected, &actual)
+                })
+                .collect();
+            let ty = Type::Tuple(instantiated);
             self.record_expr_type(expr, &ty);
             return ty;
         }
@@ -98,7 +103,10 @@ impl<'a> Checker<'a> {
         if let Expr::Closure(params, body, _) = expr
             && let Type::Fun(want_params, want_ret) = self.resolve(want)
         {
-            return self.check_closure_against(expr, params, body, &want_params, &want_ret, scopes);
+            let got =
+                self.check_closure_against(expr, params, body, &want_params, &want_ret, scopes);
+            self.expect_expr_assignable(&got, want, expr);
+            return got;
         }
         // A call (or `call!`) in a required position keys a reflective
         // `-> infer!` method by `want`. Only these shapes can be keyed; set the
@@ -113,6 +121,21 @@ impl<'a> Checker<'a> {
         } else {
             self.check_expr(expr, scopes)
         };
+        // A still-open value in a required FUNCTION position takes that type
+        // outright. The assignability check below only PROBES; it commits nothing,
+        // so `fun g(handler) { f(handler) }` -- with `f`'s parameter annotated
+        // `(int32) -> void` -- left `g`'s parameter an open variable: the program
+        // ran (the back end recovers closure contracts its own way) but every
+        // editor surface showed `handler: unknown_0`. The annotation is the whole
+        // call contract of a function value, so binding to it is inference, not a
+        // guess. Function positions ONLY: a record position must stay open for
+        // structural width, and a numeric one converts rather than unifies.
+        if matches!(self.resolve(want), Type::Fun(..)) {
+            let resolved_got = self.resolve(&got);
+            if !prepoly_hir::is_fully_known(&resolved_got) && self.can_unify(&got, want) {
+                let _ = self.solver.unify(&got, want);
+            }
+        }
         self.expect_expr_assignable(&got, want, expr);
         got
     }
@@ -137,16 +160,14 @@ impl<'a> Checker<'a> {
                 .get(i)
                 .cloned()
                 .unwrap_or_else(|| self.fresh_unknown());
-            // An explicit parameter annotation still applies and is checked
-            // against the expected type; an unannotated parameter takes it.
+            // An explicit parameter annotation still applies; the complete
+            // function type is checked after the body so parameter variance and
+            // passing mode are decided together. An unannotated parameter takes
+            // the expected type directly.
             let ty = match &p.ty {
-                Some(te) => {
-                    let annotated = self
-                        .resolve_type(te)
-                        .unwrap_or_else(|_| self.fresh_unknown());
-                    self.expect_assignable(&annotated, &expected, p.span);
-                    annotated
-                }
+                Some(te) => self
+                    .resolve_type(te)
+                    .unwrap_or_else(|_| self.fresh_unknown()),
                 None => expected,
             };
             closure_scope.insert(p.name.clone(), ty.clone());

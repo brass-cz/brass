@@ -519,6 +519,16 @@ own absolute source path, so "the file I am in" is `Path.parse(_PATH)`.
 ### fs -- `import fs.{ File, read_file, write_file, create_dir, remove_dir }`
 
 - `read_file(path) -> string!`; `write_file(path, content) -> void!`
+- `copy_file(source, target) -> void!` / `move_file(source, target) -> void!`
+  -- both REPLACE an existing target; `move_file` is a rename, falling back to
+  copy+delete across filesystems. `remove_file(path) -> void!`. A DIRECTORY is
+  refused by move_file/remove_file, and a MISSING file is an ERROR.
+- `copy_dir(source, target) -> void!` / `move_dir(source, target) -> void!` --
+  the whole tree; unlike the file forms these REFUSE an existing target (call
+  `remove_dir` first), and refuse a target inside the source. A symlink in the
+  tree is recreated as a link, not followed.
+- `copy(source, target)` / `move(source, target)` -- take EITHER kind,
+  dispatching on what `source` is; each half keeps its own target rule.
 - `create_dir(path) -> void!` -- RECURSIVE (`mkdir -p`); an existing directory
   is success. `remove_dir(path) -> void!` -- RECURSIVE (`rm -r`); a missing
   directory is an ERROR.
@@ -691,7 +701,9 @@ connection close); chunked transfer coding is NOT decoded.
   with `Header = { name: string, value: string }`;
   `HttpRequest.parse(raw)!`; `req.serialize() -> uint8[]`
 - `HttpResponse = { version, status: int32, reason, headers, body }`;
-  `resp.body_text() -> string!`; `HttpResponse.parse(raw)!`
+  `resp.body_text() -> string!`; `HttpResponse.parse(raw)!`;
+  `resp.serialize() -> uint8[]` (the bytes a server writes; nothing is added,
+  so `Content-Length` is yours to set, as with the request)
 - `request(req) -> HttpResponse!` -- plain HTTP; the host comes from the
   request's `Host` header
 

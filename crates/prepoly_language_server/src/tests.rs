@@ -523,6 +523,37 @@ fn hover_shows_a_sum_types_method() {
     }
 }
 
+/// An unannotated parameter that is FORWARDED into an annotated function
+/// position takes that annotation: it is the parameter's whole call contract,
+/// so `g`'s signature is determined, not generic. It used to hover as
+/// `handler: unknown_0` -- the assignability check only probed the annotation
+/// without committing it.
+#[test]
+fn hover_resolves_a_forwarded_function_parameter() {
+    let src = concat!(
+        "fun f(handler: (int32) -> void) {\n",
+        "    handler(1)\n",
+        "}\n",
+        "\n",
+        "fun g(handler) {\n",
+        "    f(handler)\n",
+        "}\n",
+        "\n",
+        "g((v) -> { println(v) })\n",
+    );
+    let full = full_analysis(src);
+    for (needle, what) in [("g(handler)", "declaration"), ("g((v)", "call")] {
+        let (doc, pos) = position(src, needle, false);
+        let h = hover::hover(&doc, &full, pos).unwrap_or_else(|| panic!("hover at the {what}"));
+        let text = hover_text(&h);
+        assert!(
+            text.contains("(int32) -> void"),
+            "{what} must show the forwarded contract: {text}"
+        );
+        assert!(!text.contains("unknown"), "{what} must be resolved: {text}");
+    }
+}
+
 /// Hovering a method call shows the *method's* signature (its type), not the
 /// call's result type, with an unannotated return filled from the call site.
 #[test]

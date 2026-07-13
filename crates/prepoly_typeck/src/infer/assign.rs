@@ -185,6 +185,25 @@ impl<'a> Checker<'a> {
         self.expect_assignable(got, want, expr.span());
     }
 
+    /// Commit equality information produced by a write into typed storage.
+    /// Ordinary assignability probes are intentionally non-committing so a
+    /// polymorphic value may be checked at several call sites. A value that is
+    /// stored is different: an open closure parameter written into `int32`
+    /// storage is itself constrained to `int32`, and every later call must see
+    /// that constraint. A failed attempt is rolled back; the normal
+    /// assignability check remains responsible for its diagnostic.
+    pub(super) fn constrain_stored_value(&mut self, got: &Type, storage: &Type) -> bool {
+        if self.solver.free_vars(&self.resolve(got)).is_empty() {
+            return false;
+        }
+        let snapshot = self.solver.snapshot();
+        if self.solver.unify(got, storage).is_ok() {
+            return true;
+        }
+        self.solver.rollback(snapshot);
+        false
+    }
+
     pub(super) fn expect_assignable(
         &mut self,
         got: &Type,
@@ -345,6 +364,9 @@ impl<'a> Checker<'a> {
             // `_grow` re-inserts `old_entries[0]`), which is loose by construction.
             // A genuine clash on a fully concrete element is caught by the concrete
             // path below, which still runs because such an element has no free var.
+            return;
+        }
+        if self.constrain_stored_value(&got, &want) {
             return;
         }
         if got.is_null() && !matches!(want, Type::Nullable(_)) {

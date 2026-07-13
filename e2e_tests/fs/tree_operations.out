@@ -1,0 +1,12 @@
+A
+B
+true
+existing target refused
+target inside source refused
+false A
+A
+B
+false A
+false A
+missing source rejected
+false

@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 
 use prepoly_hir::{
-    CallableSignature, MethodInfo, NominalType, ParamInfo, Program, STRUCTURAL_RECORD_ID, Type,
-    TypeKind,
+    CallableSignature, MethodInfo, NominalType, ParamInfo, PassingMode, Program,
+    STRUCTURAL_RECORD_ID, Type, TypeKind, passing_modes_match, split_passing_mode,
 };
 
 /// Whether `a` and `b` are mutually compatible, i.e. invariant. Mutable record
@@ -29,6 +29,9 @@ pub fn types_compatible(program: &Program, have: &Type, want: &Type) -> bool {
     }
     if have.is_result_type() && want.is_result_type() {
         return true;
+    }
+    if drops_fixed_length_through_mutable_reference(have, want) {
+        return false;
     }
     match (have, want) {
         (Type::Unknown(_), _) | (_, Type::Unknown(_)) => true,
@@ -67,8 +70,8 @@ pub fn types_compatible(program: &Program, have: &Type, want: &Type) -> bool {
         (Type::Fun(hp, hr), Type::Fun(wp, wr)) if hp.len() == wp.len() => {
             hp.iter()
                 .zip(wp)
-                .all(|(h, w)| types_compatible(program, w, h))
-                && types_compatible(program, hr, wr)
+                .all(|(h, w)| function_part_compatible(program, w, h))
+                && function_part_compatible(program, hr, wr)
         }
         // Same *declared* record type instantiated two ways: compatible only when
         // each field the required instance fixes matches the value's. This mirrors
@@ -87,6 +90,26 @@ pub fn types_compatible(program: &Program, have: &Type, want: &Type) -> bool {
     }
 }
 
+/// Function subtyping may reverse the value-type direction of a parameter, but
+/// it never changes how that parameter or result aliases caller-owned state.
+pub fn function_part_compatible(program: &Program, have: &Type, want: &Type) -> bool {
+    if !passing_modes_match(have, want) {
+        return false;
+    }
+    let (_, have) = split_passing_mode(have);
+    let (_, want) = split_passing_mode(want);
+    types_compatible(program, have, want)
+}
+
+fn drops_fixed_length_through_mutable_reference(have: &Type, want: &Type) -> bool {
+    let (want_mode, want_value) = split_passing_mode(want);
+    if want_mode != PassingMode::MutableReference {
+        return false;
+    }
+    let (_, have_value) = split_passing_mode(have);
+    matches!(have_value, Type::Array(..)) && matches!(want_value, Type::Slice(_))
+}
+
 /// Whether a value of record instance `sub` is usable where the same declared
 /// record `sup` (a possibly-differently-instantiated version) is required: every
 /// field the required instance fixes in its substitution must be present in the
@@ -98,7 +121,7 @@ fn record_refinement_compatible(program: &Program, sub: &NominalType, sup: &Nomi
         .iter()
         .all(|(key, wt)| match sub.substitution.get(key) {
             Some(ht) => types_invariant(program, ht, wt),
-            None => true,
+            None => false,
         })
 }
 
@@ -307,7 +330,7 @@ fn record_fields(program: &Program, nt: &NominalType) -> Vec<NormField> {
             })
             .collect();
     }
-    match program.types.get(nt.name()).map(|info| &info.kind) {
+    match program.type_by_id(nt.id).map(|info| &info.kind) {
         Some(TypeKind::Record { fields, .. }) => fields
             .iter()
             .map(|f| {
@@ -342,7 +365,7 @@ fn declared_methods<'a>(
     if nt.id == STRUCTURAL_RECORD_ID {
         return None;
     }
-    match program.types.get(nt.name()).map(|info| &info.kind) {
+    match program.type_by_id(nt.id).map(|info| &info.kind) {
         Some(TypeKind::Record { methods, .. }) => Some(methods),
         _ => None,
     }

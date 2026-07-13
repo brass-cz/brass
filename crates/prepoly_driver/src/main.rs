@@ -748,10 +748,10 @@ fn drive(mode: Mode, file: &str) -> Result<(), u8> {
     };
 
     match mode {
-        Mode::Check => {
-            println!("ok");
-            Ok(())
-        }
+        // Silence on success, as a checker in a pipeline should be: the exit code
+        // carries the answer, and anything on stdout is noise an editor or a script
+        // has to filter out.
+        Mode::Check => Ok(()),
         Mode::Run => execute(
             &checked.program,
             &checked.expr_types,

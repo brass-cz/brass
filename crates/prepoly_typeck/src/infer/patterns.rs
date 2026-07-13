@@ -262,6 +262,79 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Check a `let` pattern, whose bindings must always be initialized. Array
+    /// patterns are refutable on a growable slice because its runtime length is
+    /// not part of the type; those patterns belong in `if let` or `match`.
+    /// Fixed arrays and tuples carry an exact arity and remain valid total
+    /// destructures. Recurse so a slice nested in a tuple/record cannot bypass
+    /// the same requirement.
+    pub(super) fn check_let_pattern_against(
+        &mut self,
+        scrutinee: &Type,
+        pat: &Pattern,
+        value: &Expr,
+    ) {
+        self.check_pattern_against(scrutinee, pat);
+        self.check_let_pattern_lengths(scrutinee, pat, Some(value));
+    }
+
+    fn check_let_pattern_lengths(&mut self, scrutinee: &Type, pat: &Pattern, value: Option<&Expr>) {
+        match pat {
+            Pattern::Array(patterns, span) => match self.resolve(scrutinee) {
+                Type::Tuple(elements) => {
+                    for (index, (pattern, element)) in patterns.iter().zip(&elements).enumerate() {
+                        let item = match value {
+                            Some(Expr::Array(items, _)) => items.get(index),
+                            _ => None,
+                        };
+                        self.check_let_pattern_lengths(element, pattern, item);
+                    }
+                }
+                Type::Array(element, _) => {
+                    for (index, pattern) in patterns.iter().enumerate() {
+                        let item = match value {
+                            Some(Expr::Array(items, _)) => items.get(index),
+                            _ => None,
+                        };
+                        self.check_let_pattern_lengths(&element, pattern, item);
+                    }
+                }
+                Type::Slice(element) => {
+                    let literal_items = match value {
+                        Some(Expr::Array(items, _)) if items.len() == patterns.len() => Some(items),
+                        _ => None,
+                    };
+                    if literal_items.is_none() {
+                        self.errors.push(TypeError {
+                            message: "cannot use a fixed-length array pattern in `let` with a growable array; use `if let` or `match`"
+                                .to_string(),
+                            span: *span,
+                        });
+                    }
+                    for (index, pattern) in patterns.iter().enumerate() {
+                        self.check_let_pattern_lengths(
+                            &element,
+                            pattern,
+                            literal_items.and_then(|items| items.get(index)),
+                        );
+                    }
+                }
+                _ => {}
+            },
+            Pattern::Record(variant, fields, _) => {
+                let field_types = self.pattern_field_types(scrutinee, variant);
+                for field in fields {
+                    if let Some(pattern) = &field.pat
+                        && let Some(field_ty) = field_types.get(&field.name)
+                    {
+                        self.check_let_pattern_lengths(field_ty, pattern, None);
+                    }
+                }
+            }
+            Pattern::Binding(..) | Pattern::Wildcard(_) | Pattern::Literal(..) => {}
+        }
+    }
+
     pub(super) fn pattern_field_types(
         &mut self,
         ty: &Type,
@@ -278,8 +351,7 @@ impl<'a> Checker<'a> {
         if let Type::Sum(name) = &resolved {
             return self
                 .program
-                .types
-                .get(name.name())
+                .type_by_id(name.id)
                 .and_then(|info| info.variant(variant))
                 .map(|variant_info| {
                     variant_info

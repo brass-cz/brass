@@ -20,8 +20,13 @@ import libfs.{
     fd_write,
     fd_seek,
     fd_close,
+    file_remove,
+    file_copy,
+    file_move,
     dir_create,
     dir_remove,
+    dir_copy,
+    dir_move,
 }
 import path.{ Path }
 
@@ -132,6 +137,118 @@ fun write_file(path, content: string) {
     let f = File.open(path, "w")!
     f.write(to_bytes(content))!
     f.close()!
+}
+
+/**
+ * Delete the file at `path` (a string or a `Path`).
+ *
+ * A symbolic link is removed as the LINK -- what it points at is untouched. A
+ * `path` that is a directory is an error (`remove_dir` takes a tree), and so is
+ * one that is not there: a typo in a destructive call must not read as "done".
+ */
+fun remove_file(path) {
+    file_remove(_as_text(path)!)!
+}
+
+/**
+ * Copy the file at `source` onto `target`, contents and permissions, REPLACING
+ * `target` when it already exists. Each path is a string or a `Path`.
+ *
+ * `target`'s parent directory must exist -- `create_dir` makes one -- and a
+ * directory as either side is an error.
+ */
+fun copy_file(source, target) {
+    file_copy(_as_text(source)!, _as_text(target)!)!
+}
+
+/**
+ * Move the file at `source` to `target`, REPLACING `target` when it already
+ * exists. Each path is a string or a `Path`.
+ *
+ * Within one filesystem this is a rename: atomic, and the file's contents are
+ * never read. Across filesystems -- and a temporary directory very often IS
+ * another filesystem, which is exactly where "move the file I just built into
+ * place" happens -- a rename cannot work, so the move falls back to a copy
+ * followed by a delete. That fallback is not atomic, and `source` survives if
+ * the delete fails (the error says so).
+ *
+ * `source` must be a file: moving a directory would succeed on one filesystem
+ * and fail on another, so it is refused rather than left to chance.
+ */
+fun move_file(source, target) {
+    file_move(_as_text(source)!, _as_text(target)!)!
+}
+
+/**
+ * Copy the directory tree at `source` to `target`, recursively. Each path is a
+ * string or a `Path`.
+ *
+ * `target` must NOT already exist. This is where the directory forms part ways
+ * with `copy_file`, which replaces its target: replacing a TREE would mean
+ * deleting files the copy never mentioned, which is not something a copy should
+ * do behind the caller's back. Remove the old tree with `remove_dir` first if
+ * that is what you want.
+ *
+ * A symbolic link inside the tree is recreated as a LINK rather than followed,
+ * as `cp -R` does -- which is also what keeps the walk finite when a link points
+ * back at an ancestor. `target` may not lie inside `source`, for the same
+ * reason.
+ */
+fun copy_dir(source, target) {
+    dir_copy(_as_text(source)!, _as_text(target)!)!
+}
+
+/**
+ * Move the directory tree at `source` to `target`. Each path is a string or a
+ * `Path`, and `target` must NOT already exist (see `copy_dir`).
+ *
+ * Within one filesystem this is a rename: atomic, and nothing in the tree is
+ * read. Across filesystems it falls back to copying the tree and then removing
+ * the original -- not atomic, and `source` survives if the removal fails (the
+ * error says so).
+ */
+fun move_dir(source, target) {
+    dir_move(_as_text(source)!, _as_text(target)!)!
+}
+
+/**
+ * Copy `source` to `target`, whichever it is: a directory is copied as a tree
+ * (`copy_dir`), anything else as a file (`copy_file`). Each path is a string or
+ * a `Path`.
+ *
+ * The two halves keep their own rules about an existing `target` -- a file is
+ * REPLACED, a tree is REFUSED (see `copy_dir` on why) -- so reach for the
+ * specific call when it matters which one you are doing.
+ */
+fun copy(source, target) {
+    if _is_dir(source)! {
+        copy_dir(source, target)!
+    } else {
+        copy_file(source, target)!
+    }
+}
+
+/**
+ * Move `source` to `target`, whichever it is: a directory moves as a tree
+ * (`move_dir`), anything else as a file (`move_file`). Each path is a string or
+ * a `Path`.
+ *
+ * As with `copy`, the two halves keep their own rules about an existing
+ * `target`: a file is replaced, a tree is refused.
+ */
+fun move(source, target) {
+    if _is_dir(source)! {
+        move_dir(source, target)!
+    } else {
+        move_file(source, target)!
+    }
+}
+
+// Whether `path` names a directory. A `source` that is not there at all answers
+// false, so the call goes to the file half -- whose error names the missing file
+// rather than talking about directories.
+fun _is_dir(path) -> bool! {
+    return Path.parse(_as_text(path)!).is_dir()
 }
 
 /**

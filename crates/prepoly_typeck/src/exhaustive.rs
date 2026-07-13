@@ -4,16 +4,17 @@
 
 use std::collections::HashSet;
 
-use prepoly_hir::{Program, TypeKind};
+use prepoly_hir::{Program, Type, TypeInfo, TypeKind, TypedProgram, peel_modes};
 use prepoly_parser::Span;
 use prepoly_parser::ast::*;
 
 use crate::TypeError;
 use crate::walk::{ExprVisitor, walk_program_exprs};
 
-pub fn check(program: &Program) -> Vec<TypeError> {
+pub fn check(program: &Program, typed: &TypedProgram) -> Vec<TypeError> {
     let mut v = ExhaustiveVisitor {
         program,
+        typed,
         errors: Vec::new(),
     };
     walk_program_exprs(program, &mut v);
@@ -65,52 +66,43 @@ pub(crate) fn pattern_names_sum_variant(program: &Program, p: &Pattern) -> bool 
 
 struct ExhaustiveVisitor<'a> {
     program: &'a Program,
+    typed: &'a TypedProgram,
     errors: Vec<TypeError>,
 }
 
 impl ExprVisitor for ExhaustiveVisitor<'_> {
     fn visit(&mut self, e: &Expr) {
-        if let Expr::Match(_, arms, span) = e {
-            self.check_match(arms, *span);
+        if let Expr::Match(scrutinee, arms, span) = e {
+            for id in self.scrutinee_sum_ids(scrutinee) {
+                if let Some(sum) = self.program.type_by_id(id).cloned() {
+                    self.check_match(&sum, arms, *span);
+                }
+            }
         }
     }
 }
 
 impl ExhaustiveVisitor<'_> {
-    /// The sum type the arms of a match are over. The scrutinee's type is not
-    /// known in this AST pass, so the owner is chosen from the variant names
-    /// the arms use: the sum containing *all* of them. When several sums
-    /// qualify (shared variant names), the most specific one (fewest variants,
-    /// then name) is picked -- a deterministic choice, so the type table's hash
-    /// order never decides accept/reject; an ambiguous match is then judged
-    /// against the sum most likely to make it exhaustive (conservative accept).
-    fn owning_sum(&self, arms: &[MatchArm]) -> Option<String> {
-        let variant_names: Vec<&str> = arms
+    /// Every concrete sum inferred for this source scrutinee. Re-elaboration may
+    /// record the same expression more than once at different call instances;
+    /// checking every distinct nominal id keeps a polymorphic match safe for all
+    /// of them instead of letting the last sidecar entry decide coverage.
+    fn scrutinee_sum_ids(&self, scrutinee: &Expr) -> Vec<i32> {
+        let mut seen = HashSet::new();
+        self.typed
+            .expressions
             .iter()
-            .filter_map(|a| match &a.pattern {
-                Pattern::Record(n, _, _) | Pattern::Binding(n, _) => {
-                    is_variant_name(self.program, n).then_some(n.as_str())
-                }
+            .filter(|expr| expr.span == scrutinee.span())
+            .filter_map(|expr| match peel_modes(&expr.ty) {
+                Type::Sum(sum) => Some(sum.id),
                 _ => None,
             })
-            .collect();
-        let first = variant_names.first()?;
-        self.program
-            .sums_containing_variant(first)
-            .into_iter()
-            .filter(|info| variant_names.iter().all(|n| info.variant(n).is_some()))
-            .min_by_key(|info| match &info.kind {
-                TypeKind::Sum { variants } => (variants.len(), info.name.clone()),
-                TypeKind::Record { .. } => (usize::MAX, info.name.clone()),
-            })
-            .map(|info| info.symbol.clone())
+            .filter(|id| seen.insert(*id))
+            .collect()
     }
 
-    fn check_match(&mut self, arms: &[MatchArm], span: Span) {
-        let Some(owner) = self.owning_sum(arms) else {
-            return;
-        };
-        let TypeKind::Sum { variants } = &self.program.types[&owner].kind else {
+    fn check_match(&mut self, sum: &TypeInfo, arms: &[MatchArm], span: Span) {
+        let TypeKind::Sum { variants } = &sum.kind else {
             return;
         };
         let all: Vec<String> = variants.iter().map(|v| v.name.clone()).collect();
@@ -125,13 +117,15 @@ impl ExhaustiveVisitor<'_> {
                     // `Both { left: 1, .. }`) matches only some of the variant's
                     // values, so the rest must still be handled by another arm or a
                     // catch-all -- otherwise an unmatched value reaches `unreachable`.
-                    if fields.iter().all(|f| field_irrefutable(self.program, f)) {
-                        covered.insert(n.clone());
+                    if let Some(variant) = variant_name(sum, n)
+                        && fields.iter().all(|f| field_irrefutable(self.program, f))
+                    {
+                        covered.insert(variant.to_string());
                     }
                 }
                 Pattern::Binding(n, _) => {
-                    if all.contains(n) {
-                        covered.insert(n.clone());
+                    if let Some(variant) = variant_name(sum, n) {
+                        covered.insert(variant.to_string());
                     } else {
                         catch_all = true;
                     }
@@ -146,10 +140,11 @@ impl ExhaustiveVisitor<'_> {
                 .map(|s| s.as_str())
                 .collect();
             if !missing.is_empty() {
-                tracing::debug!(sum = %owner, missing = ?missing, "non-exhaustive match");
+                tracing::debug!(sum = %sum.symbol, missing = ?missing, "non-exhaustive match");
                 self.errors.push(TypeError {
                     message: format!(
-                        "non-exhaustive match on `{owner}`: missing variant(s) {}",
+                        "non-exhaustive match on `{}`: missing variant(s) {}",
+                        sum.symbol,
                         missing.join(", ")
                     ),
                     span,
@@ -157,4 +152,12 @@ impl ExhaustiveVisitor<'_> {
             }
         }
     }
+}
+
+fn variant_name<'a>(sum: &TypeInfo, pattern_name: &'a str) -> Option<&'a str> {
+    if sum.variant(pattern_name).is_some() {
+        return Some(pattern_name);
+    }
+    let unqualified = pattern_name.rsplit('.').next()?;
+    sum.variant(unqualified).is_some().then_some(unqualified)
 }

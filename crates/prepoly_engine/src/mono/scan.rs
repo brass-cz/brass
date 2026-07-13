@@ -363,7 +363,7 @@ pub(super) fn collect_array_pushes(body: &MirBody) -> HashMap<LocalId, Operand> 
 }
 
 /// Map each `dst` of an `Assign(dst, Use(Local(src)))` to `src`.
-fn use_aliases(body: &MirBody) -> HashMap<LocalId, LocalId> {
+pub(super) fn use_aliases(body: &MirBody) -> HashMap<LocalId, LocalId> {
     let mut alias: HashMap<LocalId, LocalId> = HashMap::new();
     for block in &body.blocks {
         for stmt in &block.stmts {
@@ -376,7 +376,7 @@ fn use_aliases(body: &MirBody) -> HashMap<LocalId, LocalId> {
 }
 
 /// Follow a `Use`-alias chain to its root local.
-fn resolve_alias(alias: &HashMap<LocalId, LocalId>, mut l: LocalId) -> LocalId {
+pub(super) fn resolve_alias(alias: &HashMap<LocalId, LocalId>, mut l: LocalId) -> LocalId {
     for _ in 0..alias.len() + 1 {
         match alias.get(&l) {
             Some(&s) => l = s,

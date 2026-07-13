@@ -23,7 +23,7 @@ pub use rows::{
 };
 pub use specialize::{Generated, KeyedNeed, mangled_name, specialize_all, type_to_expr};
 pub use structural::{
-    record_satisfies, record_satisfies_fields, signature_satisfies, types_compatible,
-    types_invariant,
+    function_part_compatible, record_satisfies, record_satisfies_fields, signature_satisfies,
+    types_compatible, types_invariant,
 };
 pub use valueflow::{flow_unify, strip_nullable};

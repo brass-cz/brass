@@ -7,8 +7,19 @@ tmp="$(mktemp -d)"
 ./x cargo install --path crates/prepoly_driver --root "$tmp"
 ./x cargo install --path crates/prepoly_language_server --root "$tmp"
 ./x cargo install --path crates/prepoly_formatter --root "$tmp"
-./x cargo install --path crates/prepoly_package_manager --root "$tmp"
 
+#
+# prepoly scripts
+#
+ppm_path="$tmp/bin/ppm"
+cat << PPM > "$ppm_path"
+#!/usr/bin/env -S prepoly --
+
+import package_manager.exec.main
+
+main()
+PPM
+chmod +x "$ppm_path"
 
 #
 # libraries

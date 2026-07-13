@@ -193,6 +193,21 @@ pub enum Type {
     SelfType,
 }
 
+/// The caller-visible convention attached to a function parameter type.
+///
+/// Passing wrappers are transparent when a value is matched against a direct
+/// call parameter, because the call itself creates the borrow or copy. They are
+/// not transparent inside a function value's signature: replacing a copied
+/// parameter with a mutable reference would change which caller-owned value the
+/// function can modify.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PassingMode {
+    Value,
+    MutableCopy,
+    SharedReference,
+    MutableReference,
+}
+
 /// A nominal type substitution keyed by lowered member paths.
 ///
 /// For the built-in `Result`, `Ok.value` and `Err.error` carry the statically
@@ -772,6 +787,42 @@ pub fn peel_modes(ty: &Type) -> &Type {
     match ty {
         Type::Ref(t) | Type::Mut(t) | Type::ConstOf(t) => peel_modes(t),
         _ => ty,
+    }
+}
+
+/// Split one caller-visible passing wrapper from its underlying value type.
+/// `const` describes the source binding rather than the callee convention and
+/// is therefore ignored. An open type has no fixed mode yet; callers that
+/// compare modes should allow it to be unified before requiring equality.
+pub fn split_passing_mode(ty: &Type) -> (PassingMode, &Type) {
+    let ty = peel_const(ty);
+    match ty {
+        Type::Ref(inner) => split_reference_mode(peel_const(inner)),
+        Type::Mut(inner) => (PassingMode::MutableCopy, peel_const(inner)),
+        other => (PassingMode::Value, other),
+    }
+}
+
+/// Whether two types can denote the same caller-visible passing convention.
+/// A whole open type may still be instantiated with any convention; an open
+/// value nested inside an explicit wrapper does not erase that wrapper.
+pub fn passing_modes_match(a: &Type, b: &Type) -> bool {
+    let a = peel_const(a);
+    let b = peel_const(b);
+    a.is_unknown() || b.is_unknown() || split_passing_mode(a).0 == split_passing_mode(b).0
+}
+
+fn split_reference_mode(ty: &Type) -> (PassingMode, &Type) {
+    match ty {
+        Type::Mut(inner) => (PassingMode::MutableReference, peel_const(inner)),
+        other => (PassingMode::SharedReference, other),
+    }
+}
+
+fn peel_const(ty: &Type) -> &Type {
+    match ty {
+        Type::ConstOf(inner) => peel_const(inner),
+        other => other,
     }
 }
 

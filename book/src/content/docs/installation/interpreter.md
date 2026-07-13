@@ -53,7 +53,7 @@ Note that you have to add the path where the `prepoly` binary is placed to `$PAT
 
 ```bash
 prepoly program.pp     # type-check and run a program
-prepoly check program.pp   # type-check only; prints `ok` on success
+prepoly check program.pp   # type-check only; silent on success
 prepoly repl program.pp    # run a program with the interpreter (no JIT)
 prepoly                # start an interactive REPL
 ```

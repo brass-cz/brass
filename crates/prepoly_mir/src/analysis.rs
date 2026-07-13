@@ -160,6 +160,16 @@ fn free_expr(e: &Expr, bound: &mut HashSet<String>, free: &mut HashSet<String>) 
                 free.insert(n.clone());
             }
         }
+        // `self` is a read like any other: a method binds it as an ordinary
+        // parameter named `self`, and the expression form lowers through
+        // `lower_ident("self")`. Left out of this walk, a closure in a method
+        // body never CAPTURED it -- the body's `self` then resolved to nothing,
+        // and the value it stood for was one the back ends could not type.
+        Expr::SelfExpr(_) => {
+            if !bound.contains("self") {
+                free.insert("self".to_string());
+            }
+        }
         // A nested closure binds its own parameters; whatever else it reads and
         // we have not bound is transitively free here.
         Expr::Closure(params, body, _) => {

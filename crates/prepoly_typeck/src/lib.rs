@@ -86,7 +86,6 @@ pub fn analyze(program: &Program) -> Analysis {
     errors.extend(resolve_annotations(program));
     errors.extend(check_constructions(program));
     errors.extend(interface::check(program));
-    errors.extend(exhaustive::check(program));
     errors.extend(flow::check(program));
     errors.extend(definite::check(program));
     errors.extend(globals::check(program));
@@ -98,6 +97,10 @@ pub fn analyze(program: &Program) -> Analysis {
     errors.extend(hm::check(program));
     tracing::debug!(after_hm = errors.len(), "errors after Hindley-Milner pass");
     let infer = infer::analyze(program);
+    // Exhaustiveness depends on the scrutinee's inferred nominal id. Running it
+    // after inference prevents a same-named variant in another sum from being
+    // mistaken for the match's owner.
+    errors.extend(exhaustive::check(program, &infer.typed));
     errors.extend(infer.errors);
     // Message is the secondary key so identical diagnostics from re-checked
     // bodies (per-instance re-elaboration, expanded fields-loop copies) land
@@ -544,6 +547,50 @@ mod tests {
         analyze(&prog)
     }
 
+    fn module_errs(modules: &[(&[&str], &str)]) -> Vec<String> {
+        let loaded = modules
+            .iter()
+            .map(|(path, src)| LoadedModule {
+                is_prelude: false,
+                path: path.iter().map(|part| (*part).to_string()).collect(),
+                ast: parse(src).expect("parse"),
+            })
+            .collect::<Vec<_>>();
+        let (program, lower_errors) = lower(&loaded);
+        assert!(lower_errors.is_empty(), "lower errors: {lower_errors:?}");
+        check(&program)
+            .into_iter()
+            .map(|error| error.message)
+            .collect()
+    }
+
+    #[test]
+    fn structural_records_resolve_declarations_by_nominal_id() {
+        // Both modules declare `Target`, so the type table keys are qualified.
+        // Looking fields up by the bare display name would make both records
+        // appear fieldless and accept this unrelated argument.
+        let errors = module_errs(&[
+            (
+                &["a"],
+                "type Target = { x: int32 }\nfun read(t: Target) -> int32 { return t.x }\n",
+            ),
+            (
+                &["b"],
+                "type Target = { y: string }\nfun make() -> Target { return Target { y: \"bad\" } }\n",
+            ),
+            (
+                &["main"],
+                "import a.{ read }\nimport b.{ make }\nfun main() { read(make()) }\n",
+            ),
+        ]);
+        assert!(
+            errors
+                .iter()
+                .any(|message| message.contains("cannot use") && message.contains("Target")),
+            "{errors:?}"
+        );
+    }
+
     #[test]
     fn row_rejection_reports_once_at_the_value() {
         // A row-rejected anonymous argument must produce exactly the value-site
@@ -862,6 +909,54 @@ mod tests {
     }
 
     #[test]
+    fn annotated_generic_record_is_instantiated_under_composite_types() {
+        // A passing wrapper must not hide the actual record field type from the
+        // callee body. Otherwise this write would change an integer field into a
+        // string while callers continue to observe it as an integer.
+        let wrapped = errs(
+            "type Box = { value }\nfun smash(b: ref(mut(Box))) { b.value = \"bad\" }\nfun main() {\n  let b = Box { value: 1 }\n  smash(b)\n}\n",
+        );
+        assert!(
+            wrapped
+                .iter()
+                .any(|m| m.contains("cannot use `string` where `int32` is required")),
+            "{wrapped:?}"
+        );
+
+        // Tuple and nullable positions use the same recursive instantiation,
+        // including promotion from a non-null actual into `Box?`.
+        let tuple = errs(
+            "type Box = { value }\nfun get(p: [Box, int32]) -> string { return p[0].value }\nfun main() { get([Box { value: 1 }, 0]) }\n",
+        );
+        assert!(
+            tuple
+                .iter()
+                .any(|m| m.contains("cannot use `int32` where `string` is required")),
+            "{tuple:?}"
+        );
+        let nullable = errs(
+            "type Box = { value }\nfun get(b: Box?) -> string {\n  if b { return b.value }\n  return \"\"\n}\nfun main() { get(Box { value: 1 }) }\n",
+        );
+        assert!(
+            nullable
+                .iter()
+                .any(|m| m.contains("cannot use `int32` where `string` is required")),
+            "{nullable:?}"
+        );
+    }
+
+    #[test]
+    fn annotated_nominal_instantiation_stops_at_concrete_method_types() {
+        // The inferred return type of `copy` contains `Box` again. Instantiating
+        // an annotated `Box` argument must reuse that concrete method type
+        // instead of recursively expanding the same nominal declaration.
+        let e = errs(
+            "type Box = { value }\nfun Box.copy(self) { return Self { value: self.value } }\nfun take(b: Box) {}\nfun main() { take(Box { value: 1 }) }\n",
+        );
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
     fn method_body_param_unknown_keeps_call_site_argument_type() {
         let e = errs(
             "type Box = {\n    value\n}\nfun Box.set(self, value) {\n    self.value = value\n}\nfun main() {\n    let box = Box { value: 1 }\n    box.set(\"bad\")\n}\n",
@@ -1059,6 +1154,34 @@ mod tests {
     }
 
     #[test]
+    fn function_value_passing_mode_cannot_change() {
+        // Parameter variance applies to value types, not to the calling
+        // convention. Hiding a mutable reference behind a copied parameter
+        // would let a caller-owned value be changed through the function slot.
+        let direct = errs(
+            "fun main() {\n  let f: (int32[]) -> void = (x: ref(mut(int32[]))) -> { x.push(2) }\n}\n",
+        );
+        assert!(
+            direct
+                .iter()
+                .any(|m| m.contains("ref(mut(int32[]))") && m.contains("int32[]")),
+            "{direct:?}"
+        );
+
+        // The same rule must hold after the closure has first been inferred and
+        // then flows through a separately annotated function-value binding.
+        let indirect = errs(
+            "fun main() {\n  let g = (x: ref(mut(int32[]))) -> { x.push(2) }\n  let f: (int32[]) -> void = g\n}\n",
+        );
+        assert!(
+            indirect
+                .iter()
+                .any(|m| m.contains("ref(mut(int32[]))") && m.contains("int32[]")),
+            "{indirect:?}"
+        );
+    }
+
+    #[test]
     fn function_typed_field_is_invariant_through_interface() {
         // A function-typed field is mutable storage, hence invariant: neither a
         // contravariantly-wider nor a covariantly-narrower parameter is allowed
@@ -1227,6 +1350,25 @@ mod tests {
             "type T = | A | B | C\nfun f(x: T) {\n    return match x {\n        A => 1,\n        B => 2,\n    }\n}\n",
         );
         assert!(e.iter().any(|m| m.contains("non-exhaustive")), "{e:?}");
+    }
+
+    #[test]
+    fn exhaustiveness_uses_the_scrutinee_nominal_type() {
+        // `X` belongs to both sums. Coverage must be computed from `b: B`, not
+        // from the smaller `A` that happens to make the written arm exhaustive.
+        let e = errs(
+            "type A = | X\ntype B = | X | Y\nfun f(b: B) -> int32 {\n  return match b { X => 1 }\n}\n",
+        );
+        assert!(
+            e.iter()
+                .any(|m| m.contains("non-exhaustive match on `B`") && m.contains("Y")),
+            "{e:?}"
+        );
+
+        let ok = errs(
+            "type A = | X\ntype B = | X | Y\nfun f(a: A) -> int32 {\n  return match a { X => 1 }\n}\n",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
     }
 
     #[test]
@@ -2942,6 +3084,20 @@ mod tests {
     }
 
     #[test]
+    fn fixed_array_cannot_become_growable_through_mutable_reference() {
+        // Dropping a fixed length is valid for a copied/read-only slice view,
+        // but not for an alias through which the callee can grow the storage.
+        let e = errs(
+            "fun grow(a: ref(mut(int32[]))) { a.push(3) }\nfun main() {\n  let xs: int32[2] = [1, 2]\n  grow(xs)\n}\n",
+        );
+        assert!(
+            e.iter()
+                .any(|m| m.contains("int32[2]") && m.contains("ref(mut(int32[]))")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
     fn fixed_array_pattern_length_is_checked() {
         let e = errs(
             "fun main() {\n    let values: int32[2] = [1, 2]\n    let [a, b, c] = values\n}\n",
@@ -2950,6 +3106,33 @@ mod tests {
             e.iter().any(|m| m.contains("array pattern has length 3")),
             "{e:?}"
         );
+    }
+
+    #[test]
+    fn growable_array_pattern_requires_a_refutable_context() {
+        // A growable array does not prove the pattern's fixed arity, so a plain
+        // `let` could leave one of its bindings uninitialized.
+        let e = errs("fun main() {\n  let values = [1]\n  let [a, b] = values\n}\n");
+        assert!(
+            e.iter()
+                .any(|m| m.contains("fixed-length array pattern") && m.contains("growable array")),
+            "{e:?}"
+        );
+
+        // A literal supplies the exact arity even though a `let`-bound array is
+        // growable after construction.
+        let literal = errs("fun main() {\n  let [a, b] = [1, 2]\n}\n");
+        assert!(literal.is_empty(), "{literal:?}");
+
+        // Refutable contexts handle a length mismatch by choosing another path.
+        let matched = errs(
+            "fun main() {\n  let values = [1]\n  match values {\n    [a, b] => println(a),\n    _ => println(0),\n  }\n}\n",
+        );
+        assert!(matched.is_empty(), "{matched:?}");
+        let conditional = errs(
+            "fun main() {\n  let values = [1]\n  if let [a, b] = values {\n    println(a)\n  }\n}\n",
+        );
+        assert!(conditional.is_empty(), "{conditional:?}");
     }
 
     #[test]
@@ -3377,6 +3560,33 @@ mod tests {
     fn closure_numeric_constraint_accepts_matching_argument() {
         let e = errs("fun main() {\n    let f = (x) -> x + 1\n    let n: int32 = f(2)\n}\n");
         assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn closure_storage_constraint_is_enforced_at_every_call() {
+        // The closure parameter is stored into a concrete array, so the body
+        // fixes it to the element type before the closure is generalized.
+        let array = errs(
+            "fun main() {\n  let xs: int32[] = []\n  let put = (x) -> { xs.push(x) }\n  put(1)\n  put(\"bad\")\n}\n",
+        );
+        assert!(
+            array
+                .iter()
+                .any(|m| m.contains("cannot use `string` where `int32` is required")),
+            "{array:?}"
+        );
+
+        // A top-level place follows the same rule; globals must not turn a
+        // captured closure parameter into a fresh type at each call.
+        let global = errs(
+            "let sink: int32 = 0\nfun main() {\n  let put = (x) -> { sink = x }\n  put(\"bad\")\n}\n",
+        );
+        assert!(
+            global
+                .iter()
+                .any(|m| m.contains("cannot use `string` where `int32` is required")),
+            "{global:?}"
+        );
     }
 
     #[test]

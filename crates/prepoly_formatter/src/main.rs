@@ -1,18 +1,18 @@
-//! `prepoly-fmt`: the standalone formatter CLI. Prints one file's formatted
-//! text to stdout; with `--write`, rewrites each file in place instead. Exits
-//! non-zero on a syntax error (the offending file is reported and left
+//! `ppfmt`: the standalone formatter CLI. Prints one file's formatted text
+//! to stdout; with `--write` (or `-w`), rewrites each file in place instead.
+//! Exits non-zero on a syntax error (the offending file is reported and left
 //! untouched).
 
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let write = args.first().is_some_and(|a| a == "--write");
+    let write = args.first().is_some_and(|a| a == "--write" || a == "-w");
     if write {
         args.remove(0);
     }
     if args.is_empty() || (!write && args.len() != 1) {
-        eprintln!("usage: prepoly-fmt FILE | prepoly-fmt --write FILE...");
+        eprintln!("usage: ppfmt FILE | ppfmt --write|-w FILE...");
         return ExitCode::FAILURE;
     }
     let mut failed = false;
