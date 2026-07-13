@@ -5,7 +5,7 @@
 --
 -- Override any field from your own config without editing this file, e.g. to
 -- point `cmd` at a locally built binary:
---   vim.lsp.config("prepoly", { cmd = { "/path/to/target/debug/prepoly-lsp" } })
+--   vim.lsp.config("prepoly", { cmd = { "/path/to/target/debug/ppls" } })
 
 return {
   cmd = { "ppm", "lsp" },

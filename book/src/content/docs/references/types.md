@@ -220,6 +220,31 @@ if let person = Person.from(obj) {
 }
 ```
 
+`v` may be of **any** type — a value that is not a record at all simply has
+none of `T`'s fields, so the conversion answers `null` rather than failing to
+compile. That is what lets one function take a value whose type differs per
+call site and branch on what it turned out to be:
+
+```
+fun as_text(value) -> string! {
+    if let p = Path.from(value) {     // a Path: render it
+        return p.to_string()
+    }
+    if value.chars {                  // a string: it is already text
+        return value
+    }
+    return error("expected a string or a `Path`")
+}
+```
+
+The second guard is a **member-presence test**: an uncalled member is a
+compile-time question about the argument's type, and the arm behind a member
+that type does not have is statically dead — never checked, never emitted (see
+[Absent fields in conditions](#absent-fields-in-conditions)). `Path.from`, by
+contrast, decides at run time, which is why the string case needs a guard of its
+own: without it, `return value` would be checked against the `string` return with
+`value` still a `Path`.
+
 ## Interfaces
 
 `type B: A = ...` requires `B` to provide every member of `A`, checked at
@@ -280,6 +305,25 @@ negative arm. This is what lets structurally typed code probe optional
 fields (`if person.name { ... }`). Outside a condition, a missing field is
 still an error, and a missing field on a _sum type_ value is an error even in
 a condition.
+
+A condition the type alone decides — an absent member (always false) or a
+present, non-nullable one (always true) — **folds statically**, and everything
+the fold makes unreachable is left unchecked: the arm that is not taken, and,
+when the taken arm always returns, the statements after the `if`. The back end
+folds the same branch and never emits that code, so a generic body can probe
+its argument and let each instantiation take the arm that fits it:
+
+```
+fun as_text(value) -> string {
+    if value._components {        // a Path has this field; a string does not
+        return value.to_string()  // for a string: dead, not checked
+    }
+    return value                  // for a Path: unreachable, not checked
+}
+```
+
+An ordinary `bool` condition is not statically known, so it never folds — this
+does not hide errors in code that can run.
 
 ## Result
 

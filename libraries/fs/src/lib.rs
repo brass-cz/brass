@@ -7,6 +7,9 @@
 //! lives on the prepoly side. The descriptor is borrowed without ownership for
 //! reads/writes/seeks (so an operation does not close it); `fd_close` takes
 //! ownership and closes it.
+//!
+//! Directories are not descriptors: `dir_create`/`dir_remove` work by name, so
+//! they take a path and hand back nothing.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -89,6 +92,23 @@ export! {
         }
         Ok(())
     }
+
+    /// Create the directory at `path` along with every missing parent, as
+    /// `mkdir -p` does. An existing directory is not an error (the requested
+    /// state already holds); a `path` that exists as a file is.
+    fn dir_create(path: String) -> Result<(), String> {
+        std::fs::create_dir_all(&path).map_err(|e| format!("{path}: {e}"))
+    }
+
+    /// Remove the directory at `path` and everything under it, recursively.
+    /// A symbolic link inside is removed as a link -- the walk does not follow
+    /// it, so the target is untouched. `path` itself must be a directory: a
+    /// symlink to one is not removed through here (nor is its target), and a
+    /// missing `path` is an error rather than a silent success, so a typo in a
+    /// destructive call does not read as done.
+    fn dir_remove(path: String) -> Result<(), String> {
+        std::fs::remove_dir_all(&path).map_err(|e| format!("{path}: {e}"))
+    }
 }
 
 struct FsLib;
@@ -100,6 +120,8 @@ impl PrepolyLib for FsLib {
         reg.export(decl!(fd_write));
         reg.export(decl!(fd_seek));
         reg.export(decl!(fd_close));
+        reg.export(decl!(dir_create));
+        reg.export(decl!(dir_remove));
     }
 }
 

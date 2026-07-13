@@ -57,17 +57,26 @@ fun _stdio_mode(s: Stdio) -> int64 {
 type Command = {
     _program: string
     _args: string[]
+    // Environment overrides as a flat [name, value, name, value, ...] run: the
+    // plugin ABI carries arrays, not maps, and the child's environment is built
+    // by SETTING each pair on top of this process's own.
+    _env: string[]
     _stdin: Stdio
     _stdout: Stdio
     _stderr: Stdio
 }
 
-/** A command that runs `program` (looked up on `PATH`) with no arguments and inherited streams. */
+/**
+ * A command that runs `program` (looked up on `PATH`) with no arguments,
+ * inherited streams, and this process's environment.
+ */
 fun Command.new(program: string) -> Command {
     let args: string[] = []
+    let env: string[] = []
     return Self {
         _program: program,
         _args: args,
+        _env: env,
         _stdin: Stdio.Inherit,
         _stdout: Stdio.Inherit,
         _stderr: Stdio.Inherit,
@@ -85,6 +94,27 @@ fun Command.args(self, values: string[]) -> Command {
     for v in values {
         self._args.push(v)
     }
+    return self
+}
+
+/**
+ * Set the environment variable `name` to `value` in the child.
+ *
+ * The child otherwise INHERITS this process's environment, so this adds to it
+ * (or overrides one entry of it) rather than replacing it; setting the same
+ * name twice keeps the last value, as an assignment would. There is no way to
+ * unset an inherited variable or to start from an empty environment -- neither
+ * has been needed, and both would be new plugin calls.
+ *
+ *     const child = Command.new("printenv")
+ *         .arg("GREETING")
+ *         .env("GREETING", "hello")
+ *         .stdout(Stdio.Pipe)
+ *         .spawn()!
+ */
+fun Command.env(self, name: string, value: string) -> Command {
+    self._env.push(name)
+    self._env.push(value)
     return self
 }
 
@@ -111,6 +141,7 @@ fun Command.spawn(self) -> Child! {
     let handle = process_spawn(
         self._program,
         self._args,
+        self._env,
         _stdio_mode(self._stdin),
         _stdio_mode(self._stdout),
         _stdio_mode(self._stderr),

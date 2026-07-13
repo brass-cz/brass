@@ -119,20 +119,37 @@ export! {
     /// Spawn `program` (looked up on `PATH`) with `args`, connecting each
     /// standard stream by its mode (0 = inherit, 1 = pipe, 2 = null).
     /// Returns a handle to the running child.
+    ///
+    /// `env` is a flat `[name, value, name, value, ...]` run of environment
+    /// overrides (the ABI carries arrays, not maps): each is SET on top of the
+    /// environment this process passes on, so a child sees the parent's
+    /// variables plus these. A name repeated in the run takes its last value,
+    /// as an assignment would. An odd-length run is a bug in the wrapper that
+    /// built it, so it is reported rather than silently dropping the last name.
     fn process_spawn(
         program: String,
         args: Vec<String>,
+        env: Vec<String>,
         stdin: i64,
         stdout: i64,
         stderr: i64,
     ) -> Result<i64, String> {
-        let child = Command::new(&program)
+        if !env.len().is_multiple_of(2) {
+            return Err(format!(
+                "environment overrides must be name/value pairs, got {} entries",
+                env.len()
+            ));
+        }
+        let mut command = Command::new(&program);
+        command
             .args(&args)
             .stdin(stdio(stdin))
             .stdout(stdio(stdout))
-            .stderr(stdio(stderr))
-            .spawn()
-            .map_err(|e| e.to_string())?;
+            .stderr(stdio(stderr));
+        for pair in env.chunks_exact(2) {
+            command.env(&pair[0], &pair[1]);
+        }
+        let child = command.spawn().map_err(|e| e.to_string())?;
         static NEXT: AtomicI64 = AtomicI64::new(1);
         let handle = NEXT.fetch_add(1, Ordering::Relaxed);
         let entry = Entry { child: Some(child), ..Entry::default() };

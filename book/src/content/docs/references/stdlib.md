@@ -147,6 +147,7 @@ and `Null` discards it.
 | `Command.new(program)`         | `(string) -> Command`         | `program` is looked up on `PATH`             |
 | `cmd.arg(value)`               | `(string) -> Command`         | append one argument                          |
 | `cmd.args(values)`             | `(string[]) -> Command`       | append several arguments                     |
+| `cmd.env(name, value)`         | `(string, string) -> Command` | set a variable in the child                  |
 | `cmd.stdin/stdout/stderr(mode)`| `(Stdio) -> Command`          | connect a stream (`Inherit`/`Pipe`/`Null`)   |
 | `cmd.spawn()`                  | `() -> Child!`                | start the process                            |
 | `child.stdin/stdout/stderr()`  | `() -> File!`                 | a piped stream (requires `Stdio.Pipe`)       |
@@ -156,6 +157,19 @@ and `Null` discards it.
 `Stdio` is `| Inherit | Pipe | Null`. Piped streams are `File`s, so the
 prelude byte helpers `to_bytes`/`to_text` convert their contents. The
 accessors may be called repeatedly: each hands back the same `File`.
+
+The child **inherits this process's environment**, and `env` adds to it (or
+overrides one entry of it) rather than replacing it; setting the same name
+twice keeps the last value. There is no way to unset an inherited variable or
+to start from an empty environment.
+
+```prepoly norun
+const child = Command.new("sh")
+    .args(["-c", "echo $GREETING"])
+    .env("GREETING", "hello")
+    .stdout(Stdio.Pipe)
+    .spawn()!
+```
 
 `wait` blocks for exit and nothing else, so a child writing more to a pipe
 than the OS buffers (about 64KiB on Linux) blocks on the full pipe while
@@ -254,18 +268,20 @@ for entry in here.join("assets").entries()! {
 ## `fs` (a library, not `std`)
 
 ```prepoly norun
-import fs.{ File, read_file, write_file }
+import fs.{ File, read_file, write_file, create_dir, remove_dir }
 ```
 
-File handles and byte I/O. Like the other libraries this is a plugin under
-`libraries/`, with the same setup — automatic for a distributed toolchain,
-`libraries/build.sh` + `PREPOLY_INCLUDE` from a repo checkout.
+File handles, byte I/O, and directories. Like the other libraries this is a
+plugin under `libraries/`, with the same setup — automatic for a distributed
+toolchain, `libraries/build.sh` + `PREPOLY_INCLUDE` from a repo checkout.
 
 | Function / method           | Signature                   | Behavior                                          |
 | --------------------------- | --------------------------- | -------------------------------------------------- |
-| `File.open(path, mode)`     | `(string, string) -> File!` | `"r"` read, `"w"` truncate+create, `"a"` append   |
-| `read_file(path)`           | `(string) -> string!`       | whole file as text                                 |
-| `write_file(path, content)` | `(string, string) -> void!` | write text, truncating                             |
+| `File.open(path, mode)`     | `(string or Path, string) -> File!` | `"r"` read, `"w"` truncate+create, `"a"` append |
+| `read_file(path)`           | `(string or Path) -> string!` | whole file as text                               |
+| `write_file(path, content)` | `(string or Path, string) -> void!` | write text, truncating                     |
+| `create_dir(path)`          | `(string or Path) -> void!` | recursive, like `mkdir -p`                         |
+| `remove_dir(path)`          | `(string or Path) -> void!` | recursive, like `rm -r`                            |
 | `f.read(n)`                 | `(int64) -> uint8[]!`       | up to `n` bytes; fewer at end-of-file              |
 | `f.write(bytes)`            | `(uint8[]) -> int64!`       | write all of `bytes`                               |
 | `f.seek(pos)`               | `(int64) -> void!`          | absolute reposition                                |
@@ -279,6 +295,18 @@ descriptor — so it works exactly for files opened by path; an adopted
 descriptor or standard stream has no path to ask about and reports an error.
 `File.from_fd` is how the `process` and `net` libraries hand their pipes and
 sockets to the ordinary read/write/close methods.
+
+**Every path a function in this library takes may be a string or a `Path`** —
+`File.open`, `read_file`, `write_file`, `create_dir`, `remove_dir` — so a path
+built with the `path` library needs no `to_string()` on the way in. (The arm
+that fits the argument is the only one compiled, so neither form costs the
+other anything.)
+
+`create_dir` and `remove_dir` are both recursive: `create_dir` makes every missing parent
+and treats an existing directory as success, while `remove_dir` takes the whole
+tree, removing a symbolic link inside it as a link rather than following it. A
+directory that is not there is an **error** for `remove_dir`, not a silent
+success — a typo in a destructive call must not read as "done".
 
 File I/O runs on both back ends: the plugin executes natively whether the
 program is JIT-compiled or interpreted, so the old "the REPL refuses file
@@ -368,6 +396,119 @@ early-exit comparison leaks how many leading bytes of a forgery were right.
 All of these are **fast** hashes — storing a password needs a purpose-built
 slow KDF (argon2, scrypt, bcrypt), which this library deliberately does not
 offer, so that a fast hash cannot be mistaken for one.
+
+## `regex` (a library, not `std`)
+
+```prepoly norun
+import regex.{ Regex, escape }
+```
+
+Regular expressions, on Rust's `regex` engine: a finite automaton, so matching
+is **linear** in the subject's length however the pattern is written — a regex
+over untrusted input cannot blow up the way a backtracking engine does. The
+price is that **backreferences (`\1`) and lookaround (`(?=..)`, `(?<=..)`) do
+not exist**; a pattern using one fails to compile rather than quietly meaning
+something else. Everything else is the usual syntax: classes (`\d`, `\w`,
+`\p{Greek}`), repetition (`*`, `+`, `?`, `{m,n}`, each with a lazy `?` form),
+alternation, anchors (`^`, `$`, `\b`), groups (`(..)`, `(?:..)`,
+`(?<name>..)`), and inline flags (`(?i)`, `(?m)`, `(?s)`, `(?x)`).
+
+### Writing a pattern
+
+A prepoly string literal is **not raw**: it interprets `\` and it interpolates
+`{expr}`. A pattern therefore needs two escapes, and the second one bites
+silently:
+
+- a backslash doubles — `\\d`, `\\w`, `\\b`;
+- an opening brace is escaped `\{` — `"\\d{4}"` does **not** mean "four
+  digits": the `{4}` interpolates to the text `4`, so the pattern compiles as
+  `\d4` (a digit, then the character `4`). Write `"\\d\{4}"`. A closing brace
+  needs nothing, and a quantifier with a comma (`{2,3}`) is a syntax error
+  rather than a silent change.
+
+In a replacement string, prefer `$name` and `$1` over the braced `${name}`
+form for the same reason.
+
+```prepoly norun
+const date = Regex.new("(?<year>\\d\{4})-(\\d\{2})-(\\d\{2})")!
+if let m = date.find("due 2026-07-13, ok") {
+    println(m.text)                                   // 2026-07-13
+    println("{m.start}..{m.end}")                     // 4..14
+    if let y = m.named("year") { println(y.text) }    // 2026
+}
+println(date.replace_all("2026-07-13", "$year/$2"))   // 2026/07
+```
+
+### API
+
+`Regex.new(pattern) -> Regex!` is where a bad pattern is reported; every method
+below is infallible.
+
+| Method                            | Signature                        | Behavior                                    |
+| --------------------------------- | -------------------------------- | ------------------------------------------- |
+| `re.is_match(text)`               | `(string) -> bool`               | cheapest — no groups recorded               |
+| `re.find(text)`                   | `(string) -> Match?`             | leftmost match, `null` when none            |
+| `re.find_from(text, from)`        | `(string, int64) -> Match?`      | search starts at a byte offset              |
+| `re.find_all(text)`               | `(string) -> Match[]`            | every non-overlapping match                 |
+| `re.replace(text, rep)`           | `(string, string) -> string`     | first match only                            |
+| `re.replace_all(text, rep)`       | `(string, string) -> string`     | `$1` / `$name` / `$$` expand in `rep`       |
+| `re.split(text)`                  | `(string) -> string[]`           | one more field than there were matches      |
+| `re.group_count()`                | `() -> int64`                    | counts group 0, so no groups answers 1      |
+| `escape(text)`                    | `(string) -> string`             | a pattern matching `text` literally         |
+
+A `Match` carries `text`, `start`, `end` (byte offsets into the subject) and
+`groups: Group?[]`, where `groups[0]` is the whole match. Reach a group by
+number with `m.group(i)` or by name with `m.named("year")`; both answer `null`
+when the group did not participate (the `(a)` of `(a)|(b)` against `"b"`) or
+the pattern has no such group. A `Group` is `{ text, start, end }`.
+
+A compiled `Regex` is never released (the language has no destructors), so
+compile a pattern **once** and keep it — compiling inside a loop grows the
+process. That is the right way to use any regex engine: compilation costs far
+more than matching.
+
+## `semver` (a library, not `std`)
+
+```prepoly norun
+import semver.{ Version, sort }
+```
+
+[Semantic Versioning 2.0.0](https://semver.org): parse a version, render it
+back, and order two of them. Pure prepoly on top of `regex` — it has no native
+half of its own — and it parses with the **official pattern from semver.org
+verbatim**, so what it accepts is exactly what the spec defines: no leading
+zeros, an optional dot-separated pre-release, optional build metadata, and
+nothing else in the string (`v1.0.0` and `1.0` are rejected).
+
+```prepoly norun
+const v = Version.parse("1.4.2-rc.1+build.5")!
+println("{v.major}.{v.minor}.{v.patch}")        // 1.4.2
+println(v.prerelease)                           // rc.1  (null when absent)
+println(v.compare(Version.parse("1.4.2")!))     // -1: a pre-release is LOWER
+```
+
+`Version` is `{ major, minor, patch: int64, prerelease, build: string? }` —
+the optional components are `null` when absent, which the grammar keeps
+distinct from empty.
+
+| Method / function                | Signature                     | Behavior                                       |
+| -------------------------------- | ----------------------------- | ---------------------------------------------- |
+| `Version.parse(text)`            | `(string) -> Version!`        | the whole string must be a version             |
+| `Version.new(major, minor, patch)` | `(int64, int64, int64) -> Version` | no pre-release, no build             |
+| `v.to_string()`                  | `() -> string`                | parsing the result yields an equal version     |
+| `v.compare(other)`               | `(Version) -> int64`          | `-1` / `0` / `1` by precedence                 |
+| `v.equals` / `less_than` / `greater_than` | `(Version) -> bool`  | in terms of `compare`                          |
+| `v.is_prerelease()`              | `() -> bool`                  |                                                |
+| `v.prerelease_ids()`             | `() -> string[]`              | `"rc.1"` → `["rc", "1"]`                       |
+| `sort(versions)`                 | `(Version[]) -> Version[]`    | a new array, ascending                         |
+
+**Precedence** follows §11: major/minor/patch numerically, then a version with
+a pre-release *precedes* the same version without one (`1.0.0-rc.1 < 1.0.0`).
+Pre-release identifiers compare left to right — numeric ones numerically (so
+`beta.2 < beta.11`, not lexically) and before alphanumeric ones, which compare
+in ASCII order; if all shared identifiers are equal, the shorter list precedes.
+**Build metadata is ignored** (§10), so `1.0.0+a` and `1.0.0+b` compare equal —
+compare `to_string()` if textual identity is what you want.
 
 ## `net` (a library, not `std`)
 

@@ -1,7 +1,7 @@
 # Prepoly language server in Neovim
 
 Diagnostics, hover types, go-to-definition, and semantic-token highlighting for
-`.pp` files, backed by `prepoly-lsp` (the `prepoly_language_server` crate).
+`.pp` files, backed by `ppls` (the `prepoly_language_server` crate).
 
 Uses the native Neovim 0.11+ LSP workflow: a server definition in `lsp/`, the
 filetype mapping in `ftdetect/`, and `vim.lsp.enable("prepoly")` to start it.
@@ -10,13 +10,13 @@ filetype mapping in `ftdetect/`, and `vim.lsp.enable("prepoly")` to start it.
 
 ```sh
 # Install onto PATH (recommended):
-cargo install --path crates/prepoly_language_server   # -> ~/.cargo/bin/prepoly-lsp
+cargo install --path crates/prepoly_language_server   # -> ~/.cargo/bin/ppls
 
 # ...or just build it and override `cmd` to point at the binary (see below):
-cargo build -p prepoly_language_server                # -> target/debug/prepoly-lsp
+cargo build -p prepoly_language_server                # -> target/debug/ppls
 ```
 
-`prepoly-lsp` has no LLVM dependency, so it builds without the JIT toolchain.
+`ppls` has no LLVM dependency, so it builds without the JIT toolchain.
 
 ## 2. Put this directory on the runtimepath and enable the server
 
@@ -48,7 +48,7 @@ Override `cmd` before enabling; the override merges over `lsp/prepoly.lua`:
 
 ```lua
 vim.lsp.config("prepoly", {
-  cmd = { vim.fn.getcwd() .. "/target/debug/prepoly-lsp" },
+  cmd = { vim.fn.getcwd() .. "/target/debug/ppls" },
 })
 vim.lsp.enable("prepoly")
 ```

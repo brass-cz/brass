@@ -44,13 +44,13 @@ use builtins::primitive_static_return;
 use helpers::{
     Pipe, apply_method_substitution, apply_nominal_substitution, assign_binop,
     block_always_returns, block_rebinds, closure_write_targets_block, collect_closure_writes_stmt,
-    const_index, contains_typeof, env_from_scopes, expr_may_branch, field_substitution_key,
-    int_fits_kind, is_concrete_primitive, is_concrete_type, is_maybe_indexable, is_null_comparison,
-    is_result_return_type, is_runtime_builtin_value, is_self_expr, literal_pattern_matches,
-    literal_pattern_type, method_param_substitution_key, method_return_substitution_key,
-    next_unknown_after_program, numeric_literal_repr, param_expected_type, peel_ref_mut,
-    peel_value_wrappers, required_arg_count, same_nominal_instance, stmt_may_branch,
-    substitute_self,
+    const_index, contains_typeof, env_from_scopes, expr_always_returns, expr_may_branch,
+    field_substitution_key, int_fits_kind, is_concrete_primitive, is_concrete_type,
+    is_maybe_indexable, is_null_comparison, is_result_return_type, is_runtime_builtin_value,
+    is_self_expr, literal_pattern_matches, literal_pattern_type, method_param_substitution_key,
+    method_return_substitution_key, next_unknown_after_program, numeric_literal_repr,
+    param_expected_type, peel_ref_mut, peel_value_wrappers, required_arg_count,
+    same_nominal_instance, stmt_may_branch, substitute_self,
 };
 
 type ScopeStack = Vec<HashMap<String, Type>>;
@@ -161,6 +161,14 @@ pub struct Inference {
     /// `Result`: the value case unwraps, the null case propagates as
     /// `Result.Null`. MIR lowering emits the presence-test shape for these.
     pub null_props: HashSet<Span>,
+    /// The inferred return type of every free function, keyed by symbol and
+    /// resolved. A function with no `-> T` annotation has none in its signature,
+    /// so this is the only record of what the checker settled on; the language
+    /// server renders it.
+    pub function_returns: HashMap<String, Type>,
+    /// The same for methods, keyed by (type name, method name). Covers both an
+    /// unannotated return and the open Err payload of a `T!` one.
+    pub method_returns: HashMap<(String, String), Type>,
 }
 
 /// Check every type's method bodies in the shared per-type environment. Binding
@@ -262,11 +270,17 @@ pub fn analyze(program: &Program) -> Inference {
     checker.validate_param_declarations();
     checker.precompute_global_bindings();
     checker.precompute_function_returns();
-    // Twice: a method's inferred return may depend on another type's method
-    // (`Tcp.close` propagating `File.close`); the second pass sees every
-    // first-pass entry, so cross-type chains converge.
+    // The method pass runs twice: a method's inferred return may depend on
+    // another type's method (`Tcp.close` propagating `File.close`), and the
+    // second pass sees every first-pass entry, so cross-type chains converge.
     checker.precompute_method_returns();
     checker.precompute_method_returns();
+    // The free functions were inferred before any method return existed (the
+    // method pass needs theirs, so it cannot go first), which leaves a function
+    // whose value flows OUT of a method call with nothing to read: `http`'s
+    // `fetch` returns `client.fetch(path)`. Re-infer them now that the methods
+    // have converged.
+    checker.refresh_function_returns();
     // Check each type's method bodies, then generalize each record type into a
     // scheme. Generalizing before the function bodies are checked makes the
     // schemes available at call sites (a function instantiates a method's scheme
@@ -278,9 +292,12 @@ pub fn analyze(program: &Program) -> Inference {
 
     for (symbol, f) in &program.functions {
         tracing::debug!(function = %f.signature.name, "inferring function body");
+        // The module comes first: the body's bottom scope is the globals visible
+        // from IT, so building the scope before setting it would hand the function
+        // some other module's globals.
+        checker.current_module = f.module.clone();
         let mut scopes = checker.signature_scopes(&f.signature.params);
         let ret = f.signature.ret_ty.clone();
-        checker.current_module = f.module.clone();
         // The root module's bare `main` symbol is the program entry; its `!`
         // propagations abort at runtime, waiving the fallible-return-context
         // requirement for its own body.
@@ -289,10 +306,18 @@ pub fn analyze(program: &Program) -> Inference {
     }
     checker.in_entry_main = false;
 
-    let mut scopes = vec![HashMap::new()];
     checker.const_scopes = vec![HashSet::new()];
     for init in &program.inits {
         checker.current_module = init.path.clone();
+        // The globals of OTHER modules this one can see. Its own are left out so
+        // they still accumulate as its statements are checked -- a later global is
+        // not visible to an earlier initializer.
+        let mut scopes = vec![checker.globals_visible_from(&init.path)];
+        if let Some(own) = checker.global_defs.get(&init.path) {
+            for name in own.keys() {
+                scopes[0].remove(name);
+            }
+        }
         checker.narrowed_bindings.clear();
         checker.closure_write_targets = init
             .stmts
@@ -315,6 +340,24 @@ pub fn analyze(program: &Program) -> Inference {
     // reflects the fully solved types -- which hover and the other LSP features
     // read directly.
     checker.finalize_typed();
+    let function_returns: HashMap<String, Type> = checker
+        .function_returns
+        .clone()
+        .into_iter()
+        .map(|(name, ty)| {
+            let ty = checker.resolve(&ty);
+            (name, ty)
+        })
+        .collect();
+    let method_returns: HashMap<(String, String), Type> = checker
+        .method_returns
+        .clone()
+        .into_iter()
+        .map(|(key, ty)| {
+            let ty = checker.resolve(&ty);
+            (key, ty)
+        })
+        .collect();
     Inference {
         errors: checker.errors,
         typed: checker.typed,
@@ -326,6 +369,8 @@ pub fn analyze(program: &Program) -> Inference {
         keyed_calls: checker.keyed_calls,
         typeof_types: checker.typeof_types,
         null_props: checker.null_props,
+        function_returns,
+        method_returns,
     }
 }
 
@@ -344,7 +389,14 @@ struct Checker<'a> {
     /// light pass -- a witness-free constructor's nullable slot element resolves
     /// here. Consumed by `check_block_root` for an inferred-return body.
     return_values: Vec<Vec<(Type, prepoly_parser::Span)>>,
-    global_scope: HashMap<String, Type>,
+    /// Top-level bindings keyed by their DEFINING module. Globals are per-module
+    /// (the back end keys their storage that way too), so two modules' same-named
+    /// `const`s are two different globals with two different types -- a single
+    /// name-keyed table would hand one module the other's type and let the back
+    /// end read the wrong slot at it.
+    global_defs: HashMap<Vec<String>, HashMap<String, Type>>,
+    /// Memoized `globals_visible_from`, keyed by the referencing module.
+    global_scopes: HashMap<Vec<String>, HashMap<String, Type>>,
     function_returns: HashMap<String, Type>,
     /// (method qualifier, method name) -> return type.
     /// Record qualifiers are the type name; variant qualifiers are `Type.Variant`.
@@ -484,6 +536,13 @@ struct Checker<'a> {
     /// instead of returning a `Result`, so the return-context requirement is
     /// waived for its own body (depth 1 -- closures inside it still propagate).
     in_entry_main: bool,
+    /// Set by the `if` checker when the condition folded STATICALLY and the arm
+    /// that condition selects always returns: everything after that `if` in the
+    /// enclosing block is then unreachable. `check_block` reads it to stop
+    /// reporting there, exactly as it already stops reporting inside the dead
+    /// ARM of such an `if` -- the back end folds the branch to a direct jump and
+    /// never emits the fall-through either.
+    static_divergence: bool,
 }
 
 /// What a checked `expr!` propagates on failure: the null of a nullable
@@ -506,7 +565,8 @@ impl<'a> Checker<'a> {
             self_variant: None,
             return_contexts: Vec::new(),
             return_values: Vec::new(),
-            global_scope: HashMap::new(),
+            global_defs: HashMap::new(),
+            global_scopes: HashMap::new(),
             function_returns: HashMap::new(),
             method_returns: HashMap::new(),
             method_return_props: HashSet::new(),
@@ -545,6 +605,7 @@ impl<'a> Checker<'a> {
             type_names: HashMap::new(),
             null_props: HashSet::new(),
             in_entry_main: false,
+            static_divergence: false,
         }
     }
 
@@ -556,6 +617,20 @@ impl<'a> Checker<'a> {
         let id = self.next_unknown;
         self.next_unknown += 1;
         Type::Unknown(id)
+    }
+
+    /// `ty` with every inference variable replaced by a fresh one. A type read
+    /// out of a precompute table describes ONE shared instantiation, so a site
+    /// that uses it must take its own copy or it will constrain every other site
+    /// that reads the same entry.
+    fn freshen(&mut self, ty: &Type) -> Type {
+        let next = &mut self.next_unknown;
+        let mut fresh = || {
+            let id = *next;
+            *next += 1;
+            Type::Unknown(id)
+        };
+        prepoly_hir::freshen_unknowns(ty, &mut fresh)
     }
 
     /// A fresh inference variable for the element type of a bare `[]` literal,
@@ -677,12 +752,40 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Check every statement of a block.
+    ///
+    /// Statements after a statically-folded `if` whose taken arm always returns
+    /// are UNREACHABLE (see [`Checker::static_divergence`]). They are still
+    /// walked -- so the calls they make still reach monomorphization -- but their
+    /// type errors are dropped, the same treatment the dead arm of such an `if`
+    /// already gets. This is what lets a generic body pick the arm that fits its
+    /// instantiation and fall through for the others:
+    ///
+    /// ```text
+    /// fun as_text(v) -> string {
+    ///     if v._components { return v.to_string() }   // a Path: returns here
+    ///     return v                                    // a string: unreachable above
+    /// }
+    /// ```
+    ///
+    /// A `bool` condition never folds, so ordinary control flow is unaffected:
+    /// only a condition whose truthiness the type alone decides (a present member
+    /// vs an absent one) can make a fall-through dead.
     fn check_block(&mut self, b: &Block, scopes: &mut ScopeStack) {
         scopes.push(HashMap::new());
         self.const_scopes.push(HashSet::new());
+        let mut unreachable = false;
         for s in &b.stmts {
+            let mark = self.errors.len();
+            self.static_divergence = false;
             self.check_stmt(s, scopes);
+            if unreachable {
+                self.errors.truncate(mark);
+            } else {
+                unreachable = self.static_divergence;
+            }
         }
+        self.static_divergence = false;
         self.const_scopes.pop();
         scopes.pop();
     }

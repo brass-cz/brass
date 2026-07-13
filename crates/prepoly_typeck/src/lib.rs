@@ -45,6 +45,12 @@ pub struct Analysis {
     /// field/method signatures over them), keyed by the type's source name. The
     /// language server renders a method generically from this.
     pub schemes: std::collections::HashMap<String, prepoly_hir::TypeScheme>,
+    /// The inferred return type of every free function, keyed by symbol. An
+    /// unannotated return is absent from the signature table, so this is where
+    /// the checker's answer lives.
+    pub function_returns: std::collections::HashMap<String, prepoly_hir::Type>,
+    /// The same for methods, keyed by (type name, method name).
+    pub method_returns: std::collections::HashMap<(String, String), prepoly_hir::Type>,
     /// Spans of anonymous structural arguments that passed the callee's row
     /// check for a view-eligible parameter (`prepoly_typesys::rows`); MIR
     /// lowering converts exactly these arguments into the parameter's view.
@@ -114,6 +120,8 @@ pub fn analyze(program: &Program) -> Analysis {
         keyed_calls: infer.keyed_calls,
         typeof_types: infer.typeof_types,
         null_props: infer.null_props,
+        function_returns: infer.function_returns,
+        method_returns: infer.method_returns,
     }
 }
 
@@ -1671,6 +1679,22 @@ mod tests {
     fn void_function_may_fall_through() {
         let e = errs("fun f() {\n    let x = 1\n}\n");
         assert!(e.is_empty(), "{e:?}");
+    }
+
+    /// A RECORD `T.from(v)` accepts an argument of any type: it is a fallible
+    /// structural conversion whose result is `T?`, and an argument that is not a
+    /// record simply lands in the null path. (The numeric `T.from` below is a
+    /// different conversion and stays strict.) Accepting it is what lets one
+    /// function branch on "is this a T?" for a value whose type differs per call
+    /// site -- `fs.create_dir` takes a string or a `Path` that way.
+    #[test]
+    fn record_from_accepts_any_argument_type() {
+        let src = "type P = { x: int32 }\nfun main() {\n    let a = P.from(\"s\")\n    let b = P.from(1)\n    let c = P.from([1])\n    let d = P.from(P { x: 1 })\n}\n";
+        let e = errs(src);
+        assert!(
+            e.is_empty(),
+            "a non-record argument must not be an error: {e:?}"
+        );
     }
 
     #[test]

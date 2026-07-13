@@ -68,10 +68,10 @@ let lspPromise: Promise<WebAssembly.Module | null> | undefined;
 
 const loadLsp = () =>
   (lspPromise ??= WebAssembly.compileStreaming(
-    fetch("/prepoly-lsp.wasm"),
+    fetch("/ppls.wasm"),
   ).catch((err) => {
     console.warn(
-      "prepoly-lsp.wasm unavailable; language features disabled",
+      "ppls.wasm unavailable; language features disabled",
       err,
     );
     return null;

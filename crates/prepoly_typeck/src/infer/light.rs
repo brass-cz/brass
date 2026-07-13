@@ -321,28 +321,45 @@ impl<'a> Checker<'a> {
                 if let Some(ret) = ret {
                     return ret;
                 }
-                // A user type's STATIC method (`File.open(..)`): the base names a
-                // type rather than a value, so there is no receiver to infer and
-                // the receiver-keyed lookup below cannot fire. Take the method's
-                // DECLARED return, so a body propagating an annotated static's
-                // `!` (`fun File.open(..) -> File!`) infers fallible exactly as it
-                // does for a free function.
+                // A user type's STATIC method (`File.open(..)`, `HttpClient.http(..)`):
+                // the base names a type rather than a value, so there is no receiver
+                // to infer and the receiver-keyed lookup below cannot fire.
                 //
-                // Only a declared return is used. An unannotated static's
-                // precomputed return carries the inference variables of one shared
-                // instantiation, and a witness-free constructor (`HashMap.new()`,
-                // whose key/value slots are meant to be fixed by each binding's
-                // use) would have those slots pinned by the first call site instead
-                // of freshly per site -- leaving later ones unrefined. Falling
-                // through to a fresh unknown keeps that inference intact.
+                // A fully-known annotation IS the answer. Otherwise -- an unannotated
+                // constructor, or a `T!` whose Err payload the annotation leaves open
+                // -- the precompute table has it, and is read FRESHENED. That table
+                // holds the variables of one shared instantiation, so handing it over
+                // verbatim would let the first call site that constrains them pin them
+                // for every other: a witness-free `HashMap.new()`, whose key/value
+                // slots are meant to be fixed by each binding's own use, would take
+                // the first `set` in the program and leave every later binding
+                // unrefined. Fresh variables per site keep that inference intact while
+                // still telling the light pass WHICH type the call built -- without
+                // which a local bound from a constructor stays unknown and every method
+                // called on it is unknown too (`http`'s `fetch` came out as
+                // `Result<unknown, string>`), and a caller of `File.open(..)!` could
+                // not see the Err type it propagates.
                 if self.program.types.contains_key(tname)
                     && let Some(resolved) = self.method_for_qualifier(tname, method)
-                    && let Some(ret) = resolved.signature.ret_ty.clone()
                 {
-                    args.iter().for_each(|arg| {
-                        self.infer_expr_light(&arg.expr, env, props);
-                    });
-                    return ret;
+                    let declared = resolved.signature.ret_ty.clone();
+                    let ret = match &declared {
+                        Some(ty) if prepoly_hir::is_fully_known(ty) => declared,
+                        _ => {
+                            let key = (resolved.qualifier.clone(), method.clone());
+                            let from_table = self.method_returns.get(&key).cloned().map(|ty| {
+                                let ty = self.resolve(&ty);
+                                self.freshen(&ty)
+                            });
+                            from_table.or(declared)
+                        }
+                    };
+                    if let Some(ret) = ret {
+                        args.iter().for_each(|arg| {
+                            self.infer_expr_light(&arg.expr, env, props);
+                        });
+                        return ret;
+                    }
                 }
             }
             let recv = self.infer_expr_light(base, env, props);

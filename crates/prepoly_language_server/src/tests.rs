@@ -411,6 +411,118 @@ fn hover_shows_inferred_return_type() {
     );
 }
 
+/// A function whose value flows out of a method call on a value built by an
+/// unannotated CONSTRUCTOR shows the concrete return -- at its own declaration,
+/// with nothing in the file calling it.
+///
+/// This is `http`'s `fetch` (`let client = HttpClient.http(..)` then
+/// `return client.fetch(path)`), which used to render as
+/// `Result<unknown_0, unknown_1>`: the light pass refused to type a local bound
+/// from an unannotated static, so every method called on it was unknown too, and
+/// hover could only recover a return from call sites in the file being edited.
+#[test]
+fn hover_shows_inferred_return_through_a_constructor_and_method_chain() {
+    let src = concat!(
+        "type Response = {\n",
+        "    status: int32,\n",
+        "}\n",
+        "type Client = {\n",
+        "    host: string,\n",
+        "}\n",
+        "\n",
+        "fun Client.open(host: string) {\n",
+        "    return Self { host: host }\n",
+        "}\n",
+        "\n",
+        "fun Client.get(self) {\n",
+        "    if len(self.host) == 0 {\n",
+        "        error(\"no host\")!\n",
+        "    }\n",
+        "    return Response { status: 200 }\n",
+        "}\n",
+        "\n",
+        "fun fetch(host: string) {\n",
+        "    let client = Client.open(host)\n",
+        "    return client.get()\n",
+        "}\n",
+    );
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "fetch(host: string)", true);
+    let h = hover::hover(&doc, &full, pos).expect("hover over the declaration");
+    let text = hover_text(&h);
+    assert!(
+        text.contains("Result<Response, string>"),
+        "return through the constructor+method chain must be concrete: {text}"
+    );
+}
+
+/// Hovering the name in a method DECLARATION shows THAT method -- not a free
+/// function that happens to share the name. `http` declares both
+/// `fun HttpClient.request` and a free `request`, and the declaration used to
+/// render the free one's signature and doc comment.
+#[test]
+fn hover_method_declaration_does_not_resolve_to_a_same_named_function() {
+    let src = concat!(
+        "type Client = {\n",
+        "    host: string,\n",
+        "}\n",
+        "\n",
+        "/** The method. */\n",
+        "fun Client.send(self, body: string) -> int32 {\n",
+        "    return len(body)\n",
+        "}\n",
+        "\n",
+        "/** The free function. */\n",
+        "fun send(count: int32) -> bool {\n",
+        "    return count > 0\n",
+        "}\n",
+    );
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "send(self, body: string)", true);
+    let h = hover::hover(&doc, &full, pos).expect("hover over the method declaration");
+    let text = hover_text(&h);
+    assert!(
+        text.contains("body: string") && text.contains("The method."),
+        "the method declaration must show the method: {text}"
+    );
+    assert!(
+        !text.contains("count: int32") && !text.contains("The free function."),
+        "the same-named free function must not be shown: {text}"
+    );
+}
+
+/// A SUM's methods are stored per variant but dispatch on the sum, so they hover
+/// like a record's -- at the declaration and at a call.
+#[test]
+fn hover_shows_a_sum_types_method() {
+    let src = concat!(
+        "type Shape =\n",
+        "    | Circle { r: int32 }\n",
+        "    | Square { w: int32 }\n",
+        "\n",
+        "/** The bounding width. */\n",
+        "fun Shape.width(self) -> int32 {\n",
+        "    match self {\n",
+        "        Circle { r } => return r * 2,\n",
+        "        Square { w } => return w,\n",
+        "    }\n",
+        "}\n",
+        "\n",
+        "const s = Shape.Circle { r: 2 }\n",
+        "println(s.width())\n",
+    );
+    let full = full_analysis(src);
+    for (needle, what) in [("width(self)", "declaration"), ("width())", "call")] {
+        let (doc, pos) = position(src, needle, true);
+        let h = hover::hover(&doc, &full, pos).unwrap_or_else(|| panic!("hover at the {what}"));
+        let text = hover_text(&h);
+        assert!(
+            text.contains("-> int32") && text.contains("The bounding width."),
+            "{what} must show the method: {text}"
+        );
+    }
+}
+
 /// Hovering a method call shows the *method's* signature (its type), not the
 /// call's result type, with an unannotated return filled from the call site.
 #[test]
@@ -1528,4 +1640,52 @@ fn duplicate_module_qualifier_matches_the_driver_message() {
             .any(|(m, _)| m.contains("two module imports share the qualifier `util`")),
         "diags: {diags:?}"
     );
+}
+
+/// A `T!` annotation names only the OK payload; its Err side is inferred from the
+/// body's `error(..)` sites. Rendering the annotation alone gave
+/// `Result<T, unknown_0>` -- for free functions, methods, and statics alike.
+#[test]
+fn hover_completes_the_error_payload_of_a_fallible_annotation() {
+    let src = concat!(
+        "type R = {\n",
+        "    v: int32,\n",
+        "}\n",
+        "\n",
+        "fun mk(n: int32) -> R! {\n",
+        "    if n < 0 {\n",
+        "        error(\"negative\")!\n",
+        "    }\n",
+        "    return R { v: n }\n",
+        "}\n",
+        "\n",
+        "fun R.make(n: int32) -> R! {\n",
+        "    return mk(n)\n",
+        "}\n",
+        "\n",
+        "fun R.bump(self) -> int32! {\n",
+        "    if self.v > 100 {\n",
+        "        return error(self.v)\n",
+        "    }\n",
+        "    return self.v + 1\n",
+        "}\n",
+        "\n",
+        "println(mk(1)!.v)\n",
+    );
+    let full = full_analysis(src);
+    // `R.make` FORWARDS `mk`'s Result rather than propagating it with `!`, so the
+    // Err it hands back is the one it returns -- not an `error(..)` site of its own.
+    for (needle, want) in [
+        ("mk(n: int32)", "Result<R, string>"),
+        ("make(n: int32)", "Result<R, string>"),
+        ("bump(self)", "Result<int32, int32>"),
+    ] {
+        let (doc, pos) = position(src, needle, true);
+        let h = hover::hover(&doc, &full, pos).unwrap_or_else(|| panic!("hover over {needle}"));
+        let text = hover_text(&h);
+        assert!(
+            text.contains(want),
+            "{needle} must render `{want}`, not an open Err: {text}"
+        );
+    }
 }

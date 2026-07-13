@@ -263,9 +263,10 @@ impl<'a> Checker<'a> {
         scheme_params: &[Option<Type>],
         receiver_ty: Option<Type>,
     ) -> HashMap<String, Type> {
-        // Re-checking a callee body sees top-level globals; signature
-        // parameters layer on top so they shadow same-named globals.
-        let mut frame = self.global_scope.clone();
+        // Re-checking a callee body sees the globals visible from ITS module
+        // (`current_module` is the callee's here); signature parameters layer on
+        // top so they shadow same-named globals.
+        let mut frame = self.global_scope();
         let mut arg_idx = 0;
         for param in params {
             // A method called with the receiver passed separately (`receiver_ty`)

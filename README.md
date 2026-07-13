@@ -56,7 +56,7 @@ curl -L https://raw.githubusercontent.com/cordx56/prepoly/refs/heads/main/script
   marks a private name, plus a small standard library written in prepoly itself.
 - **Experimental concurrency.** `spawn(f)`, `with(cown, f)`, and `sync()` are the
   primitives; the compiler infers ownership, never the programmer.
-- **Tooling:** an interactive REPL and an LSP server (`prepoly-lsp`).
+- **Tooling:** an interactive REPL and an LSP server (`ppls`).
 
 ## Learning the language
 

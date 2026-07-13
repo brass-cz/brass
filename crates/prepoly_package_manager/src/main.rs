@@ -323,11 +323,11 @@ fn child_exit(status: std::io::Result<std::process::ExitStatus>, tool: &str) -> 
     }
 }
 
-/// Start `prepoly-lsp`, with `PREPOLY_PACKAGES` set when the current
+/// Start `ppls`, with `PREPOLY_PACKAGES` set when the current
 /// directory is a ppm project. Without a `package.toml` (the editor opened a
 /// plain directory of .pp files) the server still starts, just without
 /// dependency resolution: editors run this command at startup, so it must not
-/// die where `prepoly-lsp` itself would come up.
+/// die where `ppls` itself would come up.
 fn cmd_lsp() -> ExitCode {
     let env_val = if Path::new("package.toml").exists() {
         match resolve_packages() {
@@ -338,12 +338,12 @@ fn cmd_lsp() -> ExitCode {
         String::new()
     };
 
-    let mut cmd = Command::new("prepoly-lsp");
+    let mut cmd = Command::new("ppls");
     if !env_val.is_empty() {
         cmd.env("PREPOLY_PACKAGES", &env_val);
     }
 
-    child_exit(cmd.status(), "prepoly-lsp")
+    child_exit(cmd.status(), "ppls")
 }
 
 /// `$HOME/.prepoly/packages/` (the git-dependency clone cache), created on

@@ -276,10 +276,52 @@ fun request(req: HttpRequest) {
     return client.request(req)
 }
 
-/** GETs the given URL (http:// or https://) and returns the response. */
+/** How many redirects `fetch` follows before it gives up. */
+const MAX_REDIRECTS = 10
+
+/**
+ * GETs the given URL (http:// or https://), following redirects, and returns the
+ * response.
+ *
+ * A 3xx carrying a `Location` is followed, up to `MAX_REDIRECTS` hops; the header
+ * is resolved against the URL it came from, so a relative `Location` (`/next`,
+ * `../next`) works as well as an absolute one, and a hop may cross schemes or
+ * hosts. The chain stays a GET: `fetch` sends no body, so the method rewrite RFC
+ * 9110 prescribes for 301/302/303 is a no-op here, and 307/308 preserve the
+ * method anyway.
+ *
+ * A 3xx with NO `Location` is returned as it stands rather than treated as a
+ * failure -- a 304 (not modified) or a 300 (multiple choices) is an answer, not
+ * a hop.
+ */
 fun fetch(url_str: string) {
     let uri = URI.parse(url_str)!
+    let hops = 0
+    while hops <= MAX_REDIRECTS {
+        let response = _fetch_uri(uri)!
+        if !_is_redirect(response.status) {
+            return response
+        }
+        if let location = _find_header(response.headers, "Location") {
+            uri = uri.resolve(location)!
+            hops += 1
+        } else {
+            return response
+        }
+    }
+    error("too many redirects ({MAX_REDIRECTS}) following {url_str}")!
+}
 
+// The redirects that name a new target in `Location`. 300 and 304 are 3xx too,
+// but neither is a hop, so they are deliberately absent.
+fun _is_redirect(status: int32) -> bool {
+    return status == 301 || status == 302 || status == 303 ||
+           status == 307 || status == 308
+}
+
+// One GET of an already-parsed URL. The scheme picks the transport and the
+// default port; an explicit port overrides it.
+fun _fetch_uri(uri: URI) {
     let is_https = false
     let s = uri.scheme
     if s { is_https = s == "https" }
@@ -304,5 +346,6 @@ fun fetch(url_str: string) {
         let client = HttpClient.http(host, port)
         return client.fetch(path)
     }
+    let url_str = uri.to_string()
     error("URL has no authority: {url_str}")!
 }

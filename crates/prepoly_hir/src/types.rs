@@ -2,7 +2,7 @@
 //! runtime value tags. `Unknown` models the parts inference leaves open, which
 //! the JIT handles via runtime tag dispatch (deferred monomorphization).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use prepoly_parser::ast::TypeExpr;
@@ -801,6 +801,49 @@ pub fn freshen_infer(ty: Type, fresh: &mut impl FnMut() -> Type) -> Type {
         Type::Record(n) => Type::Record(freshen_nominal(n, fresh)),
         Type::Sum(n) => Type::Sum(freshen_nominal(n, fresh)),
         other => other,
+    }
+}
+
+/// Replace EVERY inference variable in `ty` with a fresh one, memoized so a
+/// variable occurring twice stays one variable.
+///
+/// [`freshen_infer`] renews only the `infer` placeholder; this renews a resolved
+/// type's whole variable set, which is what a PRECOMPUTED type needs before it
+/// reaches a use site. The precompute inferred it once, in a single shared
+/// instantiation, so handing it over verbatim would tie every site that reads it
+/// to the first one that constrains it -- a witness-free `HashMap.new()` would
+/// have its key/value slots pinned by the first `set` anywhere in the program
+/// and left unrefined at every later site.
+pub fn freshen_unknowns(ty: &Type, fresh: &mut impl FnMut() -> Type) -> Type {
+    let mut vars = BTreeSet::new();
+    collect_unknowns(ty, &mut vars);
+    let map: BTreeMap<u32, Type> = vars.into_iter().map(|v| (v, fresh())).collect();
+    substitute_vars(ty, &map)
+}
+
+/// Every inference variable occurring in `ty`, including inside a nominal's
+/// payload substitution.
+fn collect_unknowns(ty: &Type, out: &mut BTreeSet<u32>) {
+    match ty {
+        Type::Unknown(v) => {
+            out.insert(*v);
+        }
+        Type::Array(inner, _)
+        | Type::Slice(inner)
+        | Type::Nullable(inner)
+        | Type::ConstOf(inner)
+        | Type::Mut(inner)
+        | Type::Ref(inner) => collect_unknowns(inner, out),
+        Type::Tuple(elems) => elems.iter().for_each(|e| collect_unknowns(e, out)),
+        Type::Fun(params, ret) => {
+            params.iter().for_each(|p| collect_unknowns(p, out));
+            collect_unknowns(ret, out);
+        }
+        Type::Record(n) | Type::Sum(n) => n
+            .substitution
+            .iter()
+            .for_each(|(_, t)| collect_unknowns(t, out)),
+        _ => {}
     }
 }
 

@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "prepoly-lsp"
+name = "ppls"
 path = "src/main.rs"
 
 [dependencies]

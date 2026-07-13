@@ -29,9 +29,10 @@ pub use plugin::{plugin_builtin_code, plugin_builtin_return, plugin_sig_types, p
 pub use typed::{Constness, Ownership, RegionId, TypedExpr, TypedExprKind, TypedProgram};
 pub use types::{
     FloatKind, INFER_VAR, IntKind, NominalInfo, NominalKind, NominalType, STRUCTURAL_RECORD_ID,
-    STRUCTURAL_RECORD_NAME, Substitution, Type, collapse_nullable, freshen_infer, index_element,
-    int_literal_kind, is_fully_known, mismatch_display, peel_modes, prim_method_symbol,
-    primitive_kind_conflict, resolve, structural_record, substitute_vars, type_key,
+    STRUCTURAL_RECORD_NAME, Substitution, Type, collapse_nullable, freshen_infer, freshen_unknowns,
+    index_element, int_literal_kind, is_fully_known, mismatch_display, peel_modes,
+    prim_method_symbol, primitive_kind_conflict, resolve, structural_record, substitute_vars,
+    type_key,
 };
 
 /// Re-exported so back ends can name source spans (e.g. typed-literal codegen

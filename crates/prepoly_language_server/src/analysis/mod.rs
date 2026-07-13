@@ -35,6 +35,14 @@ pub struct FullAnalysis {
     /// Per record-type generalized scheme, keyed by type name; rendered by hover
     /// to show a method's signature over the type's inferred parameters.
     pub schemes: std::collections::HashMap<String, prepoly_hir::TypeScheme>,
+    /// The checker's inferred return type per free-function symbol. A function
+    /// with no `-> T` annotation has none in its signature, so hover reads it
+    /// here rather than reverse-engineering it from call sites.
+    pub function_returns: std::collections::HashMap<String, prepoly_hir::Type>,
+    /// The same for methods, keyed by (type name, method name). An annotated
+    /// `-> T!` return leaves its Err payload open, so this is where the Err type
+    /// a method actually produces lives.
+    pub method_returns: std::collections::HashMap<(String, String), prepoly_hir::Type>,
     pub sources: SourceMap,
     pub main_base: usize,
     pub main_ast: Module,
@@ -55,6 +63,27 @@ impl DocAnalyzer {
             path,
             cache: ItemCache::default(),
         }
+    }
+
+    /// The document's SYNTAX errors alone, without loading its imports or
+    /// checking anything.
+    ///
+    /// This is the while-typing answer: type inference re-checks the whole module
+    /// graph, which is far too much work to redo on every keystroke, so the editor
+    /// gets it only when the file is saved (see the server's `did_change` /
+    /// `did_save`). Parsing is cheap and its errors are the ones worth reporting
+    /// mid-edit anyway -- a half-typed line is a syntax error long before it is a
+    /// type error.
+    ///
+    /// The incremental cache is left ALONE: it still describes the last checked
+    /// version, and the next full run diffs against it, so the items the edit did
+    /// not touch keep their diagnostics instead of being re-checked.
+    pub fn syntax_diagnostics(&self, text: &str) -> Vec<(String, Span)> {
+        let (_, errors) = prepoly_parser::parse_recovering(text, 0);
+        errors
+            .into_iter()
+            .map(|e| (format!("syntax error: {}", e.message), e.span))
+            .collect()
     }
 
     /// Recompute the document's diagnostics for `text`, reusing cached results
@@ -83,7 +112,7 @@ impl DocAnalyzer {
         } else {
             reduce_main(&world.main_ast, &new_items, &d.reduced)
         };
-        let (_program, _typed, _schemes, run_diags) =
+        let (_program, _typed, _schemes, _returns, _method_returns, run_diags) =
             run_pipeline(&world.context_modules, main_for_run);
 
         // Attribute this run's diagnostics to the items they fall in; the rest
@@ -127,11 +156,14 @@ impl DocAnalyzer {
     pub fn analyze_full(&self, text: &str) -> Option<FullAnalysis> {
         let world = world::build(&self.path, text);
         let main = world.main_ast.clone();
-        let (program, typed, schemes, _diags) = run_pipeline(&world.context_modules, main);
+        let (program, typed, schemes, function_returns, method_returns, _diags) =
+            run_pipeline(&world.context_modules, main);
         Some(FullAnalysis {
             program,
             typed,
             schemes,
+            function_returns,
+            method_returns,
             sources: world.sources,
             main_base: world.main_base,
             main_ast: world.main_ast,
@@ -150,6 +182,8 @@ fn run_pipeline(
     Program,
     TypedProgram,
     std::collections::HashMap<String, prepoly_hir::TypeScheme>,
+    std::collections::HashMap<String, prepoly_hir::Type>,
+    std::collections::HashMap<(String, String), prepoly_hir::Type>,
     Vec<(String, Span)>,
 ) {
     let mut modules = context.to_vec();
@@ -179,7 +213,14 @@ fn run_pipeline(
     for e in &analysis.errors {
         diags.push((e.message.clone(), e.span));
     }
-    (program, analysis.typed, analysis.schemes, diags)
+    (
+        program,
+        analysis.typed,
+        analysis.schemes,
+        analysis.function_returns,
+        analysis.method_returns,
+        diags,
+    )
 }
 
 /// Rebuild the document module keeping only the items whose index is in `keep`.

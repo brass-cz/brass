@@ -20,6 +20,8 @@ import libfs.{
     fd_write,
     fd_seek,
     fd_close,
+    dir_create,
+    dir_remove,
 }
 import path.{ Path }
 
@@ -44,11 +46,14 @@ fun File.from_fd(fd: int64) -> File {
 }
 
 /**
- * Open the file at `path`. Modes: `"r"` read, `"w"` truncate+create write,
- * `"a"` append+create.
+ * Open the file at `path`, which is a string or a `Path`. Modes: `"r"` read,
+ * `"w"` truncate+create write, `"a"` append+create.
  */
-fun File.open(path: string, mode: string) -> File! {
-    return File { _fd: fd_open(path, mode)!, _path: path }
+fun File.open(path, mode: string) -> File! {
+    // The text is kept as well as the descriptor: `size` stats by name (see
+    // below), so the `File` has to remember the name it was opened under.
+    const text = _as_text(path)!
+    return File { _fd: fd_open(text, mode)!, _path: text }
 }
 
 /** Standard input as a `File` (never closed by `close`). */
@@ -106,8 +111,11 @@ fun File.close(self) {
     }
 }
 
-/** Read the whole file at `path` as text. Fallible: returns a `Result`. */
-fun read_file(path: string) {
+/**
+ * Read the whole file at `path` (a string or a `Path`) as text. Fails when the
+ * file cannot be opened or does not hold valid UTF-8.
+ */
+fun read_file(path) {
     let f = File.open(path, "r")!
     let size = f.size()!
     let bytes = f.read(size)!
@@ -115,9 +123,69 @@ fun read_file(path: string) {
     return to_text(bytes)!
 }
 
-/** Write `content` to the file at `path`, truncating it. Fallible: returns a `Result`. */
-fun write_file(path: string, content: string) {
+/**
+ * Write `content` to the file at `path` (a string or a `Path`), truncating it
+ * -- creating the file when it is not there, but NOT its parent directories
+ * (`create_dir` does that). Fallible: returns a `Result`.
+ */
+fun write_file(path, content: string) {
     let f = File.open(path, "w")!
     f.write(to_bytes(content))!
     f.close()!
+}
+
+/**
+ * Create the directory at `path`, and every missing parent along the way -- as
+ * `mkdir -p` does, so a nested directory needs one call. `path` is a string or
+ * a `Path`.
+ *
+ * A directory that already exists is NOT an error: the state the call asks for
+ * already holds. A `path` that exists as something else (a file, a symbolic
+ * link) is.
+ */
+fun create_dir(path) {
+    dir_create(_as_text(path)!)!
+}
+
+/**
+ * Remove the directory at `path` and everything under it, recursively -- as
+ * `rm -r` does. `path` is a string or a `Path`.
+ *
+ * A symbolic link inside the tree is removed as a LINK: the walk does not
+ * follow it, so whatever it points at is untouched. `path` itself must BE a
+ * directory (a symbolic link to one is not removed through here), and a `path`
+ * that does not exist is an error rather than a silent success -- a typo in a
+ * destructive call must not read as "done".
+ */
+fun remove_dir(path) {
+    dir_remove(_as_text(path)!)!
+}
+
+// A string or a `Path` as text, so one function takes either. Every path-taking
+// function in this module goes through here, so the two forms are accepted
+// everywhere a path is.
+//
+// `Path.from(path)` is the `Path` test: a structural conversion accepts an
+// argument of any type and answers null when it cannot build the record -- a
+// string has none of `Path`'s fields, so it lands in the failure path rather
+// than being a type error.
+//
+// The string case still needs its own guard: `Path.from` decides at RUN time,
+// so the code after it is live for both types, and `return path` would be
+// checked against the `string` return with `path` still a `Path`. `chars` is a
+// member a `Path` does not have, and an uncalled member is a compile-time
+// presence test, so for a `Path` argument that arm is statically dead -- never
+// checked, never emitted.
+//
+// The trailing error is a backstop: an argument that is neither (an `int32`)
+// has no `chars` member either, and is already rejected at compile time by the
+// presence test itself.
+fun _as_text(path) -> string! {
+    if let p = Path.from(path) {
+        return p.to_string()
+    }
+    if path.chars {
+        return path
+    }
+    return error("expected a string or a `Path`, found `{typeof(path)}`")
 }

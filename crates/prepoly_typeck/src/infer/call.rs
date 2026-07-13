@@ -897,11 +897,18 @@ impl<'a> Checker<'a> {
         scopes: &mut ScopeStack,
     ) -> Type {
         // `T.from(v)`: a *fallible* structural conversion to record type `T`. The
-        // result is `T?`: whether `v` actually has every field `T` declares is
-        // decided per monomorphized argument type (the conversion yields the record
-        // when the concrete argument has the fields, else null), so a missing field
-        // is not a static error -- the caller narrows the nullable (an `if`/`if let`)
-        // and handles the failure path.
+        // result is `T?` for an argument of ANY type: whether `v` actually has
+        // every field `T` declares is decided per monomorphized argument type
+        // (the conversion yields the record when the concrete argument has the
+        // fields, else null), so neither a missing field nor an argument that is
+        // not a record at all is a static error -- the caller narrows the nullable
+        // (an `if`/`if let`) and handles the failure path.
+        //
+        // Accepting a non-record argument is what lets ONE function take a value
+        // of several types and decide per instance: `if let p = Path.from(x) {..}`
+        // reads as "when this is a Path", and answers null when `x` is a string.
+        // Rejecting it (as this once did, on the ground that the conversion could
+        // only ever produce null) made that idiom impossible to write.
         if method == "from" {
             let target = self
                 .program
@@ -912,12 +919,12 @@ impl<'a> Checker<'a> {
                 });
             if let Some(ty) = target {
                 // Every argument is still type-checked (an undeclared name in a
-                // trailing argument must surface), and the conversion's arity is
-                // exactly one.
-                let arg_tys: Vec<Type> = args
-                    .iter()
-                    .map(|arg| self.check_expr(&arg.expr, scopes))
-                    .collect();
+                // trailing argument must surface) -- but no argument TYPE is
+                // required: any value may be offered to the conversion. The arity
+                // is exactly one.
+                for arg in args {
+                    self.check_expr(&arg.expr, scopes);
+                }
                 if args.len() != 1 {
                     self.errors.push(TypeError {
                         message: format!(
@@ -926,27 +933,6 @@ impl<'a> Checker<'a> {
                         ),
                         span,
                     });
-                }
-                // The conversion reads the argument's FIELDS. A fully-known
-                // argument that is not a record has none, so this could only ever
-                // produce null -- a program the checker accepts but that always
-                // takes its failure path at run time. Reject it here. An argument
-                // whose type is still open belongs to a generic body and is left to
-                // monomorphization, where the field set is known per instance.
-                if let (Some(arg), Some(got)) = (args.first(), arg_tys.first()) {
-                    let got = self.resolve(got);
-                    let base = prepoly_hir::types::peel_modes(&got);
-                    if prepoly_hir::is_fully_known(base) && !matches!(base, Type::Record(_)) {
-                        self.errors.push(TypeError {
-                            message: format!(
-                                "`{qualifier}.from` builds `{qualifier}` from the fields of a \
-                                 record, but `{}` is not a record: the conversion can never \
-                                 produce a value",
-                                got.display()
-                            ),
-                            span: arg.expr.span(),
-                        });
-                    }
                 }
                 return Type::Nullable(Box::new(ty));
             }

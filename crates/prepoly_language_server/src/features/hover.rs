@@ -12,6 +12,7 @@ use prepoly_hir::{
     TypedExprKind, collapse_nullable, substitute_vars,
 };
 use prepoly_parser::Span;
+use prepoly_parser::ast::{TopLevel, TypeExpr};
 use tower_lsp_server::ls_types::{
     Hover, HoverContents, MarkupContent, MarkupKind, Position, Range,
 };
@@ -41,6 +42,15 @@ pub fn hover(doc: &Document, full: &FullAnalysis, pos: Position) -> Option<Hover
     // (its signature), not the call's result type. (A method called through UFCS is
     // a free function and is handled by the `resolve_function` path below.)
     if let Some(h) = method_hover(doc, full, local, global) {
+        return Some(h);
+    }
+
+    // The cursor on the name in a method DECLARATION (`fun T.m(..)`). It must be
+    // answered before the identifier paths below, which resolve a bare name
+    // against the FREE functions: `http` declares both `fun HttpClient.request`
+    // and a free `request`, and the declaration showed the free one's signature
+    // and doc comment.
+    if let Some(h) = method_decl_hover(doc, full, local, global) {
         return Some(h);
     }
 
@@ -226,8 +236,72 @@ fn method_hover(doc: &Document, full: &FullAnalysis, local: usize, global: usize
     }
     let recv_hi = full.main_base + (span.lo - 1);
     let recv_ty = receiver_type_at(full, recv_hi)?;
+    // Specialize to this call's argument types when the cursor is in a call: the
+    // receiver is the call's first argument, aligned with `self`, so `map.get(1)`
+    // can pin a parameter the scheme leaves open (a key compared with `==` does
+    // not unify onto the scheme's parameter).
+    let (call_span, ret) = enclosing_call(full, global)
+        .map(|e| (Some(e.span), Some(e.ty.clone())))
+        .unwrap_or((None, None));
+    let call_args = call_span.and_then(|s| nav::call_args_at_span(full, s));
+    method_signature_hover(
+        doc,
+        full,
+        &recv_ty,
+        &name,
+        call_args.as_deref(),
+        ret.as_ref(),
+        span,
+    )
+}
+
+/// Hover for the name in a method DECLARATION (`fun T.m(..)`).
+///
+/// The name is preceded by a `.` exactly like a member access, but the receiver
+/// is a TYPE rather than an expression, so [`method_hover`] finds nothing to type
+/// there and the name falls through to the free-function paths -- which is how a
+/// method declaration came to show a same-named free function's signature and doc.
+/// A stdlib method on a primitive or array receiver (`fun string.m`) has no
+/// nominal to resolve and still falls through.
+fn method_decl_hover(
+    doc: &Document,
+    full: &FullAnalysis,
+    local: usize,
+    global: usize,
+) -> Option<Hover> {
+    let (name, span) = nav::ident_at(&doc.text, local)?;
+    let module = vec!["main".to_string()];
+    let recv_name = full.main_ast.items.iter().find_map(|item| {
+        let TopLevel::Fun(f) = item else { return None };
+        let recv = f.recv.as_ref()?;
+        let TypeExpr::Named(tname, tspan) = recv else {
+            return None;
+        };
+        // The cursor is on this declaration's method name: the identifier under it
+        // matches, and it sits between the receiver type and the body.
+        let in_header = tspan.hi < global && global < f.body.span.lo;
+        (f.name == name && in_header).then(|| tname.clone())
+    })?;
+    let info = full.program.resolve_type(&module, &recv_name)?;
+    let recv_ty = info.type_ref();
+    // No call and no instance: the declaration's own view, with the type's slots
+    // left open, matching what the type-definition hover shows for the same method.
+    method_signature_hover(doc, full, &recv_ty, &name, None, None, span)
+}
+
+/// Render the signature of method `name` on `recv_ty`, optionally specialized to a
+/// call's argument and result types. Shared by the call-site and declaration paths.
+fn method_signature_hover(
+    doc: &Document,
+    full: &FullAnalysis,
+    recv_ty: &Type,
+    name: &str,
+    call_args: Option<&[Type]>,
+    ret: Option<&Type>,
+    span: Span,
+) -> Option<Hover> {
     let sig =
-        record_method(full, &recv_ty, &name).or_else(|| primitive_method(full, &recv_ty, &name))?;
+        record_method(full, recv_ty, name).or_else(|| primitive_method(full, recv_ty, name))?;
     // Resolve the signature against the receiver's instance via the type's scheme:
     // the scheme expresses each method over the type's inferred parameters (the
     // same variables the stored signature names), so matching the scheme's field
@@ -235,24 +309,29 @@ fn method_hover(doc: &Document, full: &FullAnalysis, local: usize, global: usize
     // string>` receiver shows `set : (self, string, string) -> void` and `get :
     // (self, key) -> string?` even with no call -- the return is resolved from the
     // instance, not left a bare `unknown_N`.
-    let scheme_sig = scheme_resolved_signature(full, &recv_ty, &name, sig);
-    // Specialize further to this call's argument types when the cursor is in a
-    // call: the receiver is the call's first argument, aligned with `self`, so
-    // `map.get(1)` can pin a parameter the scheme leaves open (a key compared with
-    // `==` does not unify onto the scheme's parameter).
-    let (call_span, ret) = enclosing_call(full, global)
-        .map(|e| (Some(e.span), Some(e.ty.clone())))
-        .unwrap_or((None, None));
-    let call_args = call_span.and_then(|s| nav::call_args_at_span(full, s));
-    let specialized = specialize_method_signature(&scheme_sig, call_args.as_deref(), ret.as_ref());
+    let scheme_sig = scheme_resolved_signature(full, recv_ty, name, sig);
+    let mut specialized = specialize_method_signature(&scheme_sig, call_args, ret);
+    // Neither the scheme nor the call can supply what the ANNOTATION leaves out: a
+    // `-> T!` names only the OK payload, and its Err side -- inferred from the
+    // body's `error(..)` sites -- lives only in the checker's return table. Without
+    // it `fun TomlValue.get(..) -> TomlValue!` rendered as
+    // `Result<TomlValue, unknown_0>`.
+    if !specialized
+        .ret_ty
+        .as_ref()
+        .is_some_and(prepoly_hir::is_fully_known)
+        && let Some(inferred) = inferred_method_return(full, recv_ty, name)
+    {
+        specialized.ret_ty = Some(inferred);
+    }
     // Show the inferred `ref`/`mut` passing mode of unannotated parameters
     // (including `self`): a parameter the method body mutates -- directly, or by
     // handing it to a mutating position -- is a private `mut` copy (or a
     // `ref(mut(Self))` receiver), otherwise a `ref` borrow. Same predicate as
     // the back end's entry copy.
-    let mutated: Option<Vec<bool>> = method_body(full, &recv_ty, &name).map(|body| {
+    let mutated: Option<Vec<bool>> = method_body(full, recv_ty, name).map(|body| {
         let mutation = prepoly_hir::MutationInfo::analyze(&full.program);
-        let module = receiver_module(full, &recv_ty);
+        let module = receiver_module(full, recv_ty);
         specialized
             .params
             .iter()
@@ -268,7 +347,7 @@ fn method_hover(doc: &Document, full: &FullAnalysis, local: usize, global: usize
     );
     Some(markup_with_doc(
         rendered,
-        method_doc(full, &recv_ty, &name),
+        method_doc(full, recv_ty, name),
         Some(doc.range_of(span)),
     ))
 }
@@ -293,14 +372,12 @@ fn receiver_module<'a>(full: &'a FullAnalysis, recv_ty: &Type) -> &'a [String] {
 /// declaration for a record/sum method, or the stdlib function declaration for
 /// a primitive/array method.
 fn method_doc<'a>(full: &'a FullAnalysis, recv_ty: &Type, name: &str) -> Option<&'a str> {
+    if let Some(m) = nominal_method(full, recv_ty, name) {
+        return m.decl.doc.as_deref();
+    }
     let mut t = recv_ty;
     while let Type::Ref(i) | Type::Mut(i) | Type::ConstOf(i) | Type::Nullable(i) = t {
         t = i;
-    }
-    if let Type::Record(n) | Type::Sum(n) = t
-        && let TypeKind::Record { methods, .. } = &full.program.type_by_id(n.id)?.kind
-    {
-        return methods.get(name).and_then(|m| m.decl.doc.as_deref());
     }
     let class = t.primitive_class()?;
     let symbol = full
@@ -512,6 +589,46 @@ fn record_method<'a>(
     recv_ty: &Type,
     name: &str,
 ) -> Option<&'a CallableSignature> {
+    nominal_method(full, recv_ty, name).map(|m| &m.signature)
+}
+
+/// The checker's inferred return for method `name` on `recv_ty`, when it settled
+/// on a concrete type. Keyed by the NOMINAL's name, which is how the checker
+/// records a method (a sum's variants share one table).
+fn inferred_method_return(full: &FullAnalysis, recv_ty: &Type, name: &str) -> Option<Type> {
+    let mut t = recv_ty;
+    while let Type::Ref(i) | Type::Mut(i) | Type::ConstOf(i) | Type::Nullable(i) = t {
+        t = i;
+    }
+    let nominal = match t {
+        Type::Record(n) | Type::Sum(n) => n,
+        _ => return None,
+    };
+    // A record's methods are keyed by the type name; a SUM's are keyed per VARIANT
+    // (`TomlValue.Table`), all dispatching on the sum, so any variant's entry
+    // answers for the sum.
+    let owner = nominal.name();
+    let variant_prefix = format!("{owner}.");
+    full.method_returns
+        .iter()
+        .find(|((qualifier, method), _)| {
+            method == name && (qualifier == owner || qualifier.starts_with(&variant_prefix))
+        })
+        .map(|(_, ty)| ty)
+        .filter(|ty| prepoly_hir::is_fully_known(ty))
+        .cloned()
+}
+
+/// The method `name` declared on the nominal `recv_ty` names, peeling the
+/// wrappers a receiver may carry. A SUM keeps its methods per variant, all of
+/// them dispatching on the sum itself, so any variant declaring the name answers
+/// for it -- without this a sum's methods had no hover at all, at the call site
+/// or at the declaration.
+fn nominal_method<'a>(
+    full: &'a FullAnalysis,
+    recv_ty: &Type,
+    name: &str,
+) -> Option<&'a prepoly_hir::MethodInfo> {
     let mut t = recv_ty;
     while let Type::Ref(i) | Type::Mut(i) | Type::ConstOf(i) | Type::Nullable(i) = t {
         t = i;
@@ -521,8 +638,8 @@ fn record_method<'a>(
         _ => return None,
     };
     match &full.program.type_by_id(id)?.kind {
-        TypeKind::Record { methods, .. } => methods.get(name).map(|m| &m.signature),
-        _ => None,
+        TypeKind::Record { methods, .. } => methods.get(name),
+        TypeKind::Sum { variants } => variants.iter().find_map(|v| v.methods.get(name)),
     }
 }
 
@@ -535,14 +652,12 @@ fn method_body<'a>(
     recv_ty: &Type,
     name: &str,
 ) -> Option<&'a prepoly_parser::ast::Block> {
+    if let Some(m) = nominal_method(full, recv_ty, name) {
+        return m.decl.body.as_ref();
+    }
     let mut t = recv_ty;
     while let Type::Ref(i) | Type::Mut(i) | Type::ConstOf(i) | Type::Nullable(i) = t {
         t = i;
-    }
-    if let Type::Record(n) | Type::Sum(n) = t
-        && let TypeKind::Record { methods, .. } = &full.program.type_by_id(n.id)?.kind
-    {
-        return methods.get(name).and_then(|m| m.decl.body.as_ref());
     }
     let class = t.primitive_class()?;
     let symbol = full

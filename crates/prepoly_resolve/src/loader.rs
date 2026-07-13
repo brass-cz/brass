@@ -263,7 +263,7 @@ impl SearchPaths {
 /// The `libraries/` directory a distributed toolchain ships beside its
 /// `bin/` directory: `<dir of the running binary>/../libraries`, when it
 /// exists, so the bundled libraries import with no environment setup
-/// (`bin/prepoly` and `bin/prepoly-lsp` resolve to the same directory).
+/// (`bin/prepoly` and `bin/ppls` resolve to the same directory).
 /// In-repo builds have no such directory (`target/debug/../libraries`), so
 /// development runs see nothing implicit. Cached: the executable's location
 /// cannot change within a process.

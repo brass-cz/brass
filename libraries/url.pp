@@ -152,6 +152,127 @@ fun URI.to_string(self) -> string {
 }
 
 /**
+ * Resolves `reference` against `self`, per RFC 3986 section 5.2.
+ *
+ * This is what turns a `Location:` header into the URL to request next: a
+ * redirect may answer with an absolute URI, an absolute path (`/next`), or a
+ * relative one (`../next`), and only the base says what the last two mean. The
+ * base must be absolute -- a relative one has no scheme to lend.
+ */
+fun URI.resolve(self, reference: string) -> URI! {
+    let base_scheme = self.scheme
+    if !base_scheme { return error("cannot resolve against a relative base") }
+    let r = URI.parse_reference(reference)!
+
+    // A reference with its own scheme is already absolute; only its path is
+    // normalized. One with an authority but no scheme borrows only the scheme.
+    let r_scheme = r.scheme
+    if r_scheme {
+        return URI {
+            scheme: r_scheme,
+            authority: r.authority,
+            path: _remove_dot_segments(r.path),
+            query: r.query,
+            fragment: r.fragment,
+        }
+    }
+    let r_authority = r.authority
+    if r_authority {
+        return URI {
+            scheme: base_scheme,
+            authority: r_authority,
+            path: _remove_dot_segments(r.path),
+            query: r.query,
+            fragment: r.fragment,
+        }
+    }
+
+    // No authority: the reference's path decides. An empty path names the base's
+    // resource, so it keeps the base's path -- and its query too, unless the
+    // reference wrote one (a bare `#fragment` must not drop the base's query).
+    let path = self.path
+    let query = r.query
+    if len(r.path) == 0 {
+        if !query { query = self.query }
+    } else if r.path.starts_with("/") {
+        path = _remove_dot_segments(r.path)
+    } else {
+        path = _remove_dot_segments(_merge_path(self, r.path))
+    }
+    return URI {
+        scheme: base_scheme,
+        authority: self.authority,
+        path: path,
+        query: query,
+        fragment: r.fragment,
+    }
+}
+
+// RFC 3986 section 5.2.3: a relative path is merged onto the base's, replacing
+// everything after the base's last `/`. A base that has an authority but an empty
+// path stands in for one whose path is `/`.
+fun _merge_path(base: URI, path: string) -> string {
+    let base_path = base.path
+    if len(base_path) == 0 {
+        let authority = base.authority
+        if authority { return "/{path}" }
+        return path
+    }
+    let cs = base_path.chars()
+    let cut = _last_slash(cs)
+    if cut < 0 { return path }
+    let head = substr(cs, 0, cut + 1)
+    return "{head}{path}"
+}
+
+// RFC 3986 section 5.2.4: interpret the `.` and `..` segments of a path. A `..`
+// that would climb above the root is dropped, as the RFC requires -- the result
+// of a resolution is never allowed to escape the authority.
+fun _remove_dot_segments(path: string) -> string {
+    if len(path) == 0 { return path }
+    let absolute = path.starts_with("/")
+    let parts = path.split("/")
+    let kept: string[] = []
+    // A path ending in `/`, `.` or `..` names a directory, so it keeps a trailing
+    // slash even though the segment itself contributes nothing.
+    let directory = false
+    let i: int64 = 0
+    while i < len(parts) {
+        let segment = parts[i]
+        i += 1
+        if segment == "." {
+            directory = true
+        } else if segment == ".." {
+            if len(kept) > 0 { kept = kept.slice(0, len(kept) - 1) }
+            directory = true
+        } else if len(segment) > 0 {
+            kept.push(segment)
+            directory = false
+        } else if i == len(parts) {
+            // The empty segment a trailing `/` leaves behind. (A leading one --
+            // the `/` of an absolute path -- is carried by `absolute` instead.)
+            directory = true
+        }
+    }
+    let joined = kept.join("/")
+    let out = joined
+    if absolute { out = "/{joined}" }
+    if directory && len(kept) > 0 { out = "{out}/" }
+    return out
+}
+
+// The index of the last `/` in `cs`, or -1.
+fun _last_slash(cs: string[]) -> int64 {
+    let i = len(cs) - 1
+    while i >= 0 {
+        if cs[i] == "/" { return i }
+        i -= 1
+    }
+    let missing: int64 = -1
+    return missing
+}
+
+/**
  * The percent-decoded path segments, without the empty segment that a leading
  * `/` would produce. A trailing `/` still yields a final empty segment, since
  * `/a/` and `/a` name different resources.

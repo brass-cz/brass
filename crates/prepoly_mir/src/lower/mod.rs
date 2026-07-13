@@ -170,28 +170,31 @@ impl<'p> ProgramCtx<'p> {
     /// (its own, an import origin's, or a stdlib prelude global) -- the same
     /// resolution [`Self::global_symbol`] keys storage by.
     fn is_global_name(&self, module: &[String], name: &str) -> bool {
-        let defines = |m: &[String]| {
+        let defines = |m: &[String], n: &str| {
             self.module_globals
                 .get(m)
-                .is_some_and(|names| names.contains(name))
+                .is_some_and(|names| names.contains(n))
         };
-        defines(module)
+        defines(module, name)
             || self
                 .program
                 .import_origins
                 .get(module)
                 .and_then(|o| o.get(name))
-                .is_some_and(|origin| defines(origin))
+                .is_some_and(|origin| defines(origin, name))
+            || self
+                .aliased_global(module, name)
+                .is_some_and(|(declared, origin)| defines(&origin, &declared))
             || self.prelude_globals.contains_key(name)
     }
 
     fn global_symbol(&self, module: &[String], name: &str) -> String {
-        let defines = |m: &[String]| {
+        let defines = |m: &[String], n: &str| {
             self.module_globals
                 .get(m)
-                .is_some_and(|names| names.contains(name))
+                .is_some_and(|names| names.contains(n))
         };
-        if defines(module) {
+        if defines(module, name) {
             return prepoly_hir::qualify(name, module);
         }
         if let Some(origin) = self
@@ -199,14 +202,34 @@ impl<'p> ProgramCtx<'p> {
             .import_origins
             .get(module)
             .and_then(|o| o.get(name))
-            && defines(origin)
+            && defines(origin, name)
         {
             return prepoly_hir::qualify(name, origin);
+        }
+        if let Some((declared, origin)) = self.aliased_global(module, name)
+            && defines(&origin, &declared)
+        {
+            return prepoly_hir::qualify(&declared, &origin);
         }
         if let Some(owner) = self.prelude_globals.get(name) {
             return prepoly_hir::qualify(name, owner);
         }
         prepoly_hir::qualify(name, module)
+    }
+
+    /// The (declared name, defining module) behind a global referenced by a name
+    /// other than its own: a qualified use (`m.VERSION`, which the resolve pass
+    /// rewrote to the dotted marker `m.VERSION`) or a renamed import
+    /// (`import m.{ VERSION as V }`). Storage is keyed by the DECLARED name in its
+    /// DEFINING module, so neither form finds its slot without this.
+    fn aliased_global(&self, module: &[String], name: &str) -> Option<(String, Vec<String>)> {
+        if let Some((alias, bare)) = name.split_once('.') {
+            let origin = self.program.module_aliases.get(module)?.get(alias)?;
+            return Some((bare.to_string(), origin.clone()));
+        }
+        let declared = self.program.import_renames.get(module)?.get(name)?;
+        let origin = self.program.import_origins.get(module)?.get(name)?;
+        Some((declared.clone(), origin.clone()))
     }
 
     /// The checker-resolved type recorded for the expression at `span`, if any.

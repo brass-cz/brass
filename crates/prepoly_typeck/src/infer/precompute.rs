@@ -89,11 +89,119 @@ impl<'a> Checker<'a> {
             let Some(info) = self.program.functions.get(&name) else {
                 continue;
             };
-            let ty = info.signature.ret_ty.clone().unwrap_or_else(|| {
-                self.infer_function_return(&info.signature.params, &info.decl.body)
-            });
+            let ty = self.function_return_entry(info);
             self.function_returns.insert(name, ty);
         }
+    }
+
+    /// Re-infer every UNANNOTATED function return, replacing the first pass's
+    /// answer.
+    ///
+    /// The first pass necessarily runs before any method return exists (a
+    /// method's body calls free functions, so its own pass needs theirs), which
+    /// leaves a function whose value flows OUT of a method call with nothing to
+    /// read: `http`'s `fetch` returns `client.fetch(path)`, and with
+    /// `HttpClient.fetch` still unknown the light pass could only give the
+    /// return a bare variable -- reported as `Result<unknown, string>` once the
+    /// body's own `error(..)` propagation supplied the Err payload. Running the
+    /// two in alternation closes that loop, exactly as repeating
+    /// `precompute_method_returns` closes it for cross-TYPE method chains.
+    ///
+    /// A FULLY-KNOWN annotation is skipped: its entry is the declaration itself
+    /// and re-inferring it would be both wasted work and a chance to disagree with
+    /// what the checker enforces. A `T!` annotation is not fully known -- it names
+    /// only the OK payload -- so its Err side is completed here.
+    pub(super) fn refresh_function_returns(&mut self) {
+        let mut names: Vec<String> = self.program.functions.keys().cloned().collect();
+        names.sort();
+        for name in names {
+            let Some(info) = self.program.functions.get(&name) else {
+                continue;
+            };
+            // A fully-known annotation is the declaration itself: re-inferring it
+            // would be wasted work and a chance to disagree with what the checker
+            // enforces.
+            if info
+                .signature
+                .ret_ty
+                .as_ref()
+                .is_some_and(prepoly_hir::is_fully_known)
+            {
+                continue;
+            }
+            let ty = self.function_return_entry(info);
+            self.function_returns.insert(name, ty);
+        }
+    }
+
+    /// The return-table entry for `info`: its annotation when that is fully known,
+    /// the light-pass inference when there is none, and -- for a `T!`, which names
+    /// only the OK payload -- the annotation with its Err side completed.
+    fn function_return_entry(&mut self, info: &FunInfo) -> Type {
+        match &info.signature.ret_ty {
+            Some(declared) if prepoly_hir::is_fully_known(declared) => declared.clone(),
+            Some(declared) => {
+                let declared = declared.clone();
+                let err = self.body_error_payload(&info.signature.params, &info.decl.body);
+                self.complete_open_error(&declared, err)
+            }
+            None => self.infer_function_return(&info.signature.params, &info.decl.body),
+        }
+    }
+
+    /// The Err payload `body` produces, as the light pass reconciles the sites.
+    ///
+    /// Both shapes count: an `error(..)` / `expr!` PROPAGATION, and a plain
+    /// `return` of an already-fallible value -- a body may never propagate and
+    /// simply FORWARD a `Result` (`return _plugin_fcall_..(..)`, which is what every
+    /// synthesized plugin wrapper does), and the Err it hands back is its own. An
+    /// OPEN Err carries no information, so it is dropped rather than allowed to win
+    /// the reconciliation against a concrete one.
+    fn body_error_payload(&mut self, params: &[ParamInfo], body: &Block) -> Option<Type> {
+        let mut env = self.signature_param_env(params);
+        let mut normal = Vec::new();
+        let mut props = LightProps::default();
+        self.infer_returns_block(body, &mut env, &mut normal, &mut props);
+        self.error_payload_of(&normal, &props)
+    }
+
+    /// The Err payload of a body whose light pass produced `normal` and `props`.
+    /// See [`Self::body_error_payload`].
+    fn error_payload_of(&mut self, normal: &[(Type, Span)], props: &LightProps) -> Option<Type> {
+        let mut sites = props.errors.clone();
+        for (ty, span) in normal {
+            let resolved = self.resolve(ty);
+            if let Some((_, err)) = resolved.result_payloads() {
+                sites.push((err.clone(), *span));
+            }
+        }
+        let sites: Vec<(Type, Span)> = sites
+            .into_iter()
+            .map(|(ty, span)| (self.resolve(&ty), span))
+            .filter(|(ty, _)| !ty.is_unknown())
+            .collect();
+        self.reconcile_error_payloads(&sites, false)
+    }
+
+    /// Fill the open Err payload of a `T!` return with `err`.
+    ///
+    /// `T!` names only the OK side; the Err side is inferred from the body's
+    /// `error(..)` sites, so the annotation alone describes `Result<T, ?>` -- which
+    /// is what a caller reading the signature table, and the editor rendering it,
+    /// were left with (`Result<TomlValue, unknown_0>`). Only an OPEN Err is filled,
+    /// so an annotation that already names one is never overridden.
+    fn complete_open_error(&mut self, declared: &Type, err: Option<Type>) -> Type {
+        let Some(err) = err else {
+            return declared.clone();
+        };
+        let resolved = self.resolve(declared);
+        let Some((ok, declared_err)) = resolved.result_payloads() else {
+            return declared.clone();
+        };
+        if !declared_err.is_unknown() {
+            return declared.clone();
+        }
+        Type::result(ok.clone(), err)
     }
 
     pub(super) fn precompute_method_returns(&mut self) {
@@ -145,13 +253,25 @@ impl<'a> Checker<'a> {
         let Some(resolved) = self.method_for_qualifier(qualifier, method) else {
             return (self.fresh_unknown(), false);
         };
-        if let Some(ty) = resolved.signature.ret_ty.clone() {
-            return (ty, false);
-        }
+        let declared = resolved.signature.ret_ty.clone();
         let signature_params = resolved.signature.params.clone();
         let decl = resolved.method;
+        // A fully-known annotation IS the return type. A `T!` is not -- it names
+        // only the OK payload, leaving the Err side to the body's `error(..)` sites
+        // -- so the light pass below runs anyway, purely to complete it. A keyed
+        // `-> infer!` template has no fixed type at all (it is specialized per call
+        // site from the caller's expectation), so it stays exactly as declared.
+        let complete_error = match &declared {
+            Some(ty) => {
+                if prepoly_hir::is_fully_known(ty) || prepoly_hir::keyed_return(decl.ret.as_ref()) {
+                    return (ty.clone(), false);
+                }
+                true
+            }
+            None => false,
+        };
         let Some(body) = &decl.body else {
-            return (Type::Void, false);
+            return (declared.unwrap_or(Type::Void), false);
         };
         let saved = self.self_type.replace(self_type.to_string());
         let saved_variant = self.self_variant.clone();
@@ -169,6 +289,14 @@ impl<'a> Checker<'a> {
         self.infer_returns_block(body, &mut env, &mut normal, &mut props);
         self.self_type = saved;
         self.self_variant = saved_variant;
+        if complete_error {
+            let err_ty = self.error_payload_of(&normal, &props);
+            let declared = declared.unwrap_or(Type::Void);
+            // The annotation still governs the shape, so this is not a
+            // light-assembled return: `has_props` stays false, as for any
+            // annotated method.
+            return (self.complete_open_error(&declared, err_ty), false);
+        }
         let has_props = !props.errors.is_empty() || !props.nulls.is_empty();
         let normal_ty = self.reconcile_return_types(&normal, true);
         let err_ty = self.reconcile_error_payloads(&props.errors, true);
@@ -500,16 +628,20 @@ impl<'a> Checker<'a> {
             .collect()
     }
 
-    /// Infer the types of top-level `let`/`const` bindings in module/source
-    /// order and record them in `global_scope`. Bindings
-    /// accumulate as iteration proceeds, so a later global is never visible to
-    /// an earlier initializer. Annotation resolution errors are surfaced by
-    /// `resolve_annotations`, so they are intentionally swallowed here.
+    /// Infer the types of top-level `let`/`const` bindings in module/source order
+    /// and record them per DEFINING module. Bindings accumulate as iteration
+    /// proceeds, so a later global is never visible to an earlier initializer, and
+    /// a module's initializers see only what that module can see (its own globals
+    /// so far, its imports', and the stdlib's) -- modules are processed in
+    /// dependency order, so an imported module's globals are already inferred.
+    /// Annotation resolution errors are surfaced by `resolve_annotations`, so they
+    /// are intentionally swallowed here.
     pub(super) fn precompute_global_bindings(&mut self) {
         let program = self.program;
-        let mut env: HashMap<String, Type> = HashMap::new();
         let mut props = LightProps::default();
         for init in &program.inits {
+            let mut env = self.globals_visible_from(&init.path);
+            let mut own: HashMap<String, Type> = HashMap::new();
             for stmt in &init.stmts {
                 let Stmt::Let { pat, ty, value, .. } = stmt else {
                     continue;
@@ -533,25 +665,72 @@ impl<'a> Checker<'a> {
                     None => value_ty,
                 };
                 self.bind_pattern_light(pat, &binding_ty, &mut env);
+                self.bind_pattern_light(pat, &binding_ty, &mut own);
             }
+            self.global_defs.insert(init.path.clone(), own);
+            self.global_scopes.clear();
         }
-        self.global_scope = env;
     }
 
-    /// The scope stack used to check a function or method body: top-level
-    /// globals at the bottom, signature parameters on top so parameters shadow
-    /// same-named globals.
+    /// The globals a body in `module` sees, by the name it sees them under: the
+    /// stdlib's (visible everywhere, so `INT64_MAX` needs no import), then the
+    /// ones its imports bring in (under the LOCAL name, so a rename resolves),
+    /// then its own, which shadow both.
+    pub(super) fn globals_visible_from(&self, module: &[String]) -> HashMap<String, Type> {
+        let mut out: HashMap<String, Type> = HashMap::new();
+        let mut std_paths: Vec<&Vec<String>> = self
+            .global_defs
+            .keys()
+            .filter(|p| p.first().is_some_and(|seg| seg == "std"))
+            .collect();
+        std_paths.sort();
+        for path in std_paths {
+            for (name, ty) in &self.global_defs[path] {
+                out.entry(name.clone()).or_insert_with(|| ty.clone());
+            }
+        }
+        if let Some(origins) = self.program.import_origins.get(module) {
+            let renames = self.program.import_renames.get(module);
+            for (local, origin) in origins {
+                let remote = renames
+                    .and_then(|r| r.get(local))
+                    .map(String::as_str)
+                    .unwrap_or(local);
+                if let Some(ty) = self.global_defs.get(origin).and_then(|g| g.get(remote)) {
+                    out.insert(local.clone(), ty.clone());
+                }
+            }
+        }
+        if let Some(own) = self.global_defs.get(module) {
+            for (name, ty) in own {
+                out.insert(name.clone(), ty.clone());
+            }
+        }
+        out
+    }
+
+    /// [`Self::globals_visible_from`] for the module being checked, memoized.
+    pub(super) fn global_scope(&mut self) -> HashMap<String, Type> {
+        let module = self.current_module.clone();
+        if let Some(scope) = self.global_scopes.get(&module) {
+            return scope.clone();
+        }
+        let scope = self.globals_visible_from(&module);
+        self.global_scopes.insert(module, scope.clone());
+        scope
+    }
+
+    /// The scope stack used to check a function or method body: the globals
+    /// visible from its module at the bottom, signature parameters on top so
+    /// parameters shadow same-named globals.
     pub(super) fn signature_scopes(&mut self, params: &[ParamInfo]) -> ScopeStack {
-        vec![
-            self.global_scope.clone(),
-            self.signature_param_scope(params),
-        ]
+        vec![self.global_scope(), self.signature_param_scope(params)]
     }
 
     /// A single-scope environment for return inference that layers signature
     /// parameters over the globals, mirroring `signature_scopes` shadowing.
     fn signature_param_env(&mut self, params: &[ParamInfo]) -> HashMap<String, Type> {
-        let mut env = self.global_scope.clone();
+        let mut env = self.global_scope();
         env.extend(self.signature_param_scope(params));
         env
     }

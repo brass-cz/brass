@@ -424,6 +424,19 @@ pub(super) fn block_always_returns(block: &Block) -> bool {
     block.stmts.iter().any(|s| matches!(s, Stmt::Return(..)))
 }
 
+/// Whether an `else` arm always returns: a braced block that does, or an
+/// `else if` whose own arms all do. Any other expression (a value the `if`
+/// yields) does not return.
+pub(super) fn expr_always_returns(e: &Expr) -> bool {
+    match e {
+        Expr::Block(b, _) => block_always_returns(b),
+        Expr::If(_, then, els, _) => {
+            block_always_returns(then) && els.as_deref().is_some_and(expr_always_returns)
+        }
+        _ => false,
+    }
+}
+
 /// Names assigned (rebound) anywhere inside a closure literal of `b`. A closure
 /// captures such a binding by reference, so any call made while the binding is
 /// narrowed non-null can run the closure and re-null it; the narrowing pass

@@ -285,6 +285,10 @@ impl<'a> Checker<'a> {
             Expr::Ident(name, span) => {
                 if let Some(t) = self.lookup(scopes, name) {
                     t
+                } else if let Some(t) = self.lookup_aliased_global(name) {
+                    // A global reached under an import rename or a module
+                    // qualifier; the global scope holds it under its declared name.
+                    t
                 } else if self.is_resolvable_free_name(name) {
                     // A free function or runtime builtin used as a first-class
                     // value. Its precise function type is recovered at the call
@@ -575,6 +579,15 @@ impl<'a> Checker<'a> {
                 let else_ty = match els {
                     Some(e) => self.check_branch_expr(e, scopes, truth == Some(true)),
                     None => Type::Void,
+                };
+                // A statically-folded `if` whose selected arm always returns
+                // leaves the REST OF THE BLOCK unreachable (see
+                // `Checker::static_divergence`). Only the selected arm counts: an
+                // unselected arm's `return` is code the back end never emits.
+                self.static_divergence = match truth {
+                    Some(true) => block_always_returns(then),
+                    Some(false) => els.as_deref().is_some_and(expr_always_returns),
+                    None => false,
                 };
                 match truth {
                     Some(true) => then_ty,

@@ -204,7 +204,15 @@ pub fn render_signature_into(
         rendered.push(format!("{}: {ty}", p.name));
     }
     let params = rendered.join(", ");
+    // The annotation is the contract and normally wins. The exception is an
+    // annotation that leaves part of the type open: a `T!` names only the OK
+    // payload, and its Err side is inferred from the body's `error(..)` sites, so
+    // rendering the annotation alone gives `Result<T, unknown_0>`. The caller only
+    // ever passes an `inferred_ret` it has already found concrete.
     let ret = match (&sig.ret_ty, inferred_ret) {
+        (Some(t), Some(inferred)) if !prepoly_hir::is_fully_known(t) => {
+            render_type(inferred, namer)
+        }
         (Some(t), _) => render_type(t, namer),
         (None, Some(t)) => render_type(t, namer),
         (None, None) => namer.fresh(),

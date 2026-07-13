@@ -1,4 +1,4 @@
-//! Browser-side bridge to the Prepoly LSP server (`prepoly-lsp.wasm`).
+//! Browser-side bridge to the Prepoly LSP server (`ppls.wasm`).
 //!
 //! The server is an ordinary stdio LSP process: it reads `Content-Length`
 //! framed JSON-RPC from stdin and writes framed replies to stdout. A browser
@@ -206,7 +206,7 @@ export class PrepolyLsp {
       ConsoleStdout.lineBuffered(() => {}), // fd 2: server tracing, discarded
       new PreopenDirectory(".", new Map()), // cwd, for best-effort import paths
     ];
-    const wasi = new WASI(["prepoly-lsp"], [], fds);
+    const wasi = new WASI(["ppls"], [], fds);
     const inst = await WebAssembly.instantiate(this.module, {
       wasi_snapshot_preview1: wasi.wasiImport,
     });
@@ -220,7 +220,7 @@ export class PrepolyLsp {
       );
     } catch (err) {
       if (!(err instanceof WASIProcExit)) {
-        console.error("prepoly-lsp crashed", err);
+        console.error("ppls crashed", err);
       }
     }
     return parseMessages(stdout.data);

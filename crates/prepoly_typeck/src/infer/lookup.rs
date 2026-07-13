@@ -191,6 +191,23 @@ impl<'a> Checker<'a> {
         scopes.iter().rev().find_map(|s| s.get(name).cloned())
     }
 
+    /// The type of a module-level global reached through a module QUALIFIER
+    /// (`m.VERSION`, which the resolve pass rewrote to the dotted marker
+    /// `m.VERSION`). The qualifier names no import of the global itself, so the
+    /// scope does not hold it; it is read from its defining module directly.
+    ///
+    /// A renamed import needs nothing here: the scope already carries the global
+    /// under the local name the rename gave it.
+    pub(super) fn lookup_aliased_global(&self, name: &str) -> Option<Type> {
+        let (alias, bare) = name.split_once('.')?;
+        let origin = self
+            .program
+            .module_aliases
+            .get(&self.current_module)?
+            .get(alias)?;
+        self.global_defs.get(origin)?.get(bare).cloned()
+    }
+
     /// The type of a `typeof(arg)` argument for static-qualifier resolution,
     /// looked up without inference (so this stays `&self`): a bound variable's
     /// type, or `self`'s. A general expression has no already-known type here

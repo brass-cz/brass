@@ -62,9 +62,9 @@ file (`<package-name>.pp`).
 
 ## The language server in a project
 
-`ppm lsp` starts `prepoly-lsp` with the same dependency resolution, so editor
+`ppm lsp` starts `ppls` with the same dependency resolution, so editor
 diagnostics, hover, and completion see the project's dependencies. Point your
-editor's LSP command at `ppm lsp` instead of `prepoly-lsp` (see
+editor's LSP command at `ppm lsp` instead of `ppls` (see
 [Installing the LSP server](/installation/lsp/)). In a directory without a
 `package.toml` it simply starts the plain server, so the one editor
 configuration works for projects and loose `.pp` files alike.
@@ -168,7 +168,7 @@ always binds before the include search. Include entries should not nest
 inside each other (or inside the project): a file reachable from two roots
 can be loaded twice under two module paths.
 
-Finally, the toolchain binaries (`prepoly` and `prepoly-lsp`) append one
+Finally, the toolchain binaries (`prepoly` and `ppls`) append one
 implicit include entry: the `libraries/` directory sitting beside their own
 `bin/` directory (`<bin>/../libraries`), when it exists. A distributed
 toolchain therefore serves its bundled libraries (`process`, `path`, ...)

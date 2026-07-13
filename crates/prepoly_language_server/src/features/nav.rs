@@ -158,13 +158,22 @@ fn let_value_in_expr(e: &Expr, off: usize, name: &str) -> Option<Span> {
     }
 }
 
-/// The inferred return type of free function `name`, recovered from its call
-/// sites. The signature table only records the syntactic return annotation, so
-/// an unannotated return reads as absent there even though inference knows it.
-/// Each `name(...)` call's typed result type *is* that return type, so this
-/// returns the type all call sites agree on, or `None` when there are no calls
-/// or they disagree (a genuinely polymorphic return that has no single type).
-pub fn inferred_return(full: &FullAnalysis, name: &str) -> Option<Type> {
+/// The inferred return type of a free function whose return is unannotated.
+///
+/// The checker's own answer is preferred, when it settled on a concrete type.
+/// Failing that, the type is recovered from the call sites in the file being
+/// edited: each `name(...)` call's typed result *is* the return type, so this
+/// takes the one they all agree on, and `None` when they disagree (a genuinely
+/// polymorphic return has no single type to show). That fallback is all there
+/// used to be, and it can only work while the open file happens to CALL the
+/// function -- open the module that DEFINES it and there is nothing to read,
+/// which is why `http`'s `fetch` rendered as `unknown` in its own file.
+pub fn inferred_return(full: &FullAnalysis, symbol: &str, name: &str) -> Option<Type> {
+    if let Some(ty) = full.function_returns.get(symbol)
+        && prepoly_hir::is_fully_known(ty)
+    {
+        return Some(ty.clone());
+    }
     let mut call_spans: Vec<Span> = Vec::new();
     let mut visit = |e: &Expr| {
         if let Expr::Call(callee, _, span) = e

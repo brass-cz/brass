@@ -149,6 +149,14 @@ pub(crate) fn collect_exports(modules: &[LoadedModule]) -> HashMap<String, HashS
                 TopLevel::Fun(f) if is_public(&f.name) => {
                     names.insert(f.name.clone());
                 }
+                // A top-level binding (`const VERSION = ..`) is a module member
+                // like any other: the module's own resolution already treats it as
+                // a declaration, so it exports too.
+                TopLevel::Stmt(Stmt::Let { pat, .. }) => {
+                    let mut bound = HashSet::new();
+                    collect_pattern_names(pat, &mut bound);
+                    names.extend(bound.into_iter().filter(|n| is_public(n)));
+                }
                 _ => {}
             }
         }

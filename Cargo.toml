@@ -29,6 +29,7 @@ members = [
     "libraries/fs",
     "libraries/env",
     "libraries/hash",
+    "libraries/regex",
 ]
 # The default set includes the command-line driver. On native targets the driver
 # enables its `jit` feature by default, so a plain `cargo build` may need LLVM;

@@ -1,0 +1,23 @@
+true
+false
+4
+2026-07-13 [4..14]
+year=2026@4
+day=13
+true
+true
+true
+arm=b
+a@0
+bb@2
+ccc@5
+0
+true
+from2=bb@2
+ll 3 5
+2026/07 and 1999/01
+X and 1999-01-02
+[a, b, c]
+a\.b\*c
+true
+false

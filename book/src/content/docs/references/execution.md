@@ -78,7 +78,7 @@ interpreter.
 prepoly program.pp         # check + run (JIT)
 prepoly check program.pp   # check only
 prepoly repl [program.pp]  # interpreter / interactive REPL
-prepoly-lsp                # LSP server (hover, diagnostics, completion,
+ppls                       # LSP server (hover, diagnostics, completion,
                            # go-to-definition, semantic tokens)
 ```
 

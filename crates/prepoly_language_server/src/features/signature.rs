@@ -50,18 +50,28 @@ pub fn function_markdown(full: &FullAnalysis, f: &FunInfo, call_args: Option<&[T
 
     // A return that depends on a parameter variable is shown as that variable;
     // otherwise the inferred (call-site) return, which carries the real wrapping
-    // (e.g. a fallible `Result`). An annotated return is left to the renderer.
-    let ret_override = if f.signature.ret_ty.is_some() {
-        None
-    } else {
-        let param_vars: HashSet<u32> = param_types
-            .iter()
-            .flatten()
-            .flat_map(nav::free_vars)
-            .collect();
-        match nav::generic_return_type(full, f) {
-            Some(g) if nav::free_vars(&g).iter().any(|v| param_vars.contains(v)) => Some(g),
-            _ => nav::inferred_return(full, &f.signature.name),
+    // (e.g. a fallible `Result`).
+    //
+    // An annotated return is normally left to the renderer -- except a `T!`, which
+    // names only its OK payload: the Err side is inferred from the body's
+    // `error(..)` sites, so the annotation alone renders as `Result<T, unknown_0>`.
+    // Any annotation inference left open is completed from the checker's answer.
+    let ret_override = match &f.signature.ret_ty {
+        Some(declared) if !prepoly_hir::is_fully_known(declared) => {
+            nav::inferred_return(full, &f.symbol, &f.signature.name)
+                .filter(prepoly_hir::is_fully_known)
+        }
+        Some(_) => None,
+        None => {
+            let param_vars: HashSet<u32> = param_types
+                .iter()
+                .flatten()
+                .flat_map(nav::free_vars)
+                .collect();
+            match nav::generic_return_type(full, f) {
+                Some(g) if nav::free_vars(&g).iter().any(|v| param_vars.contains(v)) => Some(g),
+                _ => nav::inferred_return(full, &f.symbol, &f.signature.name),
+            }
         }
     };
 

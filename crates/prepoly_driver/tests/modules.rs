@@ -1395,3 +1395,86 @@ fn distributed_binary_includes_its_sibling_libraries_dir() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(stdout.trim(), "explicit", "{stdout}");
 }
+
+/// A module's top-level bindings are exported like its functions and types, in
+/// every form an import takes: by name, renamed, and through a module qualifier.
+/// Only functions and types used to be collected as exports, so importing a
+/// `const` was rejected as a name the module did not have.
+#[test]
+fn top_level_bindings_are_importable() {
+    let main = setup(
+        "import_globals",
+        &[
+            (
+                "lib/consts.pp",
+                "const VERSION = \"1.0.0\"\nconst MAX: int32 = 10\nconst LIMITS: int32[] = [1, 2]\nconst _SECRET = \"hidden\"\n",
+            ),
+            (
+                "main.pp",
+                "import lib.consts.{ VERSION, MAX as CAP }\n\
+                 import lib.consts as C\n\
+                 fun main() {\n\
+                 \x20   println(VERSION)\n\
+                 \x20   println(CAP)\n\
+                 \x20   println(C.LIMITS)\n\
+                 }\n",
+            ),
+        ],
+    );
+    let (ok, out) = run(&main);
+    assert!(ok, "expected success, got: {out}");
+    assert_eq!(out, "1.0.0\n10\n[1, 2]\n", "{out}");
+}
+
+/// A private top-level binding is not exported, like any other private name.
+#[test]
+fn a_private_top_level_binding_is_not_importable() {
+    let main = setup(
+        "import_private_global",
+        &[
+            ("lib/consts.pp", "const _SECRET = \"hidden\"\n"),
+            (
+                "main.pp",
+                "import lib.consts.{ _SECRET }\nfun main() { println(_SECRET) }\n",
+            ),
+        ],
+    );
+    let (ok, out) = check(&main);
+    assert!(!ok, "a private binding must not import: {out}");
+    assert!(
+        out.contains("cannot import private name `_SECRET`"),
+        "{out}"
+    );
+}
+
+/// Globals are keyed per DEFINING module, so two modules' same-named `const`s are
+/// two globals with two types. A name-keyed table handed one module the other's
+/// type -- and the back end then read the wrong slot at it.
+#[test]
+fn same_global_name_in_two_modules_keeps_its_own_type() {
+    let main = setup(
+        "same_global_name",
+        &[
+            (
+                "lib/a.pp",
+                "const MAX: int32 = 7\nfun a_max() -> int32 { return MAX }\n",
+            ),
+            (
+                "lib/b.pp",
+                "const MAX = \"seven\"\nfun b_max() -> string { return MAX }\n",
+            ),
+            (
+                "main.pp",
+                "import lib.a.{ a_max }\n\
+                 import lib.b.{ b_max }\n\
+                 fun main() {\n\
+                 \x20   println(a_max())\n\
+                 \x20   println(b_max())\n\
+                 }\n",
+            ),
+        ],
+    );
+    let (ok, out) = run(&main);
+    assert!(ok, "expected success, got: {out}");
+    assert_eq!(out, "7\nseven\n", "{out}");
+}

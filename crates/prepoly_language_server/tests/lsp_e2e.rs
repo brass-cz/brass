@@ -1,4 +1,4 @@
-//! End-to-end test of the `prepoly-lsp` binary over the LSP stdio transport.
+//! End-to-end test of the `ppls` binary over the LSP stdio transport.
 //!
 //! Unlike the in-process tests in `src/tests.rs` (which call the feature
 //! functions directly), this spawns the built server and exchanges real
@@ -43,12 +43,12 @@ const FMT_URI: &str = "file:///tmp/prepoly_e2e/fmt.pp";
 
 #[test]
 fn server_answers_hover_definition_completion_and_diagnostics() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_prepoly-lsp"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ppls"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn prepoly-lsp");
+        .expect("spawn ppls");
 
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
@@ -124,7 +124,7 @@ fn server_answers_hover_definition_completion_and_diagnostics() {
         Ok(seen) => seen,
         Err(_) => {
             let _ = child.kill();
-            panic!("prepoly-lsp did not complete the conversation within 30s");
+            panic!("ppls did not complete the conversation within 30s");
         }
     };
     let _ = child.wait();
@@ -192,6 +192,138 @@ fn send(stdin: &mut ChildStdin, value: &Value) {
     write!(stdin, "Content-Length: {}\r\n\r\n", body.len()).unwrap();
     stdin.write_all(&body).unwrap();
     stdin.flush().unwrap();
+}
+
+/// A document whose SYNC behaviour is under test: clean, then edited to carry a
+/// type error, then edited to carry a syntax error.
+const SYNC_URI: &str = "file:///tmp/prepoly_e2e/sync.pp";
+const SYNC_CLEAN: &str = "fun main() {\n    let n: int32 = 1\n    println(n)\n}\n";
+const SYNC_TYPE_ERROR: &str = "fun main() {\n    let n: int32 = \"oops\"\n    println(n)\n}\n";
+const SYNC_SYNTAX_ERROR: &str = "fun main() {\n    let n: int32 = )\n    println(n)\n}\n";
+
+/// Type inference runs on SAVE, not on every keystroke: an edit that introduces a
+/// type error publishes nothing until the file is saved, while a syntax error is
+/// reported straight away (parsing is cheap, and a half-typed line is a syntax
+/// error long before it is a type error).
+#[test]
+fn type_diagnostics_arrive_on_save_and_syntax_diagnostics_on_change() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ppls"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ppls");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut seen: Vec<Value> = Vec::new();
+
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"capabilities":{},"rootUri":null}}),
+        );
+        read_until(&mut reader, &mut seen, 1);
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+        );
+
+        // Each step's diagnostics are drained before the next, so the published
+        // sets stay in step with the notification that produced them.
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","method":"textDocument/didOpen",
+            "params":{"textDocument":{"uri":SYNC_URI,"languageId":"prepoly","version":1,"text":SYNC_CLEAN}}}),
+        );
+        let opened = next_diagnostics(&mut reader, &mut seen);
+
+        let change = |text: &str, version: i64| {
+            json!({"jsonrpc":"2.0","method":"textDocument/didChange",
+            "params":{"textDocument":{"uri":SYNC_URI,"version":version},
+                      "contentChanges":[{"text":text}]}})
+        };
+        send(&mut stdin, &change(SYNC_TYPE_ERROR, 2));
+        let typed = next_diagnostics(&mut reader, &mut seen);
+
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","method":"textDocument/didSave",
+            "params":{"textDocument":{"uri":SYNC_URI}}}),
+        );
+        let saved = next_diagnostics(&mut reader, &mut seen);
+
+        send(&mut stdin, &change(SYNC_SYNTAX_ERROR, 3));
+        let broken = next_diagnostics(&mut reader, &mut seen);
+
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","id":9,"method":"shutdown","params":{}}),
+        );
+        read_until(&mut reader, &mut seen, 9);
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","method":"exit","params":{}}),
+        );
+        let _ = tx.send((opened, typed, saved, broken, seen));
+    });
+
+    let (opened, typed, saved, broken, seen) = match rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = child.kill();
+            panic!("ppls did not complete the conversation within 30s");
+        }
+    };
+    let _ = child.wait();
+
+    // `save` must be advertised, or the client never sends the notification the
+    // type check now hangs off.
+    let sync = &response(&seen, 1)["capabilities"]["textDocumentSync"];
+    assert_eq!(sync["save"], json!(true), "save must be advertised: {sync}");
+
+    assert!(opened.is_empty(), "the clean document is clean: {opened:?}");
+    assert!(
+        typed.is_empty(),
+        "an edit must not run the type check: {typed:?}"
+    );
+    assert!(
+        messages(&saved).iter().any(|m| m.contains("int32")),
+        "saving must publish the type error: {saved:?}"
+    );
+    assert!(
+        messages(&broken)
+            .iter()
+            .any(|m| m.starts_with("syntax error")),
+        "a syntax error is reported on the edit itself: {broken:?}"
+    );
+}
+
+/// The messages of a diagnostic set.
+fn messages(diags: &[Value]) -> Vec<String> {
+    diags
+        .iter()
+        .map(|d| d["message"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+/// Read framed messages until the next `publishDiagnostics` and return its
+/// diagnostics, collecting everything read into `seen`.
+fn next_diagnostics(reader: &mut impl BufRead, seen: &mut Vec<Value>) -> Vec<Value> {
+    while let Some(msg) = read_message(reader) {
+        let published = (msg["method"] == json!("textDocument/publishDiagnostics"))
+            .then(|| msg["params"]["diagnostics"].as_array().cloned())
+            .flatten();
+        seen.push(msg);
+        if let Some(diags) = published {
+            return diags;
+        }
+    }
+    panic!("stream ended before the next publishDiagnostics");
 }
 
 /// Read framed messages into `seen` until one with response id `id` arrives,

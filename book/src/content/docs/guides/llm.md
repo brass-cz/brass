@@ -256,7 +256,11 @@ importing the type name). Several satisfying types make the call ambiguous (a
 compile error at the value asking for an annotation); a missing field is
 reported at the value with the unsatisfied constraint. For a record type `T`, `T.from(v)` yields `T?`: the
 record value when `v` structurally has all of `T`'s fields (decided at that
-call site), else `null`. Pair it with `if let`:
+call site), else `null`. `v` may be of ANY type -- one that is not a record at
+all has none of `T`'s fields, so the conversion answers `null` rather than
+failing to compile, which is how one function takes a value whose type differs
+per call site (`Path.from(x)` reads as "when this is a Path"). Pair it with
+`if let`:
 
 ```
 fun get_name(obj) {
@@ -512,9 +516,14 @@ own absolute source path, so "the file I am in" is `Path.parse(_PATH)`.
   `p.entries() -> Path[]!` (directory listing, OS order);
   `p.file_size() -> int64!`
 
-### fs -- `import fs.{ File, read_file, write_file }`
+### fs -- `import fs.{ File, read_file, write_file, create_dir, remove_dir }`
 
 - `read_file(path) -> string!`; `write_file(path, content) -> void!`
+- `create_dir(path) -> void!` -- RECURSIVE (`mkdir -p`); an existing directory
+  is success. `remove_dir(path) -> void!` -- RECURSIVE (`rm -r`); a missing
+  directory is an ERROR.
+- EVERY path here may be a string OR a `path` `Path` (`File.open`, `read_file`,
+  `write_file`, `create_dir`, `remove_dir`) -- no `to_string()` needed.
 - `File.open(path, mode) -> File!` -- mode `"r"` read, `"w"` truncate+create,
   `"a"` append+create
 - `f.read(max) -> uint8[]!` -- up to `max` bytes, fewer on a short read,
@@ -539,7 +548,10 @@ println(to_text(out.stdout)!)
 ```
 
 - `Command.new(program)` (looked up on `PATH`), then `.arg(v)`, `.args(vs)`,
-  `.stdin(m)`, `.stdout(m)`, `.stderr(m)`, then `.spawn() -> Child!`
+  `.env(name, value)`, `.stdin(m)`, `.stdout(m)`, `.stderr(m)`, then
+  `.spawn() -> Child!`
+- `.env` ADDS to the inherited environment (or overrides one entry); the child
+  always inherits this process's variables, and there is no way to unset one
 - `child.output() -> Output!` -- drains the piped streams while waiting, then
   returns `{ code, stdout, stderr }`; cannot deadlock. Prefer this.
 - `child.wait() -> int32!` -- the exit code; DEADLOCKS if a `Pipe` stream
@@ -570,6 +582,59 @@ security decision; prefer `sha256`. Authenticate with `hmac_sha256`, NOT
 `sha256(key + data)` (length-extension forgeable). Compare a MAC with
 `equal`, not `==`. These are FAST hashes: password storage needs a slow KDF
 (argon2/scrypt/bcrypt), which this library deliberately does not provide.
+
+### regex -- `import regex.{ Regex, escape }`
+
+Rust's `regex` engine: linear-time matching, so NO backreferences (`\1`) and
+NO lookaround (`(?=..)`, `(?<=..)`) -- a pattern using one fails to compile.
+Everything else is standard (classes, `{m,n}`, alternation, `^`/`$`/`\b`,
+`(?:..)`, `(?<name>..)`, inline flags `(?i)(?m)(?s)(?x)`).
+
+WRITING A PATTERN -- a prepoly string is NOT raw and it interpolates `{expr}`:
+
+- double every backslash: `\\d`, `\\w`, `\\b`
+- escape an opening brace: `"\\d\{4}"`. Writing `"\\d{4}"` SILENTLY compiles
+  as `\d4` (the `{4}` interpolates to the text `4`), which still matches
+  things -- this is the #1 mistake. A closing brace needs no escape.
+- in a replacement, prefer `$1` / `$name` over `${name}` (same brace problem)
+
+```
+const date = Regex.new("(?<year>\\d\{4})-(\\d\{2})-(\\d\{2})")!   // fallible
+if let m = date.find("due 2026-07-13") {          // Match?, null when no match
+    println("{m.text} {m.start} {m.end}")         // 2026-07-13 4 14 (BYTE offsets)
+    if let y = m.named("year") { println(y.text) }
+}
+println(date.replace_all("2026-07-13", "$year/$2"))
+```
+
+- `Regex.new(pattern) -> Regex!` -- the ONLY fallible call; every method below
+  is infallible. Compile ONCE (a Regex is never released; compiling in a loop
+  grows the process).
+- `re.is_match(text) -> bool`; `re.find(text) -> Match?`;
+  `re.find_from(text, from: int64) -> Match?`; `re.find_all(text) -> Match[]`
+- `re.replace(text, rep) -> string` (first) / `re.replace_all(text, rep)`
+- `re.split(text) -> string[]`; `re.group_count() -> int64` (counts group 0)
+- `escape(text) -> string` -- a pattern matching `text` literally
+- `Match` = `{ text, start, end, groups: Group?[] }` (`groups[0]` is the whole
+  match); `m.group(i) -> Group?`, `m.named("year") -> Group?` -- both null when
+  the group did not participate. `Group` = `{ text, start, end }`.
+
+### semver -- `import semver.{ Version, sort }`
+
+Semantic Versioning 2.0.0, parsed with the official semver.org pattern (so
+`v1.0.0`, `1.0`, and `01.0.0` are all REJECTED).
+
+- `Version.parse(text) -> Version!`; `Version.new(major, minor, patch) -> Version`
+- `Version` = `{ major, minor, patch: int64, prerelease: string?, build: string? }`
+  -- the optional parts are `null` when absent
+- `v.to_string() -> string`; `v.is_prerelease() -> bool`;
+  `v.prerelease_ids() -> string[]` (`"rc.1"` -> `["rc", "1"]`)
+- `v.compare(other) -> int64` (-1/0/1); `v.equals/less_than/greater_than(other)
+  -> bool`; `sort(versions: Version[]) -> Version[]` (a new array, ascending)
+
+PRECEDENCE: a pre-release PRECEDES its release (`1.0.0-rc.1 < 1.0.0`); numeric
+pre-release identifiers compare numerically (`beta.2 < beta.11`) and precede
+alphanumeric ones; BUILD METADATA IS IGNORED (`1.0.0+a` equals `1.0.0+b`).
 
 ### net -- `import net.{ Tcp, TcpListener, Udp, TlsStream }`
 

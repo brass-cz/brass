@@ -1,10 +1,14 @@
 //! The LSP server: glue between the protocol and the analysis layer.
 //!
 //! One [`DocState`] per open document holds its text and its incremental
-//! analyzer. Notifications (`did_open`/`did_change`) re-run diagnostics and
-//! publish them; requests (`hover`, `definition`, `semantic_tokens`) read the
-//! cached analysis. Each handler does its synchronous analysis under the
-//! document's map entry, then releases it before awaiting the client.
+//! analyzer. Requests (`hover`, `definition`, `semantic_tokens`) read the
+//! analysis; each handler does its synchronous analysis under the document's map
+//! entry, then releases it before awaiting the client.
+//!
+//! Diagnostics are published on `did_open` and `did_save` (the full check) and on
+//! `did_change` (SYNTAX ONLY). Type inference re-checks the whole module graph,
+//! which is too much work to redo on every keystroke; parsing is cheap, and its
+//! errors are the ones worth reporting mid-edit anyway.
 
 use std::path::PathBuf;
 
@@ -12,14 +16,15 @@ use dashmap::DashMap;
 use tower_lsp_server::ls_types::{
     CompletionOptions, CompletionParams, CompletionResponse, Diagnostic,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
-    DocumentFormattingParams, FullDocumentDiagnosticReport, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverParams, InitializeParams, InitializeResult,
-    InitializedParams, MessageType, OneOf, Position, Range, RelatedFullDocumentDiagnosticReport,
-    SemanticTokens, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
-    Uri, WorkDoneProgressOptions,
+    DidSaveTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
+    DocumentDiagnosticReportResult, DocumentFormattingParams, FullDocumentDiagnosticReport,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InitializeParams,
+    InitializeResult, InitializedParams, MessageType, OneOf, Position, Range,
+    RelatedFullDocumentDiagnosticReport, SemanticTokens, SemanticTokensFullOptions,
+    SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri,
+    WorkDoneProgressOptions,
 };
 // Advertised only on wasm, where the browser transport pulls diagnostics rather
 // than receiving server-pushed ones.
@@ -59,18 +64,37 @@ impl Backend {
         }
     }
 
-    /// Re-analyze a document and publish its diagnostics. The analysis runs
-    /// under the map entry; the entry is dropped before the async publish.
-    async fn refresh(&self, uri: Uri, text: String, version: i32) {
+    /// Store a document's new text and publish its diagnostics. `check` decides
+    /// whether the full analysis runs or only the parse. The analysis runs under
+    /// the map entry; the entry is dropped before the async publish.
+    async fn refresh(&self, uri: Uri, text: String, version: i32, check: Check) {
         let diags = {
             let mut entry = self
                 .docs
                 .entry(uri.clone())
                 .or_insert_with(|| DocState::new(&uri, String::new(), version));
             entry.document.update(text, version);
-            analyze(&mut entry)
+            match check {
+                Check::Full => analyze(&mut entry),
+                Check::SyntaxOnly => {
+                    let raw = entry.analyzer.syntax_diagnostics(&entry.document.text);
+                    features::diagnostics::to_lsp(&raw, &entry.document)
+                }
+            }
         };
         self.publish(uri, diags, version).await;
+    }
+
+    /// Re-publish the current document's full diagnostics, without a new text.
+    /// The save notification carries no text under `TextDocumentSyncKind::FULL`.
+    async fn recheck(&self, uri: Uri) {
+        let Some(diags) = self.docs.get_mut(&uri).map(|mut entry| {
+            let version = entry.document.version;
+            (analyze(&mut entry), version)
+        }) else {
+            return;
+        };
+        self.publish(uri, diags.0, diags.1).await;
     }
 
     /// Diagnostics for an already-open document, for the pull
@@ -93,8 +117,15 @@ impl LanguageServer for Backend {
     async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                // `save` must be advertised for the client to send `did_save`, which
+                // is when the type check runs (`did_change` only parses).
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::FULL),
+                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                        ..Default::default()
+                    },
                 )),
                 hover_provider: Some(true.into()),
                 definition_provider: Some(OneOf::Left(true)),
@@ -135,7 +166,7 @@ impl LanguageServer for Backend {
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
-                name: "prepoly-lsp".to_string(),
+                name: "ppls".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
             ..Default::default()
@@ -152,11 +183,17 @@ impl LanguageServer for Backend {
         Ok(())
     }
 
+    /// Opening a file checks it in full: its type errors must be visible before
+    /// the user has touched (and saved) anything.
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let doc = params.text_document;
-        self.refresh(doc.uri, doc.text, doc.version).await;
+        self.refresh(doc.uri, doc.text, doc.version, Check::Full)
+            .await;
     }
 
+    /// An edit re-parses only. The type diagnostics of the last checked version
+    /// are cleared rather than left behind: their spans no longer describe this
+    /// text, and a stale squiggle under the wrong code is worse than none.
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
@@ -164,7 +201,13 @@ impl LanguageServer for Backend {
         let Some(change) = params.content_changes.into_iter().next() else {
             return;
         };
-        self.refresh(uri, change.text, version).await;
+        self.refresh(uri, change.text, version, Check::SyntaxOnly)
+            .await;
+    }
+
+    /// Saving runs the type check.
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        self.recheck(params.text_document.uri).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -280,6 +323,15 @@ impl LanguageServer for Backend {
             data,
         })))
     }
+}
+
+/// How much analysis a document update triggers.
+#[derive(Clone, Copy)]
+enum Check {
+    /// Parse, lower, and type-check the whole module graph.
+    Full,
+    /// Parse the document alone.
+    SyntaxOnly,
 }
 
 /// Run the incremental analyzer over a document's current text and lower the
