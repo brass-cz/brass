@@ -57,17 +57,22 @@ fun parse_positive(s) {
 for s in ["42", "-5", "abc"] {
     match parse_positive(s) {
         Ok { value } => println("parsed {s} -> {value}"),
-        Err { error } => println("failed {s} -> {error}"),
+        Err { error } => println("failed {s} -> {error.value}"),
     }
 }
 ```
 
-Two things are happening here:
+Three things are happening here:
 
 - The postfix **`!` operator** propagates errors: `expr!` unwraps an `Ok`
   value, or returns the `Err` from the enclosing function immediately.
 - A `Result` is consumed by **matching** on its variants, `Ok { value }` and
   `Err { error }`.
+- The `Err` payload is an **`Error` record**: `error(x)` wraps `x` together
+  with the call site's position, and a builtin failure forwarded by `!` (the
+  parse error here) is wrapped the same way at the propagation site. The
+  original value is `error.value`; the position and any
+  [context frames](#error-traces-and-context) ride along.
 
 ## `!` at the top level and in `main`
 
@@ -90,6 +95,83 @@ unhandled error: cannot parse `12x` as integer
 instead of continuing with a bad value. So the beginner-friendly default is:
 write `!` after any fallible call and let a failure stop the script; reach
 for `match` only where you want to _handle_ the error.
+
+## Error traces and `context`
+
+An error raised by `error(..)` remembers **where** it was raised, and
+`context("...")` lets every layer on the way out say what it was doing.
+When the failure finally goes unhandled, the whole story prints as a nested
+trace, newest step first:
+
+```prepoly
+fun read_config() -> infer! {
+    return error("missing key `port`")
+}
+
+fun start_server() -> infer! {
+    return read_config().context("starting the server")
+}
+
+start_server()!
+```
+
+```text
+[main.pp:6:12] unhandled error: starting the server
+    [main.pp:2:12] unhandled error: missing key `port`
+```
+
+No plumbing is needed: `error` and `context` pick up their call site through
+an implicit `Location` argument the compiler fills in. When you handle the
+error yourself, the same information is on the `Error` record — `error.value`
+is the raised value, `error.location` the position, and `error.display()`
+renders the trace text above. A failure that never went through
+`error(..)`/`context` (a plain builtin error hit at the top level) keeps the
+short `unhandled error: <message>` form.
+
+## Your own Result type
+
+A library that wants to carry more than `Ok`/`Err` can declare its own sum
+**as a subtype of `Result`**: it must have exactly the `Ok` and `Err`
+variants, and each variant may add fields. The `!` operator (and any other
+place a `Result` is expected) accepts it by rebuilding the value as a plain
+`Result`, dropping the extra fields:
+
+```prepoly
+type Lookup: Result =
+    | Ok {
+        value: int32
+        source: string
+    }
+    | Err {
+        error: string
+    }
+
+fun find_port(name: string) -> Lookup {
+    if name == "http" {
+        return Lookup.Ok { value: 80, source: "well-known" }
+    }
+    return Lookup.Err { error: "unknown service `{name}`" }
+}
+
+fun connect(name: string) -> infer! {
+    let port = find_port(name)!      // Lookup propagates like a Result
+    return "{name}:{port}"
+}
+
+fun main() {
+    println(connect("http")!)
+    match find_port("gopher") {      // or match Lookup directly, source and all
+        Ok { value, source } => { println("{value} via {source}") }
+        Err { error } => { println("no port: {error}") }
+    }
+}
+```
+
+Matching the `Lookup` itself keeps the extra `source` field; going through
+`!` trades it for plain-`Result` interoperability. Two structurally
+identical sums that do **not** declare the relationship stay unrelated — see
+[the reference](/references/syntax-sugar/#declared-sum-subtyping) for the
+exact rules, including how a module can instead shadow `Result` outright.
 
 ## Fallible conversions
 
@@ -154,18 +236,18 @@ fun f(c: int32) {
     if c == 0 {
         return 1          // Result.Ok { value: 1 }
     } else if c == 1 {
-        error("a")!       // Result.Err { error: "a" }
+        error("a")!       // Result.Err — the payload is an Error wrapping "a"
     } else {
         null!             // null itself
     }
 }
 
-// f is (int32) -> Result<int32, string>?: narrow the `?` first, then match.
+// f is (int32) -> Result<int32, Error>?: narrow the `?` first, then match.
 let r = f(0)
 if r {
     match r {
         Ok { value } => println("ok {value}"),
-        Err { error } => println("err {error}"),
+        Err { error } => println("err {error.value}"),
     }
 } else {
     println("null")

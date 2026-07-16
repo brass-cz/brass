@@ -413,11 +413,13 @@ impl<'p, 'm> Interp<'p, 'm> {
     ) -> Result<Value, String> {
         match place.proj.as_slice() {
             [Projection::Field(field)] => {
-                // A `string`/array receiver has no fields: the access is the
-                // compile-time member presence value -- the member's own name when
-                // the class carries it, otherwise null.
+                // A member that can only be a method is the compile-time
+                // presence value: the member's own name when the receiver's
+                // class or declared type carries it, null when a primitive
+                // class does not; a nominal's non-method member falls through
+                // to the ordinary field read.
                 let base_ty = f.local_type(place.local);
-                if let Some(present) = self.hir.primitive_member_presence(base_ty, field) {
+                if let Some(present) = self.hir.member_presence(base_ty, field) {
                     return Ok(if present {
                         Value::str(field.to_string())
                     } else {

@@ -1,2 +1,10 @@
 7
-err: bad id
+err: Error {
+    value: "bad id",
+    location: Location {
+        file: "e2e_tests/types/static_method_prop_infers_fallible.pp",
+        line: 10,
+        col: 16,
+    },
+    frames: [],
+}

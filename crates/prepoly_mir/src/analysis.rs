@@ -365,7 +365,18 @@ fn scan_stmt(s: &Stmt, props: Props) -> bool {
 
 fn scan_expr(e: &Expr, props: Props) -> bool {
     match e {
-        Expr::ErrorProp(inner, span) => props.counts(*span) || scan_expr(inner, props),
+        // `error(..)!` immediately unwraps (aborts at an entry, propagates
+        // elsewhere -- and the propagation is counted via `props`); the
+        // construction never escapes as this body's own Result, so it alone
+        // does not make the body fallible. Its arguments are still scanned.
+        Expr::ErrorProp(inner, span) => {
+            if let Expr::Call(c, args, _) = &**inner
+                && matches!(&**c, Expr::Ident(n, _) if n == "error")
+            {
+                return props.counts(*span) || args.iter().any(|a| scan_expr(&a.expr, props));
+            }
+            props.counts(*span) || scan_expr(inner, props)
+        }
         Expr::Call(c, args, _) => {
             matches!(&**c, Expr::Ident(n, _) if n == "error")
                 || scan_expr(c, props)

@@ -1,0 +1,14 @@
+Result.Ok {
+    value: 21,
+}
+Result.Err {
+    error: Error {
+        value: "denied",
+        location: Location {
+            file: "e2e_tests/types/sum_subtype_bang.pp",
+            line: 18,
+            col: 13,
+        },
+        frames: [],
+    },
+}

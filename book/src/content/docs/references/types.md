@@ -183,7 +183,10 @@ required: a function parameter constrains a value only by the members it
 actually uses (unannotated parameters), or by the named type's members
 (annotated). A record with more fields satisfies a requirement of fewer
 fields. Arrays are invariant in their element type. Sum types are nominal —
-only the declared type matches.
+only the declared type matches, unless the sum **declares a parent**
+(`type Child: Parent`), which admits it at the parent's flow sites by
+rebuild — see
+[Declared sum subtyping](/references/syntax-sugar/#declared-sum-subtyping).
 
 When an **anonymous record** (`{ field: value, ... }`) is passed to an
 unannotated parameter, the compiler derives the parameter's required "row" of
@@ -243,13 +246,20 @@ that type does not have is statically dead — never checked, never emitted (see
 [Absent fields in conditions](#absent-fields-in-conditions)). `Path.from`, by
 contrast, decides at run time, which is why the string case needs a guard of its
 own: without it, `return value` would be checked against the `string` return with
-`value` still a `Path`.
+`value` still a `Path`. The same guard is written more directly as
+`value.is_string` — each primitive type implements only its own `is_<type>`
+method, so the presence test doubles as a type test (see
+[the reflection reference](/references/reflection/#member-presence-xm-without-a-call)).
 
 ## Interfaces
 
 `type B: A = ...` requires `B` to provide every member of `A`, checked at
-compile time; multiple constraints are comma-separated (`type B: A, C`). No
-implementation is inherited — the constraint is pure satisfaction:
+compile time; multiple constraints are comma-separated (`type B: A, C`). When
+`A` is itself a **sum** type, the declaration means
+[declared sum subtyping](/references/syntax-sugar/#declared-sum-subtyping)
+instead: exact variant coverage, widening-only variants, and admission at the
+parent's flow sites by rebuild. For record constraints, no implementation is
+inherited — the constraint is pure satisfaction:
 
 - a required **field** must exist with an _invariant_ type (fields are
   mutable, so a subtype field would be unsound);
@@ -327,19 +337,34 @@ does not hide errors in code that can run.
 
 ## Result
 
-`T!` is the built-in `Result` type with variants `Ok { value: T }` and
-`Err { error: E }`; the error payload type `E` is inferred from the
-`error(x)` calls the function makes (all error sites of one function must
-reconcile to one payload type).
+`T!` is `Result<T, E>` over the `Result` declared in the prelude
+(std/prelude/error.pp) — an ordinary two-variant sum with `Ok { value }` and
+`Err { error }`, resolved by normal scoping at every sugar site, so a module
+may [shadow it](/references/syntax-sugar/#the-result-behind-fallibility). The
+error payload type `E` is inferred from the function's error sources (all
+error sites of one function must reconcile to one payload type).
 
-- `error(x)` constructs an `Err`. It is a reserved builtin.
+- `error(x)` is an ordinary prelude function (its name is reserved in call
+  position) that builds
+  `Err { error: Error { value: x, location: <call site>, frames: [] } }` —
+  the payload is the prelude `Error` record, stamped with the caller's
+  position through the implicit `Location` argument. Traces, `context`, and
+  the rendering are specified in
+  [Error traces](/references/syntax-sugar/#error-traces).
 - A function is _fallible_ when its body uses `error(...)` or a
   Result-operand `expr!`, or its declared return type is a Result. In a
   fallible function, `return v` with a plain value wraps it as
   `Ok { value: v }` automatically; returning a Result value passes it
   through whole.
 - The postfix **`!`** operator propagates: `expr!` unwraps an `Ok` or returns
-  the `Err` early from the enclosing function.
+  the `Err` early from the enclosing function. A propagated payload that is
+  not already the prelude `Error` (a builtin's or plugin's plain string, for
+  example) is **lifted** into one at the propagation site — that is what
+  lets one body mix `error(..)` with `!`-forwarded builtin failures.
+- `!` also accepts a **declared subtype** of the scope's Result
+  (`type MyResult: Result` — see
+  [Declared sum subtyping](/references/syntax-sugar/#declared-sum-subtyping)):
+  the value is rebuilt as the parent at the operand and `!` proceeds on it.
 - On a **NULLABLE** operand, `expr!` unwraps the value, and a null returns
   **null itself** early -- the enclosing function's return type gains an
   outer `?` (it does not become fallible). A body mixing bare returns,
@@ -350,10 +375,14 @@ reconcile to one payload type).
   failure, **at the module top level, and in `main`** (not yet in closures —
   see [Closures](#closures)). At those two entry
   points a failed `!` does not propagate (there is no caller to receive it):
-  the program aborts with `unhandled error: <payload>` (or the null
-  message) on stderr and a non-zero exit. Elsewhere, a function explicitly
-  annotated with an incompatible return type rejects `!`.
-- Consume a Result by matching `Ok { value }` / `Err { error }`.
+  the program aborts on stderr with a non-zero exit — with the nested
+  `[file:line:col] unhandled error:` trace when the payload went through
+  `error(..)`/`context`, or the plain `unhandled error: <payload>` line (or
+  the null message) when it never did.
+- Consume a Result by matching `Ok { value }` / `Err { error }`. A payload
+  raised by `error(..)` — or lifted at a `!` — matches as the `Error`
+  record: the original value is `error.value`, and `error.display()` renders
+  the trace.
 - A function that can only ever `error(...)` (no successful return) cannot be
   used where a value is required.
 

@@ -2,5 +2,13 @@
 boxed
 7
 t
-err: negative
+err: Error {
+    value: "negative",
+    location: Location {
+        file: "e2e_tests/types/method_declared_fallible_wraps_ok.pp",
+        line: 60,
+        col: 16,
+    },
+    frames: [],
+}
 3

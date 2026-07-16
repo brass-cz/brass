@@ -1,2 +1,10 @@
 ok 7
-err -3
+err Error {
+    value: -3,
+    location: Location {
+        file: "e2e_tests/types/fallible_bang.pp",
+        line: 5,
+        col: 9,
+    },
+    frames: [],
+}

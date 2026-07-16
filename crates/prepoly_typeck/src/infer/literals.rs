@@ -242,12 +242,15 @@ impl<'a> Checker<'a> {
         // would fall to the permissive arm and skip field type checking.
         let resolved = self.resolve(&base_ty);
         let peeled = prepoly_hir::peel_modes(&resolved).clone();
-        // A `string`/array receiver carries methods but no fields, so an uncalled
-        // member access on it is a compile-time presence test: a method decays to
-        // its own NAME as a string (exactly as a `fields()` descriptor does), and a
-        // member the class does not have is the always-null `never?`. A generic
-        // body branches on this to pick the arm that fits its instantiation.
-        if let Some(present) = self.program.primitive_member_presence(&peeled, name) {
+        // An uncalled member access is a compile-time presence test wherever the
+        // name can only be a method: on a `string`/array/scalar receiver (no
+        // fields at all), and on a record/sum whose declaration carries a method
+        // of that name. A present method decays to its own NAME as a string
+        // (exactly as a `fields()` descriptor does); a member a primitive class
+        // does not have is the always-null `never?`; anything else falls through
+        // to ordinary field lookup. A generic body branches on this to pick the
+        // arm that fits its instantiation.
+        if let Some(present) = self.program.member_presence(&peeled, name) {
             return if present { Type::Str } else { Type::null() };
         }
         match peeled {
@@ -256,18 +259,13 @@ impl<'a> Checker<'a> {
                     return ty.clone();
                 }
                 if let Some(info) = self.program.type_by_id(record.id)
-                    && let TypeKind::Record { fields, methods } = &info.kind
+                    && let TypeKind::Record { fields, .. } = &info.kind
+                    && let Some(field) = fields.iter().find(|f| f.name == name)
                 {
-                    if let Some(field) = fields.iter().find(|f| f.name == name) {
-                        return field
-                            .resolved_ty
-                            .clone()
-                            .unwrap_or_else(|| self.fresh_unknown());
-                    }
-                    // A bare `recv.method` (method as a value) is left to the runtime.
-                    if methods.contains_key(name) {
-                        return self.fresh_unknown();
-                    }
+                    return field
+                        .resolved_ty
+                        .clone()
+                        .unwrap_or_else(|| self.fresh_unknown());
                 }
                 // Accessing a field a structure does not have is an inference
                 // failure typed as the always-null `never?`: an `if` on it is

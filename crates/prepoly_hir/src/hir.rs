@@ -83,10 +83,15 @@ pub fn resolve_qualified<'a, T>(
             .get(&qualify(remote, origin))
             .or_else(|| table.get(remote.as_str()));
     }
-    if let Some(v) = table.get(name) {
+    // The defining module's own qualified entry wins over a bare (unique)
+    // definition elsewhere. For most names only one of the two forms exists
+    // (a unique name keeps its bare symbol); `Result` is the exception -- the
+    // prelude's declaration holds the bare key while a module's shadowing
+    // declaration is always qualified, and the nearer scope must win.
+    if let Some(v) = table.get(&qualify(name, module)) {
         return Some(v);
     }
-    if let Some(v) = table.get(&qualify(name, module)) {
+    if let Some(v) = table.get(name) {
         return Some(v);
     }
     let origin = import_origins.get(module)?.get(name)?;
@@ -363,26 +368,68 @@ impl Program {
         self.types.values().find(|t| t.id == id)
     }
 
-    /// The compile-time presence of an uncalled member `x.m` whose receiver has a
-    /// method namespace but no fields -- a `string` or an array. `Some(true)` when
-    /// the receiver's class carries a method `m`, `Some(false)` when it carries
-    /// nothing of that name, and `None` for a receiver this rule says nothing
-    /// about (a record, a sum, a scalar).
+    /// The compile-time presence of an uncalled member `x.m`: `Some(true)` when
+    /// the receiver's class or declared type carries a METHOD `m`, `Some(false)`
+    /// when it carries nothing of that name at all (a primitive class without
+    /// the method, a sum where no variant declares such a field or method), and
+    /// `None` when this rule says nothing and ordinary field lookup applies (a
+    /// record's fields -- whose absent read is already `never?` -- and a sum
+    /// field, common or not).
     ///
     /// This is what lets one generic body branch on its argument's concrete type:
     /// a present member types as its own name (a truthy string constant) and an
     /// absent one as the always-null `never?`, so the `if` folds statically and
-    /// only the arm that fits the instantiation is checked and emitted.
-    pub fn primitive_member_presence(&self, ty: &Type, name: &str) -> Option<bool> {
-        let class = match ty.primitive_class()? {
-            class @ ("string" | "array") => class,
-            _ => return None,
-        };
-        Some(
-            self.primitive_methods
-                .contains_key(&(class.to_string(), name.to_string()))
-                || builtin_member(class, name),
-        )
+    /// only the arm that fits the instantiation is checked and emitted. A
+    /// declared method answers exactly like a primitive's, so
+    /// `if v.m { v.m() } else { .. }` dispatches on method presence for records
+    /// and sums too.
+    pub fn member_presence(&self, ty: &Type, name: &str) -> Option<bool> {
+        // Every primitive class supports the presence test: a member a scalar
+        // receiver lacks reads as absent (`never?`, statically false) instead
+        // of a hard error, so a generic presence-dispatching body (`if
+        // x.frames { .. }`) instantiates at scalars too.
+        if let Some(class) = ty.primitive_class() {
+            return Some(
+                self.primitive_methods
+                    .contains_key(&(class.to_string(), name.to_string()))
+                    || builtin_member(class, name),
+            );
+        }
+        match ty {
+            Type::Record(n) | Type::Sum(n) => {
+                match &self.type_by_id(n.id)?.kind {
+                    // A record's non-method member falls through to field
+                    // lookup, whose absent read is already the null presence
+                    // value.
+                    TypeKind::Record { methods, .. } => methods.contains_key(name).then_some(true),
+                    // A sum method is injected into every variant, so any
+                    // variant answers. A name that is a FIELD of some variant
+                    // falls through to the common-field rule (accessing a
+                    // per-variant field without a `match` stays an error); a
+                    // name found nowhere is statically absent, so a presence
+                    // dispatch can send a sum through its else arm. A
+                    // variant-scoped MIR read (`Err.error`, emitted by match
+                    // arms and the error-propagation rebuilds) is not a surface
+                    // member name and belongs to the sum field machinery.
+                    TypeKind::Sum { variants } => {
+                        if name.contains('.') {
+                            return None;
+                        }
+                        if variants.iter().any(|v| v.methods.contains_key(name)) {
+                            Some(true)
+                        } else if variants
+                            .iter()
+                            .any(|v| v.fields.iter().any(|f| f.name == name))
+                        {
+                            None
+                        } else {
+                            Some(false)
+                        }
+                    }
+                }
+            }
+            _ => None,
+        }
     }
 
     pub fn type_ref(&self, name: &str) -> Option<Type> {
@@ -433,6 +480,66 @@ impl Program {
             module,
             name,
         )
+    }
+
+    /// The `Result` instance the fallibility sugar (`T!`, `error(..)`, an
+    /// inferred fallible return, Ok-wrapping) builds in `module`'s scope: the
+    /// prelude's Result, or the module's shadowing `type Result` sum. A
+    /// shadow's declared payload annotation pins the corresponding slot; an
+    /// unannotated payload takes the caller's `ok`/`err` (the annotation's
+    /// payload or a fresh inference variable). Returns the required-shape
+    /// message when the shadow is not `| Ok { value } | Err { error }`; the
+    /// caller reports it and falls back to the built-in Result.
+    pub fn scoped_result_instance(
+        &self,
+        module: &[String],
+        ok: &Type,
+        err: &Type,
+    ) -> Result<Type, String> {
+        let Some(info) = self.resolve_type(module, crate::types::RESULT_TYPE_NAME) else {
+            return Ok(Type::result(ok.clone(), err.clone()));
+        };
+        if info.id == crate::types::RESULT_TYPE_ID {
+            return Ok(Type::result(ok.clone(), err.clone()));
+        }
+        let shape_err = || {
+            format!(
+                "`{}` shadows the prelude's `Result` but is not `| Ok {{ value }} | Err {{ error }}`, \
+                 the shape the fallibility sugar (`T!`, `error(..)`, `!`) builds",
+                info.name
+            )
+        };
+        let TypeKind::Sum { variants } = &info.kind else {
+            return Err(shape_err());
+        };
+        if variants.len() != 2
+            || variants[0].name != "Ok"
+            || variants[0].fields.len() != 1
+            || variants[0].fields[0].name != "value"
+            || variants[1].name != "Err"
+            || variants[1].fields.len() != 1
+            || variants[1].fields[0].name != "error"
+        {
+            return Err(shape_err());
+        }
+        // An annotated payload field is the declaration's pin for that slot;
+        // an unannotated one is generic and takes the caller's payload.
+        let pin = |v: &VariantInfo, fallback: &Type| -> Type {
+            if v.fields[0].ty.is_some() {
+                v.fields[0]
+                    .resolved_ty
+                    .clone()
+                    .unwrap_or_else(|| fallback.clone())
+            } else {
+                fallback.clone()
+            }
+        };
+        let mut n = NominalType::new(info.id, crate::types::RESULT_TYPE_NAME);
+        n.substitution
+            .insert(crate::types::RESULT_OK_VALUE, pin(&variants[0], ok));
+        n.substitution
+            .insert(crate::types::RESULT_ERR_ERROR, pin(&variants[1], err));
+        Ok(Type::Sum(n))
     }
 
     /// Resolve a bare free-function name to its definition as seen from `module`,

@@ -1,2 +1,10 @@
-error: No such file or directory (os error 2)
+error: Error {
+    value: "No such file or directory (os error 2)",
+    location: Location {
+        file: "<plugin:libraries/libfs.so>",
+        line: 10,
+        col: 12,
+    },
+    frames: [],
+}
 still running

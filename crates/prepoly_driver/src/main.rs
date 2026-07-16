@@ -427,6 +427,9 @@ fn execute(
     program: &Program,
     expr_types: &HashMap<Span, prepoly_hir::Type>,
     view_args: &HashSet<Span>,
+    sum_views: &HashMap<Span, prepoly_hir::Type>,
+    call_locations: &HashMap<Span, (String, u32, u32)>,
+    lift_errs: &HashSet<Span>,
     fields_loops: &HashMap<Span, Vec<String>>,
     type_names: &HashMap<Span, String>,
     typeof_types: &HashMap<Span, prepoly_hir::Type>,
@@ -437,6 +440,9 @@ fn execute(
         program,
         expr_types,
         view_args,
+        sum_views,
+        call_locations,
+        lift_errs,
         fields_loops,
         type_names,
         typeof_types,
@@ -452,6 +458,9 @@ fn execute(
     program: &Program,
     expr_types: &HashMap<Span, prepoly_hir::Type>,
     view_args: &HashSet<Span>,
+    sum_views: &HashMap<Span, prepoly_hir::Type>,
+    call_locations: &HashMap<Span, (String, u32, u32)>,
+    lift_errs: &HashSet<Span>,
     fields_loops: &HashMap<Span, Vec<String>>,
     type_names: &HashMap<Span, String>,
     typeof_types: &HashMap<Span, prepoly_hir::Type>,
@@ -461,6 +470,9 @@ fn execute(
         program,
         expr_types,
         view_args,
+        sum_views,
+        call_locations,
+        lift_errs,
         fields_loops,
         type_names,
         typeof_types,
@@ -471,10 +483,14 @@ fn execute(
 
 /// Run a checked program through the REPL interpreter (the `repl` subcommand),
 /// regardless of the `jit` feature.
+#[allow(clippy::too_many_arguments)] // mirrors the checker's channel outputs
 fn execute_repl(
     program: &Program,
     expr_types: &HashMap<Span, prepoly_hir::Type>,
     view_args: &HashSet<Span>,
+    sum_views: &HashMap<Span, prepoly_hir::Type>,
+    call_locations: &HashMap<Span, (String, u32, u32)>,
+    lift_errs: &HashSet<Span>,
     fields_loops: &HashMap<Span, Vec<String>>,
     type_names: &HashMap<Span, String>,
     typeof_types: &HashMap<Span, prepoly_hir::Type>,
@@ -484,6 +500,9 @@ fn execute_repl(
         program,
         expr_types,
         view_args,
+        sum_views,
+        call_locations,
+        lift_errs,
         fields_loops,
         type_names,
         typeof_types,
@@ -719,6 +738,16 @@ struct Checked {
     /// Spans of anonymous structural arguments the checker approved for view
     /// conversion; MIR lowering wraps exactly these in `Rvalue::RecordView`.
     view_args: HashSet<Span>,
+    /// Value expressions the checker accepted as a declared sum subtype at a
+    /// flow site (span -> parent sum symbol); MIR lowering rebuilds them.
+    sum_views: HashMap<Span, prepoly_hir::Type>,
+    /// Every call expression's source position (label, line, col), keyed by
+    /// the call's span. MIR lowering fills a callee's implicit trailing
+    /// `Location` parameter from this map.
+    call_locations: HashMap<Span, (String, u32, u32)>,
+    /// `expr!` sites whose propagated Err payload is re-raised wrapped into
+    /// the prelude `Error`; MIR's propagation arm rebuilds the value.
+    lift_errs: HashSet<Span>,
     /// Field lists of checker-approved fields-loops, keyed by loop-statement
     /// span; MIR lowering unrolls them (see `prepoly_hir::expand`).
     fields_loops: HashMap<Span, Vec<String>>,
@@ -760,26 +789,32 @@ fn drive(mode: Mode, file: &str) -> Result<(), u8> {
             &checked.program,
             &checked.expr_types,
             &checked.view_args,
+            &checked.sum_views,
+            &checked.call_locations,
+            &checked.lift_errs,
             &checked.fields_loops,
             &checked.type_names,
             &checked.typeof_types,
             &checked.null_props,
         )
         .map_err(|e| {
-            eprintln!("error: {e}");
+            report_runtime_error(&e);
             1
         }),
         Mode::Repl => execute_repl(
             &checked.program,
             &checked.expr_types,
             &checked.view_args,
+            &checked.sum_views,
+            &checked.call_locations,
+            &checked.lift_errs,
             &checked.fields_loops,
             &checked.type_names,
             &checked.typeof_types,
             &checked.null_props,
         )
         .map_err(|e| {
-            eprintln!("error: {e}");
+            report_runtime_error(&e);
             1
         }),
     }
@@ -813,6 +848,9 @@ fn analyze(main_label: &str, main_src: &str, root: &Path) -> Result<Checked, Vec
                 program,
                 expr_types: c.expr_types.into_iter().collect(),
                 view_args: c.view_args.into_iter().collect(),
+                sum_views: c.sum_views.into_iter().collect(),
+                call_locations: c.call_locations.into_iter().collect(),
+                lift_errs: c.lift_errs.into_iter().collect(),
                 fields_loops: c.fields_loops.into_iter().collect(),
                 type_names: c.type_names.into_iter().collect(),
                 typeof_types: c.typeof_types.into_iter().collect(),
@@ -1071,6 +1109,7 @@ fn analyze(main_label: &str, main_src: &str, root: &Path) -> Result<Checked, Vec
     }
 
     let expr_types = aggregate_result_types(&analysis.typed, &program);
+    let call_locations = call_site_locations(&modules, &sources);
     // Persist the clean analysis for the next run. Every stat'able source in
     // the map is stamped (the embedded stdlib has no path and is covered by
     // the compiler tag in the header); a file that cannot be stamped anymore
@@ -1095,6 +1134,16 @@ fn analyze(main_label: &str, main_src: &str, root: &Path) -> Result<Checked, Vec
                     channels: prepoly_cache::Channels {
                         expr_types: expr_types.iter().map(|(s, t)| (*s, t.clone())).collect(),
                         view_args: analysis.view_args.iter().copied().collect(),
+                        sum_views: analysis
+                            .sum_views
+                            .iter()
+                            .map(|(s, n)| (*s, n.clone()))
+                            .collect(),
+                        call_locations: call_locations
+                            .iter()
+                            .map(|(s, l)| (*s, l.clone()))
+                            .collect(),
+                        lift_errs: analysis.lift_errs.iter().copied().collect(),
                         fields_loops: analysis
                             .fields_loops
                             .iter()
@@ -1121,6 +1170,9 @@ fn analyze(main_label: &str, main_src: &str, root: &Path) -> Result<Checked, Vec
         program,
         expr_types,
         view_args: analysis.view_args,
+        sum_views: analysis.sum_views,
+        call_locations,
+        lift_errs: analysis.lift_errs,
         fields_loops: analysis.fields_loops,
         type_names: analysis.type_names,
         typeof_types: analysis.typeof_types,
@@ -1313,6 +1365,174 @@ fn rewrite_calls_expr(
     }
 }
 
+/// Every call expression's span mapped to its source position (diagnostic
+/// label, 1-based line and column). MIR lowering reads this to fill a
+/// callee's implicit trailing `Location` parameter with the call site;
+/// computing it here keeps source access out of the type-free lowering, and
+/// the map reproduces from the cache (whose ASTs carry the same spans).
+fn call_site_locations(
+    modules: &[LoadedModule],
+    sources: &prepoly_resolve::SourceMap,
+) -> HashMap<Span, (String, u32, u32)> {
+    let mut spans: Vec<Span> = Vec::new();
+    for m in modules {
+        for item in &m.ast.items {
+            match item {
+                prepoly_parser::ast::TopLevel::Fun(f) => {
+                    collect_call_spans_block(&f.body, &mut spans)
+                }
+                prepoly_parser::ast::TopLevel::Stmt(st) => collect_call_spans_stmt(st, &mut spans),
+                prepoly_parser::ast::TopLevel::Type(_) => {}
+            }
+        }
+    }
+    // Labels are relativized against the working directory and the include
+    // roots' parents, so a baked expectation (an e2e `.out`) does not embed a
+    // machine-specific absolute path.
+    let mut prefixes: Vec<String> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir()
+        && let Ok(c) = cwd.canonicalize()
+    {
+        prefixes.push(format!("{}/", c.display()));
+    }
+    if let Ok(inc) = std::env::var("PREPOLY_INCLUDE") {
+        for root in inc.split(':').filter(|r| !r.is_empty()) {
+            if let Ok(c) = Path::new(root).canonicalize()
+                && let Some(parent) = c.parent()
+            {
+                prefixes.push(format!("{}/", parent.display()));
+            }
+        }
+    }
+    let relativize = |label: &str| -> String {
+        // Canonicalize the label's path first (a plugin label wraps one), so
+        // the caller's spelling (`../../x.pp`) does not leak into the
+        // recorded position.
+        let mut label = if let Some(inner) = label
+            .strip_prefix("<plugin:")
+            .and_then(|r| r.strip_suffix('>'))
+        {
+            match std::fs::canonicalize(inner) {
+                Ok(c) => format!("<plugin:{}>", c.display()),
+                Err(_) => label.to_string(),
+            }
+        } else {
+            match std::fs::canonicalize(label) {
+                Ok(c) => c.display().to_string(),
+                Err(_) => label.to_string(),
+            }
+        };
+        for p in &prefixes {
+            label = label.replace(p.as_str(), "");
+        }
+        label
+    };
+    let mut out = HashMap::new();
+    for span in spans {
+        if let Some(loc) = sources.locate(span.lo) {
+            let (line, col) = prepoly_parser::line_col(loc.src, loc.local);
+            out.insert(span, (relativize(loc.label), line as u32, col as u32));
+        }
+    }
+    out
+}
+
+fn collect_call_spans_block(b: &prepoly_parser::ast::Block, out: &mut Vec<Span>) {
+    for s in &b.stmts {
+        collect_call_spans_stmt(s, out);
+    }
+}
+
+fn collect_call_spans_stmt(s: &Stmt, out: &mut Vec<Span>) {
+    match s {
+        Stmt::Let { value: Some(v), .. } => collect_call_spans_expr(v, out),
+        Stmt::Assign { target, value, .. } => {
+            collect_call_spans_expr(target, out);
+            collect_call_spans_expr(value, out);
+        }
+        Stmt::Expr(e) | Stmt::Return(Some(e), _) => collect_call_spans_expr(e, out),
+        Stmt::While { cond, body, .. } => {
+            collect_call_spans_expr(cond, out);
+            collect_call_spans_block(body, out);
+        }
+        Stmt::For { iter, body, .. } => {
+            collect_call_spans_expr(iter, out);
+            collect_call_spans_block(body, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_call_spans_expr(e: &prepoly_parser::ast::Expr, out: &mut Vec<Span>) {
+    use prepoly_parser::ast::{Expr, StrSeg};
+    match e {
+        Expr::Call(callee, args, span) => {
+            out.push(*span);
+            collect_call_spans_expr(callee, out);
+            for a in args {
+                collect_call_spans_expr(&a.expr, out);
+            }
+        }
+        Expr::Field(b, _, _) | Expr::Unary(_, b, _) => collect_call_spans_expr(b, out),
+        // `!` sites need positions too: a lifted propagation stamps its own.
+        Expr::ErrorProp(b, span) => {
+            out.push(*span);
+            collect_call_spans_expr(b, out);
+        }
+        Expr::Binary(_, l, r, _) | Expr::Index(l, r, _) | Expr::Range(l, r, _) => {
+            collect_call_spans_expr(l, out);
+            collect_call_spans_expr(r, out);
+        }
+        Expr::Array(es, _) => es.iter().for_each(|e| collect_call_spans_expr(e, out)),
+        // Construction spans are collected too: a lifted forwarded return
+        // stamps the construction's own position into the wrapped Error.
+        Expr::TypeLit(_, fs, span) | Expr::VariantLit(_, _, fs, span) => {
+            out.push(*span);
+            fs.iter().for_each(|(_, e)| collect_call_spans_expr(e, out))
+        }
+        Expr::Str(segs, _) => segs.iter().for_each(|seg| {
+            if let StrSeg::Expr(e) = seg {
+                collect_call_spans_expr(e, out);
+            }
+        }),
+        Expr::If(c, t, els, _) => {
+            collect_call_spans_expr(c, out);
+            collect_call_spans_block(t, out);
+            if let Some(e) = els {
+                collect_call_spans_expr(e, out);
+            }
+        }
+        Expr::IfLet(_, scrut, t, els, _) => {
+            collect_call_spans_expr(scrut, out);
+            collect_call_spans_block(t, out);
+            if let Some(e) = els {
+                collect_call_spans_expr(e, out);
+            }
+        }
+        Expr::Match(scrut, arms, _) => {
+            collect_call_spans_expr(scrut, out);
+            for arm in arms {
+                collect_call_spans_expr(&arm.body, out);
+            }
+        }
+        Expr::Block(b, _) => collect_call_spans_block(b, out),
+        Expr::Closure(_, b, _) => collect_call_spans_expr(b, out),
+        _ => {}
+    }
+}
+
+/// Print a runtime failure. A message that is already a rendered error trace
+/// (the prelude's unhandled-`!` rendering, whose lines carry their own
+/// `[file:line:col] unhandled error:` framing) prints verbatim; anything else
+/// keeps the `error:` prefix.
+fn report_runtime_error(e: &str) {
+    if e.starts_with('[') && e.contains("unhandled error:") {
+        eprintln!("{e}");
+    } else {
+        eprintln!("error: {e}");
+    }
+}
+
 /// Render each `(message, span)` diagnostic as `path:line:col: error: message`,
 /// locating the span's file by its globally-unique offset (or a bare `error:`
 /// line when no source contains it).
@@ -1428,6 +1648,9 @@ fn run_capture(defs: &[String], body: &[String], root: &Path) -> Result<String, 
         &checked.program,
         &checked.expr_types,
         &checked.view_args,
+        &checked.sum_views,
+        &checked.call_locations,
+        &checked.lift_errs,
         &checked.fields_loops,
         &checked.type_names,
         &checked.typeof_types,

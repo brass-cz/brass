@@ -7,4 +7,12 @@ true
 2
 demo 3 localhost 5432
 localhost
-error: missing key 'nope'
+error: Error {
+    value: "missing key 'nope'",
+    location: Location {
+        file: "libraries/data/toml.pp",
+        line: 112,
+        col: 20,
+    },
+    frames: [],
+}

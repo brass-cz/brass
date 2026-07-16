@@ -205,7 +205,7 @@ mod tests {
     fn sum_type_layout() {
         // Short sums inline; long ones get one leading-pipe line per variant.
         let short = "type Color = Red | Green | Blue\n";
-        assert_eq!(roundtrip(short), "type Color = Red | Green | Blue\n");
+        assert_eq!(roundtrip(short), "type Color = | Red | Green | Blue\n");
         let single = "type Wrap =\n    | Only { value: int32 }\n";
         assert_eq!(roundtrip(single), "type Wrap = | Only { value: int32 }\n");
         let long = "type Shape = Circle { radius: float64 } | Rectangle { width: float64, height: float64 }\n";

@@ -200,6 +200,85 @@ pub(super) fn null_prop_returns(body: &MirBody) -> HashSet<usize> {
     returns
 }
 
+/// Whether every non-propagated, non-null-arm return in `body` returns a
+/// value built by an `Err` construction (directly or through `Use` copies):
+/// such a body produces no Ok value, so its fallible Ok payload is
+/// uninhabited and may default (see `infer_result_ret`). Conservative: any
+/// other return operand -- a bare value, or a call the fixpoint has not
+/// resolved yet -- keeps the payload open.
+pub(super) fn returns_only_err_constructions(
+    body: &MirBody,
+    propagated: &HashSet<(usize, LocalId)>,
+    null_props: &HashSet<usize>,
+) -> bool {
+    let err_only = err_construction_locals(body);
+    let mut any = false;
+    for (idx, block) in body.blocks.iter().enumerate() {
+        let Terminator::Return(op) = &block.term else {
+            continue;
+        };
+        if null_props.contains(&idx) {
+            continue;
+        }
+        match op {
+            Operand::Local(l) if propagated.contains(&(idx, *l)) => {}
+            Operand::Local(l) if err_only.contains(l) => {
+                any = true;
+            }
+            _ => return false,
+        }
+    }
+    any
+}
+
+/// Locals that only ever hold an `Err`-variant `Result` construction
+/// (directly or through `Use` copies of such locals). A return of one can
+/// only execute an error path, so it must not define the enclosing
+/// callable's Ok payload: the `!` lift arm returns such a rebuild, whose
+/// seeded Ok slot is the OPERAND's Ok, not this callable's. Copy chains
+/// resolve by iterating to a fixed point (the chains are shallow: a
+/// branch-merge result local at most).
+pub(super) fn err_construction_locals(body: &MirBody) -> HashSet<LocalId> {
+    let mut err_only: HashSet<LocalId> = HashSet::new();
+    let mut poisoned: HashSet<LocalId> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for block in &body.blocks {
+            for stmt in &block.stmts {
+                let MirStmt::Assign(local, rv) = stmt else {
+                    continue;
+                };
+                let is_err = match rv {
+                    Rvalue::Variant { ty, variant, .. } => ty == "Result" && variant == "Err",
+                    Rvalue::Use(Operand::Local(src)) => {
+                        if poisoned.contains(src) {
+                            false
+                        } else if err_only.contains(src) {
+                            true
+                        } else {
+                            continue; // source not classified yet
+                        }
+                    }
+                    _ => false,
+                };
+                if is_err {
+                    if !poisoned.contains(local) && err_only.insert(*local) {
+                        changed = true;
+                    }
+                } else if poisoned.insert(*local) {
+                    err_only.remove(local);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    err_only.retain(|l| !poisoned.contains(l));
+    err_only
+}
+
 /// Whether a fallible body actually raises an error: an `error(...)` (an `Err`
 /// construction) or an `expr!` propagation (a `result_is_ok` test). A body with
 /// neither never produces an `Err`, so its `Result` error payload is free.

@@ -1,3 +1,11 @@
 42
 hi
-err: cannot decode this value as `int64`
+err: Error {
+    value: "cannot decode this value as `int64`",
+    location: Location {
+        file: "<unknown>",
+        line: 0,
+        col: 0,
+    },
+    frames: [],
+}

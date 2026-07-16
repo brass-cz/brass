@@ -2,5 +2,13 @@ Result.Ok {
     value: 4,
 }
 Result.Err {
-    error: "null",
+    error: Error {
+        value: "null",
+        location: Location {
+            file: "e2e_tests/control_flow/null_condition_dead_arm.pp",
+            line: 10,
+            col: 16,
+        },
+        frames: [],
+    },
 }

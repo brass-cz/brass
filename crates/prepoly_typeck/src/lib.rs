@@ -58,6 +58,13 @@ pub struct Analysis {
     /// check for a view-eligible parameter (`prepoly_typesys::rows`); MIR
     /// lowering converts exactly these arguments into the parameter's view.
     pub view_args: std::collections::HashSet<Span>,
+    /// Value expressions accepted as a declared sum subtype at a flow site
+    /// (span -> the parent sum's table symbol); MIR lowering rebuilds exactly
+    /// these values as the parent.
+    pub sum_views: std::collections::HashMap<Span, prepoly_hir::Type>,
+    /// `expr!` sites whose propagated Err payload is re-raised wrapped into
+    /// the prelude `Error`; MIR's propagation arm rebuilds the value.
+    pub lift_errs: std::collections::HashSet<Span>,
     /// Field lists of checker-approved `for f in fields(x)` loops, keyed by the
     /// loop statement's span; MIR lowering unrolls the same expanded copies the
     /// checker typed (see `prepoly_hir::expand`).
@@ -134,6 +141,7 @@ pub fn analyze_with(program: &Program, seed: Option<&ContextTables>) -> Analysis
     errors.extend(definite::check(program));
     errors.extend(globals::check(program));
     errors.extend(check_reserved_names(program));
+    errors.extend(check_result_shadows(program));
     errors.extend(constck::check(program));
     // Hindley-Milner inference runs as the principled type-checking pass before
     // monomorphization: it infers principal types for the
@@ -162,6 +170,8 @@ pub fn analyze_with(program: &Program, seed: Option<&ContextTables>) -> Analysis
         fn_instances: infer.fn_instances,
         schemes: infer.schemes,
         view_args: infer.view_args,
+        sum_views: infer.sum_views,
+        lift_errs: infer.lift_errs,
         fields_loops: infer.fields_loops,
         type_names: infer.type_names,
         keyed_calls: infer.keyed_calls,
@@ -179,10 +189,108 @@ pub fn analyze_with(program: &Program, seed: Option<&ContextTables>) -> Analysis
 /// definition would silently capture the standard library's internal calls
 /// (e.g. `len(s)`) or, in the case of `error`, become dead code because
 /// `error(x)` is always desugared to `Result.Err { error: x }`.
+/// The Err payload as `!`-propagation re-raises it: a RESOLVED payload that
+/// is not already the prelude `Error` record is wrapped into one at the
+/// propagation site (`Error { value: <payload>, .. }`), gaining the site's
+/// location. An `Error` -- or a payload still open -- passes through.
+/// Mirrored by MIR's propagation arm, which rebuilds the value.
+pub(crate) fn lift_err_payload(
+    program: &Program,
+    resolved: prepoly_hir::Type,
+) -> prepoly_hir::Type {
+    use prepoly_hir::{NominalType, Type};
+    let Some(info) = program.types.get("Error") else {
+        return resolved;
+    };
+    if resolved.is_unknown() || matches!(&resolved, Type::Record(n) if n.id == info.id) {
+        return resolved;
+    }
+    // The FULL instance: every declared field's type plus the wrapped
+    // payload. A value-only substitution would make the other fields read as
+    // absent downstream.
+    let TypeKind::Record { fields, .. } = &info.kind else {
+        return resolved;
+    };
+    let mut n = NominalType::new(info.id, &info.name);
+    for f in fields {
+        if f.name == "value" {
+            continue;
+        }
+        if let Some(t) = &f.resolved_ty {
+            n.substitution.insert(f.name.clone(), t.clone());
+        }
+    }
+    n.substitution.insert("value", resolved);
+    Type::Record(n)
+}
+
+/// A user `type Result` shadows the prelude's for the fallibility sugar, so
+/// it must carry the sugar's shape; checked at the declaration (not at use)
+/// so the mistake is reported once, where it was made. An ALIAS named
+/// `Result` cannot carry the sugar's identity at all.
+fn check_result_shadows(program: &Program) -> Vec<TypeError> {
+    let mut errors = Vec::new();
+    for info in program.types.values() {
+        if info.name != prepoly_hir::RESULT_TYPE_NAME
+            || program.prelude_modules.contains(&info.module)
+            || info.module.is_empty()
+        {
+            continue;
+        }
+        if program
+            .scoped_result_instance(
+                &info.module,
+                &prepoly_hir::Type::Void,
+                &prepoly_hir::Type::Void,
+            )
+            .is_err()
+        {
+            errors.push(TypeError {
+                message: format!(
+                    "`{}` shadows the prelude's `Result` but is not `| Ok {{ value }} | Err {{ \
+                     error }}`, the shape the fallibility sugar (`T!`, `error(..)`, `!`) builds",
+                    info.name
+                ),
+                span: info.span,
+            });
+        }
+    }
+    for alias in program.type_aliases.values() {
+        if program.prelude_modules.contains(&alias.module) {
+            continue;
+        }
+        // The alias table is keyed by (possibly qualified) symbol; detect a
+        // shadow by what the module's bare `Result` resolves to.
+        let key = prepoly_hir::resolve_qualified(
+            &program.type_aliases,
+            &program.import_origins,
+            &program.import_renames,
+            &alias.module,
+            prepoly_hir::RESULT_TYPE_NAME,
+        );
+        if key.is_some_and(|a| a.span == alias.span) {
+            errors.push(TypeError {
+                message: "a `type Result = ..` alias cannot shadow the fallibility sugar's \
+                          `Result`; declare a sum type named `Result` (or name the aliased type \
+                          explicitly)"
+                    .to_string(),
+                span: alias.span,
+            });
+        }
+    }
+    errors
+}
+
 fn check_reserved_names(program: &Program) -> Vec<TypeError> {
     let mut errors = Vec::new();
     for name in prepoly_hir::RESERVED_FUNCTION_NAMES {
         if let Some(info) = program.functions.get(*name) {
+            // The prelude itself provides some of these (`error` is an
+            // ordinary std/prelude/error.pp function); only a user
+            // redefinition is rejected.
+            if program.prelude_modules.contains(&info.module) {
+                continue;
+            }
             errors.push(TypeError {
                 message: format!("`{name}` is a builtin and cannot be redefined"),
                 span: info.signature.span,
@@ -1933,12 +2041,12 @@ mod tests {
     }
 
     #[test]
-    fn field_access_on_primitive_is_rejected() {
-        let e = errs("fun main() {\n    let x: int32 = 5\n    let y = x.foo\n}\n");
-        assert!(
-            e.iter().any(|m| m.contains("`int32` has no field `foo`")),
-            "{e:?}"
-        );
+    fn absent_primitive_member_reads_null_but_cannot_be_used() {
+        // An unknown member on a scalar is the null member-presence value
+        // (`never?`), not a hard error -- that is what lets one generic body
+        // presence-dispatch over scalars. Consuming it as a value still fails.
+        let e = errs("fun main() {\n    let x: int32 = 5\n    let y: int32 = x.foo\n}\n");
+        assert!(e.iter().any(|m| m.contains("cannot use")), "{e:?}");
     }
 
     #[test]

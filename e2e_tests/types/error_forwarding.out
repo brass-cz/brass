@@ -1,0 +1,28 @@
+Result.Ok {
+    value: 1,
+}
+Result.Err {
+    error: Error {
+        value: "boom",
+        location: Location {
+            file: "e2e_tests/types/error_forwarding.pp",
+            line: 5,
+            col: 12,
+        },
+        frames: [],
+    },
+}
+Result.Ok {
+    value: 2,
+}
+Result.Err {
+    error: Error {
+        value: "bad",
+        location: Location {
+            file: "e2e_tests/types/error_forwarding.pp",
+            line: 9,
+            col: 12,
+        },
+        frames: [],
+    },
+}

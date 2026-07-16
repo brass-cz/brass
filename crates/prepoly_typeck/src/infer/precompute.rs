@@ -157,9 +157,14 @@ impl<'a> Checker<'a> {
             Some(declared) if prepoly_hir::is_fully_known(declared) => declared.clone(),
             Some(declared) => {
                 let declared = declared.clone();
-                let (err, any) = self.body_error_payload(&info.signature.params, &info.decl.body);
+                let (err, any, generic) =
+                    self.body_error_payload(&info.signature.params, &info.decl.body);
                 if any {
                     self.error_sites.insert(format!("fn:{}", info.symbol));
+                }
+                if generic {
+                    self.generic_error_returns
+                        .insert(format!("fn:{}", info.symbol));
                 }
                 self.complete_open_error(&declared, err)
             }
@@ -175,12 +180,20 @@ impl<'a> Checker<'a> {
     /// synthesized plugin wrapper does), and the Err it hands back is its own. An
     /// OPEN Err carries no information, so it is dropped rather than allowed to win
     /// the reconciliation against a concrete one.
-    fn body_error_payload(&mut self, params: &[ParamInfo], body: &Block) -> (Option<Type>, bool) {
+    fn body_error_payload(
+        &mut self,
+        params: &[ParamInfo],
+        body: &Block,
+    ) -> (Option<Type>, bool, bool) {
         let mut env = self.signature_param_env(params);
+        // The variables standing for the parameters in THIS light run: an
+        // open Err that is one of them is the function's own generic error.
+        let param_vars: std::collections::BTreeSet<u32> =
+            env.values().flat_map(prepoly_hir::type_vars).collect();
         let mut normal = Vec::new();
         let mut props = LightProps::default();
         self.infer_returns_block(body, &mut env, &mut normal, &mut props);
-        self.error_payload_of(&normal, &props)
+        self.error_payload_of(&normal, &props, &param_vars)
     }
 
     /// The Err payload of a body whose light pass produced `normal` and `props`,
@@ -195,21 +208,49 @@ impl<'a> Checker<'a> {
         &mut self,
         normal: &[(Type, Span)],
         props: &LightProps,
-    ) -> (Option<Type>, bool) {
+        param_vars: &std::collections::BTreeSet<u32>,
+    ) -> (Option<Type>, bool, bool) {
         let mut sites = props.errors.clone();
         for (ty, span) in normal {
             let resolved = self.resolve(ty);
-            if let Some((_, err)) = resolved.result_payloads() {
-                sites.push((err.clone(), *span));
+            // The Err slot alone decides: an Err-only construction
+            // (`return Result.Err { error: e }`) has no `Ok.value` entry, so
+            // `result_payloads` (which demands both) would miss the site. A
+            // declared Result subtype counts like the Result itself.
+            if let Type::Sum(n) = &resolved
+                && self.is_result_like(n)
+                && let Some(err) = n.substitution.get(prepoly_hir::types::RESULT_ERR_ERROR)
+            {
+                // Forwarded errors are re-raised lifted into the prelude
+                // `Error` (see `link_forwarded_error`).
+                let lifted = crate::lift_err_payload(self.program, self.resolve(err));
+                sites.push((lifted, *span));
             }
         }
         let any = !sites.is_empty();
+        // An open err that is one of the SIGNATURE's own variables is a
+        // generic error type (`fun wrap(e) -> infer! { return Result.Err {
+        // error: e } }`): keeping the variable in the entry ties the err to
+        // the parameter, so each call site's instantiation names it. Any
+        // other open err carries no information (a body-local variable must
+        // not leak into a table shared across call sites) and is dropped.
+        let mut generic: Option<Type> = None;
         let known: Vec<(Type, Span)> = sites
             .into_iter()
             .map(|(ty, span)| (self.resolve(&ty), span))
-            .filter(|(ty, _)| !ty.is_unknown())
+            .filter(|(ty, _)| {
+                if let Type::Unknown(v) = ty {
+                    if generic.is_none() && param_vars.contains(v) {
+                        generic = Some(ty.clone());
+                    }
+                    return false;
+                }
+                true
+            })
             .collect();
-        (self.reconcile_error_payloads(&known, false), any)
+        let reconciled = self.reconcile_error_payloads(&known, false);
+        let generic_used = reconciled.is_none() && generic.is_some();
+        (reconciled.or(generic), any, generic_used)
     }
 
     /// Fill the open Err payload of a `T!` return with `err`.
@@ -279,6 +320,9 @@ impl<'a> Checker<'a> {
             };
             if f.signature.ret_ty.is_some()
                 && self.error_sites.contains(&format!("fn:{}", f.symbol))
+                && !self
+                    .generic_error_returns
+                    .contains(&format!("fn:{}", f.symbol))
                 && let Some(span) = self.open_error_span(ret, f.decl.ret.as_ref())
             {
                 open.push(span);
@@ -292,7 +336,11 @@ impl<'a> Checker<'a> {
                 if prepoly_hir::keyed_return(m.decl.ret.as_ref()) || m.signature.ret_ty.is_none() {
                     return;
                 }
-                if !self.error_sites.contains(&format!("m:{qualifier}.{name}")) {
+                if !self.error_sites.contains(&format!("m:{qualifier}.{name}"))
+                    || self
+                        .generic_error_returns
+                        .contains(&format!("m:{qualifier}.{name}"))
+                {
                     return;
                 }
                 let key = (qualifier.to_string(), name.clone());
@@ -328,10 +376,39 @@ or drop the `!`"
         }
     }
 
+    /// Whether a sum carries the fallibility sugar's shape: the (possibly
+    /// shadowing) `Result` itself, or a declared subtype of the `Result` the
+    /// current module resolves (or the prelude's).
+    fn is_result_like(&self, n: &prepoly_hir::NominalType) -> bool {
+        if n.is_result_type() {
+            return true;
+        }
+        let scoped = self
+            .program
+            .resolve_type(&self.current_module, prepoly_hir::RESULT_TYPE_NAME)
+            .map(|info| info.id)
+            .unwrap_or(prepoly_hir::RESULT_TYPE_ID);
+        crate::structural::declares_sum_parent(self.program, n.id, scoped, 0)
+            || crate::structural::declares_sum_parent(
+                self.program,
+                n.id,
+                prepoly_hir::RESULT_TYPE_ID,
+                0,
+            )
+    }
+
     /// The span to report a still-open Err payload at, if `ret` has one.
+    ///
+    /// Resolved through the solver: the full body checks ran before this
+    /// report, and a body whose only error source is a FORWARDED callee
+    /// Result (`return helper()`) binds its Err variable there rather than in
+    /// the light-pass reconciliation the table entry was built from. An err
+    /// that is one of the signature's own variables is a GENERIC error type,
+    /// named per call site, not an inference failure. Only a variable nothing
+    /// binds and nothing ties is genuinely open.
     fn open_error_span(&self, ret: &Type, decl_ret: Option<&TypeExpr>) -> Option<Span> {
         let (_, err) = ret.result_payloads()?;
-        if !matches!(err, Type::Unknown(_)) {
+        if !self.resolve(err).is_unknown() {
             return None;
         }
         Some(decl_ret?.span())
@@ -348,7 +425,8 @@ or drop the `!`"
         if !declared_err.is_unknown() {
             return declared.clone();
         }
-        Type::result(ok.clone(), err)
+        // Keep the declared Result's nominal (a scope's shadow included).
+        resolved.rebuild_result(ok.clone(), err)
     }
 
     pub(super) fn precompute_method_returns(&mut self) {
@@ -447,15 +525,21 @@ or drop the `!`"
         if signature_params.first().is_some_and(|p| p.name == "self") {
             env.insert("self".to_string(), self.type_by_name(self_type));
         }
+        let param_vars: std::collections::BTreeSet<u32> =
+            env.values().flat_map(prepoly_hir::type_vars).collect();
         let mut normal = Vec::new();
         let mut props = LightProps::default();
         self.infer_returns_block(body, &mut env, &mut normal, &mut props);
         self.self_type = saved;
         self.self_variant = saved_variant;
         if complete_error {
-            let (err_ty, any) = self.error_payload_of(&normal, &props);
+            let (err_ty, any, generic) = self.error_payload_of(&normal, &props, &param_vars);
             if any {
                 self.error_sites.insert(format!("m:{qualifier}.{method}"));
+            }
+            if generic {
+                self.generic_error_returns
+                    .insert(format!("m:{qualifier}.{method}"));
             }
             let declared = declared.unwrap_or(Type::Void);
             // The annotation still governs the shape, so this is not a
@@ -661,13 +745,18 @@ or drop the `!`"
                     } else {
                         fwd_err.clone()
                     };
-                    Type::result(fwd_ok.clone(), merged)
+                    // Keep the forwarded Result's nominal (a shadow included).
+                    resolved.rebuild_result(fwd_ok.clone(), merged)
                 } else {
-                    Type::result(ok, err)
+                    let span = prepoly_parser::Span::new(0, 0);
+                    self.scoped_result(ok, err, span)
                 }
             }
             (Some(ty), None) => ty,
-            (None, Some(err)) => Type::result(self.fresh_error_only_ok(), err),
+            (None, Some(err)) => {
+                let ok = self.fresh_error_only_ok();
+                self.scoped_result(ok, err, prepoly_parser::Span::new(0, 0))
+            }
             (None, None) => Type::Void,
         }
     }

@@ -1,4 +1,12 @@
 100
 102
 1
-err: duplicate key 'a'
+err: Error {
+    value: "duplicate key 'a'",
+    location: Location {
+        file: "e2e_tests/types/refinement_alias_in_signature.pp",
+        line: 28,
+        col: 16,
+    },
+    frames: [],
+}

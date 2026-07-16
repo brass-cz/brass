@@ -37,8 +37,6 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
     // are collected (an alias may refine a type declared anywhere).
     let mut alias_decls: Vec<(String, Vec<String>, TypeDecl)> = Vec::new();
 
-    types.insert("Result".to_string(), result_type());
-
     // How many modules define each top-level function/type name. A name defined
     // in a single module keeps its bare symbol (so all existing bare-name lookups
     // and codegen symbols are unchanged); a name defined in several modules is
@@ -89,17 +87,35 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
         for item in &m.ast.items {
             match item {
                 TopLevel::Type(td) => {
-                    let symbol = qualified_symbol(&td.name, &m.path, &type_name_modules);
-                    // `Result` is built in (fallible returns construct it); a
-                    // user definition would silently vanish behind the builtin,
-                    // so redefining it is an error rather than a skip.
-                    if td.name == "Result" {
-                        errors.push(LowerError {
-                            message: "`Result` is built in and cannot be redefined".to_string(),
-                            span: td.span,
-                        });
+                    // `Result` is the type behind the fallibility sugar (`T!`,
+                    // `error(..)`, Ok-wrapping, `!`). The prelude's declaration
+                    // (std/prelude/error.pp) is pinned to RESULT_TYPE_ID under
+                    // the bare `Result` symbol so every construct that builds a
+                    // Result by default finds the same nominal. A user's `type
+                    // Result` is an ordinary declaration that shadows it in the
+                    // declaring module's scope; it always takes the qualified
+                    // symbol so it never competes for the prelude's bare key
+                    // (the sugar's fallback), even in a program without the
+                    // prelude.
+                    if td.name == "Result" && m.is_prelude {
+                        if types.contains_key(&td.name) {
+                            errors.push(LowerError {
+                                message: "duplicate type `Result`".to_string(),
+                                span: td.span,
+                            });
+                            continue;
+                        }
+                        let info =
+                            type_info(td, RESULT_TYPE_ID, &m.path, td.name.clone(), &mut errors);
+                        validate_prelude_result(&info, td.span, &mut errors);
+                        types.insert(td.name.clone(), info);
                         continue;
                     }
+                    let symbol = if td.name == "Result" {
+                        crate::hir::qualify(&td.name, &m.path)
+                    } else {
+                        qualified_symbol(&td.name, &m.path, &type_name_modules)
+                    };
                     // Same symbol => same name twice in one module (a genuine
                     // duplicate). A different module yields a different symbol,
                     // so cross-module same-named types coexist.
@@ -157,6 +173,13 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
             stmts,
         });
     }
+
+    // Programs assembled without the prelude (unit tests, embedders) still
+    // need Result -- every fallibility construct references it. Fall back to
+    // the built-in declaration when no prelude module provided one.
+    types
+        .entry("Result".to_string())
+        .or_insert_with(result_type);
 
     let mut primitive_methods: HashMap<(String, String), String> = HashMap::new();
     inject_method_impls(
@@ -534,7 +557,37 @@ fn split_members(
     (fields, methods, slots)
 }
 
-/// Built-in `Result = Ok { value } | Err { error }`.
+/// The prelude's `Result` declaration is load-bearing: every fallibility
+/// construct assumes exactly `| Ok { value } | Err { error }` (tags 0/1,
+/// generic unannotated payload fields, no slots). Reject any drift in
+/// std/prelude/error.pp loudly instead of letting the sugar misbehave.
+fn validate_prelude_result(info: &TypeInfo, span: Span, errors: &mut Vec<LowerError>) {
+    let shape_ok = match &info.kind {
+        TypeKind::Sum { variants } => {
+            variants.len() == 2
+                && variants[0].name == "Ok"
+                && variants[0].fields.len() == 1
+                && variants[0].fields[0].name == "value"
+                && variants[0].fields[0].ty.is_none()
+                && variants[1].name == "Err"
+                && variants[1].fields.len() == 1
+                && variants[1].fields[0].name == "error"
+                && variants[1].fields[0].ty.is_none()
+                && info.slots.is_empty()
+        }
+        TypeKind::Record { .. } => false,
+    };
+    if !shape_ok {
+        errors.push(LowerError {
+            message: "the prelude `Result` must be declared as `| Ok { value } | Err { error }`"
+                .to_string(),
+            span,
+        });
+    }
+}
+
+/// Built-in `Result = Ok { value } | Err { error }`, used when no prelude
+/// module declares it (std/prelude/error.pp is the normal source).
 fn result_type() -> TypeInfo {
     TypeInfo {
         name: "Result".into(),

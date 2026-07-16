@@ -198,10 +198,40 @@ impl<'a> Checker<'a> {
         ty
     }
 
-    fn check_error_propagation_return_context(&mut self, span: prepoly_parser::Span) {
+    fn check_error_propagation_return_context(
+        &mut self,
+        operand: &Type,
+        span: prepoly_parser::Span,
+    ) {
         match self.return_contexts.last() {
             Some(ReturnContext::Inferred) => {}
-            Some(ReturnContext::Explicit(ret)) if is_result_return_type(&self.resolve(ret)) => {}
+            Some(ReturnContext::Explicit(ret)) if is_result_return_type(&self.resolve(ret)) => {
+                // The failure arm returns the operand's Result unchanged, so
+                // the operand's declaration must be the one the callable
+                // returns: a scope's shadowing `Result` and the prelude's are
+                // distinct nominals even though both satisfy the sugar shape.
+                let resolved_ret = self.resolve(ret);
+                let ret_result = match &resolved_ret {
+                    Type::Nullable(inner) => inner.as_ref(),
+                    other => other,
+                };
+                if let (Type::Sum(have), Type::Sum(want)) = (operand, ret_result)
+                    && have.is_result_type()
+                    && want.is_result_type()
+                    && have.id != want.id
+                {
+                    self.errors.push(TypeError {
+                        message: format!(
+                            "`!` propagates its operand's `Result` declaration unchanged, \
+                             but the operand and the return type resolve to different \
+                             `Result` declarations (`{}` vs `{}`)",
+                            operand.display(),
+                            resolved_ret.display()
+                        ),
+                        span,
+                    });
+                }
+            }
             // The entry `main`'s OWN body (context depth 1: not a closure or a
             // re-checked callee inside it) may propagate regardless of its
             // annotation: a failed `!` there aborts the program with the error
@@ -284,7 +314,12 @@ impl<'a> Checker<'a> {
             let err = self
                 .reconcile_error_payloads(&props.errors, true)
                 .unwrap_or_else(|| self.fresh_unknown());
-            Type::result(ok, err)
+            let span = props
+                .errors
+                .first()
+                .map(|(_, s)| *s)
+                .unwrap_or(prepoly_parser::Span::new(0, 0));
+            self.scoped_result(ok, err, span)
         };
         super::precompute::wrap_null_propagated_return(base, &props.nulls)
     }
@@ -433,18 +468,62 @@ impl<'a> Checker<'a> {
                     return (**inner_ty).clone();
                 }
                 match resolved.result_payloads() {
-                    Some((ok, _)) => {
-                        self.check_error_propagation_return_context(*span);
+                    Some((ok, err)) => {
+                        let ok = ok.clone();
+                        let err = self.resolve(err);
+                        self.check_error_propagation_return_context(&resolved, *span);
                         self.record_prop_kind(*span, PropKind::Err);
-                        ok.clone()
+                        // A propagated payload that is not the prelude Error
+                        // is re-raised wrapped into one (gaining this site's
+                        // location); MIR's propagation arm does the rebuild.
+                        if !err.is_unknown()
+                            && crate::lift_err_payload(self.program, err.clone()) != err
+                        {
+                            self.lift_errs.insert(*span);
+                        }
+                        ok
                     }
                     None if resolved.is_result_type() => {
-                        self.check_error_propagation_return_context(*span);
+                        self.check_error_propagation_return_context(&resolved, *span);
                         self.record_prop_kind(*span, PropKind::Err);
                         self.fresh_unknown()
                     }
                     None if resolved.is_unknown() => self.fresh_unknown(),
                     None => {
+                        // A declared subtype of the scope's Result unwraps
+                        // like a Result: the operand is coerced to the parent
+                        // at its own span (the same rebuild a return-position
+                        // flow gets) and `!` proceeds on the parent.
+                        let scoped = {
+                            let ok = self.fresh_unknown();
+                            let err = self.fresh_unknown();
+                            self.scoped_result(ok, err, *span)
+                        };
+                        if let (Type::Sum(h), Type::Sum(w)) = (&resolved, &scoped)
+                            && h.id != w.id
+                            && crate::structural::declares_sum_parent(self.program, h.id, w.id, 0)
+                        {
+                            self.record_sum_view(&resolved, &scoped, inner.span());
+                            let coerced = self.resolve(&scoped);
+                            let (ok, err) = coerced
+                                .result_payloads()
+                                .map(|(ok, err)| (ok.clone(), err.clone()))
+                                .unwrap_or_else(|| (self.fresh_unknown(), self.fresh_unknown()));
+                            // The rebuilt payload lifts exactly like a plain
+                            // Result's (see above); without this the subtype's
+                            // raw payload propagates and the arm returns the
+                            // rebuilt Result whole, pinning the enclosing
+                            // callable's Ok side to the SUBTYPE's Ok payload.
+                            let err = self.resolve(&err);
+                            if !err.is_unknown()
+                                && crate::lift_err_payload(self.program, err.clone()) != err
+                            {
+                                self.lift_errs.insert(*span);
+                            }
+                            self.check_error_propagation_return_context(&coerced, *span);
+                            self.record_prop_kind(*span, PropKind::Err);
+                            return ok;
+                        }
                         self.errors.push(TypeError {
                             message: format!(
                                 "error propagation requires `Result` or a nullable, found `{}`",

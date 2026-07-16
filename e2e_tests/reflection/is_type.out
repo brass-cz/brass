@@ -1,0 +1,9 @@
+string true
+int32
+int64
+uint8
+bool
+float64
+array
+other
+literal

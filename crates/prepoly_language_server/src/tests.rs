@@ -402,7 +402,7 @@ fn hover_shows_inferred_return_type() {
     let text = hover_text(&h);
     assert!(text.contains("fun f("), "got: {text}");
     assert!(
-        text.contains("Result<string, int32>"),
+        text.contains("Result<string, Error<value=int32>>"),
         "inferred fallible return must be shown: {text}"
     );
     assert!(
@@ -451,7 +451,7 @@ fn hover_shows_inferred_return_through_a_constructor_and_method_chain() {
     let h = hover::hover(&doc, &full, pos).expect("hover over the declaration");
     let text = hover_text(&h);
     assert!(
-        text.contains("Result<Response, string>"),
+        text.contains("Result<Response, Error<value=string>>"),
         "return through the constructor+method chain must be concrete: {text}"
     );
 }
@@ -1707,9 +1707,9 @@ fn hover_completes_the_error_payload_of_a_fallible_annotation() {
     // `R.make` FORWARDS `mk`'s Result rather than propagating it with `!`, so the
     // Err it hands back is the one it returns -- not an `error(..)` site of its own.
     for (needle, want) in [
-        ("mk(n: int32)", "Result<R, string>"),
-        ("make(n: int32)", "Result<R, string>"),
-        ("bump(self)", "Result<int32, int32>"),
+        ("mk(n: int32)", "Result<R, Error<value=string>>"),
+        ("make(n: int32)", "Result<R, Error<value=string>>"),
+        ("bump(self)", "Result<int32, Error<value=int32>>"),
     ] {
         let (doc, pos) = position(src, needle, true);
         let h = hover::hover(&doc, &full, pos).unwrap_or_else(|| panic!("hover over {needle}"));

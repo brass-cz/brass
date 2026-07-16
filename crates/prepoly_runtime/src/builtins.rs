@@ -12,9 +12,16 @@ unsafe fn cstr<'a>(p: *const u8, len: i64) -> &'a str {
 }
 
 /// Abort the process with a runtime error message. The typed back end has no
-/// recoverable panic path, so this prints to stderr and exits.
+/// recoverable panic path, so this prints to stderr and exits. A message that
+/// is already a rendered error trace (the prelude's unhandled-`!` rendering,
+/// whose lines carry their own `[file:line:col] unhandled error:` framing)
+/// prints verbatim; anything else keeps the `runtime error:` prefix.
 pub fn pp_panic_str(msg: &str) -> ! {
-    eprintln!("runtime error: {msg}");
+    if msg.starts_with('[') && msg.contains("unhandled error:") {
+        eprintln!("{msg}");
+    } else {
+        eprintln!("runtime error: {msg}");
+    }
     std::process::exit(1);
 }
 

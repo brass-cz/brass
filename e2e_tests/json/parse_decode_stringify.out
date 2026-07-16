@@ -3,4 +3,12 @@ hi
 42.0
 {"x":1.0,"y":[2.0,3.0]}
 Aki 30 Tokyo 100
-error: missing field 'age'
+error: Error {
+    value: "missing field 'age'",
+    location: Location {
+        file: "libraries/data/json.pp",
+        line: 78,
+        col: 20,
+    },
+    frames: [],
+}

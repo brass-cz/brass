@@ -63,7 +63,8 @@ use rules::{
 use scan::{
     binding_name_of, body_has_error_source, collect_array_pushes, collect_closure_passes,
     collect_indirect_args, collect_record_field_closures, method_ret_annotation, null_prop_returns,
-    propagated_result_returns, result_concrete_ok, seed_returned_aggregate,
+    propagated_result_returns, result_concrete_ok, returns_only_err_constructions,
+    seed_returned_aggregate,
 };
 use symbols::is_return_polymorphic_result;
 
@@ -293,6 +294,11 @@ impl MonoFunction<'_> {
 /// resolving call targets.
 pub struct MonoProgram<'m> {
     pub functions: Vec<MonoFunction<'m>>,
+    /// The HIR program the instances were monomorphized against. The shared
+    /// codegen consults it for declaration-level facts a concrete type alone
+    /// cannot answer (e.g. whether an uncalled member is a declared method,
+    /// so its load folds to the compile-time presence constant).
+    pub hir: &'m Program,
     /// Module-level globals and their concrete types (declared by the back end,
     /// written by init instances, read via `Rvalue::Global`).
     pub globals: Vec<(String, Type)>,
@@ -321,7 +327,10 @@ impl<'m> MonoProgram<'m> {
 /// Monomorphize a MIR program against its HIR program. Returns one concrete
 /// instance per reachable (callable, type-tuple), or an error describing the
 /// first construct outside the typed subset.
-pub fn monomorphize<'m>(mir: &'m MirProgram, program: &Program) -> Result<MonoProgram<'m>, String> {
+pub fn monomorphize<'m>(
+    mir: &'m MirProgram,
+    program: &'m Program,
+) -> Result<MonoProgram<'m>, String> {
     let mut mono = Monomorphizer::new(mir, program);
 
     // Monomorphization is best-effort across roots: a root outside the typed
@@ -383,9 +392,9 @@ pub fn monomorphize<'m>(mir: &'m MirProgram, program: &Program) -> Result<MonoPr
         }
     }
 
-    let mut program = mono.into_program(init_symbols);
-    program.main_skip = main_skip;
-    Ok(program)
+    let mut mono_program = mono.into_program(init_symbols, program);
+    mono_program.main_skip = main_skip;
+    Ok(mono_program)
 }
 
 /// Monomorphize a single callable on demand for a concrete argument-type tuple,
@@ -397,7 +406,7 @@ pub fn monomorphize<'m>(mir: &'m MirProgram, program: &Program) -> Result<MonoPr
 /// boundary: an unfit type is rejected before specialization, never miscompiled.
 pub fn monomorphize_instance<'m>(
     mir: &'m MirProgram,
-    program: &Program,
+    program: &'m Program,
     base: &str,
     type_args: Vec<Type>,
 ) -> Result<MonoProgram<'m>, String> {
@@ -405,7 +414,7 @@ pub fn monomorphize_instance<'m>(
     mono.instantiate_fn(base, type_args)?;
     mono.in_progress.clear();
     mono.assumed_rets.clear();
-    Ok(mono.into_program(Vec::new()))
+    Ok(mono.into_program(Vec::new(), program))
 }
 
 struct Monomorphizer<'m, 'p> {
@@ -484,7 +493,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
 
     /// Collect the instances created so far into a [`MonoProgram`] with a symbol
     /// index and the discovered globals.
-    fn into_program(self, init_symbols: Vec<String>) -> MonoProgram<'m> {
+    fn into_program(self, init_symbols: Vec<String>, hir: &'m Program) -> MonoProgram<'m> {
         let mut globals: Vec<(String, Type)> = self
             .global_types
             .iter()
@@ -502,6 +511,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             .collect();
         MonoProgram {
             functions,
+            hir,
             globals,
             init_symbols,
             main_skip: None,
@@ -621,11 +631,13 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         // The provisional return type mutual recursion may type against: the
         // authoritative annotation when there is one. A fallible callable's
         // annotation (`T!`) leaves the error payload open, so it is guessed as
-        // `string` (the payload `error(...)` produces); the guess is validated
-        // against the final inferred type when this frame completes.
+        // the payload `error(...)`/a lifted `!` produces (the prelude `Error`
+        // wrapping a string); the guess is validated against the final
+        // inferred type when this frame completes.
         let provisional = ret_ann.clone().or_else(|| {
             if fallible {
-                declared_ok.clone().map(|ok| result_type(ok, Type::Str))
+                let err = self.guessed_error_payload();
+                declared_ok.clone().map(|ok| result_type(ok, err))
             } else {
                 None
             }
@@ -704,6 +716,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                         &array_pushes,
                         &mut local_types,
                         &ret,
+                        fallible,
                         &mut changed,
                     ) && block_errors[i].is_none()
                     {
@@ -732,8 +745,11 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 }
             }
             if fallible
-                && ret.is_none()
                 && let Some(t) = self.infer_result_ret(body, &local_types, declared_ok.as_ref())?
+                && (ret.is_none()
+                    || ret
+                        .as_ref()
+                        .is_some_and(|cur| self.result_err_upgrade(cur, &t)))
             {
                 ret = Some(t);
                 changed = true;
@@ -904,12 +920,63 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 *slot = Some(t);
             }
         };
+        // The Err slot prefers the LIFTED payload (the prelude `Error`): a
+        // body whose propagation/return rebuilds its Err arm contains both
+        // the pre-lift construction and the lifted one, and the lifted one is
+        // what the body hands back.
+        let error_id = self.program.types.get("Error").map(|i| i.id);
+        let note_err = |slot: &mut Option<Type>, t: Option<Type>| {
+            let Some(t) = t else {
+                return;
+            };
+            let is_error = |t: &Type| matches!(t, Type::Record(n) if Some(n.id) == error_id);
+            match slot {
+                None => *slot = Some(t),
+                Some(existing) if !is_error(existing) && is_error(&t) => *slot = Some(t),
+                _ => {}
+            }
+        };
         let propagated_returns = propagated_result_returns(body);
         let null_prop_blocks = null_prop_returns(body);
+        let err_constructions = scan::err_construction_locals(body);
+        // A construction defines this callable's payloads only when its value
+        // can actually be RETURNED as the callable's result: seeds are the
+        // return operands outside the propagate/null arms (whose payloads the
+        // return scan below notes), expanded backward through `Use` copies.
+        // Without the gate, the `!`-on-declared-subtype REBUILD -- an Ok/Err
+        // reconstruction of the OPERAND, consumed by the propagation test --
+        // would note the operand's Ok payload as this callable's.
+        let mut returned: HashSet<LocalId> = HashSet::new();
+        for (idx, block) in body.blocks.iter().enumerate() {
+            if null_prop_blocks.contains(&idx) {
+                continue;
+            }
+            if let Terminator::Return(Operand::Local(l)) = &block.term
+                && !propagated_returns.contains(&(idx, *l))
+            {
+                returned.insert(*l);
+            }
+        }
+        loop {
+            let mut grew = false;
+            for block in &body.blocks {
+                for stmt in &block.stmts {
+                    if let MirStmt::Assign(dest, Rvalue::Use(Operand::Local(src))) = stmt
+                        && returned.contains(dest)
+                        && returned.insert(*src)
+                    {
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
         for (block_idx, block) in body.blocks.iter().enumerate() {
             for stmt in &block.stmts {
                 if let MirStmt::Assign(
-                    _,
+                    dest,
                     Rvalue::Variant {
                         ty,
                         variant,
@@ -917,12 +984,13 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                     },
                 ) = stmt
                     && ty == "Result"
+                    && returned.contains(dest)
                 {
                     for (fname, op) in fields {
                         let t = self.operand_type(op, local_types)?;
                         match (variant.as_str(), fname.as_str()) {
                             ("Ok", "value") => note(&mut ok_t, t),
-                            ("Err", "error") => note(&mut err_e, t),
+                            ("Err", "error") => note_err(&mut err_e, t),
                             _ => {}
                         }
                     }
@@ -953,14 +1021,20 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                             ) =>
                     {
                         if let Some((_, err)) = n.result_payloads() {
-                            note(&mut err_e, Some(err.clone()));
+                            note_err(&mut err_e, Some(err.clone()));
                         }
                     }
-                    // A directly-returned Result carries both payloads.
+                    // A directly-returned Result carries both payloads -- unless
+                    // the returned local is an `Err { .. }` construction (the `!`
+                    // lift arm's rebuild): that return only executes an error
+                    // path, and its Ok slot (seeded from the propagated operand)
+                    // must not define this callable's Ok payload.
                     Some(Type::Sum(n)) if n.id == RESULT_TYPE_ID => {
                         if let Some((ok, err)) = n.result_payloads() {
-                            note(&mut ok_t, Some(ok.clone()));
-                            note(&mut err_e, Some(err.clone()));
+                            if !matches!(op, Operand::Local(l) if err_constructions.contains(l)) {
+                                note(&mut ok_t, Some(ok.clone()));
+                            }
+                            note_err(&mut err_e, Some(err.clone()));
                         }
                     }
                     // A bare value is the implicit Ok payload.
@@ -988,6 +1062,16 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             (Some(ok), None) if !body_has_error_source(body) => {
                 Ok(Some(wrap(result_type(ok, Type::Str))))
             }
+            // The mirror: a body whose every non-propagated return is an `Err`
+            // construction produces no Ok value at all, so its Ok payload is
+            // uninhabited for this instance and defaults to void. Guarded
+            // conservatively -- any other return operand (a call the fixpoint
+            // has not resolved yet) keeps the payload open.
+            (None, Some(err))
+                if returns_only_err_constructions(body, &propagated_returns, &null_prop_blocks) =>
+            {
+                Ok(Some(wrap(result_type(Type::Void, err))))
+            }
             _ => Ok(None),
         }
     }
@@ -1005,6 +1089,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         array_pushes: &HashMap<LocalId, Operand>,
         local_types: &mut [Option<Type>],
         cur_ret: &Option<Type>,
+        fallible: bool,
         changed: &mut bool,
     ) -> Result<(), String> {
         match stmt {
@@ -1012,6 +1097,22 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             // `push` (it is filled before use).
             MirStmt::Assign(local, Rvalue::Array(es)) if es.is_empty() => {
                 if local_types[local.index()].is_none() {
+                    // A literal copied straight into an annotated binding
+                    // (`let frames: Frame[] = []` lowers through a temp) takes
+                    // the binding's seeded type.
+                    for block in &body.blocks {
+                        for stmt in &block.stmts {
+                            if let MirStmt::Assign(dst, Rvalue::Use(Operand::Local(src))) = stmt
+                                && src == local
+                                && let Some(t @ (Type::Slice(_) | Type::Array(..))) =
+                                    &local_types[dst.index()]
+                            {
+                                local_types[local.index()] = Some(t.clone());
+                                *changed = true;
+                                return Ok(());
+                            }
+                        }
+                    }
                     let Some(elem_op) = array_pushes.get(local) else {
                         let binding = match binding_name_of(body, *local) {
                             Some(n) => format!(" bound to `{n}`"),
@@ -1065,10 +1166,24 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 // expected type for the rvalue -- in particular a static call's
                 // return-polymorphic result.
                 let expected = local_types[local.index()].clone();
-                let t =
-                    self.rvalue_type(rv, cur_sym, module, local_types, cur_ret, expected.as_ref())?;
+                let t = self.rvalue_type(
+                    rv,
+                    cur_sym,
+                    module,
+                    local_types,
+                    cur_ret,
+                    fallible,
+                    expected.as_ref(),
+                )?;
                 match (expected, t) {
                     (None, Some(t)) => {
+                        local_types[local.index()] = Some(t);
+                        *changed = true;
+                    }
+                    // A Result local retypes when its Err payload upgrades to
+                    // the lifted (prelude `Error`) shape: the pre-lift typing
+                    // was provisional (see `infer_result_ret`).
+                    (Some(cur), Some(t)) if self.result_err_upgrade(&cur, &t) => {
                         local_types[local.index()] = Some(t);
                         *changed = true;
                     }
@@ -1100,7 +1215,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             }
             // A call run for its side effect (the result is discarded).
             MirStmt::Eval(rv @ Rvalue::Call(..)) => {
-                self.rvalue_type(rv, cur_sym, module, local_types, cur_ret, None)?;
+                self.rvalue_type(rv, cur_sym, module, local_types, cur_ret, fallible, None)?;
                 Ok(())
             }
             MirStmt::Eval(_) => {
@@ -1133,6 +1248,59 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
 
     /// The concrete type an rvalue produces (or `None` if not yet resolvable this
     /// pass). Errors on any rvalue outside the typed subset.
+    /// Whether `new` is `old` with the Err payload upgraded to the lifted
+    /// (prelude `Error`) shape. The pre-lift typing a fixpoint round derived
+    /// from the raw construction is provisional; the lifted one is what the
+    /// body actually hands back once the rebuild arm types.
+    fn result_err_upgrade(&self, old: &Type, new: &Type) -> bool {
+        let error_id = match self.program.types.get("Error") {
+            Some(i) => i.id,
+            None => return false,
+        };
+        let err_of = |t: &Type| match t {
+            Type::Sum(n) if n.is_result_type() => n
+                .substitution
+                .get(prepoly_hir::types::RESULT_ERR_ERROR)
+                .cloned(),
+            _ => None,
+        };
+        match (err_of(old), err_of(new)) {
+            (Some(o), Some(n)) => {
+                !matches!(&o, Type::Record(r) if r.id == error_id)
+                    && matches!(&n, Type::Record(r) if r.id == error_id)
+            }
+            _ => false,
+        }
+    }
+
+    /// The error payload a fallible body is assumed to produce before its
+    /// own inference completes: the prelude `Error` record wrapping a string,
+    /// instantiated the way record construction types it (deep field
+    /// substitution), so a mutual-recursion guess equals the final instance.
+    /// Bare `string` in a program without the prelude.
+    fn guessed_error_payload(&self) -> Type {
+        let Some(info) = self.program.types.get("Error") else {
+            return Type::Str;
+        };
+        let TypeKind::Record { fields, .. } = &info.kind else {
+            return Type::Str;
+        };
+        let mut subst = prepoly_hir::Substitution::empty();
+        for f in fields {
+            if f.name == "value" {
+                subst.insert("value", Type::Str);
+            } else if let Some(t) = &f.resolved_ty {
+                subst.insert(f.name.clone(), resolve_nominal(self.program, t));
+            }
+        }
+        Type::Record(prepoly_hir::NominalType::with_substitution(
+            info.id,
+            info.name.clone(),
+            subst,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)] // the fixpoint's full typing context
     fn rvalue_type(
         &mut self,
         rv: &Rvalue,
@@ -1140,6 +1308,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         module: &[String],
         local_types: &[Option<Type>],
         cur_ret: &Option<Type>,
+        fallible: bool,
         expected: Option<&Type>,
     ) -> Result<Option<Type>, String> {
         match rv {
@@ -1377,19 +1546,22 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                         .as_ref()
                         .map(unwrap_nullable)
                     {
-                        Some(Type::Record(n)) => self.record_field_type(n, field),
-                        Some(Type::Sum(n)) => self.sum_field_type(n, field),
-                        // A `string`/array receiver has no fields, so the access is
-                        // the compile-time member presence value the checker typed:
-                        // the method's own name, or null when the class has no such
-                        // member (see `Program::primitive_member_presence`).
-                        Some(other) => match self.program.primitive_member_presence(other, field) {
+                        // A member that can only be a method is the compile-time
+                        // presence value the checker typed: the method's own name,
+                        // or null when a primitive class has no such member (see
+                        // `Program::member_presence`). Everything else is an
+                        // ordinary record/sum field read.
+                        Some(ty) => match self.program.member_presence(ty, field) {
                             Some(true) => Ok(Some(Type::Str)),
                             Some(false) => Ok(Some(Type::null())),
-                            None => Err(format!(
-                                "field access `.{field}` on non-aggregate `{}`",
-                                other.display()
-                            )),
+                            None => match ty {
+                                Type::Record(n) => self.record_field_type(n, field),
+                                Type::Sum(n) => self.sum_field_type(n, field),
+                                other => Err(format!(
+                                    "field access `.{field}` on non-aggregate `{}`",
+                                    other.display()
+                                )),
+                            },
                         },
                         None => Ok(None),
                     }
@@ -1452,8 +1624,9 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                     _ => Ok(Some(src)),
                 }
             }
-            // A `Result` construction takes the enclosing fallible callable's
-            // inferred `Result` type; other (annotated) sums resolve directly.
+            // A `Result` construction takes its destination's or the enclosing
+            // fallible callable's inferred `Result` type; other (annotated)
+            // sums resolve directly.
             Rvalue::Variant {
                 ty,
                 variant,
@@ -1462,10 +1635,40 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 if ty == "Result" {
                     // The enclosing return may be `Result<..>?` (a body that
                     // also propagates a null); the construction is the Result.
-                    Ok(cur_ret
-                        .as_ref()
-                        .map(|t| unwrap_nullable(t).clone())
-                        .filter(|t| t.is_result_type()))
+                    let ctx = expected
+                        .filter(|t| t.is_result_type())
+                        .cloned()
+                        .or_else(|| {
+                            cur_ret
+                                .as_ref()
+                                .map(|t| unwrap_nullable(t).clone())
+                                .filter(|t| t.is_result_type())
+                        });
+                    if ctx.is_some() {
+                        return Ok(ctx);
+                    }
+                    // A fallible body's ret is still forming: wait for it
+                    // (the fixpoint supplies it, including for an err-only
+                    // body -- see `infer_result_ret`'s defaults). Only a
+                    // NON-fallible context (`println(error(..))` at a top
+                    // level) never gets one, so the construction itself
+                    // carries its variant's payload and the OTHER side --
+                    // uninhabited for this value -- defaults to void.
+                    if fallible {
+                        return Ok(None);
+                    }
+                    let (mut ok, mut err) = (Type::Void, Type::Void);
+                    for (fname, op) in fields {
+                        let Some(t) = self.operand_type(op, local_types)? else {
+                            return Ok(None);
+                        };
+                        match (variant.as_str(), fname.as_str()) {
+                            ("Ok", "value") => ok = t,
+                            ("Err", "error") => err = t,
+                            _ => {}
+                        }
+                    }
+                    Ok(Some(result_type(ok, err)))
                 } else {
                     self.variant_type(module, ty, variant, fields, local_types)
                 }

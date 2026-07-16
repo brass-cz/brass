@@ -59,6 +59,22 @@ pub(crate) struct ProgramCtx<'p> {
     /// Empty when lowering without a checked program, so no view is ever
     /// emitted then (tests, deferred re-lowering keep full values).
     view_args: &'p std::collections::HashSet<Span>,
+    /// Value expressions the checker accepted as a declared sum subtype at a
+    /// flow site, keyed by the expression's span, mapped to the PARENT sum
+    /// instance the site required. Lowering rebuilds exactly these values as
+    /// the parent (per-variant tag test + reconstruction); the child's variant
+    /// payloads may be wider, so identity flow would misread the unboxed
+    /// layout. Empty when lowering without a checked program.
+    sum_views: &'p HashMap<Span, Type>,
+    /// Source positions of every call expression (diagnostic label, 1-based
+    /// line/col), keyed by the call's span. A call that omits a callee's
+    /// trailing `Location` parameter is completed from this map; empty when
+    /// lowering without a checked program (the fill degrades to a placeholder).
+    call_locations: &'p HashMap<Span, (String, u32, u32)>,
+    /// `expr!` sites whose propagated Err payload is re-raised wrapped into
+    /// the prelude `Error` (gaining the site's location); the propagation arm
+    /// rebuilds the value. Empty when lowering without a checked program.
+    lift_errs: &'p std::collections::HashSet<Span>,
     /// Field lists of `for f in fields(x)` loops, keyed by the loop statement's
     /// span: the checker resolved the record type and checked one expanded copy
     /// per field; lowering unrolls the same copies (`prepoly_hir::expand`).
@@ -89,10 +105,14 @@ pub(crate) struct ProgramCtx<'p> {
 }
 
 impl<'p> ProgramCtx<'p> {
+    #[allow(clippy::too_many_arguments)] // mirrors the checker's channel outputs
     fn new(
         program: &'p Program,
         expr_types: &'p HashMap<Span, Type>,
         view_args: &'p std::collections::HashSet<Span>,
+        sum_views: &'p HashMap<Span, Type>,
+        call_locations: &'p HashMap<Span, (String, u32, u32)>,
+        lift_errs: &'p std::collections::HashSet<Span>,
         fields_loops: &'p HashMap<Span, Vec<String>>,
         type_names: &'p HashMap<Span, String>,
         typeof_types: &'p HashMap<Span, Type>,
@@ -135,6 +155,9 @@ impl<'p> ProgramCtx<'p> {
             variant_names,
             expr_types,
             view_args,
+            sum_views,
+            call_locations,
+            lift_errs,
             fields_loops,
             type_names,
             typeof_types,
@@ -156,6 +179,82 @@ impl<'p> ProgramCtx<'p> {
     /// operand (null propagates as `Result.Null`).
     fn is_null_prop(&self, span: Span) -> bool {
         self.null_props.contains(&span)
+    }
+
+    /// The parent sum instance the checker recorded for the value expression
+    /// at `span`, when that value flows as a declared sum subtype.
+    fn sum_view_target(&self, span: Span) -> Option<&Type> {
+        self.sum_views.get(&span)
+    }
+
+    /// A bare reference to nominal `name` when every declared field is
+    /// concrete (fully known) and it has no type slots: safe to seed a local
+    /// slot with. A generic nominal's open fields must stay inferred -- the
+    /// witness machinery owns them -- so it yields `None`.
+    fn concrete_nominal_ref(&self, module: &[String], name: &str) -> Option<Type> {
+        let info = self.program.resolve_type(module, name)?;
+        if !info.slots.is_empty() {
+            return None;
+        }
+        let concrete_fields = |fields: &[prepoly_hir::FieldInfo]| {
+            fields.iter().all(|f| {
+                f.resolved_ty
+                    .as_ref()
+                    .is_some_and(prepoly_hir::is_fully_known)
+            })
+        };
+        let concrete = match &info.kind {
+            TypeKind::Record { fields, .. } => concrete_fields(fields),
+            TypeKind::Sum { variants } => variants.iter().all(|v| concrete_fields(&v.fields)),
+        };
+        concrete.then(|| info.type_ref())
+    }
+
+    /// The source position of the call at `span`, or a placeholder when
+    /// lowering without a checked program (tests, deferred re-lowering).
+    fn call_location(&self, span: Span) -> (String, u32, u32) {
+        self.call_locations
+            .get(&span)
+            .cloned()
+            .unwrap_or_else(|| ("<unknown>".to_string(), 0, 0))
+    }
+
+    /// The full parameter count of free function `name` when its LAST
+    /// parameter is the implicit caller-location (a `Location`-annotated
+    /// trailing parameter a call may omit; lowering fills the call site in).
+    fn free_fn_wants_location(&self, module: &[String], name: &str) -> Option<usize> {
+        let info = self.program.resolve_function(module, name)?;
+        params_want_location(&info.signature.params)
+    }
+
+    /// Like [`Self::free_fn_wants_location`] for a method name: the fill is
+    /// routed by name (lowering is type-free), so it applies only when every
+    /// method of that name agrees on the trailing-location arity.
+    fn method_wants_location(&self, method: &str) -> Option<usize> {
+        let mut want: Option<usize> = None;
+        for info in self.program.types.values() {
+            let sigs: Vec<_> = match &info.kind {
+                TypeKind::Record { methods, .. } => methods
+                    .get(method)
+                    .map(|m| &m.signature)
+                    .into_iter()
+                    .collect(),
+                TypeKind::Sum { variants } => variants
+                    .iter()
+                    .filter_map(|v| v.methods.get(method).map(|m| &m.signature))
+                    .collect(),
+            };
+            for sig in sigs {
+                match (want, params_want_location(&sig.params)) {
+                    (None, Some(n)) => want = Some(n),
+                    (Some(prev), Some(n)) if prev == n => {}
+                    // Disagreement (or a same-named method without the
+                    // parameter): no fill, the checker's arity check governs.
+                    _ => return None,
+                }
+            }
+        }
+        want
     }
 
     /// The storage key of module-level global `name` as referenced from
@@ -647,6 +746,9 @@ pub fn lower_body(
 ) -> (MirBody, Vec<MirClosure>) {
     let no_types = HashMap::new();
     let no_views = std::collections::HashSet::new();
+    let no_sum_views = HashMap::new();
+    let no_call_locations = HashMap::new();
+    let no_lift_errs = std::collections::HashSet::new();
     let no_fields_loops = HashMap::new();
     let no_type_names = HashMap::new();
     let no_typeof_types = HashMap::new();
@@ -655,6 +757,9 @@ pub fn lower_body(
         program,
         &no_types,
         &no_views,
+        &no_sum_views,
+        &no_call_locations,
+        &no_lift_errs,
         &no_fields_loops,
         &no_type_names,
         &no_typeof_types,
@@ -671,6 +776,14 @@ pub fn lower_body(
     let mut closures = ctx.closures.into_inner();
     closures.sort_by_key(|c| c.id.0);
     (body, closures)
+}
+
+/// The full parameter count when the last parameter is the implicit
+/// caller-location (annotated with the prelude's `Location` record).
+fn params_want_location(params: &[prepoly_hir::ParamInfo]) -> Option<usize> {
+    let last = params.last()?;
+    matches!(&last.resolved_ty, Some(Type::Record(n)) if n.is_name("Location"))
+        .then_some(params.len())
 }
 
 /// Lower one callable into a [`MirBody`] using a shared context.
@@ -700,6 +813,9 @@ pub fn lower_program(program: &Program) -> MirProgram {
         &std::collections::HashSet::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &std::collections::HashSet::new(),
+        &HashMap::new(),
+        &HashMap::new(),
         &HashMap::new(),
         &std::collections::HashSet::new(),
     )
@@ -712,10 +828,14 @@ pub fn lower_program(program: &Program) -> MirProgram {
 /// real execution paths pass the checker's data; [`lower_program`] is the
 /// inputs-free form used by tests and by runtime re-lowering, where the back
 /// end re-derives types on its own and keeps full argument values.
+#[allow(clippy::too_many_arguments)] // mirrors the checker's channel outputs
 pub fn lower_program_with_types(
     program: &Program,
     expr_types: &HashMap<Span, Type>,
     view_args: &std::collections::HashSet<Span>,
+    sum_views: &HashMap<Span, Type>,
+    call_locations: &HashMap<Span, (String, u32, u32)>,
+    lift_errs: &std::collections::HashSet<Span>,
     fields_loops: &HashMap<Span, Vec<String>>,
     type_names: &HashMap<Span, String>,
     typeof_types: &HashMap<Span, Type>,
@@ -725,6 +845,9 @@ pub fn lower_program_with_types(
         program,
         expr_types,
         view_args,
+        sum_views,
+        call_locations,
+        lift_errs,
         fields_loops,
         type_names,
         typeof_types,

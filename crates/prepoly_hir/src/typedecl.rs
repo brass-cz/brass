@@ -357,10 +357,21 @@ impl Resolver<'_> {
             TypeExpr::Nullable(inner, _) => {
                 Type::Nullable(Box::new(self.resolve_texpr(owner, module, inner)))
             }
-            TypeExpr::Fallible(inner, _) => Type::result(
-                self.resolve_texpr(owner, module, inner),
-                Type::Unknown(INFER_VAR),
-            ),
+            // `T!` builds over the `Result` in scope, like the pure resolver's
+            // Fallible arm. Only a sum declared with the name `Result` can
+            // carry the sugar's identity; anything else falls back to the
+            // built-in Result (the checker reports the mismatch).
+            TypeExpr::Fallible(inner, _) => {
+                let ok = self.resolve_texpr(owner, module, inner);
+                let base = if let Some(sym) = self.alias_symbol_of(module, "Result") {
+                    Some(self.resolve_alias(&sym))
+                } else {
+                    self.nominal_lookup(module, "Result")
+                        .map(|info| crate::types::nominal_ref(info, "Result"))
+                }
+                .filter(|t| matches!(t, Type::Sum(n) if n.is_result_type()));
+                crate::types::fallible_over(base, ok, Type::Unknown(INFER_VAR))
+            }
             TypeExpr::Mut(inner, _) => {
                 Type::Mut(Box::new(self.resolve_texpr(owner, module, inner)))
             }

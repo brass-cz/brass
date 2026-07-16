@@ -20,11 +20,14 @@ impl<'a> Checker<'a> {
                 Ok(Type::Fun(ps, Box::new(self.resolve_type(ret)?)))
             }
             TypeExpr::Nullable(inner, _) => Ok(Type::Nullable(Box::new(self.resolve_type(inner)?))),
-            // `T!` is the fallible Result; the error payload is a fresh unknown so
-            // it is inferred from the body's error sites (like `infer`).
-            TypeExpr::Fallible(inner, _) => {
+            // `T!` is the fallible `Result` in scope (a shadowing declaration
+            // included); the error payload is a fresh unknown so it is inferred
+            // from the body's error sites (like `infer`), unless the scope's
+            // Result pins it.
+            TypeExpr::Fallible(inner, span) => {
                 let ok = self.resolve_type(inner)?;
-                Ok(Type::result(ok, self.fresh_unknown()))
+                let err = self.fresh_unknown();
+                Ok(self.scoped_result(ok, err, *span))
             }
             TypeExpr::Tuple(elems, _) => {
                 let mut ts = Vec::with_capacity(elems.len());
@@ -194,5 +197,79 @@ impl<'a> Checker<'a> {
     pub(super) fn type_by_name(&self, name: &str) -> Type {
         self.resolve_type_ref(name)
             .unwrap_or_else(|| Type::Record(NominalType::new(-1, name)))
+    }
+
+    /// The `Result` the fallibility sugar (`T!`, `error(..)`, an inferred
+    /// fallible return) builds in the current scope: the prelude's Result or
+    /// the module's shadowing `type Result` sum, with `ok`/`err` pinned into
+    /// the payload slots (a shadow's declared payload annotation wins). A
+    /// shadow that does not have the required shape -- or a `type Result = ..`
+    /// alias, which cannot carry the sugar's identity -- is reported once and
+    /// falls back to the built-in Result so checking continues.
+    pub(super) fn scoped_result(
+        &mut self,
+        ok: Type,
+        err: Type,
+        span: prepoly_parser::Span,
+    ) -> Type {
+        // Sites with no real source position (inferred-return assembly) leave
+        // reporting to a positioned site (`T!`, `error(..)`), which the same
+        // body necessarily contains; they still fall back consistently.
+        let report = span != prepoly_parser::Span::new(0, 0);
+        // An alias named `Result` would make a written `Result` annotation and
+        // the sugar disagree (the sugar needs a nominal named Result); reject
+        // it explicitly instead of silently ignoring the alias.
+        if self.resolve_alias(prepoly_hir::RESULT_TYPE_NAME).is_some() {
+            if report && self.reported_result_shadow.insert(i32::MIN) {
+                self.errors.push(TypeError {
+                    message: "a `type Result = ..` alias cannot shadow the fallibility sugar's \
+                              `Result`; declare a sum type named `Result` (or name the aliased \
+                              type explicitly)"
+                        .to_string(),
+                    span,
+                });
+            }
+            return Type::result(ok, err);
+        }
+        match self
+            .program
+            .scoped_result_instance(&self.current_module, &ok, &err)
+        {
+            Ok(t) => {
+                // A shadow's declared payload pin and the annotation's payload
+                // must agree; the pin wins, so a silent drop would mistype the
+                // body. Report the conflict at the annotation.
+                if let Some((got_ok, got_err)) = self.resolve(&t).result_payloads() {
+                    for (got, want, slot) in [(got_ok, &ok, "success"), (got_err, &err, "error")] {
+                        if prepoly_hir::is_fully_known(got)
+                            && prepoly_hir::is_fully_known(want)
+                            && got != want
+                        {
+                            self.errors.push(TypeError {
+                                message: format!(
+                                    "the `Result` in scope pins its {slot} payload to `{}`, \
+                                     but this annotation says `{}`",
+                                    got.display(),
+                                    want.display()
+                                ),
+                                span,
+                            });
+                        }
+                    }
+                }
+                t
+            }
+            Err(message) => {
+                let id = self
+                    .program
+                    .resolve_type(&self.current_module, prepoly_hir::RESULT_TYPE_NAME)
+                    .map(|info| info.id)
+                    .unwrap_or(i32::MIN);
+                if report && self.reported_result_shadow.insert(id) {
+                    self.errors.push(TypeError { message, span });
+                }
+                Type::result(ok, err)
+            }
+        }
     }
 }

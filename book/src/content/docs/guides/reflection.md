@@ -72,3 +72,45 @@ name-keyed data, or a whole JSON-to-struct decoder written once as
 `fun Json.into(self) -> infer!`. See the
 [reflection reference](/references/reflection/) for the complete rules and
 the decoder pattern.
+
+## Dispatching on a value's type
+
+An **uncalled** member access asks, at compile time, whether the value's type
+has that member: present reads truthy, absent reads `null`. Because only the
+arm that fits ever gets checked or compiled, one generic function can accept
+several unrelated types and treat each its own way.
+
+Two kinds of members make this a type dispatch. Each primitive type
+implements only its own `is_<type>` method (`is_string`, `is_int32`,
+`is_bool`, `is_array`, ...), so `v.is_string` answers "is this a string?".
+And a declared method (`fun T.m`) reads as present exactly on its type, so
+`if v.m { v.m() }` dispatches on whether the receiver implements `m`:
+
+```prepoly
+type Point = { x: int32, y: int32 }
+
+fun Point.norm2(self) -> int32 {
+    return self.x * self.x + self.y * self.y
+}
+
+fun describe(v) -> string {
+    if v.is_string {
+        return "string of {v.len()} bytes"
+    } else if v.is_int32 {
+        return "int32 {v}"
+    } else if v.norm2 {
+        return "point with norm^2 {v.norm2()}"
+    }
+    return "something else"
+}
+
+println(describe("hello"))
+println(describe(42))
+println(describe(Point { x: 3, y: 4 }))
+println(describe(1.5))
+```
+
+Each call compiles only its own arm: `describe("hello")` never type-checks
+`v.norm2()` against `string`. The
+[reference](/references/reflection/#member-presence-xm-without-a-call) has
+the full rules, including how record fields participate.

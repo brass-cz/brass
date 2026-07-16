@@ -168,7 +168,19 @@ impl FnLower<'_, '_> {
             }
             Stmt::Return(opt, _) => {
                 let v = match opt {
-                    Some(e) => self.lower_expr(e),
+                    Some(e) => {
+                        let v = self.lower_expr(e);
+                        // A forwarded Result whose payload the checker marked
+                        // for lifting is rebuilt with its Err arm wrapped
+                        // (`!` sites lift in their own propagation arm).
+                        if !matches!(e, Expr::ErrorProp(..))
+                            && self.ctx.lift_errs.contains(&e.span())
+                        {
+                            self.wrap_forwarded_err(v, e.span())
+                        } else {
+                            v
+                        }
+                    }
                     None => Operand::void(),
                 };
                 self.b.terminate(Terminator::Return(v));
@@ -196,8 +208,8 @@ impl FnLower<'_, '_> {
     /// reuses the value-producing path and drops the operand.
     fn lower_expr_stmt(&mut self, e: &Expr) {
         match e {
-            Expr::Call(callee, args, _) => {
-                let rv = self.lower_call(callee, args);
+            Expr::Call(callee, args, span) => {
+                let rv = self.lower_call(callee, args, *span);
                 self.b.push(MirStmt::Eval(rv));
             }
             _ => {
@@ -213,7 +225,31 @@ impl FnLower<'_, '_> {
         if let Some(t) = self.ctx.typeof_types.get(&ty.span()) {
             return Some(t.clone());
         }
-        resolve_simple_type(ty)
+        if let Some(t) = resolve_simple_type(ty) {
+            return Some(t);
+        }
+        // A fully-concrete nominal annotation (`let frames: Frame[] = []`)
+        // seeds too; generic nominals stay inferred (see
+        // `ProgramCtx::concrete_nominal_ref`).
+        self.resolve_concrete_annotation(ty)
+    }
+
+    fn resolve_concrete_annotation(&self, te: &TypeExpr) -> Option<Type> {
+        match te {
+            TypeExpr::Named(name, _) => self.ctx.concrete_nominal_ref(&self.module, name),
+            TypeExpr::Nullable(inner, _) => Some(Type::Nullable(Box::new(
+                self.resolve_concrete_annotation(inner)?,
+            ))),
+            TypeExpr::Array(inner, len, _) => {
+                let e = resolve_simple_type(inner)
+                    .or_else(|| self.resolve_concrete_annotation(inner))?;
+                Some(match len {
+                    Some(n) => Type::Array(Box::new(e), *n),
+                    None => Type::Slice(Box::new(e)),
+                })
+            }
+            _ => None,
+        }
     }
 
     fn lower_let(&mut self, pat: &Pattern, ty: Option<&TypeExpr>, value: &Expr) {

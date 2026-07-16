@@ -1,1 +1,9 @@
-no size: this file was not opened by path; its size is unknown
+no size: Error {
+    value: "this file was not opened by path; its size is unknown",
+    location: Location {
+        file: "libraries/fs.pp",
+        line: 101,
+        col: 9,
+    },
+    frames: [],
+}

@@ -34,7 +34,6 @@ pub(super) fn is_runtime_builtin_value(name: &str) -> bool {
             | "_stdin_read"
             | "_argv"
             | "_flush"
-            | "error"
             | "_string_concat"
             | "_string_slice"
             | "_string_bytes"
@@ -355,13 +354,21 @@ fn param_is_nullable(param: &ParamInfo) -> bool {
         || matches!(param.ty, Some(TypeExpr::Nullable(..)))
 }
 
+/// Whether a parameter is the implicit caller-location: a trailing parameter
+/// annotated with the prelude's `Location` record may be omitted at call
+/// sites, and MIR fills it with the call site's position (`error(..)` and
+/// `Result.context(..)` build error traces from it).
+pub(super) fn param_is_location(param: &ParamInfo) -> bool {
+    matches!(&param.resolved_ty, Some(Type::Record(n)) if n.is_name("Location"))
+}
+
 /// The fewest arguments a call must supply: the parameter count minus the trailing
-/// run of optional (nullable) parameters.
+/// run of optional (nullable, or implicit-location) parameters.
 pub(super) fn required_arg_count(params: &[ParamInfo]) -> usize {
     let optional = params
         .iter()
         .rev()
-        .take_while(|p| param_is_nullable(p))
+        .take_while(|p| param_is_nullable(p) || param_is_location(p))
         .count();
     params.len() - optional
 }

@@ -22,12 +22,21 @@ pub fn types_invariant(program: &Program, a: &Type, b: &Type) -> bool {
 
 /// Whether a value of `have` can be used where `want` is required.
 pub fn types_compatible(program: &Program, have: &Type, want: &Type) -> bool {
-    if let (Some((h_ok, h_err)), Some((w_ok, w_err))) =
-        (have.result_payloads(), want.result_payloads())
+    // Two instances of the SAME `Result` declaration compare by payloads; an
+    // instance without payload entries constrains nothing. Different
+    // declarations (a module's shadow vs the prelude's, or a declared
+    // subtype) fall through to the sum rules below.
+    if let (Type::Sum(h), Type::Sum(w)) = (have, want)
+        && h.is_result_type()
+        && w.is_result_type()
+        && h.id == w.id
     {
-        return types_compatible(program, h_ok, w_ok) && types_compatible(program, h_err, w_err);
-    }
-    if have.is_result_type() && want.is_result_type() {
+        if let (Some((h_ok, h_err)), Some((w_ok, w_err))) =
+            (h.result_payloads(), w.result_payloads())
+        {
+            return types_compatible(program, h_ok, w_ok)
+                && types_compatible(program, h_err, w_err);
+        }
         return true;
     }
     if drops_fixed_length_through_mutable_reference(have, want) {
@@ -133,13 +142,95 @@ fn record_refinement_compatible(program: &Program, sub: &NominalType, sup: &Nomi
 /// matching a variant, and bare common-field access on an unannotated variant field
 /// is rejected. The required type may not demand a refinement the value lacks.
 fn sum_assignable(program: &Program, have: &NominalType, want: &NominalType) -> bool {
-    have.id == want.id
-        && (have.id >= 0 || have.name() == want.name())
-        && want.substitution.iter().all(|(key, wt)| {
-            have.substitution
-                .get(key)
-                .is_some_and(|ht| types_compatible(program, ht, wt))
+    if have.id == want.id {
+        return (have.id >= 0 || have.name() == want.name())
+            && want.substitution.iter().all(|(key, wt)| {
+                have.substitution
+                    .get(key)
+                    .is_some_and(|ht| types_compatible(program, ht, wt))
+            });
+    }
+    declared_sum_subtype(program, have, want)
+}
+
+/// Whether sum `have` declares (transitively) `want`'s sum as a parent
+/// (`type Child: Parent = | ..`) with a compatible instantiation. The
+/// variant-set/field conformance itself is enforced once at the declaration
+/// (interface checking); here only the instances must agree: every payload
+/// the required instance pins (`"Variant.field"` in its substitution) must be
+/// compatible with the value's type for that field -- from the value's own
+/// substitution, or the child's declared field annotation. The declaration is
+/// the gate: undeclared same-shaped sums stay unrelated, and the back ends
+/// insert the rebuild coercion (SumView) exactly where this accepts.
+fn declared_sum_subtype(program: &Program, have: &NominalType, want: &NominalType) -> bool {
+    if !declares_sum_parent(program, have.id, want.id, 0) {
+        return false;
+    }
+    want.substitution.iter().all(|(key, wt)| {
+        let declared = || {
+            let (vname, fname) = key.split_once('.')?;
+            let info = program.type_by_id(have.id)?;
+            let TypeKind::Sum { variants } = &info.kind else {
+                return None;
+            };
+            variants
+                .iter()
+                .find(|v| v.name == vname)?
+                .fields
+                .iter()
+                .find(|f| f.name == fname)?
+                .resolved_ty
+                .clone()
+        };
+        match have.substitution.get(key).cloned().or_else(declared) {
+            Some(ht) => types_compatible(program, &ht, wt),
+            None => wt.is_unknown(),
+        }
+    })
+}
+
+/// The value-side type a sum instance carries for a `"Variant.field"` slot:
+/// its substitution entry (an unannotated field recorded at construction) or
+/// the declaration's annotated field type. `None` when neither is known.
+pub fn sum_field_payload(program: &Program, n: &NominalType, key: &str) -> Option<Type> {
+    if let Some(t) = n.substitution.get(key)
+        && !t.is_unknown()
+    {
+        return Some(t.clone());
+    }
+    let (vname, fname) = key.split_once('.')?;
+    let info = program.type_by_id(n.id)?;
+    let TypeKind::Sum { variants } = &info.kind else {
+        return None;
+    };
+    variants
+        .iter()
+        .find(|v| v.name == vname)?
+        .fields
+        .iter()
+        .find(|f| f.name == fname)?
+        .resolved_ty
+        .clone()
+        .filter(|t| !t.is_unknown())
+}
+
+/// Whether the sum with id `child` names (transitively) the sum with id
+/// `parent` in its declared interface list. Parents resolve by their bare
+/// table symbol, like interface checking does; the depth cap only guards a
+/// (rejected elsewhere) declaration cycle.
+pub fn declares_sum_parent(program: &Program, child: i32, parent: i32, depth: u8) -> bool {
+    if depth > 8 || child == parent {
+        return false;
+    }
+    let Some(info) = program.type_by_id(child) else {
+        return false;
+    };
+    info.interfaces.iter().any(|name| {
+        program.types.get(name).is_some_and(|p| {
+            matches!(p.kind, TypeKind::Sum { .. })
+                && (p.id == parent || declares_sum_parent(program, p.id, parent, depth + 1))
         })
+    })
 }
 
 /// Whether callable signature `have` can stand in for signature `want`.

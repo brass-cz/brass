@@ -55,7 +55,11 @@ impl<'a> Checker<'a> {
                     let resolved = self.resolve(&ty);
                     match resolved.result_payloads() {
                         Some((ok, err)) if ok.is_unknown() => {
-                            props.errors.push((err.clone(), expr.span()))
+                            // A forwarded error is re-raised lifted into the
+                            // prelude `Error` (see the full check's
+                            // `link_forwarded_error`).
+                            let lifted = crate::lift_err_payload(self.program, self.resolve(err));
+                            props.errors.push((lifted, expr.span()))
                         }
                         _ => normal.push((ty, expr.span())),
                     }
@@ -166,7 +170,10 @@ impl<'a> Checker<'a> {
             Expr::ErrorProp(inner, span) => {
                 let ty = self.infer_expr_light(inner, env, props);
                 if let Some((ok, err)) = ty.result_payloads() {
-                    props.errors.push((err.clone(), *span));
+                    {
+                        let lifted = crate::lift_err_payload(self.program, self.resolve(err));
+                        props.errors.push((lifted, *span));
+                    }
                     ok.clone()
                 } else if let Type::Nullable(inner_ty) = &ty {
                     // `e!` on a nullable unwraps the value; the null case
@@ -288,12 +295,28 @@ impl<'a> Checker<'a> {
         props: &mut LightProps,
     ) -> Type {
         if let Expr::Ident(name, _) = callee {
+            // Mirror the full check's `error(x)` typing (the prelude Error
+            // wrap; see check_call) so entries assembled by this pass carry
+            // the same payload shape.
             if name == "error" {
-                let err = args
+                let value_ty = args
                     .first()
                     .map(|a| self.infer_expr_light(&a.expr, env, props))
                     .unwrap_or(Type::Void);
-                return Type::result(self.fresh_unknown(), err);
+                for a in args.iter().skip(1) {
+                    self.infer_expr_light(&a.expr, env, props);
+                }
+                // A program without the prelude keeps the legacy raw payload.
+                let err_ty = match self.program.types.get("Error") {
+                    Some(err_info) => {
+                        let mut err = NominalType::new(err_info.id, &err_info.name);
+                        err.substitution.insert("value", self.resolve(&value_ty));
+                        Type::Record(err)
+                    }
+                    None => self.resolve(&value_ty),
+                };
+                let ok = self.fresh_unknown();
+                return Type::result(ok, err_ty);
             }
             if let Some(ret) = self.builtin_function_type_light(name) {
                 args.iter().for_each(|arg| {

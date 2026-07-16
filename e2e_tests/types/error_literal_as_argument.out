@@ -1,4 +1,12 @@
 -1
-err: nope
+err: Error {
+    value: "nope",
+    location: Location {
+        file: "e2e_tests/types/error_literal_as_argument.pp",
+        line: 36,
+        col: 22,
+    },
+    frames: [],
+}
 -2
 7

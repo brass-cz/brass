@@ -397,6 +397,23 @@ impl Type {
         ))
     }
 
+    /// Rebuild a `Result` instance with new payloads, keeping the nominal of
+    /// `self` (so a scope's shadowing `Result` declaration survives a payload
+    /// transformation instead of collapsing back to the prelude's Result).
+    /// Falls back to the built-in constructor when `self` is not a Result.
+    pub fn rebuild_result(&self, ok: Type, err: Type) -> Type {
+        let Type::Sum(n) = self else {
+            return Type::result(ok, err);
+        };
+        if !n.is_result_type() {
+            return Type::result(ok, err);
+        }
+        let mut n = n.clone();
+        n.substitution.insert(RESULT_OK_VALUE, ok);
+        n.substitution.insert(RESULT_ERR_ERROR, err);
+        Type::Sum(n)
+    }
+
     pub fn null() -> Self {
         Type::Nullable(Box::new(Type::Never))
     }
@@ -550,7 +567,17 @@ impl Type {
 pub fn mismatch_display(got: &Type, want: &Type) -> (String, String) {
     let (g, w) = (got.display(), want.display());
     if g == w && got != want {
-        return (got.display_full(), want.display_full());
+        let (gf, wf) = (got.display_full(), want.display_full());
+        if gf == wf {
+            // Even the full rendering collides: two declarations sharing a
+            // name (a module's shadowing `Result` vs the prelude's). Saying
+            // so beats printing two identical types at each other.
+            return (
+                gf,
+                format!("{wf} (a different declaration of the same name)"),
+            );
+        }
+        return (gf, wf);
     }
     (g, w)
 }
@@ -578,6 +605,54 @@ pub fn resolve_with_aliases(
     mut alias: impl FnMut(&str) -> Option<Type>,
 ) -> Result<Type, String> {
     resolve_inner(expr, &mut nominal_info, &mut alias)
+}
+
+/// Build the type of a fallible `T!` over the `Result` the scope resolves.
+///
+/// `base` is what the name `Result` resolves to at the annotation site: an
+/// alias target, a shadowing nominal's reference, or the prelude Result
+/// (`None` falls back to the built-in constructor; it cannot happen in a
+/// program with the prelude). The success payload is pinned into the base's
+/// `Ok.value` slot and the error payload into `Err.error` -- unless the base
+/// already pins that payload (an alias refinement), which is kept so the
+/// alias's pinning is what `T!` means in that scope. A base that is not a
+/// sum falls back to the built-in Result; the checker validates the scope's
+/// `Result` shape separately, so this constructor never fails.
+pub fn fallible_over(base: Option<Type>, ok: Type, err: Type) -> Type {
+    let Some(Type::Sum(mut n)) = base else {
+        return Type::result(ok, err);
+    };
+    pin_result_payload(&mut n, RESULT_OK_VALUE, ok);
+    pin_result_payload(&mut n, RESULT_ERR_ERROR, err);
+    Type::Sum(n)
+}
+
+/// Pin a Result payload slot unless the base already pins it to something
+/// other than an open inference placeholder.
+fn pin_result_payload(n: &mut NominalType, key: &str, ty: Type) {
+    match n.substitution.get(key) {
+        Some(existing) if !existing.is_unknown() => {}
+        _ => n.substitution.insert(key, ty),
+    }
+}
+
+/// Resolve the name `Result` through the caller's alias and nominal lookups,
+/// mirroring how a written `Result` annotation would resolve, so the `T!`
+/// sugar refers to whatever `Result` is in scope.
+fn scoped_result_base(
+    nominal_info: &mut dyn FnMut(&str) -> Option<NominalInfo>,
+    alias: &mut dyn FnMut(&str) -> Option<Type>,
+) -> Option<Type> {
+    let t = if let Some(t) = alias(RESULT_TYPE_NAME) {
+        t
+    } else {
+        resolve_named(RESULT_TYPE_NAME, nominal_info).ok()?
+    };
+    // Only a sum whose declared name is `Result` can carry the sugar's
+    // identity (`!`, rendering, and the back ends recognize a Result by that
+    // name); anything else -- an alias to a differently named sum included --
+    // falls back to the built-in Result, and the checker reports it.
+    matches!(&t, Type::Sum(n) if n.is_result_type()).then_some(t)
 }
 
 fn resolve_inner(
@@ -613,13 +688,18 @@ fn resolve_inner(
             nominal_info,
             alias,
         )?))),
-        // `T!` is the built-in fallible Result: success payload `T`, error payload
+        // `T!` is the fallible Result in scope: success payload `T`, error payload
         // left open (an `infer` placeholder the caller freshens, so it is inferred
-        // from the body's `error(...)` sites like an unannotated fallible return).
-        TypeExpr::Fallible(inner, _) => Ok(Type::result(
-            resolve_inner(inner, nominal_info, alias)?,
-            Type::Unknown(INFER_VAR),
-        )),
+        // from the body's `error(...)` sites like an unannotated fallible return)
+        // unless the scope's `Result` (an alias refinement) pins it.
+        TypeExpr::Fallible(inner, _) => {
+            let ok = resolve_inner(inner, nominal_info, alias)?;
+            Ok(fallible_over(
+                scoped_result_base(nominal_info, alias),
+                ok,
+                Type::Unknown(INFER_VAR),
+            ))
+        }
         TypeExpr::Tuple(elems, _) => Ok(Type::Tuple(
             elems
                 .iter()
@@ -674,6 +754,15 @@ fn resolve_inner(
     }
 }
 
+/// The bare type reference (no substitution) for a nominal lookup result, as
+/// a written name resolves to.
+pub fn nominal_ref(info: NominalInfo, name: &str) -> Type {
+    match info.kind {
+        NominalKind::Record => Type::Record(NominalType::new(info.id, name)),
+        NominalKind::Sum => Type::Sum(NominalType::new(info.id, name)),
+    }
+}
+
 fn resolve_named(
     name: &str,
     nominal_info: &mut dyn FnMut(&str) -> Option<NominalInfo>,
@@ -693,10 +782,7 @@ fn resolve_named(
         // placeholder id is freshened per occurrence by `freshen_infer`.
         "infer" => Type::Unknown(INFER_VAR),
         _ => match nominal_info(name) {
-            Some(info) => match info.kind {
-                NominalKind::Record => Type::Record(NominalType::new(info.id, name)),
-                NominalKind::Sum => Type::Sum(NominalType::new(info.id, name)),
-            },
+            Some(info) => nominal_ref(info, name),
             None => return Err(format!("unknown type `{name}`")),
         },
     })

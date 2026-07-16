@@ -1,4 +1,28 @@
 ok: 1 2
-err: missing field 'y'
-err: cannot decode this value as `Point`
-err: cannot decode this value as `int64`
+err: Error {
+    value: "missing field 'y'",
+    location: Location {
+        file: "e2e_tests/reflection/into_decode_errors.pp",
+        line: 13,
+        col: 20,
+    },
+    frames: [],
+}
+err: Error {
+    value: "cannot decode this value as `Point`",
+    location: Location {
+        file: "<unknown>",
+        line: 0,
+        col: 0,
+    },
+    frames: [],
+}
+err: Error {
+    value: "cannot decode this value as `int64`",
+    location: Location {
+        file: "<unknown>",
+        line: 0,
+        col: 0,
+    },
+    frames: [],
+}

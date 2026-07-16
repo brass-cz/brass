@@ -49,7 +49,7 @@ use helpers::{
     is_maybe_indexable, is_null_comparison, is_result_return_type, is_runtime_builtin_value,
     is_self_expr, literal_pattern_matches, literal_pattern_type, method_param_substitution_key,
     method_return_substitution_key, next_unknown_after_program, numeric_literal_repr,
-    param_expected_type, peel_ref_mut, peel_value_wrappers, required_arg_count,
+    param_expected_type, param_is_location, peel_ref_mut, peel_value_wrappers, required_arg_count,
     same_nominal_instance, stmt_may_branch, substitute_self,
 };
 
@@ -257,6 +257,14 @@ pub struct Inference {
     /// for a view-eligible parameter (see `prepoly_typesys::rows`). MIR lowering
     /// converts exactly these arguments into the parameter's view.
     pub view_args: HashSet<Span>,
+    /// Expressions accepted as a declared sum subtype at a flow site, keyed by
+    /// the value expression's span, mapped to the PARENT sum's table symbol.
+    /// MIR lowering rebuilds exactly these values as the parent (SumView).
+    pub sum_views: HashMap<Span, Type>,
+    /// `expr!` sites whose propagated Err payload is re-raised wrapped into
+    /// the prelude `Error` (gaining the site's location); MIR's propagation
+    /// arm rebuilds the value.
+    pub lift_errs: HashSet<Span>,
     /// Field lists of `for f in fields(x)` loops, keyed by the loop statement's
     /// span. The checker resolved `x`'s record type and checked one expanded
     /// copy per field; MIR lowering unrolls the same copies from this list.
@@ -613,12 +621,41 @@ pub fn analyze_with(program: &Program, seed: Option<&ContextTables>) -> Inferenc
             .chain(program.types.values().map(|t| t.name.clone()))
             .collect(),
     };
+    // Re-resolve the coercion targets against the final substitution: a
+    // variable pinned after the site was recorded (an err payload bound by a
+    // later return) must reach MIR fully known so the rebuilt value's locals
+    // can be seeded. A Result payload slot still open here was pinned by
+    // NOTHING anywhere -- the value never carries data in it (an Err-only
+    // flow's Ok side) -- so it defaults to void IN THE CHANNEL COPY only; no
+    // solver binding can leak to other callers.
+    let sum_views = checker
+        .sum_views
+        .iter()
+        .map(|(s, t)| {
+            let mut t = checker.resolve(t);
+            if let Type::Sum(n) = &mut t
+                && n.is_result_type()
+            {
+                for key in [
+                    prepoly_hir::types::RESULT_OK_VALUE,
+                    prepoly_hir::types::RESULT_ERR_ERROR,
+                ] {
+                    if n.substitution.get(key).is_none_or(|t| t.is_unknown()) {
+                        n.substitution.insert(key, Type::Void);
+                    }
+                }
+            }
+            (*s, t)
+        })
+        .collect();
     Inference {
         errors: checker.errors,
         typed: checker.typed,
         fn_instances: checker.fn_instances,
         schemes: checker.schemes,
         view_args: checker.view_args,
+        lift_errs: checker.lift_errs,
+        sum_views,
         fields_loops: checker.fields_loops,
         type_names: checker.type_names,
         keyed_calls: checker.keyed_calls,
@@ -739,6 +776,14 @@ struct Checker<'a> {
     /// per-module name visibility. Set per function,
     /// method, and module-init, and swapped while a called body is re-checked.
     current_module: Vec<String>,
+    /// Nominal ids of shadowing `type Result` declarations whose shape problem
+    /// was already reported, so every `T!`/`error(..)` in the module does not
+    /// repeat the same diagnostic (`i32::MIN` marks the alias-shadow report).
+    reported_result_shadow: HashSet<i32>,
+    /// Callables (`fn:<symbol>` / `m:<qualifier>.<name>`) whose inferred Err
+    /// payload is one of their own parameter variables: a generic error type
+    /// named per call site, exempt from the uninferable-error report.
+    generic_error_returns: HashSet<String>,
     /// Fully-concrete call instances per free-function symbol: every distinct
     /// tuple of resolved argument types a function is called with. This is the
     /// input to static monomorphization: the
@@ -789,6 +834,13 @@ struct Checker<'a> {
     /// check for a view-ELIGIBLE parameter: exactly the call sites where MIR
     /// lowering may convert the argument into the parameter's view.
     view_args: HashSet<Span>,
+    /// Value expressions accepted as a declared sum subtype at a flow site,
+    /// keyed by the expression's span, mapped to the PARENT sum's table
+    /// symbol; MIR lowering rebuilds exactly these values as the parent.
+    sum_views: HashMap<Span, Type>,
+    /// `expr!` sites whose propagated Err payload is re-raised wrapped into
+    /// the prelude `Error` (see [`Inference::lift_errs`]).
+    lift_errs: HashSet<Span>,
     /// Field lists of checked fields-loops, keyed by loop-statement span; the
     /// channel MIR lowering unrolls from (see [`Inference::fields_loops`]).
     fields_loops: HashMap<Span, Vec<String>>,
@@ -867,6 +919,8 @@ impl<'a> Checker<'a> {
                 s
             },
             current_module: Vec::new(),
+            reported_result_shadow: HashSet::new(),
+            generic_error_returns: HashSet::new(),
             fn_instances: HashMap::new(),
             schemes: HashMap::new(),
             fixed_array_binding: false,
@@ -879,6 +933,8 @@ impl<'a> Checker<'a> {
             closure_write_targets: HashSet::new(),
             rows: prepoly_typesys::RowInfo::analyze(program),
             view_args: HashSet::new(),
+            lift_errs: HashSet::new(),
+            sum_views: HashMap::new(),
             fields_loops: HashMap::new(),
             type_names: HashMap::new(),
             null_props: HashSet::new(),
@@ -1102,10 +1158,18 @@ impl<'a> Checker<'a> {
                         }
                         let got = self.check_expr(e, scopes);
                         self.call_expected = None;
-                        if self.resolve(&got).is_result_type() {
-                            self.expect_assignable(&got, &want, span);
+                        // A declared subtype of the return's Result also flows
+                        // whole (the flow site coerces it); only a genuinely
+                        // bare value is checked against the Ok payload.
+                        let got_res = self.resolve(&got);
+                        let whole = got_res.is_result_type()
+                            || matches!((&got_res, &resolved), (Type::Sum(h), Type::Sum(w))
+                                if crate::structural::declares_sum_parent(self.program, h.id, w.id, 0));
+                        if whole {
+                            let flowed = self.link_forwarded_error(&got_res, &resolved, e.span());
+                            self.expect_expr_assignable(&flowed, &want, e);
                         } else {
-                            self.expect_assignable(&got, &ok, span);
+                            self.expect_expr_assignable(&got, &ok, e);
                         }
                         got
                     } else {
@@ -1132,6 +1196,57 @@ impl<'a> Checker<'a> {
         if let Some(frame) = self.return_values.last_mut() {
             frame.push((resolved, span));
         }
+    }
+
+    /// Commit the return annotation's OPEN Err payload to a forwarded
+    /// Result's. `T!` infers its Err from the body's error sources; a body
+    /// whose only source is a forwarded callee Result (`return helper()`)
+    /// names the type only at this return, and the ordinary assignability
+    /// probe is deliberately non-committing, so the binding is made here.
+    fn link_forwarded_error(&mut self, got: &Type, want: &Type, span: Span) -> Type {
+        // The Err slot alone decides: an Err-only construction has no
+        // `Ok.value` entry, so `result_payloads` (which demands both keys)
+        // would miss it.
+        let g_err = match got {
+            Type::Sum(n) if n.is_result_type() => n
+                .substitution
+                .get(prepoly_hir::types::RESULT_ERR_ERROR)
+                .cloned(),
+            _ => None,
+        };
+        let Some(g_err) = g_err else {
+            return got.clone();
+        };
+        let g_err = self.resolve(&g_err);
+        if g_err.is_unknown() {
+            return got.clone();
+        }
+        // A forwarded payload that is not the prelude Error is re-raised
+        // wrapped into one at this return (MIR rebuilds the Err arm), so
+        // every error a fallible body hands back has one shape. The flowed
+        // type -- what the return is checked at -- carries the lifted slot.
+        let lifted = crate::lift_err_payload(self.program, g_err.clone());
+        let flowed = if lifted != g_err {
+            self.lift_errs.insert(span);
+            match got {
+                Type::Sum(n) => {
+                    let mut n = n.clone();
+                    n.substitution
+                        .insert(prepoly_hir::types::RESULT_ERR_ERROR, lifted.clone());
+                    Type::Sum(n)
+                }
+                other => other.clone(),
+            }
+        } else {
+            got.clone()
+        };
+        if let Some((_, w_err)) = want.result_payloads()
+            && self.resolve(w_err).is_unknown()
+        {
+            let w_err = w_err.clone();
+            let _ = self.solver.unify(&w_err, &lifted);
+        }
+        flowed
     }
 
     fn check_stmt(&mut self, s: &Stmt, scopes: &mut ScopeStack) {
@@ -1354,9 +1469,10 @@ impl<'a> Checker<'a> {
             TypeExpr::Array(inner, None, _) => Ok(Type::Slice(Box::new(
                 self.resolve_annotation_scoped_inner(inner, scopes)?,
             ))),
-            TypeExpr::Fallible(inner, _) => {
+            TypeExpr::Fallible(inner, span) => {
                 let ok = self.resolve_annotation_scoped_inner(inner, scopes)?;
-                Ok(Type::result(ok, self.fresh_unknown()))
+                let err = self.fresh_unknown();
+                Ok(self.scoped_result(ok, err, *span))
             }
             TypeExpr::Mut(inner, _) => Ok(Type::Mut(Box::new(
                 self.resolve_annotation_scoped_inner(inner, scopes)?,

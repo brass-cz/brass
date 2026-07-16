@@ -2,4 +2,12 @@ decoded Config:
   width = 1920
   height = 1080
   depth = 24
-error: Config: missing field 'depth'
+error: Error {
+    value: "Config: missing field 'depth'",
+    location: Location {
+        file: "<unknown>",
+        line: 0,
+        col: 0,
+    },
+    frames: [],
+}

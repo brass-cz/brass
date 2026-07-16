@@ -781,6 +781,11 @@ fn str_literal(expr: &Expr) -> Option<String> {
 }
 
 pub(super) fn primitive_static_return(tname: &str, method: &str) -> Option<Type> {
+    // `T.default()`: the zero value of every primitive class (the `Default`
+    // protocol's builtin implementations; MIR folds the call to a constant).
+    if method == "default" {
+        return primitive_default_type(tname);
+    }
     if let Some(k) = IntKind::from_name(tname) {
         return match method {
             "from" | "parse" => Some(Type::result(Type::Int(k), Type::Str)),
@@ -793,6 +798,20 @@ pub(super) fn primitive_static_return(tname: &str, method: &str) -> Option<Type>
         ("float64", "from") => Some(Type::Float(FloatKind::F64)),
         ("float64", "parse") => Some(Type::result(Type::Float(FloatKind::F64), Type::Str)),
         ("string", "from") => Some(Type::Str),
+        _ => None,
+    }
+}
+
+/// The type `T.default()` produces for a primitive type word.
+pub(super) fn primitive_default_type(tname: &str) -> Option<Type> {
+    if let Some(k) = IntKind::from_name(tname) {
+        return Some(Type::Int(k));
+    }
+    match tname {
+        "float32" => Some(Type::Float(FloatKind::F32)),
+        "float64" => Some(Type::Float(FloatKind::F64)),
+        "bool" => Some(Type::Bool),
+        "string" => Some(Type::Str),
         _ => None,
     }
 }

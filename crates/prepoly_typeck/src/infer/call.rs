@@ -63,25 +63,32 @@ impl<'a> Checker<'a> {
                 }
                 return Type::Str;
             }
+            // `error(x)` executes the ordinary prelude function, but its TYPE
+            // is special-cased so the fully-known result can be seeded: the
+            // Ok payload comes from the call's required position (nothing in
+            // the expression itself can constrain it -- see the prelude's
+            // `-> infer!`), and the Err payload is the prelude `Error` record
+            // wrapping the argument's type, mirroring what the body builds.
+            // `error` is a reserved callee name: a local binding (a match's
+            // `Err { error }` payload) never shadows it in call position.
             if name == "error" {
-                let err_ty = args
+                let value_ty = args
                     .first()
                     .map(|a| self.check_expr(&a.expr, scopes))
                     .unwrap_or(Type::Void);
-                // The Ok payload of an `error(..)` is a value no path produces, so
-                // nothing in the expression itself can constrain it -- only the
-                // position it flows into. Take it from the expectation when there
-                // is one (`call_expected` is set for a call in a required
-                // position), so the recorded type is FULLY KNOWN.
-                //
-                // That matters beyond neatness: only a fully-known type is seeded
-                // onto the MIR local, and without a seed the back end types a bare
-                // `Result` construction from the ENCLOSING callable's return type.
-                // `println(g(error("x")))` inside a fallible `main` therefore typed
-                // the argument as main's `Result<void, string>`, instantiated `g`
-                // at that, and returned its `void` Ok payload from a function
-                // declared `int32` -- `ret i1 false`, caught only by the LLVM
-                // verifier.
+                for a in args.iter().skip(1) {
+                    self.check_expr(&a.expr, scopes);
+                }
+                // A program without the prelude (unit tests, embedders) keeps
+                // the legacy raw payload.
+                let err_ty = match self.program.types.get("Error") {
+                    Some(err_info) => {
+                        let mut err = NominalType::new(err_info.id, &err_info.name);
+                        err.substitution.insert("value", self.resolve(&value_ty));
+                        Type::Record(err)
+                    }
+                    None => self.resolve(&value_ty),
+                };
                 let ok_ty = call_expected
                     .as_ref()
                     .and_then(|want| {
@@ -484,7 +491,7 @@ impl<'a> Checker<'a> {
             .clone()
             .or_else(|| self.function_returns.get(&func.symbol).cloned())
             .unwrap_or_else(|| self.fresh_unknown());
-        self.check_arg_count(method, signature_params.len(), args.len() + 1, span);
+        self.check_arg_count_range(method, signature_params, args.len() + 1, span);
         // The receiver fills the first parameter.
         if let Some(first) = signature_params.first()
             && let Some(want) = param_expected_type(first)
@@ -572,7 +579,10 @@ impl<'a> Checker<'a> {
         };
         self.keyed_calls
             .insert(span, (recv_name, method.to_string(), key.clone()));
-        Type::result(key, Type::Str)
+        // The specialization's failures come from `error(..)`, whose payload
+        // is the prelude `Error` wrapping the message string.
+        let err = crate::lift_err_payload(self.program, Type::Str);
+        Type::result(key, err)
     }
 
     /// value span), else to the call site for a foreign-module method.
@@ -606,7 +616,7 @@ impl<'a> Checker<'a> {
         } else {
             first_signature.params.clone()
         };
-        self.check_arg_count(method, signature_params.len(), args.len(), span);
+        self.check_arg_count_range(method, &signature_params, args.len(), span);
         // The types this receiver instance pins each parameter to (its scheme):
         // a witness-free `string -> int64` map's `set` value is `int64`. Checking
         // arguments against these lets a bare literal take the pinned width.
@@ -942,7 +952,7 @@ impl<'a> Checker<'a> {
         }
         if let Some(resolved) = self.method_for_qualifier(qualifier, method) {
             let signature_params = resolved.signature.params.clone();
-            self.check_arg_count(method, signature_params.len(), args.len(), span);
+            self.check_arg_count_range(method, &signature_params, args.len(), span);
             let arg_types = self.check_signature_args_collect(&signature_params, args, scopes);
             let declared_ret = resolved.signature.ret_ty.clone();
             let fallback_ret = declared_ret
@@ -1134,7 +1144,24 @@ impl<'a> Checker<'a> {
             };
             arg_types.push(got);
         }
+        // A call may omit a trailing `Location` parameter (MIR fills it with
+        // the call site); complete the collected types so the callee still
+        // instantiates at full arity.
+        if arg_types.len() + 1 == params.len()
+            && params.last().is_some_and(param_is_location)
+            && let Some(loc) = self.location_instance()
+        {
+            arg_types.push(loc);
+        }
         arg_types
+    }
+
+    /// The prelude `Location` record instance a filled implicit argument has.
+    fn location_instance(&self) -> Option<Type> {
+        self.program
+            .types
+            .get("Location")
+            .map(prepoly_hir::TypeInfo::type_ref)
     }
 
     /// Move the body errors a foreign method produced (when re-elaborated for a

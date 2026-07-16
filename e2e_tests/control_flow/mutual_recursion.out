@@ -4,4 +4,12 @@ true
 20
 leaf
 2
-err too deep
+err Error {
+    value: "too deep",
+    location: Location {
+        file: "e2e_tests/control_flow/mutual_recursion.pp",
+        line: 57,
+        col: 16,
+    },
+    frames: [],
+}

@@ -129,13 +129,25 @@ impl Subst {
     pub fn unify(&mut self, a: &Type, b: &Type) -> Result<(), String> {
         let a = self.resolve(a);
         let b = self.resolve(b);
-        if let (Some((a_ok, a_err)), Some((b_ok, b_err))) =
-            (a.result_payloads(), b.result_payloads())
+        // Two instances of the SAME `Result` declaration unify by their
+        // payloads; an instance missing its payload entries (a bare
+        // annotation) constrains nothing. The id gate matters: a module's
+        // shadowing `Result` and the prelude's are distinct declarations that
+        // must not unify just because both carry the name (they fall through
+        // to the strict sum arm below).
+        if let (Type::Sum(na), Type::Sum(nb)) = (&a, &b)
+            && na.is_result_type()
+            && nb.is_result_type()
+            && na.id == nb.id
         {
-            self.unify(a_ok, b_ok)?;
-            return self.unify(a_err, b_err);
-        }
-        if a.is_result_type() && b.is_result_type() {
+            if let (Some((a_ok, a_err)), Some((b_ok, b_err))) =
+                (na.result_payloads(), nb.result_payloads())
+            {
+                let (a_ok, a_err) = (a_ok.clone(), a_err.clone());
+                let (b_ok, b_err) = (b_ok.clone(), b_err.clone());
+                self.unify(&a_ok, &b_ok)?;
+                return self.unify(&a_err, &b_err);
+            }
             return Ok(());
         }
         match (&a, &b) {

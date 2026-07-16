@@ -1,3 +1,11 @@
 ok 1
-err a
+err Error {
+    value: "a",
+    location: Location {
+        file: "e2e_tests/types/null_prop_mixed_result.pp",
+        line: 9,
+        col: 9,
+    },
+    frames: [],
+}
 null

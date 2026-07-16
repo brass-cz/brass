@@ -1066,12 +1066,17 @@ pub trait Codegen {
             Rvalue::Load(place) => match place.proj.as_slice() {
                 [Projection::Field(field)] => {
                     let raw_ty = f.local_type(place.local).clone();
-                    // A `string`/array receiver has no fields: the access is the
-                    // compile-time member presence value, already decided into
-                    // `dest_ty` by monomorphization -- the member's own name when
-                    // the class carries it, otherwise null. The `if` that tests it
-                    // folds statically, so this constant only has to type.
-                    if matches!(raw_ty.primitive_class(), Some("string" | "array")) {
+                    // A member that can only be a method has no storage: the
+                    // access is the compile-time member presence value, already
+                    // decided into `dest_ty` by monomorphization -- the member's
+                    // own name when the receiver's class or declared type
+                    // carries it, otherwise null. The `if` that tests it folds
+                    // statically, so this constant only has to type.
+                    if program
+                        .hir
+                        .member_presence(unwrap_nullable(&raw_ty), field)
+                        .is_some()
+                    {
                         let lit = match dest_ty {
                             Type::Str => Literal::Str(field.clone()),
                             _ => Literal::Null,

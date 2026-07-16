@@ -1,3 +1,11 @@
 3
-err: nope
+err: Error {
+    value: "nope",
+    location: Location {
+        file: "e2e_tests/types/fallible_forwards_result.pp",
+        line: 14,
+        col: 15,
+    },
+    frames: [],
+}
 42

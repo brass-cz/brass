@@ -88,8 +88,12 @@ An *uncalled* member access asks whether `x`'s type has a member `m`, and the
 answer is fixed at compile time:
 
 - a **field** reads as the field's value, as always;
-- a **method** of a `string` or an array decays to its own **name** as a string,
-  exactly as a `fields()` descriptor does -- a non-null value, so it is truthy;
+- a **method** decays to its own **name** as a string, exactly as a `fields()`
+  descriptor does -- a non-null value, so it is truthy. This holds for the
+  methods of a `string`, an array, or a scalar class, and for a record's or a
+  sum's declared methods (`fun T.m`) alike, so
+  `if v.m { v.m() } else { ... }` dispatches on whether the receiver's type
+  implements `m`;
 - a name the type does not have is `null` (`never?`), which is always falsy.
 
 Because a bare `null` is statically false and any other value statically true,
@@ -122,9 +126,35 @@ of `string` -- but each arm is reached only by the receiver it fits. This is how
 a library takes "a string, an array of strings, or a `Path`" through one
 parameter without overloading or union types.
 
-Presence answers `null` for any name a record, a `string`, or an array does not
-carry. A scalar (`int32`, `bool`, ...) has no members at all, so `x.foo` on one
-stays a hard error rather than quietly reading as null.
+Every receiver class supports the test. A scalar (`int32`, `bool`, ...)
+carries only its stdlib methods, so an unknown name on one reads as `null`
+like everywhere else -- which is what lets a presence-dispatching body
+instantiate at scalars too.
+
+The prelude turns this into a direct **type test** for the primitives: each
+primitive type implements only its own `is_<type>` method (`is_string`,
+`is_int32`, `is_uint8`, ..., `is_bool`, `is_float64`, `is_array`), so
+`v.is_string` is present -- truthy -- exactly when `v` is a `string`, and
+reads as `null` on every other type:
+
+```prepoly
+fun describe(v) -> string {
+    if v.is_string {
+        return "string"
+    } else if v.is_int32 {
+        return "int32"
+    }
+    return "other"
+}
+
+println(describe("a"))
+println(describe(3))
+println(describe(1.5))
+```
+
+Calling the method (`v.is_string()`) returns `true` -- it only exists on the
+matching type, so the call is only reachable there. Records and sums carry
+none of these members.
 
 ## Building a value field by field
 

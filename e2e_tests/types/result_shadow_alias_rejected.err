@@ -1,0 +1,1 @@
+a `type Result = ..` alias cannot shadow the fallibility sugar's `Result`

@@ -17,7 +17,9 @@ println(repeat("ho", 3))
 println(checked_div(10, 2)!)
 match checked_div(1, 0) {
     Ok { value } => println("ok {value}"),
-    Err { error } => println("err {error}"),
+    // The payload is the prelude `Error` wrapping the plugin's message;
+    // print the message so the expectation stays position-free.
+    Err { error } => println("err {error.value}"),
 }
 println(byte_len(_string_bytes("abc")))
 println(scale(1.5, 4.0) == 6.0)

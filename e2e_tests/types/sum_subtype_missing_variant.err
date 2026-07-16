@@ -1,0 +1,1 @@
+`MyResult` does not satisfy `Result`: missing variant `Err`

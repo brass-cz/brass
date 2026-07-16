@@ -32,6 +32,71 @@ pub fn check(program: &Program) -> Vec<TypeError> {
                 });
                 continue;
             };
+            // A sum parent (`type MyResult: Result`) declares structural sum
+            // subtyping: the child must cover exactly the parent's variant
+            // set, and each child variant's record must satisfy the parent
+            // variant's (width allowed, annotated fields invariant). The
+            // declaration is also the gate for the value coercion (SumView)
+            // at flow sites, mirroring records' declared-id gating.
+            if let TypeKind::Sum {
+                variants: ivariants,
+            } = &iface.kind
+            {
+                let TypeKind::Sum { variants } = &info.kind else {
+                    errors.push(TypeError {
+                        message: format!(
+                            "`{}` is a record and cannot implement the sum interface `{iface_name}`",
+                            info.name
+                        ),
+                        span: info.span,
+                    });
+                    continue;
+                };
+                for iv in ivariants {
+                    let Some(v) = variants.iter().find(|v| v.name == iv.name) else {
+                        errors.push(TypeError {
+                            message: format!(
+                                "`{}` does not satisfy `{iface_name}`: missing variant `{}`",
+                                info.name, iv.name
+                            ),
+                            span: info.span,
+                        });
+                        continue;
+                    };
+                    // Only the FIELDS must conform: a sum subtype is rebuilt
+                    // as the parent at every flow site, so the parent's
+                    // methods always run on a parent value -- the child never
+                    // needs them (unlike record interfaces, whose values flow
+                    // by identity).
+                    report(
+                        &format!("{}.{}", info.name, v.name),
+                        iface_name,
+                        &v.fields,
+                        &v.methods,
+                        &iv.fields,
+                        &HashMap::new(),
+                        program,
+                        info.span,
+                        true,
+                        &mut errors,
+                    );
+                }
+                // An extra variant would build values the parent cannot
+                // represent, so the coercion would have no arm for them.
+                for v in variants {
+                    if !ivariants.iter().any(|iv| iv.name == v.name) {
+                        errors.push(TypeError {
+                            message: format!(
+                                "`{}` does not satisfy `{iface_name}`: variant `{}` does not \
+                                 exist in `{iface_name}`",
+                                info.name, v.name
+                            ),
+                            span: info.span,
+                        });
+                    }
+                }
+                continue;
+            }
             let TypeKind::Record {
                 fields: ifields,
                 methods: imethods,

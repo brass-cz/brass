@@ -209,6 +209,11 @@ fn sha1(bytes: &[u8]) -> [u8; 20] {
 pub struct Channels {
     pub expr_types: Vec<(Span, Type)>,
     pub view_args: Vec<Span>,
+    // No serde default: an old cache missing this field must fail to load (a
+    // full recheck) rather than silently drop the coercions it encodes.
+    pub sum_views: Vec<(Span, Type)>,
+    pub call_locations: Vec<(Span, (String, u32, u32))>,
+    pub lift_errs: Vec<Span>,
     pub fields_loops: Vec<(Span, Vec<String>)>,
     pub type_names: Vec<(Span, String)>,
     pub typeof_types: Vec<(Span, Type)>,

@@ -1,0 +1,14 @@
+Result.Err {
+    error: "message",
+}
+Result.Ok {
+    value: 7,
+}
+Result.Err {
+    error: "bad flag",
+}
+Result.Err {
+    error: "direct",
+}
+made: 3
+7

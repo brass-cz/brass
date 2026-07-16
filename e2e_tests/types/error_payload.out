@@ -1,4 +1,12 @@
-bad input -7
+bad input Error {
+    value: -7,
+    location: Location {
+        file: "e2e_tests/types/error_payload.pp",
+        line: 5,
+        col: 16,
+    },
+    frames: [],
+}
 Result.Ok {
     value: 42,
 }

@@ -175,6 +175,59 @@ impl<'a> Checker<'a> {
         self.fresh_unknown()
     }
 
+    /// A flow site just accepted `got` where `want` is required through the
+    /// structural path. When that acceptance is a declared sum subtype (two
+    /// different sum nominals related by `type Child: Parent`), the value must
+    /// be REBUILT as the parent at runtime -- the child's variant payloads are
+    /// wider, so identity flow would misread the unboxed layout. Record the
+    /// site for MIR lowering, and bind the payload slots the required
+    /// instance leaves open to the value's own (what unification would have
+    /// done had the nominals matched), so an `infer!` return's payloads
+    /// resolve from the coerced value.
+    pub(super) fn record_sum_view(&mut self, got: &Type, want: &Type, span: prepoly_parser::Span) {
+        let (Type::Sum(have), Type::Sum(target)) = (got, want) else {
+            return;
+        };
+        if have.id == target.id {
+            return;
+        }
+        // The value's payload for a slot comes from its substitution (an
+        // unannotated field recorded at construction) or its declaration (an
+        // annotated field, which carries no substitution entry).
+        let declared = |key: &str| -> Option<Type> {
+            let (vname, fname) = key.split_once('.')?;
+            let info = self.program.type_by_id(have.id)?;
+            let TypeKind::Sum { variants } = &info.kind else {
+                return None;
+            };
+            variants
+                .iter()
+                .find(|v| v.name == vname)?
+                .fields
+                .iter()
+                .find(|f| f.name == fname)?
+                .resolved_ty
+                .clone()
+                .filter(|t| !t.is_unknown())
+        };
+        for (key, wt) in target.substitution.iter() {
+            if !self.resolve(wt).is_unknown() {
+                continue;
+            }
+            let ht = have
+                .substitution
+                .get(key)
+                .cloned()
+                .filter(|t| !self.resolve(t).is_unknown())
+                .or_else(|| declared(key));
+            if let Some(ht) = ht {
+                let _ = self.solver.unify(wt, &ht);
+            }
+        }
+        let resolved = self.resolve(want);
+        self.sum_views.insert(span, resolved);
+    }
+
     pub(super) fn expect_expr_assignable(&mut self, got: &Type, want: &Type, expr: &Expr) {
         if integer_literal_fits(expr, want) {
             return;
@@ -263,6 +316,24 @@ impl<'a> Checker<'a> {
         {
             self.report_nullable_use(span);
             return;
+        }
+        // A declared sum subtype flowing into its parent must be RECORDED so
+        // MIR rebuilds the value -- `can_unify`'s structural fallback would
+        // otherwise accept it silently and the unboxed layout would be
+        // misread. Checked before the general acceptance paths, against the
+        // nullable-stripped requirement (`Result<..>?` still coerces the sum).
+        {
+            let want_inner = match &want {
+                Type::Nullable(inner) => inner.as_ref().clone(),
+                other => other.clone(),
+            };
+            if let (Type::Sum(h), Type::Sum(w)) = (&got, &want_inner)
+                && h.id != w.id
+                && crate::structural::types_compatible(self.program, &got, &want_inner)
+            {
+                self.record_sum_view(&got, &want_inner, span);
+                return;
+            }
         }
         if let Type::Nullable(inner) = &want
             && (self.can_unify(&got, inner)

@@ -5,5 +5,13 @@ Result.Ok {
     },
 }
 Result.Err {
-    error: "type mismatch!",
+    error: Error {
+        value: "type mismatch!",
+        location: Location {
+            file: "e2e_tests/structure/from_nullable_result.pp",
+            line: 9,
+            col: 9,
+        },
+        frames: [],
+    },
 }

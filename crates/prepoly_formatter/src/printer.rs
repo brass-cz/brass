@@ -256,13 +256,10 @@ impl<'a> Printer<'a> {
 
     fn sum_body(&mut self, head: &str, variants: &[Variant]) {
         let flats: Vec<String> = variants.iter().map(|v| self.variant_flat(v)).collect();
-        // Inline when it fits. A single-variant sum keeps its leading `|`:
-        // without it, `type X = A` re-parses as an alias.
-        let inline = if variants.len() == 1 {
-            format!("{head} | {}", flats[0])
-        } else {
-            format!("{head} {}", flats.join(" | "))
-        };
+        // Inline when it fits. The leading `|` is kept in every inline form:
+        // without it, `type X = A` re-parses as an alias, and `type X = A {
+        // f } | ..` re-parses as a refinement whose braces then fail.
+        let inline = format!("{head} | {}", flats.join(" | "));
         if self.fits(&inline) {
             self.line(&inline);
             return;

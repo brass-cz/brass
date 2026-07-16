@@ -51,9 +51,36 @@ fn array_element_needs_seed(ty: &Type) -> bool {
     }
 }
 
+/// The zero value `T.default()` folds to for a primitive type word.
+fn primitive_default_literal(tname: &str, method: &str) -> Option<Literal> {
+    if method != "default" {
+        return None;
+    }
+    if prepoly_hir::IntKind::from_name(tname).is_some() {
+        return Some(Literal::Int(0));
+    }
+    match tname {
+        "float32" | "float64" => Some(Literal::Float(0.0)),
+        "bool" => Some(Literal::Bool(false)),
+        "string" => Some(Literal::Str(String::new())),
+        _ => None,
+    }
+}
+
 impl<'a, 'p> FnLower<'a, 'p> {
-    /// Lower an expression to an operand naming its value.
+    /// Lower an expression to an operand naming its value; a value the checker
+    /// accepted as a declared sum subtype at this expression is then rebuilt
+    /// as the parent sum (see [`Self::apply_sum_view`]).
     pub(crate) fn lower_expr(&mut self, e: &Expr) -> Operand {
+        let op = self.lower_expr_inner(e);
+        if let Some(target) = self.ctx.sum_view_target(e.span()) {
+            let target = target.clone();
+            return self.apply_sum_view(&target, op);
+        }
+        op
+    }
+
+    fn lower_expr_inner(&mut self, e: &Expr) -> Operand {
         match e {
             Expr::Int(v, _) => Operand::Const(Literal::Int(*v)),
             Expr::Float(v, _) => Operand::Const(Literal::Float(*v)),
@@ -68,7 +95,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
             }
             Expr::Binary(op, a, b, _) => self.lower_binary(*op, a, b),
             Expr::Call(callee, args, span) => {
-                let rv = self.lower_call(callee, args);
+                let rv = self.lower_call(callee, args, *span);
                 // A call whose checker-resolved result is a constructed aggregate
                 // (a record/sum/array) seeds its result local `Known`, so the back
                 // end follows the instance type the caller fixed -- the path a
@@ -94,6 +121,107 @@ impl<'a, 'p> FnLower<'a, 'p> {
             Expr::Match(scrut, arms, _) => self.lower_match(scrut, arms),
             Expr::Block(b, _) => self.lower_block_value(b),
         }
+    }
+
+    /// Rebuild `source` (a value of a declared sum subtype) as its parent sum
+    /// `target`: test the value's variant, load the parent's fields for that
+    /// variant (variant-scoped projections, tag-safe under the test), and
+    /// construct the parent's variant from them. The child may carry extra
+    /// (width) fields; the rebuild drops them, which is what declared sum
+    /// subtyping means at a flow point -- identity flow would misread the
+    /// unboxed layout. The result local is seeded with the parent instance
+    /// the checker resolved, so monomorphization follows it in any position.
+    fn apply_sum_view(&mut self, target: &Type, source: Operand) -> Operand {
+        let Type::Sum(n) = target else {
+            return source;
+        };
+        let Some(info) = self.ctx.program.type_by_id(n.id) else {
+            return source;
+        };
+        let prepoly_hir::TypeKind::Sum { variants } = &info.kind else {
+            return source;
+        };
+        let symbol = info.symbol.clone();
+        let variants: Vec<(String, Vec<String>)> = variants
+            .iter()
+            .map(|v| {
+                (
+                    v.name.clone(),
+                    v.fields.iter().map(|f| f.name.clone()).collect(),
+                )
+            })
+            .collect();
+        let src = self.b.make_local(source);
+        let res = if prepoly_hir::is_fully_known(target) {
+            self.b.fresh_local_typed(None, target.clone())
+        } else {
+            self.b.fresh_local(None)
+        };
+        let merge_bb = self.b.new_block();
+        for (vname, fields) in &variants {
+            let arm_bb = self.b.new_block();
+            let next_bb = self.b.new_block();
+            let cond = self.b.emit(Rvalue::Call(
+                Callee::Builtin("value_matches".into()),
+                vec![
+                    Operand::Local(src),
+                    Operand::Const(Literal::Str(vname.clone())),
+                ],
+            ));
+            self.b.terminate(Terminator::CondBranch {
+                cond,
+                then: arm_bb,
+                els: next_bb,
+            });
+            self.b.switch_to(arm_bb);
+            let built: Vec<(String, Operand)> = fields
+                .iter()
+                .map(|f| {
+                    let key = format!("{vname}.{f}");
+                    let load =
+                        Rvalue::Load(Place::projected(src, vec![Projection::Field(key.clone())]));
+                    // Seed the loaded payload with the target instance's own
+                    // type for this slot: an arm the value never takes (the
+                    // guard above proves it) has no inferable type of its own,
+                    // and the target instance is what the rebuild constructs.
+                    let v = match n
+                        .substitution
+                        .get(&key)
+                        .filter(|t| prepoly_hir::is_fully_known(t))
+                    {
+                        Some(ft) => self.b.emit_known(load, ft.clone()),
+                        None => self.b.emit(load),
+                    };
+                    (f.clone(), v)
+                })
+                .collect();
+            let rebuild = Rvalue::Variant {
+                ty: symbol.clone(),
+                variant: vname.clone(),
+                fields: built,
+            };
+            // The construction IS the target instance; seed it so the arm
+            // types without an enclosing-return Result to borrow from.
+            let v = if prepoly_hir::is_fully_known(target) {
+                self.b.emit_known(rebuild, target.clone())
+            } else {
+                self.b.emit(rebuild)
+            };
+            self.b.push(MirStmt::Assign(res, Rvalue::Use(v)));
+            self.b.terminate(Terminator::Goto(merge_bb));
+            self.b.switch_to(next_bb);
+        }
+        // The checker enforced variant-set equality at the declaration, so the
+        // value is always one of the parent's variants.
+        self.b.push(MirStmt::Eval(Rvalue::Call(
+            Callee::Builtin("panic".into()),
+            vec![Operand::Const(Literal::Str(
+                "unreachable: sum subtype coercion saw an unknown variant".into(),
+            ))],
+        )));
+        self.b.terminate(Terminator::Unreachable);
+        self.b.switch_to(merge_bb);
+        Operand::Local(res)
     }
 
     /// A bare identifier: a bound local, otherwise a module global read.
@@ -427,12 +555,89 @@ impl<'a, 'p> FnLower<'a, 'p> {
             // also raises errors).
             self.b
                 .terminate(Terminator::Return(Operand::Const(Literal::Null)));
+        } else if self.ctx.lift_errs.contains(&span) {
+            // The checker marked this propagation as LIFTING: the payload is
+            // re-raised wrapped into the prelude `Error`, gaining this site's
+            // position (the abort path above keeps the original payload, so a
+            // never-wrapped chain renders as before).
+            let lifted = self.lift_propagated_err(v, span);
+            self.b.terminate(Terminator::Return(lifted));
         } else {
             // Propagate the error Result unchanged.
             self.b.terminate(Terminator::Return(Operand::Local(v)));
         }
 
         self.b.switch_to(cont_bb);
+        Operand::Local(res)
+    }
+
+    /// Rebuild a propagated Err whose payload the checker marked for lifting:
+    /// `Err { error: Error { value: <old payload>, location: <this site>,
+    /// frames: [] } }`, mirroring what `error(..)` builds.
+    fn lift_propagated_err(&mut self, v: LocalId, span: prepoly_parser::Span) -> Operand {
+        let old = self.b.emit(Rvalue::Load(Place::projected(
+            v,
+            vec![Projection::Field("error".into())],
+        )));
+        let loc = self.location_operand(span);
+        let frames = match self
+            .ctx
+            .concrete_nominal_ref(&self.module, "Frame")
+            .map(|t| Type::Slice(Box::new(t)))
+        {
+            Some(t) => self.b.fresh_local_typed(None, t),
+            None => self.b.fresh_local(None),
+        };
+        self.b
+            .push(MirStmt::Assign(frames, Rvalue::Array(Vec::new())));
+        let err = self.b.emit(Rvalue::Record {
+            ty: "Error".to_string(),
+            fields: vec![
+                ("value".to_string(), old),
+                ("location".to_string(), loc),
+                ("frames".to_string(), Operand::Local(frames)),
+            ],
+        });
+        self.b.emit(Rvalue::Variant {
+            ty: "Result".to_string(),
+            variant: "Err".to_string(),
+            fields: vec![("error".to_string(), err)],
+        })
+    }
+
+    /// Rebuild a forwarded Result so its Err arm carries the LIFTED payload
+    /// (see [`Self::lift_propagated_err`]); the Ok arm passes through. The
+    /// ERR block is created first on purpose: the merged result local takes
+    /// its type from the first assignment monomorphization sees, and the Err
+    /// arm's construction is the one carrying the callable's lifted Result.
+    pub(crate) fn wrap_forwarded_err(
+        &mut self,
+        source: Operand,
+        span: prepoly_parser::Span,
+    ) -> Operand {
+        let src = self.b.make_local(source);
+        let res = self.b.fresh_local(None);
+        let cond = self.b.emit(Rvalue::Call(
+            Callee::Builtin("result_is_ok".into()),
+            vec![Operand::Local(src)],
+        ));
+        let err_bb = self.b.new_block();
+        let ok_bb = self.b.new_block();
+        let merge_bb = self.b.new_block();
+        self.b.terminate(Terminator::CondBranch {
+            cond,
+            then: ok_bb,
+            els: err_bb,
+        });
+        self.b.switch_to(err_bb);
+        let lifted = self.lift_propagated_err(src, span);
+        self.b.push(MirStmt::Assign(res, Rvalue::Use(lifted)));
+        self.b.terminate(Terminator::Goto(merge_bb));
+        self.b.switch_to(ok_bb);
+        self.b
+            .push(MirStmt::Assign(res, Rvalue::Use(Operand::Local(src))));
+        self.b.terminate(Terminator::Goto(merge_bb));
+        self.b.switch_to(merge_bb);
         Operand::Local(res)
     }
 
@@ -456,16 +661,28 @@ impl<'a, 'p> FnLower<'a, 'p> {
             v,
             vec![Projection::Field("error".into())],
         )));
-        let rendered = self
-            .b
-            .emit(Rvalue::Call(Callee::Builtin("to_string".into()), vec![err]));
-        let msg = self.b.emit(Rvalue::Call(
-            Callee::Builtin("_string_concat".into()),
-            vec![
-                Operand::Const(Literal::Str("unhandled error: ".into())),
-                rendered,
-            ],
-        ));
+        // The prelude renders the payload: an `Error` prints its trace, any
+        // other payload the plain `unhandled error:` prefix form (see
+        // std/prelude/error.pp `_render_unhandled`).
+        let msg = match self
+            .ctx
+            .resolve_fn_symbol(&self.module, "_render_unhandled")
+        {
+            Some(render) => self.b.emit(Rvalue::Call(Callee::Free(render), vec![err])),
+            // Lowering without the prelude (tests): keep the prefix form.
+            None => {
+                let rendered = self
+                    .b
+                    .emit(Rvalue::Call(Callee::Builtin("to_string".into()), vec![err]));
+                self.b.emit(Rvalue::Call(
+                    Callee::Builtin("_string_concat".into()),
+                    vec![
+                        Operand::Const(Literal::Str("unhandled error: ".into())),
+                        rendered,
+                    ],
+                ))
+            }
+        };
         self.b.push(MirStmt::Eval(Rvalue::Call(
             Callee::Builtin("_panic".into()),
             vec![msg],
@@ -678,7 +895,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
     /// Build the rvalue for a call, routing it structurally (same decisions as
     /// `codegen::gen_call`). Side-effecting sub-expressions (receiver, args) are
     /// evaluated here in source order.
-    pub(crate) fn lower_call(&mut self, callee: &Expr, args: &[Arg]) -> Rvalue {
+    pub(crate) fn lower_call(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Rvalue {
         // `typeof(x)` in value position: the reflection builtin (the checker
         // reserves the name before any user binding). The operand is lowered
         // for its effects and the type NAME is left to the back ends, which
@@ -720,6 +937,14 @@ impl<'a, 'p> FnLower<'a, 'p> {
                     },
                     ops,
                 );
+            }
+            // `T.default()` for a primitive type word folds to its zero
+            // value (the `Default` protocol's builtin implementations).
+            if let Expr::Ident(tname, _) = &**base
+                && self.lookup(tname).is_none()
+                && let Some(lit) = primitive_default_literal(tname, method)
+            {
+                return Rvalue::Use(Operand::Const(lit));
             }
             if let Expr::Ident(tname, _) = &**base
                 && self.lookup(tname).is_none()
@@ -771,24 +996,24 @@ impl<'a, 'p> FnLower<'a, 'p> {
             }
             let mut ops = vec![recv];
             ops.extend(self.lower_args(args));
+            // A method call may omit the callee's trailing `Location`
+            // parameter; complete it with the call site.
+            if let Some(full) = self.ctx.method_wants_location(method)
+                && ops.len() + 1 == full
+            {
+                let loc = self.location_operand(span);
+                ops.push(loc);
+            }
             return Rvalue::Call(Callee::Method(method.clone()), ops);
         }
         if let Expr::Ident(name, _) = callee {
-            // `error(x)` desugars to the builtin `Result.Err { error: x }` and is
-            // never a user function.
-            if name == "error" {
-                let payload = match args.first() {
-                    Some(a) => self.lower_expr(&a.expr),
-                    None => Operand::void(),
-                };
-                return Rvalue::Variant {
-                    ty: "Result".to_string(),
-                    variant: "Err".to_string(),
-                    fields: vec![("error".to_string(), payload)],
-                };
-            }
             // A local holding a closure/function value is called indirectly.
-            if let Some(local) = self.lookup(name) {
+            // `error` is a reserved callee name: a local binding (a match's
+            // `Err { error }` payload) never shadows the prelude function in
+            // call position.
+            if name != "error"
+                && let Some(local) = self.lookup(name)
+            {
                 let ops = self.lower_args(args);
                 return Rvalue::Call(Callee::Indirect(Operand::Local(local)), ops);
             }
@@ -812,6 +1037,14 @@ impl<'a, 'p> FnLower<'a, 'p> {
                     }
                 }
                 self.pad_trailing_nullable(name, &mut ops);
+                // A call may omit the callee's trailing `Location` parameter;
+                // complete it with the call site.
+                if let Some(full) = self.ctx.free_fn_wants_location(&self.module, name)
+                    && ops.len() + 1 == full
+                {
+                    let loc = self.location_operand(span);
+                    ops.push(loc);
+                }
                 return Rvalue::Call(Callee::Free(symbol), ops);
             }
             // A module GLOBAL holding a closure/function value is called
@@ -824,6 +1057,20 @@ impl<'a, 'p> FnLower<'a, 'p> {
                 let ops = self.lower_args(args);
                 return Rvalue::Call(Callee::Indirect(g), ops);
             }
+            // A program lowered without the prelude (unit tests, embedders)
+            // has no `error` function to resolve to; keep the legacy builtin
+            // desugar so such programs still construct the Err.
+            if name == "error" {
+                let payload = match args.first() {
+                    Some(a) => self.lower_expr(&a.expr),
+                    None => Operand::void(),
+                };
+                return Rvalue::Variant {
+                    ty: "Result".to_string(),
+                    variant: "Err".to_string(),
+                    fields: vec![("error".to_string(), payload)],
+                };
+            }
             // Otherwise it is a runtime builtin.
             let ops = self.lower_args(args);
             return Rvalue::Call(Callee::Builtin(name.clone()), ops);
@@ -832,6 +1079,23 @@ impl<'a, 'p> FnLower<'a, 'p> {
         let clo = self.lower_expr(callee);
         let ops = self.lower_args(args);
         Rvalue::Call(Callee::Indirect(clo), ops)
+    }
+
+    /// Build the `Location` record for the call at `span` (the implicit
+    /// caller-location argument).
+    fn location_operand(&mut self, span: Span) -> Operand {
+        let (file, line, col) = self.ctx.call_location(span);
+        self.b.emit(Rvalue::Record {
+            ty: "Location".to_string(),
+            fields: vec![
+                ("file".to_string(), Operand::Const(Literal::Str(file))),
+                (
+                    "line".to_string(),
+                    Operand::Const(Literal::Int(line as i64)),
+                ),
+                ("col".to_string(), Operand::Const(Literal::Int(col as i64))),
+            ],
+        })
     }
 
     fn lower_args(&mut self, args: &[Arg]) -> Vec<Operand> {

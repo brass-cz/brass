@@ -299,9 +299,9 @@ fun name(param, other: Type, third: ref(mut(T))) -> ReturnType {
 
 Both parameter and return annotations are optional. `fun T.m(params)` declares
 a method of type `T` (see [methods](/references/types/#methods)); the standard library
-also uses the receiver forms `fun string.m`, `fun infer[].m`, and
-`fun string[].m` to put methods on primitive and array types (user code
-cannot).
+also uses the receiver forms `fun string.m`, `fun int32.m` (any primitive type
+word), `fun infer[].m`, and `fun string[].m` to put methods on primitive and
+array types (user code cannot).
 
 ### Types
 
@@ -309,6 +309,7 @@ cannot).
 type Name = { members }                  // record
 type Name = | V1 { members } | V2       // sum type
 type Name: IfaceA, IfaceB = { members } // with interface constraints
+type Child: Parent = | V1 { .. } | V2   // sum with a declared parent (subtyping)
 type Alias = Base { field: T, ... }     // refinement alias (see below)
 ```
 

@@ -21,12 +21,12 @@ Reserved builtin names that cannot be redefined: `len`, `spawn`, `with`,
 
 ## Builtins
 
-| Function                           | Signature                    | Notes                                                   |
-| ---------------------------------- | ---------------------------- | ------------------------------------------------------- |
-| `len(x)`                           | `(array or string) -> int64` | element count / byte length; also callable as `x.len()` |
-| `error(x)`                         | constructs `Result.Err`      | see [Result](/references/types/#result)                 |
-| `fields(x)`, `typeof(x)`           | compile-time                 | see [Reflection](/references/reflection/)               |
-| `spawn(f)`, `with(c, f)`, `sync()` | concurrency                  | see [Concurrency](/references/concurrency/)             |
+| Function                           | Signature                    | Notes                                                    |
+| ---------------------------------- | ---------------------------- | -------------------------------------------------------- |
+| `len(x)`                           | `(array or string) -> int64` | element count / byte length; also callable as `x.len()`  |
+| `error(x)`                         | `Err` wrapping an `Error`    | a prelude function; see [Errors](#errors-stdpreludeerror) |
+| `fields(x)`, `typeof(x)`           | compile-time                 | see [Reflection](/references/reflection/)                 |
+| `spawn(f)`, `with(c, f)`, `sync()` | concurrency                  | see [Concurrency](/references/concurrency/)               |
 
 Growable arrays (`T[]`) have these built-in methods (all rejected on
 fixed-length `T[n]`):
@@ -40,6 +40,38 @@ fixed-length `T[n]`):
 | `arr.len()`        | `() -> int64` (both `T[]` and `T[n]`) |
 
 Indexing is bounds-checked at runtime on both array kinds.
+
+## Errors (`std.prelude.error`)
+
+The error value model behind `error(..)` and `!` (normatively specified in
+[Error traces](/references/syntax-sugar/#error-traces)):
+
+| Name                     | Shape / signature                              | Behavior                                                            |
+| ------------------------ | ---------------------------------------------- | ------------------------------------------------------------------- |
+| `Location`               | `{ file: string, line: int32, col: int32 }`    | a source position; `display()` renders `file:line:col`              |
+| `Frame`                  | `{ message, location: Location }`              | one `context` annotation                                            |
+| `Error`                  | `{ value, location: Location, frames: Frame[] }` | the payload `error(..)` raises; `display()` renders the nested trace |
+| `error(value)`           | `-> infer!`                                    | an `Err` wrapping `value` into an `Error` stamped with the call site |
+| `r.context(msg)`         | `(string) -> Result`                           | appends a `Frame` to a failed result; leaves a success untouched    |
+
+`error` and `context` declare a trailing `loc: Location` parameter the
+compiler fills with the call site (the
+[implicit location argument](/references/syntax-sugar/#error-traces)); a
+caller may also pass it explicitly.
+
+## Type tests and defaults
+
+Each primitive type implements only its **own** `is_<type>` method —
+`is_string`, `is_bool`, `is_int8` … `is_int64`, `is_uint8` … `is_uint64`,
+`is_float32`, `is_float64`, and `is_array` on arrays. Calling one returns
+`true`; the point is the uncalled
+[member-presence test](/references/reflection/#member-presence-xm-without-a-call),
+which makes `if v.is_string { ... }` a compile-time type dispatch (records
+and sums carry none of these members).
+
+Every primitive type also has a static `T.default()` producing its zero
+value: `0` for the numeric widths, `false` for `bool`, `""` for `string`
+(see [the Default model](/references/syntax-sugar/#methods-are-default-fields)).
 
 ## `std.io`
 

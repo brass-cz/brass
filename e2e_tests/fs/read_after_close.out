@@ -1,2 +1,10 @@
-read after close: file is closed
+read after close: Error {
+    value: "file is closed",
+    location: Location {
+        file: "<plugin:libraries/libfs.so>",
+        line: 17,
+        col: 12,
+    },
+    frames: [],
+}
 double close ok

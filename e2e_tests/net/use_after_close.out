@@ -1,4 +1,20 @@
 read after close errs
-addr after close: socket is closed
-accept after close: socket is closed
+addr after close: Error {
+    value: "socket is closed",
+    location: Location {
+        file: "<plugin:libraries/libnet.so>",
+        line: 65,
+        col: 12,
+    },
+    frames: [],
+}
+accept after close: Error {
+    value: "socket is closed",
+    location: Location {
+        file: "<plugin:libraries/libnet.so>",
+        line: 27,
+        col: 12,
+    },
+    frames: [],
+}
 done

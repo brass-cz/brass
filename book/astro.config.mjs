@@ -87,6 +87,7 @@ export default defineConfig({
           items: [
             { label: "Syntax", slug: "references/syntax" },
             { label: "Type system", slug: "references/types" },
+            { label: "Syntax sugar", slug: "references/syntax-sugar" },
             { label: "Standard library", slug: "references/stdlib" },
             { label: "Modules", slug: "references/modules" },
             { label: "Compile-time reflection", slug: "references/reflection" },

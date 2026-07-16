@@ -348,7 +348,7 @@ impl<'p> Hm<'p> {
         self.fallible = block_constructs_error(body) || is_result(&self.solver.resolve(&declared));
         tracing::debug!(context, fallible = self.fallible, "checking callable body");
         if self.fallible {
-            let inferred = Type::result(self.ok.clone(), self.err.clone());
+            let inferred = self.scoped_result(self.ok.clone(), self.err.clone());
             self.unify(&declared, &inferred, span);
             self.ret = inferred;
         } else {
@@ -498,6 +498,16 @@ impl<'p> Hm<'p> {
     /// unify -- structural subtyping, accepting them when one error record is
     /// usable as the other. Truly unrelated error
     /// types are a type error.
+    /// The `Result` the fallibility sugar builds in the current module's scope
+    /// (see `Program::scoped_result_instance`). A shadow with the wrong shape
+    /// falls back to the built-in Result silently here; the authoritative
+    /// infer pass reports it.
+    fn scoped_result(&self, ok: Type, err: Type) -> Type {
+        self.program
+            .scoped_result_instance(&self.module, &ok, &err)
+            .unwrap_or_else(|_| Type::result(ok, err))
+    }
+
     fn reconcile_err(&mut self, t: &Type, span: Span) {
         let err = self.err.clone();
         if self.flow_unify(t, &err) {
@@ -581,13 +591,46 @@ impl<'p> Hm<'p> {
             Stmt::Return(Some(e), span) => {
                 let t = self.infer_expr(e);
                 // In a fallible function a bare value is the success payload
-                // (auto-wrapped as `Ok { value }`); a `Result` value flows whole.
-                if self.fallible && !is_result(&self.solver.resolve(&t)) {
+                // (auto-wrapped as `Ok { value }`); a `Result` value -- or a
+                // declared sum subtype of the return's Result, which the flow
+                // site coerces -- flows whole.
+                let resolved_t = self.solver.resolve(&t);
+                let whole = is_result(&resolved_t) || {
+                    let ret = self.solver.resolve(&self.ret);
+                    let ret_sum = match &ret {
+                        Type::Nullable(inner) => inner.as_ref().clone(),
+                        other => other.clone(),
+                    };
+                    matches!((&resolved_t, &ret_sum), (Type::Sum(h), Type::Sum(w))
+                        if crate::structural::declares_sum_parent(self.program, h.id, w.id, 0))
+                };
+                if self.fallible && !whole {
                     let ok = self.ok.clone();
                     self.flow_into(&t, &ok, *span);
                 } else {
+                    // A forwarded Result's error is re-raised lifted into the
+                    // prelude `Error` (the infer pass records the rebuild);
+                    // flow the lifted shape so the error type reconciles.
+                    let flowed = match &resolved_t {
+                        Type::Sum(n) if n.is_result_type() => {
+                            match n.substitution.get(prepoly_hir::types::RESULT_ERR_ERROR) {
+                                Some(err) => {
+                                    let lifted = crate::lift_err_payload(
+                                        self.program,
+                                        self.solver.resolve(err),
+                                    );
+                                    let mut n = n.clone();
+                                    n.substitution
+                                        .insert(prepoly_hir::types::RESULT_ERR_ERROR, lifted);
+                                    Type::Sum(n)
+                                }
+                                None => t.clone(),
+                            }
+                        }
+                        _ => t.clone(),
+                    };
                     let ret = self.ret.clone();
-                    self.flow_into(&t, &ret, *span);
+                    self.flow_into(&flowed, &ret, *span);
                 }
             }
             Stmt::Return(None, span) => {
@@ -797,6 +840,13 @@ impl<'p> Hm<'p> {
                     // be common to all variants). A built-in/unknown nominal (e.g.
                     // `Result`, matched not field-accessed) stays open.
                     Type::Record(_) | Type::Sum(_) if self.type_def(&resolved).is_some() => {
+                        // An uncalled DECLARED METHOD is the compile-time
+                        // presence value: the method's own name, a truthy
+                        // string; a name a sum carries nowhere is the null
+                        // presence value (see `Program::member_presence`).
+                        if let Some(present) = self.program.member_presence(&resolved, field) {
+                            return if present { Type::Str } else { Type::null() };
+                        }
                         match self.record_field_type(&resolved, field) {
                             // An unannotated (dynamic) field has no single static
                             // type shared across values; give each access a fresh
@@ -823,12 +873,23 @@ impl<'p> Hm<'p> {
                             }
                         }
                     }
+                    // A concrete primitive has no fields; an uncalled member on
+                    // one is the compile-time presence value -- the method's
+                    // own name (truthy) or the null absence (falsy). Presence
+                    // always answers for a primitive class, so this never
+                    // hard-errors.
                     Type::Int(_) | Type::Float(_) | Type::Bool | Type::Str => {
-                        self.error(
-                            format!("`{}` has no field `{}`", resolved.display(), field),
-                            *span,
-                        );
-                        self.solver.fresh(InferenceVarKind::Source)
+                        match self.program.member_presence(&resolved, field) {
+                            Some(true) => Type::Str,
+                            Some(false) => Type::null(),
+                            None => {
+                                self.error(
+                                    format!("`{}` has no field `{}`", resolved.display(), field),
+                                    *span,
+                                );
+                                self.solver.fresh(InferenceVarKind::Source)
+                            }
+                        }
                     }
                     _ => self.solver.fresh(InferenceVarKind::Source),
                 }
@@ -905,12 +966,52 @@ impl<'p> Hm<'p> {
             // payload-less `Result.Null`, constraining no error type.
             Expr::ErrorProp(e, span) => {
                 let et = self.infer_expr(e);
-                if let Type::Nullable(inner) = self.solver.resolve(&et) {
+                let resolved = self.solver.resolve(&et);
+                if let Type::Nullable(inner) = resolved {
                     return *inner;
+                }
+                // Operand-driven when the Result is already known: `!` unwraps
+                // whatever Result declaration the operand carries (a scope's
+                // shadow included), so no constructed nominal is forced on it.
+                if let Type::Sum(n) = &resolved
+                    && let Some((ok, err)) = n.result_payloads()
+                {
+                    let (ok, err) = (ok.clone(), err.clone());
+                    let err = crate::lift_err_payload(self.program, self.solver.resolve(&err));
+                    self.reconcile_err(&err, *span);
+                    return ok;
+                }
+                // A declared subtype of the Result in scope unwraps like a
+                // Result: its own payload slots reconcile and yield (the
+                // infer pass records the coercion the flow needs).
+                if let Type::Sum(h) = &resolved {
+                    let scoped = self.scoped_result(Type::Void, Type::Void);
+                    if let Type::Sum(w) = &scoped
+                        && h.id != w.id
+                        && crate::structural::declares_sum_parent(self.program, h.id, w.id, 0)
+                    {
+                        // The propagated payload lifts like a plain Result's
+                        // (the infer pass records the rebuild), so the shared
+                        // err var must see the lifted type, not the raw one.
+                        let err = crate::structural::sum_field_payload(
+                            self.program,
+                            h,
+                            prepoly_hir::types::RESULT_ERR_ERROR,
+                        )
+                        .map(|e| crate::lift_err_payload(self.program, self.solver.resolve(&e)))
+                        .unwrap_or_else(|| self.solver.fresh(InferenceVarKind::Source));
+                        self.reconcile_err(&err, *span);
+                        return crate::structural::sum_field_payload(
+                            self.program,
+                            h,
+                            prepoly_hir::types::RESULT_OK_VALUE,
+                        )
+                        .unwrap_or_else(|| self.solver.fresh(InferenceVarKind::Source));
+                    }
                 }
                 let o = self.solver.fresh(InferenceVarKind::Source);
                 let e_err = self.solver.fresh(InferenceVarKind::Source);
-                let res = Type::result(o.clone(), e_err.clone());
+                let res = self.scoped_result(o.clone(), e_err.clone());
                 self.unify(&et, &res, *span);
                 self.reconcile_err(&e_err, *span);
                 o
@@ -1251,26 +1352,34 @@ impl<'p> Hm<'p> {
     }
 
     fn infer_call(&mut self, callee: &Expr, args: &[prepoly_parser::ast::Arg], span: Span) -> Type {
-        // `error(x)` is the Err sugar: it constrains this function's error type to
-        // `typeof(x)` and yields a `Result` whose Err is that type.
         if let Expr::Ident(name, _) = callee {
+            // Mirror the infer pass's `error(x)` typing: the Err is the
+            // prelude Error record wrapping the argument, the Ok is fresh per
+            // call, and the Error reconciles into this function's error type.
             if name == "error" {
-                let xt = args
+                let value_ty = args
                     .first()
                     .map(|a| self.infer_expr(&a.expr))
                     .unwrap_or(Type::Void);
-                self.reconcile_err(&xt, span);
-                // The Ok payload is FRESH per call, not this function's own `ok`.
-                // An `error(..)` produces no Ok value, so its payload is whatever
-                // the position it flows into requires -- `return error(..)` unifies
-                // the fresh variable with this function's `ok` through the return
-                // check, and an argument position unifies it with the parameter's.
-                // Sharing `self.ok` made every `error(..)` in one body the SAME
-                // type, so two arguments needing different payloads clashed:
-                // `unwrap_or(error("a"), -1)` then `describe(error("b"))` reported
-                // "cannot use `Result<int32, string>` where `Result<string, ?>` is
-                // required" on the second.
+                for a in args.iter().skip(1) {
+                    self.infer_expr(&a.expr);
+                }
+                // A program without the prelude (unit tests, embedders) keeps
+                // the legacy raw payload.
+                let err = match self.program.types.get("Error") {
+                    Some(err_info) => {
+                        let mut err = prepoly_hir::NominalType::new(err_info.id, &err_info.name);
+                        err.substitution
+                            .insert("value", self.solver.resolve(&value_ty));
+                        Type::Record(err)
+                    }
+                    None => self.solver.resolve(&value_ty),
+                };
+                self.reconcile_err(&err, span);
                 let ok = self.solver.fresh(InferenceVarKind::Source);
+                // The call's type carries this function's SHARED error
+                // variable (reconciled just above), so a `return error(..)`
+                // unifies with the inferred fallible return trivially.
                 return Type::result(ok, self.err.clone());
             }
             // Built-in `_string_*` primitives have fixed string-argument contracts.
@@ -1332,6 +1441,16 @@ impl<'p> Hm<'p> {
                 *ret
             }
             Type::Fun(params, ret) => {
+                // A call may omit a trailing `Location` parameter (the
+                // implicit caller-location MIR fills in).
+                if params.len() == arg_tys.len() + 1
+                    && matches!(params.last(), Some(Type::Record(n)) if n.is_name("Location"))
+                {
+                    for (p, a) in params.iter().zip(&arg_tys) {
+                        self.flow_into(a, p, span);
+                    }
+                    return *ret;
+                }
                 self.errors.push(TypeError {
                     message: format!(
                         "expected {} argument(s), found {}",
@@ -1680,7 +1799,16 @@ fn stmt_constructs_error(stmt: &Stmt) -> bool {
 
 fn expr_constructs_error(e: &Expr) -> bool {
     match e {
-        Expr::ErrorProp(inner, _) => expr_constructs_error(inner),
+        // `error(..)!` immediately unwraps; the construction never escapes as
+        // this body's own Result (see the MIR-side scanner).
+        Expr::ErrorProp(inner, _) => {
+            if let Expr::Call(c, args, _) = &**inner
+                && matches!(&**c, Expr::Ident(n, _) if n == "error")
+            {
+                return args.iter().any(|a| expr_constructs_error(&a.expr));
+            }
+            expr_constructs_error(inner)
+        }
         Expr::Call(callee, args, _) => {
             matches!(&**callee, Expr::Ident(n, _) if n == "error")
                 || expr_constructs_error(callee)
