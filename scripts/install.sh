@@ -4,7 +4,7 @@ if [ -z "$BRASS_VERSION" ]; then
     # release version
     BRASS_VERSION="v0.1.0"
 fi
-BRASS_REPO_BASE_URL="https://github.com/brass-lang/brass"
+BRASS_REPO_BASE_URL="https://github.com/brass-cz/brass"
 
 # print host-tuple
 print_host_tuple() {
