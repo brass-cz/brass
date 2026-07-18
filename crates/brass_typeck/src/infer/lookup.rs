@@ -318,7 +318,7 @@ impl<'a> Checker<'a> {
             return true;
         }
         // Only the implicit-prelude modules are visible with no import; the
-        // nested standard-library modules (`std.collections.hashmap`, ...) follow the same
+        // core-library modules (`core.collections`, ...) follow the same
         // import rule as user modules.
         if self.program.prelude_modules.contains(defining) && !name.starts_with('_') {
             return true;

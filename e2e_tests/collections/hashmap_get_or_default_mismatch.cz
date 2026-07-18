@@ -1,5 +1,3 @@
-import std.collections.{ HashMap }
-
 // `get_or`'s default is returned where the stored value is, so it must BE the
 // map's value type. The co-check commits the unification of the method's two
 // returns (`e.value` and `dflt`), making `dflt` the scheme's value parameter;

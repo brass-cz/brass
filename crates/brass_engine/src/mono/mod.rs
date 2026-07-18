@@ -425,14 +425,14 @@ pub fn monomorphize<'m>(
 /// Why entry-rooted monomorphization ([`monomorphize_entry`]) stopped.
 #[derive(Debug)]
 pub enum MonoStop {
-    /// A reachable call needed function `symbol`, whose MIR body is not in
-    /// the program (the lazy pipeline lowers function bodies on demand), at
-    /// the concrete argument types `type_args`. The caller lowers that body
-    /// into the MIR program and retries.
-    MissingBody {
-        symbol: String,
-        type_args: Vec<Type>,
-    },
+    /// Reachable calls needed function bodies that are not in the MIR
+    /// program (the lazy pipeline lowers function bodies on demand), each at
+    /// the concrete argument types of the call that needed it. One pass
+    /// collects EVERY missing body it can see -- a missing call's result is
+    /// left unresolved and the walk continues -- so the caller lowers them
+    /// all and retries: the retry count is the call graph's depth, not its
+    /// node count. Never empty.
+    MissingBodies(Vec<(String, Vec<Type>)>),
     /// Monomorphization genuinely failed (the same rejection
     /// [`monomorphize`] reports for the entry).
     Fail(String),
@@ -444,7 +444,7 @@ pub enum MonoStop {
 /// only enters through inits and `main` -- so unreachable functions are
 /// never pulled in, which is the point: their bodies may not be checked or
 /// lowered yet. A missing reachable body stops the run with
-/// [`MonoStop::MissingBody`] (even inside a best-effort init, which
+/// [`MonoStop::MissingBodies`] (even inside a best-effort init, which
 /// [`monomorphize`] would silently skip) so the caller can supply the body
 /// and retry rather than mis-classify it as untypeable.
 pub fn monomorphize_entry<'m>(
@@ -456,10 +456,15 @@ pub fn monomorphize_entry<'m>(
     if defer {
         mono.defer = Some(HashMap::new());
     }
-    let missing = |mono: &Monomorphizer| mono.missing_demand.borrow_mut().take();
     let mut init_symbols = Vec::with_capacity(mir.inits.len());
     for (i, init) in mir.inits.iter().enumerate() {
         let sym = format!("{SYNTH_SIGIL}init{i}");
+        // Demands recorded during a root that completes cleanly came from
+        // dead branches or recovered speculative probes (a presence test):
+        // roll them back to this watermark so dead code demands no body. A
+        // failed root keeps its demands and the loop CONTINUES -- every
+        // root's missing set is collected before the batch is returned.
+        let watermark = mono.missing_demands.borrow().len();
         let res = mono.type_and_store(
             sym.clone(),
             &init.body,
@@ -476,18 +481,13 @@ pub fn monomorphize_entry<'m>(
         mono.in_progress.clear();
         mono.assumed_rets.clear();
         match res {
-            // A recovered speculative probe (a presence test) may have set a
-            // demand the successful root never needed; drop it so it cannot
-            // shadow a later root's real missing dependency.
             Ok(_) => {
-                mono.missing_demand.borrow_mut().take();
+                mono.missing_demands.borrow_mut().truncate(watermark);
                 init_symbols.push(sym);
             }
             Err(e) => {
-                if let Some((symbol, type_args)) = missing(&mono) {
-                    return Err(MonoStop::MissingBody { symbol, type_args });
-                }
-                if matches!(init.module.as_slice(), [m] if m == "main") {
+                let missed = mono.missing_demands.borrow().len() > watermark;
+                if !missed && matches!(init.module.as_slice(), [m] if m == "main") {
                     return Err(MonoStop::Fail(format!(
                         "top-level code is outside the typed subset: {e}"
                     )));
@@ -497,15 +497,24 @@ pub fn monomorphize_entry<'m>(
     }
     let mut main_skip = None;
     if mir.functions.iter().any(|f| f.symbol == "main") || program.functions.contains_key("main") {
-        if let Err(e) = mono.instantiate_fn("main", Vec::new()) {
-            if let Some((symbol, type_args)) = missing(&mono) {
-                return Err(MonoStop::MissingBody { symbol, type_args });
+        let watermark = mono.missing_demands.borrow().len();
+        match mono.instantiate_fn("main", Vec::new()) {
+            Ok(_) => mono.missing_demands.borrow_mut().truncate(watermark),
+            Err(e) => {
+                // Only a miss-free failure is a genuine skip; a failure with
+                // missing bodies is retried once they land.
+                if mono.missing_demands.borrow().len() == watermark {
+                    tracing::debug!(root = "main", error = %e, "skipping untypeable entry");
+                    main_skip = Some(e);
+                }
             }
-            tracing::debug!(root = "main", error = %e, "skipping untypeable entry");
-            main_skip = Some(e);
         }
         mono.in_progress.clear();
         mono.assumed_rets.clear();
+    }
+    let missing = std::mem::take(&mut *mono.missing_demands.borrow_mut());
+    if !missing.is_empty() {
+        return Err(MonoStop::MissingBodies(missing));
     }
     let mut mono_program = mono.into_program(init_symbols, program);
     mono_program.main_skip = main_skip;
@@ -537,7 +546,7 @@ pub fn monomorphize_instance<'m>(
 /// runtime-resolved sites (collected in the result's `deferred`) instead of
 /// pulling their bodies in, so one resolution compiles one call's worth of
 /// code. A missing body that cannot defer surfaces as
-/// [`MonoStop::MissingBody`] for the resolver to supply and retry.
+/// [`MonoStop::MissingBodies`] for the resolver to supply and retry.
 pub fn monomorphize_instance_deferred<'m>(
     mir: &'m MirProgram,
     program: &'m Program,
@@ -556,10 +565,13 @@ pub fn monomorphize_instance_deferred<'m>(
     mono.in_progress.clear();
     mono.assumed_rets.clear();
     match res {
+        // Demands a clean run recorded came from dead branches or recovered
+        // probes; dead code needs no body.
         Ok(_) => Ok(mono.into_program(Vec::new(), program)),
         Err(e) => {
-            if let Some((symbol, type_args)) = mono.missing_demand.borrow_mut().take() {
-                return Err(MonoStop::MissingBody { symbol, type_args });
+            let missing = std::mem::take(&mut *mono.missing_demands.borrow_mut());
+            if !missing.is_empty() {
+                return Err(MonoStop::MissingBodies(missing));
             }
             Err(MonoStop::Fail(e))
         }
@@ -606,14 +618,19 @@ struct Monomorphizer<'m, 'p> {
     /// inside them: closure code can cross to worker threads (`spawn`), and
     /// only the main thread can compile.
     closure_depth: u32,
-    /// The first function this run needed whose MIR body is absent, with the
+    /// Every function this run needed whose MIR body is absent, with the
     /// concrete argument types of the call that needed it (empty when the
-    /// need arose in a `&self` probe that does not know them). Set on the
-    /// missing lookup in `instantiate_fn` and in the closure-contract probe;
-    /// [`monomorphize_entry`] surfaces it as [`MonoStop::MissingBody`] so a
-    /// demand-driven caller can lower the body and retry. A `RefCell`
-    /// because the probes only hold `&self`.
-    missing_demand: std::cell::RefCell<Option<(String, Vec<Type>)>>,
+    /// need arose in a `&self` probe that does not know them), deduplicated.
+    /// Fed by the missing-call intercept in `resolve_free` (which leaves the
+    /// call unresolved so the walk keeps collecting), the missing lookup in
+    /// `instantiate_fn`, and the closure-contract probe;
+    /// [`monomorphize_entry`] surfaces the set as
+    /// [`MonoStop::MissingBodies`] so a demand-driven caller can lower the
+    /// bodies and retry. Demands recorded during a root that completed
+    /// cleanly are rolled back to the root's watermark: they came from dead
+    /// branches or recovered probes, and dead code needs no body. A
+    /// `RefCell` because the probes only hold `&self`.
+    missing_demands: std::cell::RefCell<Vec<(String, Vec<Type>)>>,
 }
 
 impl<'m, 'p> Monomorphizer<'m, 'p> {
@@ -648,7 +665,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             rows: None,
             defer: None,
             closure_depth: 0,
-            missing_demand: std::cell::RefCell::new(None),
+            missing_demands: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -726,6 +743,15 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         }
     }
 
+    /// Record a demand for `base` at `arg_types` (deduplicated): one of the
+    /// missing bodies this pass collects (see `missing_demands`).
+    fn note_missing(&self, base: &str, arg_types: &[Type]) {
+        let mut demands = self.missing_demands.borrow_mut();
+        if !demands.iter().any(|(b, a)| b == base && a == arg_types) {
+            demands.push((base.to_string(), arg_types.to_vec()));
+        }
+    }
+
     /// Instantiate a free function `base` for `type_args` (memoized).
     fn instantiate_fn(&mut self, base: &str, type_args: Vec<Type>) -> Result<String, String> {
         let sym = instance_symbol(base, &type_args);
@@ -735,12 +761,8 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         let Some(&func) = self.by_fn.get(base) else {
             // Record what a demand-driven caller (the lazy pipeline, which
             // lowers function bodies into the MIR program on demand) would
-            // need to make this call instantiable. First sighting wins: the
-            // error unwinds the whole frame, so later sightings on the same
-            // unwind describe the same missing dependency chain.
-            if self.missing_demand.borrow().is_none() {
-                *self.missing_demand.borrow_mut() = Some((base.to_string(), type_args.clone()));
-            }
+            // need to make this call instantiable.
+            self.note_missing(base, &type_args);
             return Err(format!("unknown function `{base}`"));
         };
         let sig_ret = self
@@ -2196,6 +2218,23 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 targets.insert(symbol, sig);
             }
             return Ok(Some(ret));
+        }
+        // A missing body in a demand-driven run: record the demand and fail
+        // the STATEMENT (a held block error) rather than the frame, so this
+        // same pass keeps walking and collects every other missing body it
+        // can see -- the retry count becomes the call graph's depth, not its
+        // node count. The existing block-error rules keep this sound: a
+        // reachable block's held error fails the frame after the walk (so
+        // nothing typed under a live miss is ever emitted -- an annotated
+        // destination local would otherwise satisfy the unresolved-temporary
+        // validation), while a statically dead block's is dropped, and the
+        // clean root then rolls the dead demand back at its watermark.
+        if self.defer.is_some()
+            && !self.by_fn.contains_key(base)
+            && self.program.functions.contains_key(base)
+        {
+            self.note_missing(base, &arg_types);
+            return Err(format!("missing body `{base}` (demanded)"));
         }
         let sym = self.instantiate_fn(base, arg_types)?;
         Ok(self.instances.get(&sym).map(|i| i.ret.clone()))

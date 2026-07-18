@@ -2,7 +2,7 @@
 // with its per-scheme _connect closure, request/response plumbing); loopback
 // port 1 has no listener, so it fails deterministically at connect, offline.
 // This pins that the unannotated-closure-field client monomorphizes at all.
-import http.{ fetch }
+import std.http.{ fetch }
 
 fun main() {
     match fetch("http://127.0.0.1:1/") {

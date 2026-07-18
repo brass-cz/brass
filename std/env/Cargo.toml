@@ -1,0 +1,20 @@
+# The env library's native half: a brass plugin (cdylib) loaded by
+# `std/env.cz`. Build and install it with `std/build.sh`, which
+# places the cdylib next to the wrapper as `libenv.<dll suffix>`.
+[package]
+name = "brass_lib_env"
+description = "brass plugin: process environment queries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+# The cdylib is installed as `std/libenv.so`, and the wrapper module
+# imports it by that file name (`import libenv.{ .. }`).
+name = "env"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+brass_plugin = { workspace = true }

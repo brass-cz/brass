@@ -1,4 +1,4 @@
-import data.toml.{ TomlValue }
+import std.data.toml.{ TomlValue }
 
 type Server = { host: string, port: int64 }
 type Config = { title: string, retries: int64, server: Server }

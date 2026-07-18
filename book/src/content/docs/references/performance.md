@@ -62,8 +62,8 @@ The `.czcache` above only helps while nothing changed. The context seed
 handles the other case, where the entry file changed but its dependencies
 did not, which is every ordinary edit-run cycle and every save in the editor.
 
-A program's **context** is every module except the entry: the standard
-library, the libraries, the project's dependencies. On a library-heavy program
+A program's **context** is every module except the entry: the embedded
+`core` library, the `std` tree, the project's dependencies. On a library-heavy program
 that context is where almost all inference time goes, and it does not depend
 on the entry at all. So the front end checks in two stages: the context alone
 (once), and then the entry against the context's saved **inference tables**:
@@ -126,12 +126,13 @@ file and each dependency, transitively. Each is identified by **contents**
 path or modification time:
 
 - a project file is recorded relative to the entry file's directory;
-- a library file relative to *some* include root (validation walks the current
-  roots, `BRASS_INCLUDE` then the distribution's implicit
-  `<bin>/../libraries`, in resolution order, and judges the first candidate
-  that exists, so a file that would shadow the recorded one is the one
-  checked);
-- a package file relative to the named `BRASS_PACKAGES` root.
+- an include-served file relative to *some* include root (validation walks
+  the current `BRASS_INCLUDE` roots in resolution order and judges the first
+  candidate that exists, so a file that would shadow the recorded one is the
+  one checked);
+- a package file relative to the named `BRASS_PACKAGES` root -- the standard
+  library's own sources among them, under the implicitly bound `std`
+  package.
 
 On load, the cache is used only when the compiler tag matches (version, cache
 format, release channel and commit; a working-tree build additionally pins its
@@ -158,7 +159,7 @@ directory is ignored) and atomic (temporary file + rename).
 Because stamps are origin-relative and content-addressed, a cache written when
 a release is packed validates wherever the archive is unpacked: `czpm` ships
 with its `bin/czpm.czcache`, whose stamps resolve through the installed
-`libraries/` next to it, so the package manager starts warm from its first
+`std/` next to it, so the package manager starts warm from its first
 run. A released compiler is identified by channel and commit, so every install
 of the same release reproduces the packing machine's tag.
 

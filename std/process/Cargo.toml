@@ -1,0 +1,20 @@
+# The process library's native half: a Brass plugin (cdylib) loaded by
+# `std/process.cz`. Build and install it with `std/build.sh`, which
+# places the cdylib next to this manifest as `process.<dll suffix>`.
+[package]
+name = "brass_lib_process"
+description = "Brass plugin: spawn and control OS processes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+# The cdylib is installed as `std/libprocess.so`, and the wrapper
+# module imports it by that file name (`import libprocess.{ .. }`).
+name = "process"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+brass_plugin = { workspace = true }

@@ -6,7 +6,7 @@
 // with CRLF, and a lone LF would be read as part of the header value by a strict
 // peer. The output is printed with the CRLFs marked, so a regression shows up as
 // changed text rather than as invisible whitespace.
-import http.{ HttpRequest, HttpResponse, Header }
+import std.http.{ HttpRequest, HttpResponse, Header }
 
 fun show(bytes: uint8[]) -> string! {
     return to_text(bytes)!.replace("\r\n", "<CRLF>")

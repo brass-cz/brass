@@ -37,15 +37,15 @@ println("Hello, {name}!")
 
 ## Files
 
-Whole-file text I/O lives in the `fs` library, not in the implicit prelude.
-Import it first; from a repo checkout, build `libraries/build.sh` and set
-`BRASS_INCLUDE` to the `libraries/` directory as described in the
-[standard library reference](/references/stdlib/#fs-a-library-not-std).
+Whole-file text I/O lives in `std.fs`, not in the implicit prelude.
+Import it first; from a repo checkout, build the plugins with `std/build.sh`
+and declare the `std` package as described in the
+[standard library reference](/references/stdlib/#stdfs).
 `read_file(path)` and `write_file(path, content)` both return a Result. In a
 quick script, unwrap with `!` and let a failure stop the program:
 
 ```brass norun
-import fs.{ read_file, write_file }
+import std.fs.{ read_file, write_file }
 
 let path = "demo.txt"
 write_file(path, "line one\nline two")!
@@ -58,7 +58,7 @@ for line in content.split("\n") {
 Where a failure should be handled instead, match on the Result:
 
 ```brass norun
-import fs.read_file
+import std.fs.read_file
 
 match read_file("missing.txt") {
     Ok { value } => println(value),
@@ -70,9 +70,9 @@ For finer control, `File.open(path, mode)` returns a `File!`; a `File` has
 `read(n)`, `write(bytes)`, `seek`, `size()`, and `close()`, all returning
 Results, plus the `File.stdin()` / `File.stdout()` / `File.stderr()`
 constructors. See the
-[standard library reference](/references/stdlib/#fs-a-library-not-std) for the
+[standard library reference](/references/stdlib/#stdfs) for the
 signatures.
 
 Note: the native `brass` and `brass repl` can both use the plugin-backed
-libraries, but the browser playground cannot load plugins, so file I/O
+`std` modules, but the browser playground cannot load plugins, so file I/O
 examples are not runnable there.

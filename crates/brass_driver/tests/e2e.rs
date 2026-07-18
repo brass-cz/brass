@@ -59,11 +59,22 @@ fn collect_cases(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The in-repo `libraries/` directory, exposed to every case as the one
-/// `BRASS_INCLUDE` entry -- the same layout a distributed toolchain ships,
-/// so the cases exercise exactly what users get.
-fn libraries_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../libraries")
+/// The in-repo `std/` directory, bound to every case as the `std` package --
+/// the same layout a distributed toolchain ships, so the cases exercise
+/// exactly what users get.
+fn std_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../std")
+}
+
+/// The `BRASS_PACKAGES` value binding the in-repo standard library: the
+/// package path is the directory CONTAINING `std/` (the repo root).
+fn std_package_env() -> String {
+    format!(
+        "std={}",
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .display()
+    )
 }
 
 /// The libraries whose native halves the suite builds: the cargo package
@@ -79,18 +90,18 @@ const NATIVE_LIBRARIES: &[(&str, &str)] = &[
     ("brass_lib_regex", "regex"),
 ];
 
-/// Build each library's plugin and install it as `libraries/lib<name>.so`,
-/// where `libraries/build.sh` puts it (a debug build here replaces a prior
-/// release install). Installed once, before any case process runs, so no
-/// running process has an older library mapped.
+/// Build each library's plugin and install it as `std/lib<name>.so`, where
+/// `std/build.sh` puts it (a debug build here replaces a prior release
+/// install). Installed once, before any case process runs, so no running
+/// process has an older library mapped.
 #[cfg(feature = "jit")]
 fn install_library_plugins() {
     for (package, library) in NATIVE_LIBRARIES {
-        brass_plugin_host::fixture::install_plugin(package, library, &libraries_root());
+        brass_plugin_host::fixture::install_plugin(package, library, &std_root());
     }
 }
 
-/// Run a case with `libraries/` on the include path, so a case may import a
+/// Run a case with the `std` package bound, so a case may import a standard
 /// library (`process/` and `path/` do). Cases that import nothing from there
 /// are unaffected.
 fn run_case(bin: &str, pp: &Path) -> std::process::Output {
@@ -107,7 +118,7 @@ fn run_case_mode(bin: &str, pp: &Path, eager: bool) -> std::process::Output {
         cmd.arg("--eager");
     }
     cmd.arg(pp)
-        .env("BRASS_INCLUDE", libraries_root())
+        .env("BRASS_PACKAGES", std_package_env())
         .output()
         .expect("spawn brass")
 }
@@ -208,8 +219,7 @@ fn check_error_mode(bin: &str, pp: &Path, expected: &str, eager: bool) {
 fn e2e_cases_produce_expected_output() {
     let bin = env!("CARGO_BIN_EXE_brass");
     // The `process/` and `path/` cases import libraries whose native halves
-    // are plugins; build them into `libraries/` as `libraries/build.sh`
-    // would. Those cases only run with the JIT back end (the interpreter has
+    // are plugins; build them into `std/` as `std/build.sh` would. Those cases only run with the JIT back end (the interpreter has
     // no file I/O for the pipes, and only this configuration builds the
     // plugins).
     #[cfg(feature = "jit")]
@@ -298,7 +308,7 @@ fn eager_flag_matches_the_lazy_pipeline() {
         .env("BRASS_CACHE", "off")
         .arg("--eager")
         .arg(&pp)
-        .env("BRASS_INCLUDE", libraries_root())
+        .env("BRASS_PACKAGES", std_package_env())
         .output()
         .expect("spawn brass --eager");
     assert!(

@@ -1,6 +1,6 @@
 // A non-zero exit code and a failed spawn both come back as ordinary values:
 // `false` exits 1, and a missing program is an Err.
-import process.{ Command }
+import std.process.{ Command }
 
 const child = Command.new("false").spawn()!
 println("false exit: {child.wait()!}")

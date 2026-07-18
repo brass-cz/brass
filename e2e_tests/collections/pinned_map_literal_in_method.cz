@@ -15,8 +15,6 @@
 // The checker now seeds the schemes from a preliminary pass, so a method body
 // sees them too.
 
-import std.collections.{ HashMap }
-
 type Counts = HashMap {
     key: string
     value: int64

@@ -1,6 +1,6 @@
 // seek repositions the cursor for the next read, and size answers through
 // the path library (a stat by name), so both are exercised through one file.
-import fs.{ File, write_file }
+import std.fs.{ File, write_file }
 
 fun main() {
     const path = "/tmp/brass_e2e_seek_and_size.txt"

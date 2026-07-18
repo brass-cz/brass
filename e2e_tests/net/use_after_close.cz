@@ -1,6 +1,6 @@
 // Closing a socket forgets both descriptors (the File's and the record's own
 // copy), so the socket-specific calls after close fail deterministically too.
-import net.{ Tcp, TcpListener }
+import std.net.{ Tcp, TcpListener }
 
 fun main() {
     let listener = TcpListener.bind("127.0.0.1", 0)!

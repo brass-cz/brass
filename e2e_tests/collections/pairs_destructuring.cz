@@ -8,8 +8,6 @@
 // tuple has none, so a `match` over one never matched, while the interpreter
 // (which reads the value's own length) always did. The two back ends disagreed.
 
-import std.collections.{ HashMap }
-
 fun main() {
     // Over an array of tuples, in a deterministic order.
     const ps = [["a", 1], ["b", 2], ["c", 3]]

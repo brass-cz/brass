@@ -534,14 +534,14 @@ fn stdlib_string_function_rejects_wrong_argument_type() {
 }
 
 #[test]
-fn phantom_std_import_is_rejected() {
-    // An import from a module that was never loaded (`std.phantom`) used to
+fn phantom_core_import_is_rejected() {
+    // An import from a module that was never loaded (`core.phantom`) used to
     // fall back to accepting any name defined anywhere in the program, which
     // made every module's definitions reachable without importing the module.
-    // Only genuine std exports resolve for unloaded paths; anything else is an
+    // Only genuine core exports resolve for unloaded paths; anything else is an
     // unknown module.
     let main = setup(
-        "phantom_std_import",
+        "phantom_core_import",
         &[
             ("a/util.cz", "fun secret_helper() -> int32 { return 42 }\n"),
             (
@@ -550,7 +550,7 @@ fn phantom_std_import_is_rejected() {
             ),
             (
                 "main.cz",
-                "import loader.{ use_it }\nimport std.phantom.{ secret_helper }\n\
+                "import loader.{ use_it }\nimport core.phantom.{ secret_helper }\n\
                  fun main() { println(secret_helper()) }\n",
             ),
         ],
@@ -558,7 +558,7 @@ fn phantom_std_import_is_rejected() {
     let (ok, out) = check(&main);
     assert!(!ok, "expected failure, got: {out}");
     assert!(
-        out.contains("cannot import from unknown module `std.phantom`"),
+        out.contains("cannot import from unknown module `core.phantom`"),
         "{out}"
     );
 }
@@ -566,7 +566,7 @@ fn phantom_std_import_is_rejected() {
 #[test]
 fn bare_prelude_import_still_resolves() {
     // The bare prelude spelling (`import conv.{ ... }`) aliases the loaded
-    // `std.conv` module and keeps resolving against its real exports, while a
+    // `core.conv` module and keeps resolving against its real exports, while a
     // name conv does not export is rejected against those same exports.
     let main = setup(
         "bare_prelude_import",
@@ -1350,18 +1350,18 @@ fn declared_package_missing_module_does_not_fall_through() {
 }
 
 #[test]
-fn distributed_binary_includes_its_sibling_libraries_dir() {
-    // A toolchain laid out as `bin/brass` + `libraries/` makes the shipped
-    // libraries importable with no environment setup: the binary's own
-    // location implies `../libraries` as a trailing include path.
+fn distributed_binary_binds_its_sibling_std_dir() {
+    // A toolchain laid out as `bin/brass` + `std/` makes the shipped standard
+    // library importable with no environment setup: the binary's own location
+    // implies its parent directory as the implicit `std` package root.
     let dist = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dist_layout");
     let _ = fs::remove_dir_all(&dist);
     fs::create_dir_all(dist.join("bin")).unwrap();
-    fs::create_dir_all(dist.join("libraries")).unwrap();
+    fs::create_dir_all(dist.join("std")).unwrap();
     let bin = dist.join("bin/brass");
     fs::copy(env!("CARGO_BIN_EXE_brass"), &bin).unwrap();
     fs::write(
-        dist.join("libraries/shipped.cz"),
+        dist.join("std/shipped.cz"),
         "fun greet() -> string { return \"shipped\" }\n",
     )
     .unwrap();
@@ -1369,7 +1369,7 @@ fn distributed_binary_includes_its_sibling_libraries_dir() {
         "dist_layout_case",
         &[(
             "main.cz",
-            "import shipped.{ greet }\nfun main() { println(greet()) }\n",
+            "import std.shipped.{ greet }\nfun main() { println(greet()) }\n",
         )],
     );
     // Retried: a PARALLEL test thread fork+execing at the wrong moment
@@ -1393,17 +1393,17 @@ fn distributed_binary_includes_its_sibling_libraries_dir() {
         "expected success, got: {stdout}{stderr}"
     );
     assert_eq!(stdout.trim(), "shipped", "{stdout}");
-    // An explicit include path is searched before the implicit one.
-    let inc = setup_tree(
-        "dist_layout_inc",
+    // An explicit `std=...` declaration overrides the implicit binding.
+    let other = setup_tree(
+        "dist_layout_override",
         &[(
-            "shipped.cz",
+            "std/shipped.cz",
             "fun greet() -> string { return \"explicit\" }\n",
         )],
     );
     let out = Command::new(&bin)
         .arg(&main)
-        .env("BRASS_INCLUDE", &inc)
+        .env("BRASS_PACKAGES", format!("std={}", other.display()))
         .output()
         .expect("spawn dist brass");
     let stdout = String::from_utf8_lossy(&out.stdout);

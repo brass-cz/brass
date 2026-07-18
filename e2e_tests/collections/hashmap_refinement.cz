@@ -9,8 +9,6 @@
 // to `total` would be a genuine mismatch: an `int32`-valued map has a different
 // slot layout than an `int64`-valued one, so it is rejected rather than adapted.
 
-import std.collections.{ HashMap }
-
 type StringInts = HashMap {
     key: string,
     value: int64,

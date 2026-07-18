@@ -946,13 +946,13 @@ or drop the `!`"
     /// then its own, which shadow both.
     pub(super) fn globals_visible_from(&self, module: &[String]) -> HashMap<String, Type> {
         let mut out: HashMap<String, Type> = HashMap::new();
-        let mut std_paths: Vec<&Vec<String>> = self
+        let mut core_paths: Vec<&Vec<String>> = self
             .global_defs
             .keys()
-            .filter(|p| p.first().is_some_and(|seg| seg == "std"))
+            .filter(|p| p.first().is_some_and(|seg| seg == "core"))
             .collect();
-        std_paths.sort();
-        for path in std_paths {
+        core_paths.sort();
+        for path in core_paths {
             for (name, ty) in &self.global_defs[path] {
                 out.entry(name.clone()).or_insert_with(|| ty.clone());
             }

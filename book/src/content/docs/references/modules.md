@@ -81,23 +81,25 @@ println(_PATH)          // /home/you/project/src/main.cz
 The path is absolute, so it does not depend on where the program was started.
 `_PATH` follows the visibility rule above: its leading `_` makes it private,
 so a module always reads its own, never an importer's, and no module can export
-one. A module with no file on disk (an embedded `std` module, a plugin's
-synthesized wrapper) reads its diagnostic label instead, such as `<std/io>`.
+one. A module with no file on disk (an embedded `core` module, a plugin's
+synthesized wrapper) reads its diagnostic label instead, such as `<core/io>`.
 
-To take the path apart, hand it to the [`path` library](/references/stdlib/#path-a-library-not-std):
+To take the path apart, hand it to [`std.path`](/references/stdlib/#stdpath):
 `Path.parse(_PATH).parent()` is the directory holding the file you are writing.
 
 ## The standard library
 
-The `std/prelude/` modules (`io`, `array`, `string`, `math`, `conv`,
-`assert`) form the **implicit prelude**: their public names are in scope
-everywhere without an import. They can also be imported explicitly by their
-bare name (`import io.{ ... }`) or `std` path.
+The embedded `core/` modules (`io`, `array`, `string`, `math`, `conv`,
+`assert`, `error`, `is`, `default`, `collections`) form the **implicit
+prelude**: their public names are in scope everywhere without an import,
+`HashMap` included. They can also be imported explicitly by their bare name
+(`import io.{ ... }`) or `core` path (`import core.io.{ ... }`), to alias or
+qualify a name.
 
-Other standard-library modules, such as `std.collections`,
-are **not** in the prelude. They are embedded in the
-compiler but loaded only when a module imports them (transitively: a nested
-std module may import another). See the
+The shipped `std/` tree (`fs`, `net`, `process`, `data.json`, ...) is NOT
+embedded: it resolves as the package named `std`, which a distributed
+toolchain binds automatically, and imports with the `std.` prefix
+(`import std.fs.{ read_file }`). See the
 [standard library reference](/references/stdlib/).
 
 ## Execution order

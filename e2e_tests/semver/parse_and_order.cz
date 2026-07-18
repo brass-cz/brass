@@ -3,7 +3,7 @@
 // spec's own §11 ordering example is the real test, because it is where a
 // lexical comparison (`beta.11` < `beta.2`) or a mishandled pre-release
 // (`1.0.0-rc.1` > `1.0.0`) would show.
-import semver.{ Version, sort }
+import std.semver.{ Version, sort }
 
 fun show(text: string) {
     match Version.parse(text) {

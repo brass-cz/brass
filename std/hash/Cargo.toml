@@ -1,0 +1,30 @@
+# The hash library's native half: a brass plugin (cdylib) loaded by
+# `std/hash.cz`. Build and install it with `std/build.sh`, which
+# places the cdylib next to the wrapper as `libhash.<dll suffix>`.
+[package]
+name = "brass_lib_hash"
+description = "brass plugin: message digests (MD5, SHA-1, SHA-2) and HMAC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+# The cdylib is installed as `std/libhash.so`, and the wrapper module
+# imports it by that file name (`import libhash.{ .. }`).
+name = "hash"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+# The RustCrypto implementations: pure Rust (no OpenSSL to link), audited, and
+# constant-time where it matters (HMAC comparison). Writing these in brass
+# instead would mean emulating wrapping arithmetic the language does not have --
+# every add and rotate masked by hand, with a silent wrong digest (or, on the
+# JIT, undefined behaviour) as the failure mode.
+[dependencies]
+brass_plugin = { workspace = true }
+digest = "0.11"
+md-5 = "0.11"
+sha1 = "0.11"
+sha2 = "0.11"
+hmac = "0.13"

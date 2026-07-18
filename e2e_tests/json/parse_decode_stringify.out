@@ -6,8 +6,8 @@ Aki 30 Tokyo 100
 error: Error {
     value: "missing field 'age'",
     location: Location {
-        file: "libraries/data/json.cz",
-        line: 78,
+        file: "std/data/json.cz",
+        line: 76,
         col: 20,
     },
     frames: [],

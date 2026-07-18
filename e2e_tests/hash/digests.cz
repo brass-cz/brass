@@ -2,7 +2,7 @@
 // indistinguishable from a right one by inspection, so the vectors -- RFC 1321
 // (MD5), RFC 3174 (SHA-1), FIPS 180-4 (SHA-2), RFC 4231 (HMAC) -- are the only
 // real check that the bytes cross the plugin boundary intact.
-import hash.{
+import std.hash.{
     md5,
     sha1,
     sha224,

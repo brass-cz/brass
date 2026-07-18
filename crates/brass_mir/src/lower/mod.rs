@@ -81,12 +81,12 @@ impl LowerTables {
             }
         }
         let mut prelude_globals: HashMap<String, Vec<String>> = HashMap::new();
-        let mut std_paths: Vec<&Vec<String>> = module_globals
+        let mut core_paths: Vec<&Vec<String>> = module_globals
             .keys()
-            .filter(|p| p.first().is_some_and(|seg| seg == "std"))
+            .filter(|p| p.first().is_some_and(|seg| seg == "core"))
             .collect();
-        std_paths.sort();
-        for path in std_paths {
+        core_paths.sort();
+        for path in core_paths {
             for name in &module_globals[path] {
                 prelude_globals
                     .entry(name.clone())

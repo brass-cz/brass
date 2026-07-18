@@ -2,7 +2,7 @@
 // the session table lives in the plugin, shared across threads. Loopback
 // port 1 has no listener, so the connect fails deterministically (before
 // any handshake or network access), keeping this case offline-safe.
-import net.{ TlsStream }
+import std.net.{ TlsStream }
 
 fun try_connect() {
     match TlsStream.connect("127.0.0.1", 1) {

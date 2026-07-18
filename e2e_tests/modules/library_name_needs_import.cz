@@ -3,7 +3,7 @@
 // the prelude. `index_of` lives in the url.text library module alongside the
 // imported `substr` and is not imported here, so calling it is an error naming
 // the module that has it.
-import url.text.{ substr }
+import std.url.text.{ substr }
 
 let cs = ["a", "b", "c"]
 let at = index_of(cs, "b", 0, 3)

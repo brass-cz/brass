@@ -10,8 +10,8 @@ localhost
 error: Error {
     value: "missing key 'nope'",
     location: Location {
-        file: "libraries/data/toml.cz",
-        line: 112,
+        file: "std/data/toml.cz",
+        line: 110,
         col: 20,
     },
     frames: [],

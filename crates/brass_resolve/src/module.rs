@@ -18,9 +18,9 @@ pub struct ResolveError {
 }
 
 /// Check each import against the loaded modules: the name must be public and
-/// exported by the named module. A bare prelude path (`io`) is checked against
-/// the loaded `std.io` module's exports; importing from any other module that
-/// was not loaded is an error.
+/// exported by the named module. A bare core-module path (`io`) is checked
+/// against the loaded `core.io` module's exports; importing from any other
+/// module that was not loaded is an error.
 pub fn check_imports(modules: &[LoadedModule]) -> Vec<ResolveError> {
     let exports = collect_exports(modules);
     let mut errors = Vec::new();
@@ -104,14 +104,15 @@ pub fn check_imports(modules: &[LoadedModule]) -> Vec<ResolveError> {
                     }),
                     Some(_) => {}
                     None => {
-                        // Not a loaded file module. A bare prelude path (`io`)
-                        // aliases the loaded `std.io`, so it is checked against
-                        // that module's real exports. Any other unloaded module
-                        // is unknown: accepting any program-wide name here (the
-                        // old fallback) let a phantom `import std.x.{ name }`
-                        // reach private definitions of arbitrary modules.
-                        let std_alias = format!("std.{key}");
-                        match exports.get(std_alias.as_str()) {
+                        // Not a loaded file module. A bare core-module path
+                        // (`io`) aliases the loaded `core.io`, so it is checked
+                        // against that module's real exports. Any other
+                        // unloaded module is unknown: accepting any
+                        // program-wide name here (the old fallback) let a
+                        // phantom `import core.x.{ name }` reach private
+                        // definitions of arbitrary modules.
+                        let core_alias = format!("core.{key}");
+                        match exports.get(core_alias.as_str()) {
                             Some(names) if !names.contains(&name.remote) => {
                                 errors.push(ResolveError {
                                     message: format!(

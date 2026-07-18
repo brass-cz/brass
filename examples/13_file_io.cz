@@ -1,7 +1,7 @@
 // File I/O via the runtime primitives. `write_file` and `read_file` return a
 // Result; we match on it explicitly.
 
-import fs.{ read_file, write_file }
+import std.fs.{ read_file, write_file }
 
 fun main() {
     let path = "/tmp/brass_io_demo.txt"

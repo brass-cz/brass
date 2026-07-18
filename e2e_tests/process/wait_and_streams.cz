@@ -3,7 +3,7 @@
 // because the pipe still holds what the child wrote before exiting. The
 // stream accessors memoize the adopted `File`, so calling one twice is not an
 // error -- the plugin gives each descriptor up exactly once.
-import process.{ Command, Stdio }
+import std.process.{ Command, Stdio }
 
 const child = Command.new("echo")
     .args(["buffered"])

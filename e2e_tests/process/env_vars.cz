@@ -2,7 +2,7 @@
 // this process's environment, so `env` adds to it (or overrides one entry)
 // rather than replacing it -- which is what the PATH check below pins, since a
 // replaced environment would leave `sh` unable to find anything.
-import process.{ Command, Stdio }
+import std.process.{ Command, Stdio }
 
 // Run `sh -c script` with the given overrides applied, and answer what it wrote.
 fun output_of(cmd) -> string! {

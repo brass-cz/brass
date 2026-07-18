@@ -10,7 +10,7 @@
 //! The two roles treat the cache differently, deliberately:
 //!
 //! - [`load_manifest`] (front end) revalidates against the file, so a language
-//!   server or REPL that outlives a `libraries/build.sh` sees the new functions.
+//!   server or REPL that outlives a `std/build.sh` sees the new functions.
 //! - [`call`] (runtime) pins: after the first load it never touches the
 //!   filesystem again, so a running program survives the `.so` being rebuilt or
 //!   deleted underneath it, and keeps the code it was compiled against.
@@ -659,7 +659,7 @@ pub fn find_library(dir: &Path, name: &str) -> Option<PathBuf> {
 
 /// Test support: build the workspace's own plugin cdylibs on demand. Only for
 /// the workspace's test suites, which cannot depend on a prior `cargo build`
-/// or on `libraries/build.sh` having been run.
+/// or on `std/build.sh` having been run.
 #[cfg(feature = "fixture")]
 pub mod fixture {
     use std::path::{Path, PathBuf};
@@ -723,7 +723,7 @@ pub mod fixture {
 
     /// Build `package` and install its cdylib into `dir` under the built
     /// library's own file name (`libprocess.so`), the layout
-    /// `libraries/build.sh` produces and a Brass `import libprocess`
+    /// `std/build.sh` produces and a Brass `import libprocess`
     /// resolves. Mirrors the script, for suites that run before it has.
     pub fn install_plugin(package: &str, lib_name: &str, dir: &Path) -> PathBuf {
         let built = build_plugin(package, lib_name);

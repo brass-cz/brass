@@ -1,0 +1,25 @@
+# The net library's native half: a Brass plugin (cdylib) loaded by
+# `std/net.cz`. Build and install it with `std/build.sh`.
+[package]
+name = "brass_lib_net"
+description = "Brass plugin: TCP/UDP sockets and TLS client connections"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+# The cdylib is installed as `std/libnet.so`, and the wrapper
+# module imports it by that file name (`import libnet.{ .. }`).
+name = "net"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+brass_plugin = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+webpki-roots = "1.0"

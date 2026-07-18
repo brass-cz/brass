@@ -663,7 +663,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
         )));
         // The prelude renders the payload: an `Error` prints its trace, any
         // other payload the plain `unhandled error:` prefix form (see
-        // std/prelude/error.cz `_render_unhandled`).
+        // core/error.cz `_render_unhandled`).
         let msg = match self
             .ctx
             .resolve_fn_symbol(&self.module, "_render_unhandled")

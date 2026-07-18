@@ -1,8 +1,8 @@
 // Every path-taking function in `fs` accepts a `Path` as readily as a string --
 // `File.open`, `read_file`, `write_file`, and the directory pair -- and the two
 // forms name the same file, so one can write what the other reads.
-import fs.{ File, read_file, write_file, create_dir, remove_dir }
-import path.{ Path }
+import std.fs.{ File, read_file, write_file, create_dir, remove_dir }
+import std.path.{ Path }
 
 fun main() {
     const root = Path.parse("/tmp/brass_e2e_fs_path_arguments")

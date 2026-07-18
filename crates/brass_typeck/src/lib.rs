@@ -16,11 +16,13 @@ pub mod interface;
 pub mod narrow;
 pub mod stream;
 pub mod structural;
+mod taint;
 mod walk;
 
 // The constraint solver lives in `brass_solver` (shared with the JIT-time MIR
 // inference); re-export it so `crate::solver` / `crate::unify` keep resolving.
 pub use brass_solver::{solver, unify};
+pub use taint::has_keyed_calls;
 
 use std::collections::{HashMap, HashSet};
 
@@ -95,7 +97,16 @@ pub use infer::ContextTables;
 /// context has any diagnostic: only a clean context's tables may stand in for
 /// re-checking it.
 pub fn context_seed(program: &Program) -> Option<ContextTables> {
-    let analysis = analyze(program);
+    context_seed_with(program, None)
+}
+
+/// [`context_seed`] over a PARTIAL prior seed (see
+/// [`infer::ContextTables::retain_modules`]): the covered modules skip their
+/// passes and only the rest re-infer; the returned tables span the whole
+/// context again (the checker's tables union the seed with the new passes),
+/// with `covered` cleared back to full.
+pub fn context_seed_with(program: &Program, seed: Option<&ContextTables>) -> Option<ContextTables> {
+    let analysis = analyze_with(program, seed);
     if !analysis.errors.is_empty() {
         for e in analysis.errors.iter().take(5) {
             tracing::debug!(
@@ -319,7 +330,7 @@ fn check_reserved_names(program: &Program) -> Vec<TypeError> {
     for name in brass_hir::RESERVED_FUNCTION_NAMES {
         if let Some(info) = program.functions.get(*name) {
             // The prelude itself provides some of these (`error` is an
-            // ordinary std/prelude/error.cz function); only a user
+            // ordinary core/error.cz function); only a user
             // redefinition is rejected.
             if program.prelude_modules.contains(&info.module) {
                 continue;
@@ -706,10 +717,11 @@ fn collect_expr(expr: &Expr, out: &mut Vec<TypeExpr>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Analysis, analyze, check};
-    use brass_hir::{Constness, IntKind, LoadedModule, Type, TypedExprKind, lower};
+    use super::{Analysis, analyze, check, context_seed};
+    use brass_hir::{Constness, IntKind, LoadedModule, Program, Type, TypedExprKind, lower};
     use brass_parser::ast::BinOp;
     use brass_parser::parse;
+    use std::collections::HashSet;
 
     fn errs(src: &str) -> Vec<String> {
         let ast = parse(src).expect("parse");
@@ -748,6 +760,68 @@ mod tests {
             .into_iter()
             .map(|error| error.message)
             .collect()
+    }
+
+    fn module_program(modules: &[(&[&str], &str)]) -> Program {
+        let loaded = modules
+            .iter()
+            .map(|(path, src)| LoadedModule {
+                is_prelude: false,
+                path: path.iter().map(|part| (*part).to_string()).collect(),
+                ast: parse(src).expect("parse"),
+            })
+            .collect::<Vec<_>>();
+        let (program, lower_errors) = lower(&loaded);
+        assert!(lower_errors.is_empty(), "lower errors: {lower_errors:?}");
+        program
+    }
+
+    #[test]
+    fn partial_context_seed_rejects_shifted_nominal_ids() {
+        // Adding a type in an earlier module renumbers the unchanged module's
+        // nominal. Its old table values must not be retained under the new ID.
+        let old = module_program(&[
+            (&["a"], "type A = { value: int32 }\n"),
+            (
+                &["b"],
+                "type B = { value: string }\nfun make() { return B { value: \"b\" } }\n",
+            ),
+        ]);
+        let mut seed = context_seed(&old).expect("clean context");
+        let current = module_program(&[
+            (
+                &["a"],
+                "type Added = { flag: bool }\ntype A = { value: int32 }\n",
+            ),
+            (
+                &["b"],
+                "type B = { value: string }\nfun make() { return B { value: \"b\" } }\n",
+            ),
+        ]);
+        let keep = HashSet::from([vec!["b".to_string()]]);
+
+        assert!(!seed.retain_modules(&current, &keep));
+        assert_eq!(seed.covered, None);
+    }
+
+    #[test]
+    fn partial_context_seed_rejects_changed_symbol_qualification() {
+        // A new same-named function qualifies the unchanged definition's
+        // storage symbol. Dropping its old entry while skipping its module is
+        // not a valid partial seed.
+        let old = module_program(&[
+            (&["a"], "fun other() { return 0 }\n"),
+            (&["b"], "fun helper() { return 1 }\n"),
+        ]);
+        let mut seed = context_seed(&old).expect("clean context");
+        let current = module_program(&[
+            (&["a"], "fun helper() { return 0 }\n"),
+            (&["b"], "fun helper() { return 1 }\n"),
+        ]);
+        let keep = HashSet::from([vec!["b".to_string()]]);
+
+        assert!(!seed.retain_modules(&current, &keep));
+        assert_eq!(seed.covered, None);
     }
 
     #[test]

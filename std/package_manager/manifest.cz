@@ -1,0 +1,132 @@
+import std.data.toml.TomlValue
+import std.path.Path
+
+/** A parsed `package.toml`. */
+type Manifest = {
+    package: PackageInfo
+    dependencies: Dependencies
+}
+
+/** The `[package]` table. Every field is required. */
+type PackageInfo = {
+    name: string
+    author: string
+    license: string
+}
+
+/** The `[dependencies]` table, keyed by dependency name. */
+type Dependencies = HashMap { key: string, value: Dependency }
+
+/**
+ * Where one dependency comes from. Exactly one source must be present:
+ *
+ *     mylib = { git = "...", rev = "..." }   # Git
+ *     mylib = { path = "../mylib" }           # Path
+ */
+type Dependency =
+    // Reserved for future resolvers. `Manifest.parse` currently rejects both
+    // forms so an unsupported dependency cannot survive until execution.
+    | Registry { version: string }
+    | Tarball { tarball: string }
+    | Git { git: string, rev: string }
+    | Path { path: Path }
+
+/** The revision a `git` dependency tracks when it names none. */
+const DEFAULT_REV = "HEAD"
+
+/**
+ * Parse a manifest, or report the first problem found.
+ *
+ * `[dependencies]` is optional; an absent one yields an empty map. A malformed
+ * one is an error rather than an empty map, so a typo cannot silently drop
+ * every dependency.
+ */
+fun Manifest.parse(s: string) -> Manifest! {
+    const toml = TomlValue.parse(s)!
+    // A RECORD target decodes in one step: `into` walks PackageInfo's own fields
+    // and reads the table key of each name. (`PackageInfo.from(..)` is a
+    // different operation -- a structural conversion, which looks for those
+    // fields on the *value*; a TOML table carries them as entries, not fields.)
+    const package: PackageInfo = toml.get("package")!.into()!
+    if !valid_package_name(package.name) {
+        return error("package name `{package.name}` is not a legal identifier")
+    }
+
+    let dependencies: Dependencies = HashMap.new()
+    if _has(toml.keys()!, "dependencies") {
+        const table = toml.get("dependencies")!
+        // `keys` rejects a non-table, so `dependencies = 3` is an error here.
+        for name in table.keys()! {
+            if !valid_package_name(name) {
+                return error(
+                    "dependency name `{name}` is not a legal identifier",
+                )
+            }
+            dependencies.set(name, _dependency(table.get(name)!)!)
+        }
+    }
+    return Manifest { package: package, dependencies: dependencies }
+}
+
+/** Whether `name` can be used as a package's leading import segment. */
+fun valid_package_name(name: string) -> bool {
+    const bytes = to_bytes(name)
+    if len(bytes) == 0 || !_identifier_start(bytes[0]) {
+        return false
+    }
+    for b in bytes.slice(1, len(bytes)) {
+        if !_identifier_start(b) && !(b >= 48 && b <= 57) {
+            return false
+        }
+    }
+    return true
+}
+
+fun _identifier_start(b: uint8) -> bool {
+    return b >= 65 && b <= 90 || b >= 97 && b <= 122 || b == 95
+}
+
+/**
+ * Decode one `[dependencies]` entry.
+ *
+ * A SUM has no field list for `into` to walk -- which variant to build is a
+ * decision, not a mapping -- so the entry's shape picks it explicitly.
+ */
+fun _dependency(entry: TomlValue) -> Dependency! {
+    const keys = entry.keys()!
+    const has_git = _has(keys, "git")
+    const has_path = _has(keys, "path")
+    if has_git == has_path {
+        return error("a dependency needs exactly one of `git` or `path`")
+    }
+    if has_git {
+        for key in keys {
+            if key != "git" && key != "rev" {
+                return error("a Git dependency has an unsupported key `{key}`")
+            }
+        }
+        const rev = if _has(keys, "rev") {
+            entry.get("rev")!.as_string()!
+        } else {
+            DEFAULT_REV
+        }
+        return Dependency.Git { git: entry.get("git")!.as_string()!, rev: rev }
+    }
+    for key in keys {
+        if key != "path" {
+            return error("a path dependency has an unsupported key `{key}`")
+        }
+    }
+    return Dependency.Path { path: Path.parse(entry.get("path")!.as_string()!) }
+}
+
+// `TomlValue.get` reports a missing key as an error rather than null, so an
+// OPTIONAL key has to be tested for before it is read.
+fun _has(keys: string[], key: string) -> bool {
+    for k in keys {
+        if k == key {
+            return true
+        }
+    }
+    return false
+}

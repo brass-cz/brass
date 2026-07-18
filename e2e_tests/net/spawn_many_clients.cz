@@ -3,7 +3,7 @@
 // hold up under threads -- the regression net-as-a-plugin is most exposed
 // to. Each client reads the echo back before closing, so every round trip
 // completes before the count is printed. Clients print only on failure.
-import net.{ Tcp, TcpListener }
+import std.net.{ Tcp, TcpListener }
 
 fun run_client(port: int64) {
     match Tcp.connect("127.0.0.1", port) {

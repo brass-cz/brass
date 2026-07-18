@@ -385,7 +385,7 @@ import geometry.vec
 import geometry.vec as g
 ```
 
-## Standard library (implicit prelude, no import needed)
+## Core library (implicit prelude, no import needed)
 
 Everything in this section is in scope with no import.
 
@@ -451,10 +451,10 @@ place:
 - Free-function aliases: `int32_from`, `int32_parse`, `float64_from`,
   `float64_parse`, `string_from`.
 
-## HashMap: `import std.collections.{ HashMap }`
+## HashMap (in the prelude, no import needed)
 
-An open-addressing hash map, in a NESTED std module (the explicit import is
-required). Keys may be of any type that renders to a stable string and
+An open-addressing hash map, in the core module `core.collections` -- part
+of the implicit prelude, so NO import is needed. Keys may be of any type that renders to a stable string and
 compares with `==` (integers, strings, records); values may be of any type.
 `HashMap.new()` takes NO arguments; the key/value types are inferred from
 the first `set` (`let m = HashMap.new(); m.set("a", 1)` is a
@@ -471,15 +471,16 @@ the first `set` (`let m = HashMap.new(); m.set("a", 1)` is a
   unspecified (slot) order
 - `m.clear()`: keeps capacity and key/value types
 
-## Bundled libraries (explicit import; not `std`)
+## Standard library (`import std.*`)
 
-The toolchain ships a `libraries/` directory. A distributed install finds it
-automatically beside its binary; from a repo checkout, build the native
-plugin halves once with `libraries/build.sh` and set
-`BRASS_INCLUDE=<repo>/libraries`. Every library below runs on BOTH back
-ends (the JIT and `brass repl`); only `spawn` concurrency is JIT-only.
+The toolchain ships a `std/` directory imported with the `std.` prefix. A
+distributed install binds it automatically beside its binary; from a repo
+checkout, build the native plugin halves once with `std/build.sh` and set
+`BRASS_PACKAGES=std=<repo>` (the path is the directory CONTAINING `std/`).
+Every module below runs on BOTH back ends (the JIT and `brass repl`); only
+`spawn` concurrency is JIT-only.
 
-### env: `import env.{ args, var, vars, path_separator, current_dir }`
+### env: `import std.env.{ args, var, vars, path_separator, current_dir }`
 
 - `args() -> string[]`: the program's argument vector, the program file as
   written on the command line, then everything after it, verbatim
@@ -491,7 +492,7 @@ ends (the JIT and `brass repl`); only `spawn` concurrency is JIT-only.
   variables (`:` on Unix, `;` on Windows)
 - `current_dir() -> Path!`: the working directory, as a `path` `Path`
 
-### path: `import path.{ Path }`
+### path: `import std.path.{ Path }`
 
 A `Path` is a list of components. Everything except the filesystem queries at
 the end is pure: it never touches the OS and works for paths that do not
@@ -520,7 +521,7 @@ own absolute source path, so "the file I am in" is `Path.parse(_PATH)`.
   `p.entries() -> Path[]!` (directory listing, OS order);
   `p.file_size() -> int64!`
 
-### fs: `import fs.{ File, read_file, write_file, create_dir, remove_dir }`
+### fs: `import std.fs.{ File, read_file, write_file, create_dir, remove_dir }`
 
 - `read_file(path) -> string!`; `write_file(path, content) -> void!`
 - `copy_file(source, target) -> void!` / `move_file(source, target) -> void!`:
@@ -550,7 +551,7 @@ own absolute source path, so "the file I am in" is `Path.parse(_PATH)`.
   `File.stdin()`, `File.stdout()`, `File.stderr()`
 - Text <-> bytes with the prelude `to_bytes` / `to_text`
 
-### process: `import process.{ Command, Stdio }`
+### process: `import std.process.{ Command, Stdio }`
 
 `Stdio = Inherit | Pipe | Null` (default `Inherit`). The builder methods
 mutate the command and return it, so they chain:
@@ -576,7 +577,7 @@ println(to_text(out.stdout)!)
 - `child.stdin()/stdout()/stderr() -> File!`: the pipe as an fs `File`
   (requires that stream be `Stdio.Pipe`); write to stdin, read the others
 
-### hash: `import hash.{ sha256, hmac_sha256, hex, equal, Hasher }`
+### hash: `import std.hash.{ sha256, hmac_sha256, hex, equal, Hasher }`
 
 Message digests and HMAC. A digest is a `uint8[]` (raw bytes); hash text by
 its UTF-8 bytes and render with `hex`:
@@ -601,7 +602,7 @@ a MAC with `equal`, not `==`. These are FAST hashes: password storage needs a
 slow KDF (argon2/scrypt/bcrypt), which this library deliberately does not
 provide.
 
-### regex: `import regex.{ Regex, escape }`
+### regex: `import std.regex.{ Regex, escape }`
 
 Rust's `regex` engine: linear-time matching, so NO backreferences (`\1`) and
 NO lookaround (`(?=..)`, `(?<=..)`); a pattern using one fails to compile.
@@ -637,7 +638,7 @@ println(date.replace_all("2026-07-13", "$year/$2"))
   match); `m.group(i) -> Group?`, `m.named("year") -> Group?`: both null when
   the group did not participate. `Group` = `{ text, start, end }`.
 
-### semver: `import semver.{ Version, sort }`
+### semver: `import std.semver.{ Version, sort }`
 
 Semantic Versioning 2.0.0, parsed with the official semver.org pattern (so
 `v1.0.0`, `1.0`, and `01.0.0` are all REJECTED).
@@ -654,7 +655,7 @@ PRECEDENCE: a pre-release PRECEDES its release (`1.0.0-rc.1 < 1.0.0`); numeric
 pre-release identifiers compare numerically (`beta.2 < beta.11`) and precede
 alphanumeric ones; BUILD METADATA IS IGNORED (`1.0.0+a` equals `1.0.0+b`).
 
-### net: `import net.{ Tcp, TcpListener, Udp, TlsStream }`
+### net: `import std.net.{ Tcp, TcpListener, Udp, TlsStream }`
 
 TCP is a BYTE STREAM: one `read` may return part of a message, so loop or
 frame messages. Bytes convert with the prelude `to_bytes` / `to_text`.
@@ -675,7 +676,7 @@ addr: string }` (a longer datagram truncates); plus `local_addr`,
   verification against `host` (bundled Mozilla roots, no configuration
   knobs); then `read`/`write`/`close` exactly like `Tcp`
 
-### url: `import url.{ URI }`
+### url: `import std.url.{ URI }`
 
 An RFC 3986 parser. Components KEEP their percent-encoding (use the decoded
 views below); null means the component was ABSENT, which differs from empty
@@ -694,7 +695,7 @@ value: string }`, from `import url.query.{ QueryPair }`)
 - Percent-coding: `import url.percent`, then `percent.decode(s) -> string!`
   and `percent.encode_component(s) -> string`
 
-### http: `import http.{ fetch, HttpClient, HttpRequest, HttpResponse, Header }`
+### http: `import std.http.{ fetch, HttpClient, HttpRequest, HttpResponse, Header }`
 
 HTTP/1.1 over `net`. Response bodies are read by `Content-Length` (or to
 connection close); chunked transfer coding is NOT decoded.
@@ -713,7 +714,7 @@ connection close); chunked transfer coding is NOT decoded.
 - `request(req) -> HttpResponse!`: plain HTTP; the host comes from the
   request's `Host` header
 
-### JSON: `import data.json.{ JsonValue }`
+### JSON: `import std.data.json.{ JsonValue }`
 
 Pure Brass (no plugin).
 

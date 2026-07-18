@@ -13,12 +13,21 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn libraries_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../libraries")
+fn std_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../std")
 }
 
-/// Run `brass [repl] <program> <args...>` with `libraries/` on the include
-/// path and return its stdout.
+fn std_package_env() -> String {
+    format!(
+        "std={}",
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .display()
+    )
+}
+
+/// Run `brass [repl] <program> <args...>` with the `std` package bound and
+/// return its stdout.
 fn run_with_args(mode: Option<&str>, program: &Path, args: &[&str]) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_brass"));
     cmd.env("BRASS_CACHE", "off");
@@ -28,7 +37,7 @@ fn run_with_args(mode: Option<&str>, program: &Path, args: &[&str]) -> String {
     let out = cmd
         .arg(program)
         .args(args)
-        .env("BRASS_INCLUDE", libraries_root())
+        .env("BRASS_PACKAGES", std_package_env())
         .output()
         .expect("spawn brass");
     assert!(
@@ -44,7 +53,7 @@ fn trailing_arguments_reach_args() {
     // The env library's plugin, plus path: env.cz imports path.cz (for
     // `current_dir`), so loading the env module needs libpath present too.
     for (package, library) in [("brass_lib_env", "env"), ("brass_lib_path", "path")] {
-        brass_plugin_host::fixture::install_plugin(package, library, &libraries_root());
+        brass_plugin_host::fixture::install_plugin(package, library, &std_root());
     }
 
     let dir = std::env::temp_dir().join(format!("brass_program_args-{}", std::process::id()));
@@ -52,7 +61,7 @@ fn trailing_arguments_reach_args() {
     let program = dir.join("echo_args.cz");
     std::fs::write(
         &program,
-        "import env.{ args }\n\nfun main() {\n    for a in args() {\n        println(a)\n    }\n}\n",
+        "import std.env.{ args }\n\nfun main() {\n    for a in args() {\n        println(a)\n    }\n}\n",
     )
     .expect("write the program");
 

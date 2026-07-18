@@ -287,11 +287,8 @@ impl Monomorphizer<'_, '_> {
                                 .map(|s| s.as_str())
                                 .filter(|s| self.program.functions.contains_key(*s))
                         };
-                        if let Some(symbol) = demand
-                            && self.missing_demand.borrow().is_none()
-                        {
-                            *self.missing_demand.borrow_mut() =
-                                Some((symbol.to_string(), Vec::new()));
+                        if let Some(symbol) = demand {
+                            self.note_missing(symbol, &[]);
                         }
                         return Ok(None);
                     }

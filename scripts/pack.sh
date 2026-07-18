@@ -23,19 +23,19 @@ czpm_path="$tmp/bin/czpm"
 cat << CZPM > "$czpm_path"
 #!/usr/bin/env -S brass --
 
-import package_manager.exec.main
+import std.package_manager.exec.main
 
 main()
 CZPM
 chmod +x "$czpm_path"
 
 #
-# libraries
+# standard library
 #
 
-./libraries/build.sh release
+./std/build.sh release
 
-for path in $(find libraries -type f | grep -E '\.(cz|so|dylib|dll)$'); do
+for path in $(find std -type f | grep -E '\.(cz|so|dylib|dll)$'); do
     mkdir -p "$tmp/$(dirname "$path")"
     cp "$path" "$tmp/$path"
 done
@@ -48,6 +48,6 @@ env -u BRASS_INCLUDE -u BRASS_PACKAGES "$tmp/bin/brass" check "$tmp/bin/czpm"
 #
 
 cd "$tmp"
-tar czf "$artifact" bin libraries
+tar czf "$artifact" bin std
 
 cd "$cwd"

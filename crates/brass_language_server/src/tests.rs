@@ -590,7 +590,7 @@ fn hover_method_call_shows_method_signature() {
 /// key/value via the call arguments -- rather than bare `unknown_N`.
 #[test]
 fn hover_method_call_specializes_unannotated_params() {
-    let src = "import std.collections.{ HashMap }\nfun main() {\n    let m = HashMap.new()\n    m.set(\"a\", \"b\")\n}\n";
+    let src = "fun main() {\n    let m = HashMap.new()\n    m.set(\"a\", \"b\")\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "set(", false);
     let h = hover::hover(&doc, &full, pos).expect("hover over the set call");
@@ -606,7 +606,7 @@ fn hover_method_call_specializes_unannotated_params() {
 /// being left as `unknown`.
 #[test]
 fn hover_method_call_resolves_return_from_receiver() {
-    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    let v = map.get(\"a\")\n}\n";
+    let src = "fun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    let v = map.get(\"a\")\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "get(", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the get call"));
@@ -621,7 +621,7 @@ fn hover_method_call_resolves_return_from_receiver() {
 /// over them, so the LSP can resolve a method against a receiver instance.
 #[test]
 fn full_analysis_exposes_record_schemes() {
-    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n}\n";
+    let src = "fun main() {\n    let map = HashMap.new()\n}\n";
     let full = full_analysis(src);
     let scheme = full.schemes.get("HashMap").expect("HashMap scheme");
     assert!(
@@ -639,7 +639,7 @@ fn full_analysis_exposes_record_schemes() {
 /// the value type taken from the instance's `entries` element, not the call.
 #[test]
 fn hover_method_return_resolved_from_instance_via_scheme() {
-    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    let v = map.get(\"a\")\n}\n";
+    let src = "fun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    let v = map.get(\"a\")\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "get(", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover get"));
@@ -656,7 +656,7 @@ fn hover_method_return_resolved_from_instance_via_scheme() {
 /// a `HashMap` reads as just its slots and operations.
 #[test]
 fn hover_record_instance_shows_resolved_public_members() {
-    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n}\n";
+    let src = "fun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "map.set", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the map value"));
@@ -731,7 +731,7 @@ fn hover_record_instance_shows_pinned_type_slots() {
 /// its open type slots as declared.
 #[test]
 fn hover_type_name_hides_internal_members() {
-    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n}\n";
+    let src = "fun main() {\n    let map = HashMap.new()\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "HashMap.new", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the HashMap type"));
@@ -886,7 +886,7 @@ fn plugin_functions_hover_and_complete() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// In `import |`, the prelude module names and the `std` namespace are offered.
+/// In `import |`, the core module names and the `core` namespace are offered.
 /// Works without analysis, since a bare `import` line does not yet parse.
 #[test]
 fn completion_offers_import_modules() {
@@ -904,8 +904,8 @@ fn completion_offers_import_modules() {
         "prelude module: {labels:?}"
     );
     assert!(
-        labels.contains(&"std".to_string()),
-        "std namespace: {labels:?}"
+        labels.contains(&"core".to_string()),
+        "core namespace: {labels:?}"
     );
 }
 
@@ -933,32 +933,32 @@ fn completion_offers_imported_names() {
     assert!(sqrt.documentation.is_some(), "stdlib doc carried");
 }
 
-/// Under the `std` namespace, the embedded nested modules complete alongside
-/// the prelude ones (`import std.|` offers `collections`), and the brace list
-/// of a nested module offers its public types with their docs.
+/// Under the `core` namespace every embedded module completes (`import
+/// core.|` offers `collections` and `math` alike), and the brace list of a
+/// core module offers its public types with their docs.
 #[test]
-fn completion_offers_nested_std_segments() {
+fn completion_offers_core_segments() {
     let analyzer = DocAnalyzer::new(path());
-    let src = "import std.";
+    let src = "import core.";
     let doc = Document::new(src.to_string(), 1);
     let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(src.len()));
-    let std_segs = labels(&items);
+    let core_segs = labels(&items);
     assert!(
-        std_segs.contains(&"collections".to_string()),
-        "nested namespace: {std_segs:?}"
+        core_segs.contains(&"collections".to_string()),
+        "core module: {core_segs:?}"
     );
     assert!(
-        std_segs.contains(&"math".to_string()),
-        "prelude under std: {std_segs:?}"
+        core_segs.contains(&"math".to_string()),
+        "core module: {core_segs:?}"
     );
 
-    let src = "import std.collections.{ ";
+    let src = "import core.collections.{ ";
     let doc = Document::new(src.to_string(), 1);
     let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(src.len()));
     let names = labels(&items);
     assert!(
         names.contains(&"HashMap".to_string()),
-        "nested std exports: {names:?}"
+        "core exports: {names:?}"
     );
 }
 
@@ -1200,7 +1200,6 @@ fn completion_offers_record_fields() {
 #[test]
 fn completion_hides_private_members_unless_typed() {
     let src = concat!(
-        "import std.collections.{ HashMap }\n",
         "fun main() {\n",
         "    let m = HashMap.new()\n",
         "    m.set(\"a\", 1)\n",
@@ -1236,7 +1235,6 @@ fn completion_hides_private_members_unless_typed() {
 #[test]
 fn completion_method_detail_resolves_via_scheme() {
     let src = concat!(
-        "import std.collections.{ HashMap }\n",
         "fun main() {\n",
         "    let m = HashMap.new()\n",
         "    m.set(\"a\", 1)\n",
@@ -1258,14 +1256,13 @@ fn completion_method_detail_resolves_via_scheme() {
     );
 }
 
-/// `HashMap` lives in the embedded prelude module `std.collections`, and
-/// its operations are `fun HashMap.m(...)` methods. The analysis must load that
-/// nested prelude module so `HashMap.new(...)` types to `HashMap` and `m.` offers
+/// `HashMap` lives in the embedded core module `core.collections`, and its
+/// operations are `fun HashMap.m(...)` methods. Core modules are all in the
+/// implicit prelude, so `HashMap.new(...)` types to `HashMap` and `m.` offers
 /// its methods -- with no import.
 #[test]
 fn completion_offers_hashmap_prelude_methods() {
     let src = concat!(
-        "import std.collections.{ HashMap }\n",
         "fun main() {\n",
         "    let m = HashMap.new()\n",
         "    m.\n",
@@ -1313,7 +1310,7 @@ fn hover_import_renamed_name_resolves_remote_declaration() {
 /// module path segment shows the module the import resolves to.
 #[test]
 fn hover_import_type_and_module_path() {
-    let src = "import std.collections.{ HashMap }\nfun main() {\n    let m = HashMap.new()\n    m.set(\"a\", 1)\n}\n";
+    let src = "import core.collections.{ HashMap }\nfun main() {\n    let m = HashMap.new()\n    m.set(\"a\", 1)\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "HashMap", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the imported type"));
@@ -1322,7 +1319,7 @@ fn hover_import_type_and_module_path() {
     let (doc, pos) = position(src, "collections", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the path segment"));
     assert!(
-        text.contains("module std.collections"),
+        text.contains("module core.collections"),
         "module path: {text}"
     );
 }
@@ -1545,7 +1542,8 @@ fn hover_infers_for_loop_iterand_and_element() {
 #[test]
 fn hashmap_instance_type_mismatch_is_reported_at_the_call() {
     let mut a = DocAnalyzer::new(path());
-    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    map.get(1)\n}\n";
+    let src =
+        "fun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    map.get(1)\n}\n";
     let diags = a.diagnostics(src);
     assert!(
         diags

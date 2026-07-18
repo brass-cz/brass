@@ -1,5 +1,3 @@
-import std.collections.{ HashMap }
-
 // Reflective deserialization: a struct is populated field by field from a
 // name-keyed map, using `fields()` to drive the field walk and `v[field]` to
 // store into each slot. `typeof` labels errors and output with the target's

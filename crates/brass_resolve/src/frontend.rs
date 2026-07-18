@@ -1,9 +1,9 @@
 //! Shared front-end orchestration: the module graph for one entry source.
 //!
 //! Both front ends -- the CLI driver and the language server -- assemble a
-//! program the same way: the embedded prelude, then the entry source, then its
-//! transitive file imports, then the nested std modules the graph names, with
-//! the entry module moved to the end. [`assemble`] is that one sequence. It
+//! program the same way: the embedded core library, then the entry source's
+//! transitive file imports, then the entry module last. [`assemble`] is that
+//! one sequence. It
 //! applies NO error policy: every problem it meets is collected into
 //! [`Frontend`], because policy is exactly where the callers differ -- the
 //! driver aborts per problem class (syntax errors before graph errors) while
@@ -18,11 +18,11 @@ use brass_hir::LoadedModule;
 use brass_parser::Span;
 
 use crate::loader::{
-    SearchPaths, SourceMap, canonicalize_imports, inject_module_path, load_module, load_std_nested,
-    module_location, parse_stdlib,
+    SearchPaths, SourceMap, canonicalize_imports, inject_module_path, load_module, module_location,
+    parse_stdlib,
 };
 
-/// The parsed embedded prelude, shared for the life of the process: it never
+/// The parsed embedded core library, shared for the life of the process: it never
 /// changes, so it is parsed once and cloned as the starting point of every
 /// assembly -- the language server assembles per keystroke and the REPL per
 /// entered line. The `SourceMap` holding the prelude sources is cached with
@@ -50,8 +50,8 @@ fn stdlib_cache() -> &'static StdlibCache {
 /// `parse_errors` before it even looks at `load_errors`, while the language
 /// server reports both and keeps analyzing.
 pub struct Frontend {
-    /// Every module of the program -- prelude, file dependencies, nested std
-    /// modules -- with the entry LAST. Everything before the entry is the
+    /// Every module of the program -- the core library, then file
+    /// dependencies -- with the entry LAST. Everything before the entry is the
     /// CONTEXT, and keeping the context a prefix gives it the same lowering
     /// ids in a context-only run as in the full one, which is what lets a
     /// cached context seed's tables apply to the full program. It also runs
@@ -83,11 +83,10 @@ pub struct Frontend {
 /// exist -- `<repl>` and unsaved editor buffers pass the text they have).
 /// File imports resolve relative to `root`, through `search`.
 ///
-/// The sequence both front ends share: the embedded prelude (parsed once per
-/// process), the entry source parsed with recovery and given its `_PATH`,
-/// its imports canonicalized and transitively loaded from disk, the nested
-/// std modules anything in the graph imports, and the entry moved to the
-/// end. Returns everything and decides nothing: syntax errors leave the
+/// The sequence both front ends share: the embedded core library (parsed once
+/// per process), the entry source parsed with recovery and given its `_PATH`,
+/// its imports canonicalized and transitively loaded from disk, and the entry
+/// last. Returns everything and decides nothing: syntax errors leave the
 /// recovered AST in the graph, graph problems leave the graph partial, and
 /// both are reported in the result for the caller to abort on or diagnose.
 pub fn assemble(entry_path: &Path, entry_src: &str, root: &Path, search: &SearchPaths) -> Frontend {
@@ -133,24 +132,14 @@ pub fn assemble(entry_path: &Path, entry_src: &str, root: &Path, search: &Search
         );
     }
 
-    // The entry joins the graph under the fixed module path `main`; its
-    // position is remembered so the move below targets it by identity.
+    // The entry joins the graph under the fixed module path `main`, LAST (the
+    // context-prefix invariant documented on `Frontend::modules`): its file
+    // dependencies were all pushed by the loop above.
     modules.push(LoadedModule {
         is_prelude: false,
         path: vec!["main".into()],
         ast: entry_ast,
     });
-    let entry_index = modules.len() - 1;
-
-    // Nested std modules (`std.collections`, ...) are not in the implicit
-    // prelude; load only the ones actually imported, transitively.
-    let nested = load_std_nested(&modules, &[], &mut sources);
-    modules.extend(nested);
-
-    // The entry goes LAST (the context-prefix invariant documented on
-    // `Frontend::modules`).
-    let entry = modules.remove(entry_index);
-    modules.push(entry);
 
     Frontend {
         modules,

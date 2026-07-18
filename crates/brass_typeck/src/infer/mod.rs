@@ -155,6 +155,39 @@ pub struct ContextTables {
     /// these would QUALIFY the context's symbols in the combined program,
     /// detaching every table key -- the consumer must bail to an unseeded run.
     pub bare_names: HashSet<String>,
+    /// The module paths these tables cover. `None` means the whole context
+    /// (every module but the entry) -- the full-seed case. `Some` marks a
+    /// PARTIAL seed (see [`ContextTables::retain_modules`]): only the listed
+    /// modules skip their passes; the rest re-analyze against the seed.
+    pub covered: Option<HashSet<Vec<String>>>,
+    /// The program-wide storage symbols and nominal IDs these tables were
+    /// built against. Both can change when an otherwise unrelated module
+    /// adds a declaration, so partial reuse requires an exact match.
+    program_identity: ContextProgramIdentity,
+}
+
+/// The parts of HIR identity embedded in context table keys and values.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct ContextProgramIdentity {
+    functions: std::collections::BTreeMap<String, Vec<String>>,
+    types: std::collections::BTreeMap<String, (Vec<String>, i32)>,
+}
+
+impl ContextProgramIdentity {
+    fn of(program: &Program) -> Self {
+        Self {
+            functions: program
+                .functions
+                .iter()
+                .map(|(symbol, info)| (symbol.clone(), info.module.clone()))
+                .collect(),
+            types: program
+                .types
+                .iter()
+                .map(|(symbol, info)| (symbol.clone(), (info.module.clone(), info.id)))
+                .collect(),
+        }
+    }
 }
 
 impl ContextTables {
@@ -239,9 +272,55 @@ impl ContextTables {
                 .collect(),
             next_var: base + map_id.len() as u32,
             bare_names: self.bare_names.clone(),
+            covered: self.covered.clone(),
+            program_identity: self.program_identity.clone(),
         };
         let next = out.next_var;
         (out, next)
+    }
+
+    /// Restrict these tables to the entries owned by `keep` modules,
+    /// attributing each entry through `program` (a context program over the
+    /// same modules): a function return by its symbol's defining module, a
+    /// scheme and the method tables by the type's, `global_defs` by its own
+    /// key. The identity guard below rejects a program whose storage symbols
+    /// or nominal IDs changed, so every retained key still names the same HIR
+    /// item. `bare_names` is kept WHOLE: the declaration set is unchanged,
+    /// and shrinking it would weaken the consumer's collision bail.
+    /// `next_var` is kept too -- the retained entries keep
+    /// their one coherent variable space, and the re-analysis of the dropped
+    /// modules allocates past it. Sound because a retained (clean) module
+    /// cannot reference a dropped (dirty) one: references follow imports,
+    /// and the dirty closure includes every transitive importer.
+    ///
+    /// Returns `false` without changing the tables when the current program's
+    /// storage symbols or nominal IDs differ. Those identities are global to
+    /// lowering rather than module-local, so even an unchanged module cannot
+    /// safely retain tables across such a change.
+    pub fn retain_modules(&mut self, program: &Program, keep: &HashSet<Vec<String>>) -> bool {
+        if self.program_identity != ContextProgramIdentity::of(program) {
+            return false;
+        }
+        let fn_kept = |sym: &String| {
+            program
+                .functions
+                .get(sym)
+                .is_some_and(|f| keep.contains(&f.module))
+        };
+        let ty_kept = |name: &String| {
+            program
+                .types
+                .get(name)
+                .is_some_and(|t| keep.contains(&t.module))
+        };
+        self.function_returns.retain(|sym, _| fn_kept(sym));
+        self.schemes.retain(|name, _| ty_kept(name));
+        self.method_returns.retain(|(ty, _), _| ty_kept(ty));
+        self.co_method_returns.retain(|(ty, _), _| ty_kept(ty));
+        self.method_return_props.retain(|(ty, _)| ty_kept(ty));
+        self.global_defs.retain(|module, _| keep.contains(module));
+        self.covered = Some(keep.clone());
+        true
     }
 }
 
@@ -314,14 +393,23 @@ impl Checker<'_> {
         self.method_return_props = seed.method_return_props;
         self.co_method_returns = seed.co_method_returns;
         self.global_defs = seed.global_defs;
+        self.seeded_set = seed.covered;
         self.next_unknown = self.next_unknown.max(next_var);
         self.entry_only = true;
     }
 
-    /// Whether `module` was covered by the applied seed (anything but the
-    /// entry, whose module path is always `main`).
+    /// Whether `module` was covered by the applied seed: anything but the
+    /// entry (whose module path is always `main`) for a full seed, or the
+    /// seed's own module list for a partial one (an incremental context
+    /// rebuild -- the uncovered modules get real passes here).
     fn seeded_module(&self, module: &[String]) -> bool {
-        self.entry_only && !matches!(module, [m] if m == "main")
+        if !self.entry_only {
+            return false;
+        }
+        match &self.seeded_set {
+            Some(set) => set.contains(module),
+            None => !matches!(module, [m] if m == "main"),
+        }
     }
 }
 
@@ -466,6 +554,9 @@ pub(crate) fn analyze_inner(
     phase("typeck/seed-schemes", t);
     let mut checker = Checker::new(program);
     checker.lazy_profile = ctl.is_some();
+    if checker.lazy_profile {
+        checker.keyed_tainted = crate::taint::keyed_reachable(program);
+    }
     if let Some((tables, next)) = &remapped {
         checker.apply_seed(tables.clone(), *next);
     }
@@ -658,20 +749,6 @@ pub(crate) fn analyze_inner(
                     continue;
                 }
                 let f = &program.functions[&symbol];
-                if checker.seeded_module(&f.module) || ctl.skip_fns.contains(&symbol) {
-                    // A seeded (context) body is settled without a check of
-                    // its own -- callers re-elaborate it at their call sites
-                    // -- but the event must still go out: a consumer waiting
-                    // on a context function would otherwise wait forever.
-                    // A resume-snapshot body is settled the same way: its
-                    // delivered state was seeded from the prior run.
-                    ctl.sched.emit(stream::CheckEvent::BodyChecked(
-                        stream::BodyId::Function(symbol),
-                        stream::ChannelDelta::default(),
-                    ));
-                    continue;
-                }
-                let fn_started = std::time::Instant::now();
                 // A demanded body checks at the instance the demand named
                 // when its types align with the signature; anything else
                 // (stale request, mismatched arity, an open type) falls back
@@ -686,6 +763,22 @@ pub(crate) fn analyze_inner(
                         && args.iter().all(brass_hir::is_fully_known)
                         && !args.iter().any(contains_structural_record)
                 });
+                if instance_args.is_none()
+                    && (checker.seeded_module(&f.module) || ctl.skip_fns.contains(&symbol))
+                {
+                    // A seeded (context) body is settled without a check of
+                    // its own -- callers re-elaborate it at their call sites
+                    // -- but the event must still go out: a consumer waiting
+                    // on a context function would otherwise wait forever.
+                    // A resume-snapshot body is settled the same way: its
+                    // delivered state was seeded from the prior run.
+                    ctl.sched.emit(stream::CheckEvent::BodyChecked(
+                        stream::BodyId::Function(symbol),
+                        stream::ChannelDelta::default(),
+                    ));
+                    continue;
+                }
+                let fn_started = std::time::Instant::now();
                 match &instance_args {
                     Some(args) => check_function_body_at(&mut checker, &symbol, f, args),
                     None => check_function_body(&mut checker, &symbol, f),
@@ -798,6 +891,8 @@ pub(crate) fn analyze_inner(
             .map(|f| f.signature.name.clone())
             .chain(program.types.values().map(|t| t.name.clone()))
             .collect(),
+        covered: None,
+        program_identity: ContextProgramIdentity::of(program),
     };
     // Re-resolve the coercion targets against the final substitution: a
     // variable pinned after the site was recorded (an err payload bound by a
@@ -1192,6 +1287,15 @@ struct Checker<'a> {
     /// so later pinning reaches every reader, and an erroring body keeps
     /// reporting at every call site.
     elaboration_memo: HashMap<String, Type>,
+    /// Free functions that can transitively reach a reflective keyed
+    /// (`-> infer!`) method call (see `taint::keyed_reachable`). The lazy
+    /// profile never types a call to one from its signature alone: the keyed
+    /// call must be SEEN by this pass, or its discovery would restart the
+    /// analysis after execution began. Empty outside the lazy profile.
+    keyed_tainted: HashSet<String>,
+    /// The module paths a PARTIAL seed covers (see `ContextTables::covered`);
+    /// `None` under a full seed or no seed.
+    seeded_set: Option<HashSet<Vec<String>>>,
     /// Callables (`fn:<symbol>` / `m:<qualifier>.<name>`) whose inferred Err
     /// payload is one of their own parameter variables: a generic error type
     /// named per call site, exempt from the uninferable-error report.
@@ -1345,6 +1449,8 @@ impl<'a> Checker<'a> {
             reported_result_shadow: HashSet::new(),
             lazy_profile: false,
             elaboration_memo: HashMap::new(),
+            keyed_tainted: HashSet::new(),
+            seeded_set: None,
             generic_error_returns: HashSet::new(),
             schemes: HashMap::new(),
             fixed_array_binding: false,

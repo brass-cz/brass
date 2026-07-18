@@ -1,7 +1,7 @@
 error: Error {
     value: "/nonexistent/brass_missing.txt: No such file or directory (os error 2)",
     location: Location {
-        file: "<plugin:libraries/libfs.so>",
+        file: "<plugin:std/libfs.so>",
         line: 49,
         col: 12,
     },

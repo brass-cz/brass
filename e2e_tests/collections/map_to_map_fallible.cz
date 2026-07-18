@@ -8,7 +8,6 @@
 // `error(..)` ones: their payload is a variable no path produces, and left in they
 // win, the payload stays open, and the caller's `out.pairs()` monomorphizes at a
 // map whose value type is not the one the body stores (a segfault, not a refusal).
-import std.collections.{ HashMap }
 
 type Dep = {
     name: string

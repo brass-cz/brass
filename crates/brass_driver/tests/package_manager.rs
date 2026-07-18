@@ -8,8 +8,17 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn libraries_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../libraries")
+fn std_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../std")
+}
+
+fn std_package_env() -> String {
+    format!(
+        "std={}",
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .display()
+    )
 }
 
 fn run(command: &mut Command) {
@@ -28,7 +37,7 @@ fn git_dependencies_clone_and_checkout_in_the_cache() {
         ("brass_lib_hash", "hash"),
         ("brass_lib_env", "env"),
     ] {
-        brass_plugin_host::fixture::install_plugin(package, library, &libraries_root());
+        brass_plugin_host::fixture::install_plugin(package, library, &std_root());
     }
 
     let nonce = SystemTime::now()
@@ -79,12 +88,12 @@ fn git_dependencies_clone_and_checkout_in_the_cache() {
     let program = dir.join("clone.cz");
     std::fs::write(
         &program,
-        "import package_manager.resolve.git_clone\nimport env.args\n\nconst argv = args()\nprintln(git_clone(argv[1], argv[2])!.to_string())\nprintln(git_clone(argv[1], argv[2])!.to_string())\n",
+        "import std.package_manager.resolve.git_clone\nimport std.env.args\n\nconst argv = args()\nprintln(git_clone(argv[1], argv[2])!.to_string())\nprintln(git_clone(argv[1], argv[2])!.to_string())\n",
     )
     .expect("write package-manager program");
     let output = Command::new(env!("CARGO_BIN_EXE_brass"))
         .env("BRASS_CACHE", "off")
-        .env("BRASS_INCLUDE", libraries_root())
+        .env("BRASS_PACKAGES", std_package_env())
         .env("HOME", &home)
         .arg(&program)
         .arg(&repo)
@@ -138,13 +147,13 @@ fn git_dependencies_clone_and_checkout_in_the_cache() {
     let resolver = path_root.join("resolve_paths.cz");
     std::fs::write(
         &resolver,
-        "import fs.read_file\nimport package_manager.manifest.Manifest\nimport package_manager.resolve.resolve_deps\n\nconst manifest = Manifest.parse(read_file(\"package.toml\")!)!\nfor [name, path] in resolve_deps(manifest.dependencies)!.pairs() {\n    println(\"{name}={path}\")\n}\n",
+        "import std.fs.read_file\nimport std.package_manager.manifest.Manifest\nimport std.package_manager.resolve.resolve_deps\n\nconst manifest = Manifest.parse(read_file(\"package.toml\")!)!\nfor [name, path] in resolve_deps(manifest.dependencies)!.pairs() {\n    println(\"{name}={path}\")\n}\n",
     )
     .expect("write path resolver");
     let resolved = Command::new(env!("CARGO_BIN_EXE_brass"))
         .current_dir(&path_root)
         .env("BRASS_CACHE", "off")
-        .env("BRASS_INCLUDE", libraries_root())
+        .env("BRASS_PACKAGES", std_package_env())
         .env("HOME", &home)
         .arg(&resolver)
         .output()
@@ -173,12 +182,15 @@ fn git_dependencies_clone_and_checkout_in_the_cache() {
     let scaffold = dir.join("scaffold");
     std::fs::create_dir_all(&scaffold).expect("create scaffold directory");
     let launcher = dir.join("czpm_test.cz");
-    std::fs::write(&launcher, "import package_manager.exec.main\n\nmain()!\n")
-        .expect("write czpm launcher");
+    std::fs::write(
+        &launcher,
+        "import std.package_manager.exec.main\n\nmain()!\n",
+    )
+    .expect("write czpm launcher");
     let czpm = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_brass"))
             .current_dir(&scaffold)
-            .env("BRASS_INCLUDE", libraries_root())
+            .env("BRASS_PACKAGES", std_package_env())
             .env("HOME", &home)
             .arg(&launcher)
             .args(args)

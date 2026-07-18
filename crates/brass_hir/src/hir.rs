@@ -103,7 +103,7 @@ pub fn resolve_qualified<'a, T>(
 pub struct LoadedModule {
     pub path: Vec<String>,
     pub ast: Module,
-    /// Whether this is an implicit-prelude module (`std/prelude/*.cz`): its
+    /// Whether this is an implicit-prelude module (every `core/*.cz` module): its
     /// public names are visible everywhere with no import. Set by the loader
     /// that embeds the prelude; every other module -- including the nested
     /// standard-library ones -- requires an explicit import.

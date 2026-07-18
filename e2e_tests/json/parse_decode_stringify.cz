@@ -1,4 +1,4 @@
-import data.json.{ JsonValue }
+import std.data.json.{ JsonValue }
 
 type Address = { city: string, zip: int64 }
 type User = { name: string, age: int64, address: Address }

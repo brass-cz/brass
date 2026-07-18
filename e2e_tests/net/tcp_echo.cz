@@ -2,7 +2,7 @@
 // socket completes in the kernel backlog before accept runs, so one thread
 // can drive both ends deterministically. Port 0 requests an ephemeral port,
 // read back through local_addr, so parallel test runs never collide.
-import net.{ Tcp, TcpListener }
+import std.net.{ Tcp, TcpListener }
 
 let listener = TcpListener.bind("127.0.0.1", 0)!
 let port = int64.parse(listener.local_addr()!.split(":")[1])!

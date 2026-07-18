@@ -1,0 +1,332 @@
+//! File descriptors and byte I/O, as a native Brass plugin.
+//!
+//! `std/fs.cz` builds the `File` surface on these primitives. A file
+//! crosses the boundary as its raw descriptor (an `i64`); everything that is
+//! policy rather than I/O -- which descriptor a `File` holds, the double-close
+//! guard, size lookups (delegated to the path library, which stats by name) --
+//! lives on the Brass side. The descriptor is borrowed without ownership for
+//! reads/writes/seeks (so an operation does not close it); `fd_close` takes
+//! ownership and closes it.
+//!
+//! Directories are not descriptors: `dir_create`/`dir_remove` work by name, so
+//! they take a path and hand back nothing.
+
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::mem::ManuallyDrop;
+use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
+
+use brass_plugin::{BrassLib, Bytes, Registry, brass_lib, decl, export};
+
+/// Validate a live descriptor before narrowing the ABI's `i64` to the host's
+/// raw descriptor type. A closed `File` stores -1.
+fn live(fd: i64) -> Result<RawFd, String> {
+    if fd < 0 {
+        return Err("file is closed".to_string());
+    }
+    RawFd::try_from(fd).map_err(|_| format!("file descriptor {fd} is out of range"))
+}
+
+/// Run `op` on the `File` for `fd` without taking ownership, so the borrow
+/// ending does not close the descriptor.
+fn borrow_fd<R>(fd: RawFd, op: impl FnOnce(&mut File) -> R) -> R {
+    let mut file = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+    op(&mut file)
+}
+
+/// Convert a byte count from the plugin ABI without turning a negative value
+/// into an empty read.
+fn byte_count(value: i64) -> Result<usize, String> {
+    usize::try_from(value).map_err(|_| format!("byte count {value} must be non-negative"))
+}
+
+/// Copy the tree rooted at `source` into `target`, which the caller has checked
+/// does not exist yet.
+///
+/// A symbolic link inside the tree is RECREATED as a link rather than followed.
+/// That is what POSIX's `cp -R` does, and it is also what keeps the walk finite:
+/// following a link that points at an ancestor would recurse forever.
+fn copy_tree(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(&from)?, &to)?;
+        } else if kind.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copy a tree and remove the newly-created target when any entry fails. The
+/// source remains untouched, so a failed copy can be retried immediately.
+fn copy_tree_clean(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    if let Err(copy_error) = copy_tree(source, target) {
+        match std::fs::remove_dir_all(target) {
+            Ok(()) => Err(copy_error),
+            Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {
+                Err(copy_error)
+            }
+            Err(cleanup_error) => Err(std::io::Error::other(format!(
+                "{copy_error}; also failed to remove the partial target: {cleanup_error}"
+            ))),
+        }
+    } else {
+        Ok(())
+    }
+}
+
+/// Check the invariants both directory operations share, and answer the pair of
+/// paths to work with: `source` must be a directory, `target` must not exist at
+/// all (see `std/fs.cz` on why an existing target is refused rather than
+/// replaced), and `target` must not lie INSIDE `source` -- copying a tree into
+/// itself would never terminate.
+fn checked_dirs(source: &str, target: &str) -> Result<(), String> {
+    let meta = std::fs::metadata(source).map_err(|e| format!("{source}: {e}"))?;
+    if !meta.is_dir() {
+        return Err(format!("{source} is not a directory"));
+    }
+    if std::path::Path::new(target).exists() {
+        return Err(format!("{target} already exists"));
+    }
+    // Compare the source's real location with the target's would-be one: the
+    // target does not exist, so only its parent can be canonicalized.
+    let src = std::fs::canonicalize(source).map_err(|e| format!("{source}: {e}"))?;
+    let dst_parent = std::path::Path::new(target)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let dst = std::fs::canonicalize(dst_parent)
+        .map_err(|e| format!("{}: {e}", dst_parent.display()))?
+        .join(std::path::Path::new(target).file_name().unwrap_or_default());
+    if dst.starts_with(&src) {
+        return Err(format!("{target} is inside {source}"));
+    }
+    Ok(())
+}
+
+export! {
+    /// Open the file at `path` and give up its descriptor. Modes: `r` read,
+    /// `w` truncate+create write, `a` append+create. The Brass side owns
+    /// the descriptor from here.
+    fn fd_open(path: String, mode: String) -> Result<i64, String> {
+        let mut opts = OpenOptions::new();
+        match mode.as_str() {
+            "r" => opts.read(true),
+            "w" => opts.write(true).create(true).truncate(true),
+            "a" => opts.append(true).create(true),
+            other => return Err(format!("invalid open mode `{other}`")),
+        };
+        match opts.open(&path) {
+            Ok(f) => Ok(i64::from(f.into_raw_fd())),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Up to `n` bytes from descriptor `fd` (fewer at end-of-file).
+    fn fd_read(fd: i64, n: i64) -> Result<Bytes, String> {
+        let fd = live(fd)?;
+        let mut buf = vec![0u8; byte_count(n)?];
+        match borrow_fd(fd, |f| f.read(&mut buf)) {
+            Ok(got) => {
+                buf.truncate(got);
+                Ok(Bytes(buf))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Write all of `data` to descriptor `fd`, returning its length.
+    fn fd_write(fd: i64, data: Bytes) -> Result<i64, String> {
+        let fd = live(fd)?;
+        match borrow_fd(fd, |f| f.write_all(&data.0)) {
+            Ok(()) => Ok(data.0.len() as i64),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Move descriptor `fd`'s read/write cursor to absolute byte offset `pos`
+    /// from the start of the file.
+    fn fd_seek(fd: i64, pos: i64) -> Result<(), String> {
+        let fd = live(fd)?;
+        let pos = u64::try_from(pos).map_err(|_| format!("seek position {pos} must be non-negative"))?;
+        borrow_fd(fd, |f| f.seek(SeekFrom::Start(pos)))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Close descriptor `fd`. The standard streams 0/1/2 are left open (a
+    /// backstop under `File.close`'s own guard), as closing them would break
+    /// the process.
+    fn fd_close(fd: i64) -> Result<(), String> {
+        let fd = live(fd)?;
+        if fd > 2 {
+            drop(unsafe { File::from_raw_fd(fd) });
+        }
+        Ok(())
+    }
+
+    /// Read a whole file while Rust owns the handle, so every success and
+    /// error path closes it before returning.
+    fn fs_read_all(path: String) -> Result<Bytes, String> {
+        std::fs::read(&path)
+            .map(Bytes)
+            .map_err(|e| format!("{path}: {e}"))
+    }
+
+    /// Replace a file with `data` while Rust owns the handle, closing it on
+    /// both success and failure. Parent directories are not created.
+    fn fs_write_all(path: String, data: Bytes) -> Result<(), String> {
+        std::fs::write(&path, data.0).map_err(|e| format!("{path}: {e}"))
+    }
+
+    /// Delete the file at `path`. A symbolic link is removed as the LINK (what
+    /// it points at is untouched). A `path` that is a directory is an error --
+    /// `dir_remove` is the call that takes a tree -- and so is one that is not
+    /// there, so a typo in a destructive call cannot read as done.
+    fn file_remove(path: String) -> Result<(), String> {
+        std::fs::remove_file(&path).map_err(|e| format!("{path}: {e}"))
+    }
+
+    /// Copy the contents and permission bits of `source` onto `target`,
+    /// replacing `target` when it already exists. `target`'s parent directory
+    /// must exist (`dir_create` makes one); a directory as either side is an
+    /// error.
+    fn file_copy(source: String, target: String) -> Result<(), String> {
+        std::fs::copy(&source, &target)
+            .map(|_| ())
+            .map_err(|e| format!("{source} -> {target}: {e}"))
+    }
+
+    /// Move the file at `source` to `target`, replacing `target` when it
+    /// already exists.
+    ///
+    /// A rename is atomic but cannot cross filesystems, and a temporary
+    /// directory very often IS another filesystem -- so a plain rename would
+    /// fail exactly where "move the file I just built in /tmp into place" is
+    /// the point. On that one error the move falls back to a copy followed by a
+    /// delete: no longer atomic, and `source` survives if the delete fails, but
+    /// it does what the caller asked. Every other error is reported as it is.
+    fn file_move(source: String, target: String) -> Result<(), String> {
+        // A directory would be renamed happily on one filesystem and fail the
+        // copy fallback on another; refuse it here so the name does not lie
+        // about what it moves.
+        if std::fs::metadata(&source)
+            .map_err(|e| format!("{source}: {e}"))?
+            .is_dir()
+        {
+            return Err(format!("{source} is a directory, not a file"));
+        }
+        match std::fs::rename(&source, &target) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                std::fs::copy(&source, &target)
+                    .map_err(|e| format!("{source} -> {target}: {e}"))?;
+                std::fs::remove_file(&source).map_err(|e| {
+                    format!("{source} was copied to {target} but could not be removed: {e}")
+                })
+            }
+            Err(e) => Err(format!("{source} -> {target}: {e}")),
+        }
+    }
+
+    /// Copy the directory tree at `source` to `target`, which must not exist.
+    /// A symbolic link inside the tree is recreated as a link, not followed.
+    fn dir_copy(source: String, target: String) -> Result<(), String> {
+        checked_dirs(&source, &target)?;
+        copy_tree_clean(std::path::Path::new(&source), std::path::Path::new(&target))
+            .map_err(|e| format!("{source} -> {target}: {e}"))
+    }
+
+    /// Move the directory tree at `source` to `target`, which must not exist.
+    ///
+    /// A rename when the two sit on one filesystem (atomic, and nothing is
+    /// read); a copy of the tree followed by its removal when they do not,
+    /// since a rename cannot cross filesystems. The fallback is not atomic, and
+    /// `source` survives if the removal fails -- the error says so.
+    fn dir_move(source: String, target: String) -> Result<(), String> {
+        checked_dirs(&source, &target)?;
+        match std::fs::rename(&source, &target) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                copy_tree_clean(std::path::Path::new(&source), std::path::Path::new(&target))
+                    .map_err(|e| format!("{source} -> {target}: {e}"))?;
+                std::fs::remove_dir_all(&source).map_err(|e| {
+                    format!("{source} was copied to {target} but could not be removed: {e}")
+                })
+            }
+            Err(e) => Err(format!("{source} -> {target}: {e}")),
+        }
+    }
+
+    /// Create the directory at `path` along with every missing parent, as
+    /// `mkdir -p` does. An existing directory is not an error (the requested
+    /// state already holds); a `path` that exists as a file is.
+    fn dir_create(path: String) -> Result<(), String> {
+        std::fs::create_dir_all(&path).map_err(|e| format!("{path}: {e}"))
+    }
+
+    /// Remove the directory at `path` and everything under it, recursively.
+    /// A symbolic link inside is removed as a link -- the walk does not follow
+    /// it, so the target is untouched. `path` itself must be a directory: a
+    /// symlink to one is not removed through here (nor is its target), and a
+    /// missing `path` is an error rather than a silent success, so a typo in a
+    /// destructive call does not read as done.
+    fn dir_remove(path: String) -> Result<(), String> {
+        std::fs::remove_dir_all(&path).map_err(|e| format!("{path}: {e}"))
+    }
+}
+
+struct FsLib;
+
+impl BrassLib for FsLib {
+    fn entry(reg: &mut Registry) {
+        reg.export(decl!(fd_open));
+        reg.export(decl!(fd_read));
+        reg.export(decl!(fd_write));
+        reg.export(decl!(fd_seek));
+        reg.export(decl!(fd_close));
+        reg.export(decl!(fs_read_all));
+        reg.export(decl!(fs_write_all));
+        reg.export(decl!(file_remove));
+        reg.export(decl!(file_copy));
+        reg.export(decl!(file_move));
+        reg.export(decl!(dir_copy));
+        reg.export(decl!(dir_move));
+        reg.export(decl!(dir_create));
+        reg.export(decl!(dir_remove));
+    }
+}
+
+brass_lib!(FsLib);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_and_byte_count_ranges_are_checked() {
+        // The ABI uses i64 even where Unix uses i32. Truncation could turn a
+        // bogus handle into a different live descriptor, including stdout.
+        assert!(live(i64::from(i32::MAX) + 1).is_err());
+        assert!(byte_count(-1).is_err());
+    }
+
+    #[test]
+    fn failed_tree_copy_removes_its_partial_target() {
+        // A regular file is not a readable tree: copy_tree creates the target
+        // before read_dir fails, exercising the cleanup path deterministically.
+        let root = std::env::temp_dir().join(format!("brass-fs-copy-{}", std::process::id()));
+        let source = root.with_extension("source");
+        let target = root.with_extension("target");
+        std::fs::write(&source, b"not a directory").expect("create source file");
+        assert!(copy_tree_clean(&source, &target).is_err());
+        assert!(!target.exists(), "partial target survived a failed copy");
+        std::fs::remove_file(source).expect("remove source file");
+    }
+}

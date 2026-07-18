@@ -1,7 +1,7 @@
 // `finalize` consumes the hasher, so a second digest from the same value is an
 // error rather than a silent second (meaningless) answer -- the handle is gone
 // from the plugin's table. Unhandled in `main`, it aborts.
-import hash.{ Hasher, hex }
+import std.hash.{ Hasher, hex }
 
 fun main() {
     let h = Hasher.sha256()!

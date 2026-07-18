@@ -7,7 +7,7 @@
 // itself would never finish). A symbolic link in the tree is recreated as a
 // link, never followed -- which is also what keeps the walk finite when one
 // points back at an ancestor.
-import fs.{
+import std.fs.{
     read_file,
     write_file,
     create_dir,
@@ -17,7 +17,7 @@ import fs.{
     copy,
     move,
 }
-import path.{ Path }
+import std.path.{ Path }
 
 fun main() {
     const root = Path.parse("/tmp/brass_e2e_fs_tree_operations")

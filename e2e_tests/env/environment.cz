@@ -1,14 +1,15 @@
 // The env library: a variable read singly, the bulk map, and the working
 // directory. Only environment-independent answers are printed: the harness
-// always sets BRASS_INCLUDE, so its presence (never its value) is the
-// stable signal, and the two ways of reading it must agree.
-import env.{ var, vars, current_dir }
+// always sets BRASS_PACKAGES (to bind the `std` package), so its presence
+// (never its value) is the stable signal, and the two ways of reading it
+// must agree.
+import std.env.{ var, vars, current_dir }
 
 fun main() {
-    let include = var("BRASS_INCLUDE")!
-    println(len(include) > 0)
+    let packages = var("BRASS_PACKAGES")!
+    println(len(packages) > 0)
     let all = vars()
-    println(all.get_or("BRASS_INCLUDE", "<unset>") == include)
+    println(all.get_or("BRASS_PACKAGES", "<unset>") == packages)
     println(all.size() > 0)
     println(current_dir()!.is_absolute())
 }

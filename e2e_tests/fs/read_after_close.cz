@@ -1,6 +1,6 @@
 // A closed File forgets its descriptor, so byte I/O after close is a clean
 // error from the plugin -- never a touch on a descriptor the OS reassigned.
-import fs.{ File, write_file }
+import std.fs.{ File, write_file }
 
 fun main() {
     const path = "/tmp/brass_e2e_read_after_close.txt"

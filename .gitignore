@@ -5,10 +5,10 @@ llvm/
 
 *.tar.gz
 
-# Native plugins built by libraries/build.sh, installed beside their module.
-libraries/**/*.so
-libraries/**/*.dylib
-libraries/**/*.dll
+# Native plugins built by std/build.sh, installed beside their module.
+std/**/*.so
+std/**/*.dylib
+std/**/*.dll
 
 # On-disk analysis caches written next to entry files.
 *.czcache

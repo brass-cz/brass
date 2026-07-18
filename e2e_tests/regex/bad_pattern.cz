@@ -4,7 +4,7 @@
 // This engine has no backreferences and no lookaround (neither is expressible
 // in a finite automaton), so a pattern using one fails to compile here rather
 // than quietly meaning something else -- which is what this case pins.
-import regex.{ Regex }
+import std.regex.{ Regex }
 
 fun main() {
     match Regex.new("(unclosed") {

@@ -14,7 +14,7 @@ the implied fields exist.
 
 ## The `Result` behind fallibility
 
-`Result` is an ordinary two-variant sum declared in `std/prelude/error.cz`:
+`Result` is an ordinary two-variant sum declared in `core/error.cz`:
 
 ```brass
 type Result =
@@ -68,7 +68,7 @@ not usable as the other.
 
 ## Error traces
 
-`std/prelude/error.cz` defines the error value model:
+`core/error.cz` defines the error value model:
 
 ```brass
 type Location = { file: string, line: int32, col: int32 }
@@ -122,7 +122,7 @@ what runs.
 
 ## Methods are `Default` fields
 
-`std/prelude/default.cz` declares the protocol type:
+`core/default.cz` declares the protocol type:
 
 ```brass
 type Default = {

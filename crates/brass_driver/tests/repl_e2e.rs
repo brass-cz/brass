@@ -31,11 +31,8 @@ fn run_mode(mode: &str, path: &str) -> (bool, String, String) {
     let out = cmd
         .arg(path)
         .env(
-            "BRASS_INCLUDE",
-            format!(
-                "{}/libraries",
-                env!("CARGO_MANIFEST_DIR").to_string() + "/../.."
-            ),
+            "BRASS_PACKAGES",
+            format!("std={}", env!("CARGO_MANIFEST_DIR").to_string() + "/../.."),
         )
         .output()
         .expect("spawn brass");

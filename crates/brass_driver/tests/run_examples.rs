@@ -51,7 +51,7 @@ fn runnable_examples_run_successfully() {
         let out = Command::new(bin)
             .env("BRASS_CACHE", "off")
             .arg(&path)
-            .env("BRASS_INCLUDE", format!("{root}/libraries"))
+            .env("BRASS_PACKAGES", format!("std={root}"))
             .output()
             .expect("spawn brass");
         assert!(
@@ -74,7 +74,7 @@ fn all_examples_typecheck() {
             .env("BRASS_CACHE", "off")
             .arg("check")
             .arg(&path)
-            .env("BRASS_INCLUDE", format!("{root}/libraries"))
+            .env("BRASS_PACKAGES", format!("std={root}"))
             .output()
             .expect("spawn brass");
         assert!(

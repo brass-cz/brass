@@ -6,7 +6,7 @@
 // behind, and removing something that is not a plain file -- a directory, or
 // nothing at all -- is an ERROR rather than a quiet success, so a typo cannot
 // read as "done".
-import fs.{
+import std.fs.{
     read_file,
     write_file,
     create_dir,
@@ -15,7 +15,7 @@ import fs.{
     copy_file,
     move_file,
 }
-import path.{ Path }
+import std.path.{ Path }
 
 fun main() {
     const root = Path.parse("/tmp/brass_e2e_fs_file_operations")

@@ -24,13 +24,13 @@ members = [
     "crates/brass_plugin_testlib",
     "crates/brass_plugin_faultylib",
     "crates/brass_plugin_altlib",
-    "libraries/process",
-    "libraries/path",
-    "libraries/net",
-    "libraries/fs",
-    "libraries/env",
-    "libraries/hash",
-    "libraries/regex",
+    "std/process",
+    "std/path",
+    "std/net",
+    "std/fs",
+    "std/env",
+    "std/hash",
+    "std/regex",
 ]
 # The default set includes the command-line driver. On native targets the driver
 # enables its `jit` feature by default, so a plain `cargo build` may need LLVM;

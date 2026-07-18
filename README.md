@@ -117,8 +117,9 @@ knowing:
 - **The JIT and interpreter agree across the language's tested surface,** but a
   few features are native-only: concurrency (`spawn`/`sync`/`with`) and runtime
   type specialization are refused by the interpreter, so they need the JIT.
-  File I/O and the other native libraries run on both back ends (`brass repl`
-  included); only the browser playground, which cannot load plugins, lacks them.
+  File I/O and the other native `std` modules run on both back ends
+  (`brass repl` included); only the browser playground, which cannot load
+  plugins, lacks them.
 
 ## License
 

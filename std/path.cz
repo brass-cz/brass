@@ -1,0 +1,408 @@
+// Filesystem paths. `Path` is a sequence of components, so the operations that
+// take paths apart and put them back together -- `parent`, `basename`, `join`,
+// `normalize`, `to_relative` -- are array manipulation rather than string
+// surgery, and a path never has to be re-parsed to be understood.
+//
+// A path is absolute exactly when its first component is the root `"/"`; every
+// other component is one name. Redundant separators and empty components are
+// dropped when a path is parsed, so `"/usr//lib/"` and `"/usr/lib"` are the same
+// path. The only calls that reach the operating system are the ones that have
+// to: `current_dir`, the existence queries, and `canonicalize`. Everything else
+// is pure, and works on paths that do not exist.
+//
+// Every method that answers with a path builds a NEW one: no method aliases the
+// receiver's components, so a `Path` can be shared without being defensive.
+//
+// This lives in `std` rather than `core`: asking the operating system what
+// exists needs native code, which arrives as a plugin instead of a runtime
+// builtin. A distributed toolchain binds the `std` package automatically
+// (`<bin>/../std`); elsewhere declare it and import:
+//
+//     BRASS_PACKAGES=std=/path/to/toolchain
+//     import std.path.{ Path }
+//
+// Build the plugin once with `std/build.sh`.
+//
+// A file's own location is not a `Path` method: every module is loaded with a
+// private `_PATH` constant holding its absolute source path, so the path of the
+// file you are writing is `Path.parse(_PATH)`.
+
+import libpath.{
+    path_canonicalize,
+    path_current_dir,
+    path_exists,
+    path_file_size,
+    path_home_dir,
+    path_is_dir,
+    path_is_file,
+    path_is_symlink,
+    path_read_dir,
+    path_read_link,
+    path_temp_dir,
+}
+
+// The component separator, and the root component itself. They are the same
+// character, which is why the root is representable as a component at all.
+const _SEP = "/"
+
+/**
+ * A filesystem path: the root `"/"` (for an absolute path) followed by one
+ * component per name. Build one with `Path.parse`, `Path.current_dir`, or by
+ * joining onto an existing path.
+ */
+type Path = {
+    _components: string[]
+}
+
+// A fresh array with the same elements, so a constructed `Path` never shares
+// its components with the path it was derived from.
+fun _copy(parts: string[]) -> string[] {
+    return parts.slice(0, len(parts))
+}
+
+// The components of `s`, dropping the empty ones a doubled or trailing
+// separator produces. A leading separator becomes the root component.
+fun _parse_components(s: string) -> string[] {
+    let parts: string[] = []
+    if s.starts_with(_SEP) {
+        parts.push(_SEP)
+    }
+    for seg in s.split(_SEP) {
+        if len(seg) > 0 {
+            parts.push(seg)
+        }
+    }
+    return parts
+}
+
+// `name` split into its stem and its extension, the extension empty when there
+// is none. The extension starts at the LAST dot, and a leading dot does not
+// begin one: `.gitignore` is all stem.
+fun _split_extension(name: string) -> string[] {
+    const cs = name.chars()
+    let cut: int64 = -1
+    let i: int64 = 0
+    for c in cs {
+        if c == "." && i > 0 {
+            cut = i
+        }
+        i = i + 1
+    }
+    if cut < 0 {
+        return [name, ""]
+    }
+    return [cs.slice(0, cut).join(""), cs.slice(cut + 1, len(cs)).join("")]
+}
+
+/**
+ * The path `s` denotes. Absolute when `s` starts with `/`. Empty and repeated
+ * separators are dropped, `.` and `..` are kept as written (`normalize`
+ * resolves them), and `Path.parse("")` is the empty relative path, which prints
+ * as `.`.
+ */
+fun Path.parse(s: string) -> Path {
+    return Self { _components: _parse_components(s) }
+}
+
+/** The process's current working directory. */
+fun Path.current_dir() -> Path! {
+    return Path.parse(path_current_dir()!)
+}
+
+/** The user's home directory. Fails when the environment names none. */
+fun Path.home() -> Path! {
+    return Path.parse(path_home_dir()!)
+}
+
+/** The directory for temporary files. */
+fun Path.temp_dir() -> Path! {
+    return Path.parse(path_temp_dir()!)
+}
+
+/** The path as text: `/usr/lib`, `src/main.cz`, or `.` for the empty path. */
+fun Path.to_string(self) -> string {
+    const n = len(self._components)
+    if n == 0 {
+        return "."
+    }
+    if self.is_absolute() {
+        return _SEP + self._components.slice(1, n).join(_SEP)
+    }
+    return self._components.join(_SEP)
+}
+
+/** A copy of the path's components, the root included as `"/"`. */
+fun Path.components(self) -> string[] {
+    return _copy(self._components)
+}
+
+// `len` would be the natural name, but `x.len()` is a runtime builtin that the
+// back end routes by the receiver's shape before any user method is consulted,
+// so a `Path.len` could never be reached.
+/** The number of components, counting the root. */
+fun Path.depth(self) -> int64 {
+    return len(self._components)
+}
+
+/** Whether the path starts at the root. */
+fun Path.is_absolute(self) -> bool {
+    if len(self._components) == 0 {
+        return false
+    }
+    return self._components[0] == _SEP
+}
+
+/** Whether the path is exactly the root `/`. */
+fun Path.is_root(self) -> bool {
+    return len(self._components) == 1 && self.is_absolute()
+}
+
+/** Whether `self` and `other` name the same path, component for component. */
+fun Path.equals(self, other: Path) -> bool {
+    if len(self._components) != len(other._components) {
+        return false
+    }
+    let i: int64 = 0
+    while i < len(self._components) {
+        if self._components[i] != other._components[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/** Whether `base` is a leading run of `self`'s components (`/usr` of `/usr/lib`). */
+fun Path.starts_with(self, base: Path) -> bool {
+    if len(base._components) > len(self._components) {
+        return false
+    }
+    let i: int64 = 0
+    while i < len(base._components) {
+        if self._components[i] != base._components[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/**
+ * The path without its last component. The root is its own parent, and so is
+ * the empty path; the parent of a lone relative name is the empty path.
+ */
+fun Path.parent(self) -> Path {
+    const n = len(self._components)
+    if n == 0 || self.is_root() {
+        return Self { _components: _copy(self._components) }
+    }
+    return Self { _components: self._components.slice(0, n - 1) }
+}
+
+/**
+ * The last component, as a path of its own. The basename of the root is the
+ * root, and of the empty path the empty path.
+ */
+fun Path.basename(self) -> Path {
+    const n = len(self._components)
+    if n == 0 {
+        return Self { _components: _copy(self._components) }
+    }
+    return Self { _components: [self._components[n - 1]] }
+}
+
+/**
+ * The last component's extension -- the text after its last dot -- or null when
+ * it has none. A name that only begins with a dot (`.gitignore`) has none.
+ */
+fun Path.extension(self) -> string? {
+    const n = len(self._components)
+    if n == 0 || self.is_root() {
+        return null
+    }
+    const split = _split_extension(self._components[n - 1])
+    if len(split[1]) == 0 {
+        return null
+    }
+    return split[1]
+}
+
+/** The last component with its extension removed. */
+fun Path.stem(self) -> string {
+    const n = len(self._components)
+    if n == 0 {
+        return ""
+    }
+    return _split_extension(self._components[n - 1])[0]
+}
+
+/**
+ * The path with its last component's extension replaced by `ext` (given without
+ * a leading dot; an empty `ext` removes the extension). The root and the empty
+ * path are returned unchanged.
+ */
+fun Path.with_extension(self, ext: string) -> Path {
+    const n = len(self._components)
+    if n == 0 || self.is_root() {
+        return Self { _components: _copy(self._components) }
+    }
+    let parts = self._components.slice(0, n - 1)
+    const stem = _split_extension(self._components[n - 1])[0]
+    if len(ext) == 0 {
+        parts.push(stem)
+    } else {
+        parts.push("{stem}.{ext}")
+    }
+    return Self { _components: parts }
+}
+
+// Append `parts` to a copy of this path's components. An absolute `parts`
+// replaces the receiver outright, exactly as `cd /x` ignores where you were.
+fun Path._extend(self, parts: string[]) -> Path {
+    if len(parts) > 0 && parts[0] == _SEP {
+        return Self { _components: _copy(parts) }
+    }
+    let out = _copy(self._components)
+    for p in parts {
+        out.push(p)
+    }
+    return Self { _components: out }
+}
+
+/**
+ * This path with `s` appended. `s` is a string (`"src/main.cz"`), an array of
+ * components (`["src", "main.cz"]`), or another `Path` -- the arm that fits the
+ * argument's type is the only one compiled, so all three cost the same.
+ *
+ * An absolute `s` replaces the receiver rather than extending it.
+ */
+fun Path.join(self, s) -> Path {
+    if s._components {
+        return self._extend(s._components)
+    } else if s.split {
+        return self._extend(_parse_components(s))
+    } else {
+        return self._extend(_parse_components(s.join(_SEP)))
+    }
+}
+
+/**
+ * The path with `.` dropped and `..` resolved against the component before it,
+ * without consulting the filesystem. A `..` that would escape the root is
+ * dropped (the root is its own parent); a `..` at the head of a relative path is
+ * kept, because there is nothing yet to cancel.
+ */
+fun Path.normalize(self) -> Path {
+    let out: string[] = []
+    for c in self._components {
+        if c == "." {
+            // A `.` component names the directory it sits in: drop it.
+        } else if c != ".." {
+            out.push(c)
+        } else {
+            const n = len(out)
+            if n == 0 || out[n - 1] == ".." {
+                out.push(c)
+            } else if out[n - 1] != _SEP {
+                // Cancel the component this `..` climbs out of. A `..` directly
+                // under the root cancels nothing: the root is its own parent.
+                const climbed = out.remove(n - 1)
+            }
+        }
+    }
+    return Self { _components: out }
+}
+
+/**
+ * This path made absolute against the current working directory, and
+ * normalized. Symbolic links are NOT resolved and the path need not exist --
+ * use `canonicalize` when it must.
+ */
+fun Path.to_absolute(self) -> Path! {
+    if self.is_absolute() {
+        return self.normalize()
+    }
+    return Path.current_dir()!._extend(self._components).normalize()
+}
+
+/**
+ * This path written relative to `base`, so that `base.join(result)` names it
+ * again. Both are made absolute first, so the answer does not depend on where
+ * the program was started. Components that `base` has and `self` does not become
+ * `..`.
+ */
+fun Path.to_relative(self, base: Path) -> Path! {
+    const me = self.to_absolute()!
+    const from = base.to_absolute()!
+    // The shared prefix is where the two paths part ways.
+    let shared: int64 = 0
+    while shared < len(me._components) && shared < len(from._components) {
+        if me._components[shared] != from._components[shared] {
+            break
+        }
+        shared = shared + 1
+    }
+    let out: string[] = []
+    let up = shared
+    while up < len(from._components) {
+        out.push("..")
+        up = up + 1
+    }
+    let down = shared
+    while down < len(me._components) {
+        out.push(me._components[down])
+        down = down + 1
+    }
+    return Self { _components: out }
+}
+
+/** Whether anything exists at this path (a symbolic link is followed). */
+fun Path.exists(self) -> bool {
+    return path_exists(self.to_string())
+}
+
+/** Whether this path exists and is a directory (a symbolic link is followed). */
+fun Path.is_dir(self) -> bool {
+    return path_is_dir(self.to_string())
+}
+
+/** Whether this path exists and is a regular file (a symbolic link is followed). */
+fun Path.is_file(self) -> bool {
+    return path_is_file(self.to_string())
+}
+
+/**
+ * Whether this path is itself a symbolic link. The link is not followed, so a
+ * dangling one is still a symbolic link -- unlike `is_file`/`is_dir`, which
+ * answer about the target.
+ */
+fun Path.is_sym_link(self) -> bool {
+    return path_is_symlink(self.to_string())
+}
+
+/**
+ * The canonical absolute path: every symbolic link resolved, every `.` and `..`
+ * removed. The path must exist. `to_absolute` is the pure counterpart.
+ */
+fun Path.canonicalize(self) -> Path! {
+    return Path.parse(path_canonicalize(self.to_string())!)
+}
+
+/** The path this symbolic link points at, which may be relative and may dangle. */
+fun Path.read_link(self) -> Path! {
+    return Path.parse(path_read_link(self.to_string())!)
+}
+
+/** The paths of this directory's entries, in the order the filesystem reports them. */
+fun Path.entries(self) -> Path[]! {
+    let out: Path[] = []
+    for name in path_read_dir(self.to_string())! {
+        out.push(self._extend([name]))
+    }
+    return out
+}
+
+/** The size of the file at this path, in bytes. */
+fun Path.file_size(self) -> int64! {
+    return path_file_size(self.to_string())!
+}

@@ -57,7 +57,7 @@ fn repo_sources_reformat_losslessly() {
 fn check_repo_sources() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = Vec::new();
-    for dir in ["std", "examples", "e2e_tests"] {
+    for dir in ["core", "examples", "e2e_tests"] {
         collect_cz(&root.join(dir), &mut files);
     }
     assert!(

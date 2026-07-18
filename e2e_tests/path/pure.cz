@@ -1,6 +1,6 @@
 // The pure half of `Path`: parsing, taking apart, putting together. Nothing
 // here touches the filesystem, so none of these paths need to exist.
-import path.{ Path }
+import std.path.{ Path }
 
 const p = Path.parse("/usr//lib/")
 println(p.to_string())

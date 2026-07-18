@@ -3,7 +3,7 @@
 // and the Datagram's sender address is what lets main reply without knowing
 // the worker's port up front. The reply gates the worker's second send, so
 // the two receives arrive in a fixed order.
-import net.{ Udp }
+import std.net.{ Udp }
 
 fun run_worker(main_port: int64) {
     match Udp.bind("127.0.0.1", 0) {

@@ -1,6 +1,6 @@
 // Package dependencies have exactly one source. Git revisions default to HEAD,
 // while explicit revisions and path dependencies retain their values.
-import package_manager.manifest.{ Manifest, Dependency }
+import std.package_manager.manifest.{ Manifest, Dependency }
 
 const valid = Manifest.parse(
     "[package]\nname = \"app\"\nauthor = \"\"\nlicense = \"MIT\"\n\n[dependencies]\nremote = \{ git = \"repo\" \}\npinned = \{ git = \"repo\", rev = \"abc\" \}\nlocal = \{ path = \"../local\" \}\n",

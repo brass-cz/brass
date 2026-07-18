@@ -9,7 +9,6 @@
 // parameters. The element types then had nowhere to be pinned, `collect(..)!.pairs()`
 // monomorphized at an open type, and the typed back end refused a program `check`
 // had accepted.
-import std.collections.{ HashMap }
 
 fun collect(names: string[]) {
     let result = HashMap.new()

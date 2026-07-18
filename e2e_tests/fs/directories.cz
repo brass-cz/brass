@@ -1,8 +1,8 @@
 // Recursive directory creation and removal, through both argument forms: the
 // same call takes a string or a `Path` (the member-presence test in `_as_text`
 // decides which arm is compiled, per call site).
-import fs.{ create_dir, remove_dir, write_file, read_file }
-import path.{ Path }
+import std.fs.{ create_dir, remove_dir, write_file, read_file }
+import std.path.{ Path }
 
 fun main() {
     const root = "/tmp/brass_e2e_directories"

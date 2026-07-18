@@ -3,7 +3,7 @@
 //
 // NOTE the pattern escaping: a Brass string interpolates `{expr}`, so a
 // repetition brace must be written `\{4}` -- `"\\d{4}"` would compile as `\d4`.
-import regex.{ Regex, escape }
+import std.regex.{ Regex, escape }
 
 fun main() {
     const date = Regex.new("(?<year>\\d\{4})-(\\d\{2})-(\\d\{2})")!

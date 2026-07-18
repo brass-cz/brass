@@ -1,5 +1,3 @@
-import std.collections.{ HashMap }
-
 type Person = {
     name: string
 }

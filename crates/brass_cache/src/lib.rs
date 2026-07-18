@@ -63,12 +63,14 @@ const MAGIC: &[u8; 8] = b"PPCACHE\0";
 pub enum StampOrigin {
     /// Relative to the entry file's directory (the project's own sources).
     Entry(String),
-    /// Relative to SOME include root; validation walks the current include
-    /// roots in resolution order (`BRASS_INCLUDE`, then the distribution's
-    /// implicit `<bin>/../libraries`) and judges the first candidate that
-    /// exists -- exactly the shadowing the loader itself would apply.
+    /// Relative to SOME include root; validation walks the current
+    /// `BRASS_INCLUDE` roots in resolution order and judges the first
+    /// candidate that exists -- exactly the shadowing the loader itself
+    /// would apply.
     Include(String),
-    /// Relative to the named `BRASS_PACKAGES` package's root.
+    /// Relative to the named `BRASS_PACKAGES` package's root. The standard
+    /// library is the package named `std` (bound implicitly by a distributed
+    /// toolchain), so its sources stamp as `Package("std", ...)`.
     Package(String, String),
     /// Outside every known root; only its absolute path can find it again.
     /// Such a cache still works in place, it just cannot be relocated.
@@ -553,6 +555,47 @@ pub fn save_context(key: &[u8; 20], seed: &brass_typeck::ContextTables) {
         return;
     }
     let (Ok(body), Some(tag)) = (postcard::to_stdvec(seed), cache_tag("ctx")) else {
+        return;
+    };
+    write_atomic(&path, &encode_file(&tag, &body));
+}
+
+/// The incremental-rebuild sidecar of a context seed: the seed together with
+/// each context module's source hash. Stored under the context's IDENTITY
+/// (its module-path list, contents excluded), so an edit finds the previous
+/// build of the SAME context, diffs the per-module hashes, and re-infers
+/// only the changed modules and their importers against the retained rest
+/// (see the driver's `cached_context_seed`).
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ContextBundle {
+    /// Dotted module path -> content hash of its source, in load order.
+    pub module_hashes: Vec<(String, [u8; 20])>,
+    pub seed: brass_typeck::ContextTables,
+}
+
+fn context_bundle_file(id: &[u8; 20]) -> Option<PathBuf> {
+    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    Some(context_dir()?.join(format!("ctxb-{hex}.czctx")))
+}
+
+/// Load the incremental sidecar for the context identity `id`; `None` when
+/// absent, foreign, corrupted, or from another compiler build.
+pub fn load_context_bundle(id: &[u8; 20]) -> Option<ContextBundle> {
+    let bytes = std::fs::read(context_bundle_file(id)?).ok()?;
+    let body = decode_file(&bytes, &cache_tag("ctxb")?)?;
+    postcard::from_bytes(body).ok()
+}
+
+/// Write the incremental sidecar, best-effort and atomic like [`save`].
+pub fn save_context_bundle(id: &[u8; 20], bundle: &ContextBundle) {
+    let Some(path) = context_bundle_file(id) else {
+        return;
+    };
+    let Some(dir) = path.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let (Ok(body), Some(tag)) = (postcard::to_stdvec(bundle), cache_tag("ctxb")) else {
         return;
     };
     write_atomic(&path, &encode_file(&tag, &body));

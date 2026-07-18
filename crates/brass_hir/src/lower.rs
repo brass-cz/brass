@@ -89,7 +89,7 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
                 TopLevel::Type(td) => {
                     // `Result` is the type behind the fallibility sugar (`T!`,
                     // `error(..)`, Ok-wrapping, `!`). The prelude's declaration
-                    // (std/prelude/error.cz) is pinned to RESULT_TYPE_ID under
+                    // (core/error.cz) is pinned to RESULT_TYPE_ID under
                     // the bare `Result` symbol so every construct that builds a
                     // Result by default finds the same nominal. A user's `type
                     // Result` is an ordinary declaration that shadows it in the
@@ -284,7 +284,7 @@ fn inject_method_impls(
 
         if let Some(class) = Type::primitive_class_of_name(recv_name, is_array) {
             // Methods on primitive types are reserved to the standard library.
-            if module.first().map(String::as_str) != Some("std") {
+            if module.first().map(String::as_str) != Some("core") {
                 errors.push(LowerError {
                     message: format!(
                         "methods on the primitive type `{recv_name}` can only be defined in the standard library"
@@ -560,7 +560,7 @@ fn split_members(
 /// The prelude's `Result` declaration is load-bearing: every fallibility
 /// construct assumes exactly `| Ok { value } | Err { error }` (tags 0/1,
 /// generic unannotated payload fields, no slots). Reject any drift in
-/// std/prelude/error.cz loudly instead of letting the sugar misbehave.
+/// core/error.cz loudly instead of letting the sugar misbehave.
 fn validate_prelude_result(info: &TypeInfo, span: Span, errors: &mut Vec<LowerError>) {
     let shape_ok = match &info.kind {
         TypeKind::Sum { variants } => {
@@ -587,7 +587,7 @@ fn validate_prelude_result(info: &TypeInfo, span: Span, errors: &mut Vec<LowerEr
 }
 
 /// Built-in `Result = Ok { value } | Err { error }`, used when no prelude
-/// module declares it (std/prelude/error.cz is the normal source).
+/// module declares it (core/error.cz is the normal source).
 fn result_type() -> TypeInfo {
     TypeInfo {
         name: "Result".into(),

@@ -84,14 +84,19 @@ fn runnable_book_fences_typecheck() {
 
     let scratch = std::env::temp_dir().join(format!("brass_book_examples-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).expect("create example directory");
-    let libraries = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../libraries");
+    let std_packages = format!(
+        "std={}",
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .display()
+    );
     let mut failures = Vec::new();
     for (index, example) in examples.iter().enumerate() {
         let program = scratch.join(format!("example-{index}.cz"));
         std::fs::write(&program, &example.code).expect("write book example");
         let output = Command::new(env!("CARGO_BIN_EXE_brass"))
             .env("BRASS_CACHE", "off")
-            .env("BRASS_INCLUDE", &libraries)
+            .env("BRASS_PACKAGES", &std_packages)
             .args(["check", program.to_str().expect("UTF-8 temporary path")])
             .output()
             .expect("check book example");

@@ -337,7 +337,7 @@ does not hide errors in code that can run.
 ## Result
 
 `T!` is `Result<T, E>` over the `Result` declared in the prelude
-(std/prelude/error.cz): an ordinary two-variant sum with `Ok { value }` and
+(core/error.cz): an ordinary two-variant sum with `Ok { value }` and
 `Err { error }`, resolved by normal scoping at every sugar site, so a module
 may [shadow it](/references/syntax-sugar/#the-result-behind-fallibility). The
 error payload type `E` is inferred from the function's error sources (all

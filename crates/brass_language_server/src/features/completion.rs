@@ -138,13 +138,13 @@ fn split_path(s: &str) -> Vec<String> {
     s.split('.').map(|p| p.trim().to_string()).collect()
 }
 
-/// Module path segment candidates under `parents`. At the root: the prelude
-/// modules, the `std` namespace, the declared package names, and the modules
-/// next to the document or under an include path. Under `std`: the prelude
-/// modules and the embedded nested std modules. Anywhere else: the next path
-/// segments served by the same roots the loader would search -- a declared
-/// package's directory when the first segment names one, otherwise the
-/// document's directory and each include path.
+/// Module path segment candidates under `parents`. At the root: the embedded
+/// core modules, the `core` namespace, the declared package names, and the
+/// modules next to the document or under an include path. Under `core`: the
+/// embedded core modules. Anywhere else: the next path segments served by the
+/// same roots the loader would search -- a declared package's directory when
+/// the first segment names one, otherwise the document's directory and each
+/// include path.
 fn import_path_items(
     parents: &[String],
     prefix: &str,
@@ -154,7 +154,7 @@ fn import_path_items(
     let mut names: Vec<String> = Vec::new();
     if parents.is_empty() {
         names.extend(prelude_module_names().map(String::from));
-        names.push("std".to_string());
+        names.push("core".to_string());
         names.extend(search.packages.keys().cloned());
         // Exclude the current file so it does not suggest importing itself.
         let self_stem = doc_path.file_stem().and_then(|s| s.to_str());
@@ -162,11 +162,8 @@ fn import_path_items(
         for include in &search.includes {
             names.extend(dir_module_names(include, None));
         }
-    } else if parents.first().is_some_and(|s| s == "std") {
-        if parents.len() == 1 {
-            names.extend(prelude_module_names().map(String::from));
-        }
-        names.extend(nested_std_segments(&parents[1..]));
+    } else if parents.first().is_some_and(|s| s == "core") {
+        names.extend(core_segments(&parents[1..]));
     } else {
         for root in module_roots(doc_path, search, &parents[0]) {
             let mut dir = root;
@@ -185,7 +182,7 @@ fn import_path_items(
         .collect()
 }
 
-/// The directories a non-`std` module path is served from, mirroring the
+/// The directories a non-`core` module path is served from, mirroring the
 /// loader: a path whose first segment names a declared package resolves only
 /// under that package's directory; anything else searches the document's
 /// directory first, then each include path.
@@ -202,12 +199,12 @@ fn module_roots(
     roots
 }
 
-/// The next path segments of the embedded nested std modules under
-/// `parents` (the segments after `std`): `[]` offers `collections`,
-/// `["collections"]` offers `hashmap`.
-fn nested_std_segments(parents: &[String]) -> Vec<String> {
+/// The next path segments of the embedded core modules under `parents` (the
+/// segments after `core`): `[]` offers every top-level module (`io`,
+/// `collections`, ...); a deeper prefix offers what sits below it.
+fn core_segments(parents: &[String]) -> Vec<String> {
     let mut names = Vec::new();
-    for (key, _) in brass_resolve::STDLIB_NESTED {
+    for (key, _) in brass_resolve::STDLIB {
         let segs: Vec<&str> = key.split('/').collect();
         if segs.len() > parents.len() && segs[..parents.len()].iter().eq(parents.iter()) {
             names.push(segs[parents.len()].to_string());
@@ -241,7 +238,7 @@ fn import_name_items(
 
 /// Enumerate a module's public exports from a full analysis of a probe source
 /// that imports it -- the same module graph the document's analysis uses, so
-/// prelude, nested std, disk, include-path, and plugin modules all resolve.
+/// core, disk, include-path, and plugin modules all resolve.
 /// Signatures and docs come from the checked program.
 fn analyzed_module_exports(module: &[String], analyzer: &DocAnalyzer) -> Vec<CompletionItem> {
     if module.is_empty() {
@@ -251,19 +248,13 @@ fn analyzed_module_exports(module: &[String], analyzer: &DocAnalyzer) -> Vec<Com
     let Some(full) = analyzer.analyze_full(&probe) else {
         return Vec::new();
     };
-    // The probe's import path was canonicalized by the loader; a bare prelude
+    // The probe's import path was canonicalized by the loader; a bare core
     // module (`import math`) keeps its written path but is stored under
-    // `std.<name>`.
+    // `core.<name>`.
     let Some(imp) = full.main_ast.imports.first() else {
         return Vec::new();
     };
-    let target: Vec<String> = if brass_resolve::is_prelude_path(&imp.path) {
-        std::iter::once("std".to_string())
-            .chain(imp.path.iter().cloned())
-            .collect()
-    } else {
-        imp.path.clone()
-    };
+    let target = brass_resolve::qualified_core_path(&imp.path);
 
     let mut items = Vec::new();
     for f in full.program.functions.values() {
@@ -299,9 +290,9 @@ fn analyzed_module_exports(module: &[String], analyzer: &DocAnalyzer) -> Vec<Com
 }
 
 /// The public top-level (name, kind) pairs a module exports, parsed from its
-/// source text. The textual fallback for [`import_name_items`]: prelude and
-/// nested std modules read from the embedded sources, everything else is
-/// located through the loader's search roots.
+/// source text. The textual fallback for [`import_name_items`]: core modules
+/// read from the embedded sources, everything else is located through the
+/// loader's search roots.
 fn module_public_symbols(
     module: &[String],
     doc_path: &Path,
@@ -309,16 +300,7 @@ fn module_public_symbols(
 ) -> Vec<(String, CompletionItemKind)> {
     let src = match module {
         [single] if prelude_source(single).is_some() => prelude_source(single).map(String::from),
-        [s, name] if s == "std" && prelude_source(name).is_some() => {
-            prelude_source(name).map(String::from)
-        }
-        [s, rest @ ..] if s == "std" => {
-            let key = rest.join("/");
-            brass_resolve::STDLIB_NESTED
-                .iter()
-                .find(|(k, _)| *k == key)
-                .map(|(_, src)| (*src).to_string())
-        }
+        [s, rest @ ..] if s == "core" => prelude_source(&rest.join("/")).map(String::from),
         _ => brass_resolve::module_source(&doc_dir(doc_path), search, module),
     };
     let Some(src) = src else {
@@ -700,7 +682,7 @@ fn symbol_items(analyzer: &DocAnalyzer, doc: &Document, doc_path: &Path) -> Vec<
 
 /// Visible symbols taken from the analyzed program: every function and type
 /// whose defining module is reachable from `main` (its own module, the empty
-/// built-in module, the `std` prelude, or an imported name).
+/// built-in module, the `core` prelude, or an imported name).
 fn program_symbols(full: &FullAnalysis) -> Vec<CompletionItem> {
     let main_module = vec!["main".to_string()];
     let imported = full

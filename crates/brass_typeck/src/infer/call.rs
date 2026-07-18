@@ -145,22 +145,34 @@ impl<'a> Checker<'a> {
                     self.invalidate_narrowed_after_call(scopes);
                     return fallback_ret;
                 }
-                // The lazy profile types a FULLY-ANNOTATED callee from its
-                // signature alone (see `Checker::lazy_profile`): the entry's
-                // gate then costs the entry's own body, not its call tree.
-                // Only for callees that GET a dedicated pass -- a seeded
-                // (context) body is never re-checked, so the call-site
-                // elaboration is the sole source of its channel entries and
-                // must stay.
-                if self.lazy_profile
+                // The lazy profile types a call from the signature alone when
+                // re-elaborating the body could not tell it more (see
+                // `Checker::lazy_profile`): the entry's gate then costs the
+                // entry's own body, not its call tree. Never for a callee
+                // that can reach a keyed (`-> infer!`) call -- that call must
+                // be SEEN by this pass, or its later discovery would restart
+                // the analysis after execution began.
+                //
+                // Only for a callee that GETS a dedicated pass and is fully
+                // annotated: such a body is instantiation-independent and its
+                // own pass records its channels. A SEEDED (context) body has
+                // no dedicated pass -- this call-site elaboration is a source
+                // of its channel entries, and skipping it would leave a
+                // COMPLETED lazy analysis un-cacheable as a full verdict (a
+                // deferred, never-executed instance would have no entries for
+                // the cache-hit eager run that monomorphizes it); the
+                // demanded-instance machinery covers executed seeded code,
+                // not that cache contract, so seeded calls keep elaborating.
+                let skip_elaboration = self.lazy_profile
+                    && !self.keyed_tainted.contains(&symbol)
                     && !self.seeded_module(&module)
                     && declared_ret.as_ref().is_some_and(brass_hir::is_fully_known)
                     && signature_params.iter().all(|p| {
                         p.resolved_ty
                             .as_ref()
                             .is_some_and(|t| brass_hir::is_fully_known(brass_hir::peel_modes(t)))
-                    })
-                {
+                    });
+                if skip_elaboration {
                     self.invalidate_narrowed_after_call(scopes);
                     return fallback_ret;
                 }

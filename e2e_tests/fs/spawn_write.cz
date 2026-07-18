@@ -1,6 +1,6 @@
 // A spawned thread writes through the fs plugin while main waits; plugin
 // calls under spawn stay safe, and main reads the result back after sync.
-import fs.{ read_file, write_file }
+import std.fs.{ read_file, write_file }
 
 fun worker(path: string) {
     match write_file(path, "written by worker") {

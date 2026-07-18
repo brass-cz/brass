@@ -1,6 +1,6 @@
 // An unset environment variable is an error, not an empty string; unhandled
 // in `main`, it aborts with the variable's name in the message.
-import env.{ var }
+import std.env.{ var }
 
 fun main() {
     let v = var("BRASS_E2E_SURELY_UNSET_VARIABLE")!

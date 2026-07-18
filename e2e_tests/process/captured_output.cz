@@ -1,7 +1,7 @@
 // `output()` drains the piped streams while the child runs, so a child that
 // writes far more than a pipe buffer holds (about 64KiB) completes. A plain
 // `wait()` on the same child would block forever: nobody is reading the pipe.
-import process.{ Command, Stdio }
+import std.process.{ Command, Stdio }
 
 const big = Command
     .new("head")

@@ -2,7 +2,7 @@
 // request next, so it is pinned against the normative examples of RFC 3986
 // section 5.4 -- both the normal ones and the abnormal `..`-past-the-root cases,
 // where a wrong answer would let a redirect escape its authority.
-import url.{ URI }
+import std.url.{ URI }
 
 fun _show(base: URI, reference: string) {
     const target = base.resolve(reference)!

@@ -2,7 +2,6 @@
 // resolve to the alias's concrete instance. The name is not a nominal of its
 // own, so leaving it to the nominal table left the field open: the program
 // type-checked but the back end refused it ("unsupported type ... deps=?").
-import std.collections.{ HashMap }
 
 type Counts = HashMap { key: string, value: int64 }
 

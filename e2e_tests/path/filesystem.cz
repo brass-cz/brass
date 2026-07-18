@@ -1,7 +1,7 @@
 // The filesystem half of `Path`. The case finds itself through `_PATH` -- the
 // constant every module is loaded with -- so nothing here depends on the working
 // directory, and only derived answers are printed, never an absolute path.
-import path.{ Path }
+import std.path.{ Path }
 
 const me = Path.parse(_PATH)
 const dir = me.parent()

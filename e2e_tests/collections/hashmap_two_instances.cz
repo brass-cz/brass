@@ -1,5 +1,3 @@
-import std.collections.{ HashMap }
-
 // Two HashMap instantiations with different value types in one program. The
 // JIT memoizes per-type glue (destructor, to_string, deep copy, tracer) by a
 // rendered type key; HashMap's members are all `_`-private, so the

@@ -6,7 +6,6 @@
 //
 // (A `T!` that raises NO error at all is fine and stays so: its returns Ok-wrap
 // and nothing ever reads the Err -- see `structure/fallible_open`.)
-import std.collections.{ HashMap }
 
 type M = HashMap { key: string, value: int64 }
 

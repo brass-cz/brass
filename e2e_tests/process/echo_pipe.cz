@@ -1,7 +1,7 @@
 // The Command builder chain: run `echo` with arguments, capturing stdout on a
 // pipe, then read it back and check the exit code. `echo` is a POSIX utility
 // present everywhere, so this stays portable.
-import process.{ Command, Stdio }
+import std.process.{ Command, Stdio }
 
 const child = Command.new("echo")
     .args(["hello", "from", "process"])

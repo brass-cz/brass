@@ -1,1 +1,1 @@
-`index_of` is defined in module `url.text` but not imported here
+`index_of` is defined in module `std.url.text` but not imported here

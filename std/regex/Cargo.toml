@@ -1,0 +1,24 @@
+# The regex library's native half: a brass plugin (cdylib) loaded by
+# `std/regex.cz`. Build and install it with `std/build.sh`, which
+# places the cdylib next to the wrapper as `libregex.<dll suffix>`.
+[package]
+name = "brass_lib_regex"
+description = "brass plugin: regular expression matching behind the Regex type"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+# The cdylib is installed as `std/libregex.so`, and the wrapper module
+# imports it by that file name (`import libregex.{ .. }`).
+name = "regex"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+# Rust's `regex`: linear-time matching (no catastrophic backtracking, whatever
+# the pattern), so a regex over untrusted input cannot hang the program. The
+# price is no backreferences and no lookaround; see `std/regex.cz`.
+[dependencies]
+brass_plugin = { workspace = true }
+regex = "1"

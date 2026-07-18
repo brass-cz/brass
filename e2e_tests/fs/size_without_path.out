@@ -1,8 +1,8 @@
 no size: Error {
     value: "this file was not opened by path; its size is unknown",
     location: Location {
-        file: "libraries/fs.cz",
-        line: 103,
+        file: "std/fs.cz",
+        line: 104,
         col: 9,
     },
     frames: [],

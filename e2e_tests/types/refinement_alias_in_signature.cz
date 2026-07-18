@@ -13,8 +13,6 @@
 // A free function's parameter merely went untyped rather than void, so there the
 // annotation was silently ignored -- `total(t)` accepted any map at all.
 
-import std.collections.HashMap
-
 type _Tbl = HashMap {
     key: string
     value: int64

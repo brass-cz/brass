@@ -1,5 +1,4 @@
-import std.collections.{ HashMap }
-import data.json.{ JsonValue }
+import std.data.json.{ JsonValue }
 
 // A user HashMap next to the json library, whose parser instantiates its own
 // string -> JsonValue map. The two instances must not share per-type glue:

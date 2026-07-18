@@ -155,6 +155,14 @@ dependencies that give the same name different locations. Both the compiler
 and the language server read the variable at startup, so editor diagnostics and
 completions work for dependencies too.
 
+The **standard library is itself the package named `std`**: an entry
+`std=/path/to/toolchain` (the directory containing `std/`) is what makes
+`import std.fs` resolve. A distributed toolchain binds it implicitly (see
+below), and `czpm` passes the parent process's `BRASS_PACKAGES` on to the
+compiler it spawns with the manifest's dependencies appended, so the `std`
+binding survives inside a project while a manifest-declared name still wins
+on a collision.
+
 ## Include paths
 
 Outside of `czpm` projects (or alongside them), the compiler also honors
@@ -162,7 +170,7 @@ Outside of `czpm` projects (or alongside them), the compiler also honors
 `:`; use `;` on Windows:
 
 ```
-BRASS_INCLUDE=/opt/brass/libraries:/home/user/brass-modules
+BRASS_INCLUDE=/opt/brass-extras:/home/user/brass-modules
 ```
 
 Any `.cz` file, module directory, or plugin under an include path is
@@ -175,10 +183,11 @@ always binds before the include search. Include entries should not nest
 inside each other (or inside the project): a file reachable from two roots
 can be loaded twice under two module paths.
 
-Finally, the toolchain binaries (`brass` and `czls`) append one
-implicit include entry: the `libraries/` directory sitting beside their own
-`bin/` directory (`<bin>/../libraries`), when it exists. A distributed
-toolchain therefore serves its bundled libraries (`process`, `path`, ...)
+Finally, the toolchain binaries (`brass` and `czls`) bind one implicit
+package: `std`, rooted at the directory beside their own `bin/`
+(`<bin>/..`) when `std/` exists there. A distributed toolchain therefore
+serves the standard library (`import std.process`, `import std.path`, ...)
 with no environment setup at all, in the compiler and in the editor alike.
-Explicit include paths and package declarations always take precedence over
-it.
+An explicit `std=...` entry in `BRASS_PACKAGES` takes precedence over the
+implicit binding, so an environment can point the standard library
+elsewhere.

@@ -1,7 +1,7 @@
 // UDP datagrams between two loopback sockets on ephemeral ports: the
 // Datagram record carries both the payload and the sender's address, so the
 // receiver can verify who sent it.
-import net.{ Udp }
+import std.net.{ Udp }
 
 let a = Udp.bind("127.0.0.1", 0)!
 let b = Udp.bind("127.0.0.1", 0)!

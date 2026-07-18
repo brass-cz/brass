@@ -5,12 +5,18 @@ description: "Every standard-library module and builtin, with signatures."
 
 The standard library has two layers:
 
-- **The implicit prelude**: the modules under `std/prelude/` (`io`, `array`,
-  `string`, `math`, `conv`, `assert`) plus the runtime builtins. Their public
-  names are in scope in every program with no import.
-- **Import-only modules**: everything else under `std/`
-  (`std.collections`): imported explicitly, e.g.
-  `import std.collections.{ HashMap }`, and loaded on demand.
+- **`core` -- the implicit prelude**: every module under `core/` (`io`,
+  `array`, `string`, `math`, `conv`, `assert`, `error`, `is`, `default`,
+  `collections`) plus the runtime builtins. It is embedded in the compiler,
+  and the public names of every core module are in scope in every program
+  with no import -- `HashMap` included.
+- **`std` -- the shipped library tree**: the `std/` directory distributed
+  beside the toolchain (`fs`, `net`, `process`, `path`, `env`, `hash`,
+  `regex`, `semver`, `url`, `http`, `data.json`, `data.toml`, ...), imported
+  explicitly with the `std.` prefix, e.g. `import std.fs.{ read_file }`.
+  Native parts arrive as plugins, so `std` lives on disk rather than in the
+  compiler; a distributed toolchain binds it automatically (see
+  [Packages](/guides/packages/)).
 
 Most of the library is written in Brass itself, on top of a small set of
 runtime primitives. Identifiers beginning with `_` (e.g. `_string_bytes`,
@@ -24,7 +30,7 @@ Reserved builtin names that cannot be redefined: `len`, `spawn`, `with`,
 | Function                           | Signature                    | Notes                                                     |
 | ---------------------------------- | ---------------------------- | --------------------------------------------------------- |
 | `len(x)`                           | `(array or string) -> int64` | element count / byte length; also callable as `x.len()`   |
-| `error(x)`                         | `Err` wrapping an `Error`    | a prelude function; see [Errors](#errors-stdpreludeerror) |
+| `error(x)`                         | `Err` wrapping an `Error`    | a prelude function; see [Errors](#errors-coreerror) |
 | `fields(x)`, `typeof(x)`           | compile-time                 | see [Reflection](/references/reflection/)                 |
 | `spawn(f)`, `with(c, f)`, `sync()` | concurrency                  | see [Concurrency](/references/concurrency/)               |
 
@@ -41,7 +47,7 @@ fixed-length `T[n]`):
 
 Indexing is bounds-checked at runtime on both array kinds.
 
-## Errors (`std.prelude.error`)
+## Errors (`core.error`)
 
 The error value model behind `error(..)` and `!` (normatively specified in
 [Error traces](/references/syntax-sugar/#error-traces)):
@@ -73,7 +79,7 @@ Every primitive type also has a static `T.default()` producing its zero
 value: `0` for the numeric widths, `false` for `bool`, `""` for `string`
 (see [the Default model](/references/syntax-sugar/#methods-are-default-fields)).
 
-## `std.io`
+## `core.io`
 
 | Function         | Signature       | Behavior                                                            |
 | ---------------- | --------------- | ------------------------------------------------------------------- |
@@ -81,11 +87,11 @@ value: `0` for the numeric widths, `false` for `bool`, `""` for `string`
 | `println(value)` | `(any) -> void` | `print` plus a newline                                              |
 | `input()`        | `() -> string!` | one line from stdin, without the trailing newline                   |
 
-Files live in the [`fs` library](#fs-a-library-not-std), not the prelude:
+Files live in [`std.fs`](#stdfs), not the prelude:
 opening and moving bytes needs native code, so it ships as a plugin like
 `process` and `path`.
 
-## `std.array`
+## `core.array`
 
 Methods on any array (`fun infer[].m`), so `arr.map(f)` works with no import:
 
@@ -103,7 +109,7 @@ Methods on any array (`fun infer[].m`), so `arr.map(f)` works with no import:
 These return new arrays; only the builtin `push`/`pop`/`insert`/`remove`
 mutate in place.
 
-## `std.string`
+## `core.string`
 
 String positions are UTF-8 **byte** offsets throughout: `len`, `find`, and
 slicing agree on byte positions; the per-character helpers advance by each
@@ -124,13 +130,13 @@ character's byte length.
 There is no public substring-slicing method and no direct `s[i]` indexing; use
 `chars`, `split`, `find`, `replace`.
 
-## `std.math`
+## `core.math`
 
 `abs(x)`, `min(a, b)`, `max(a, b)` are polymorphic free functions (any type
 supporting `<` and, for `abs`, `-`). The float routines take and return
 `float64`: `sqrt(x)`, `floor(x)`, `ceil(x)`, `pow(base, exp)`.
 
-## `std.conv`
+## `core.conv`
 
 Constants: `INT32_MAX`, `INT32_MIN`, `INT64_MAX`, `INT64_MIN`.
 
@@ -144,30 +150,28 @@ Free-function aliases of the conversion methods: `int32_from(x) -> int32!`,
 (`T.from`, `T.parse`) are described in the
 [type system](/references/types/#explicit-conversions).
 
-## `std.assert`
+## `core.assert`
 
 `assert(cond: bool, msg: string?)` aborts the program when `cond` is false.
 `msg` is a trailing nullable parameter, so `assert(cond)` works and prints a
 generic message.
 
-## `process` (a library, not `std`)
+## `std.process`
 
 ```brass norun
-import process.{ Command, Stdio }
+import std.process.{ Command, Stdio }
 ```
-
-Spawn and control child processes. Unlike the modules above this is not part
-of `std`: its native half is a Rust plugin (a `cdylib` built against the
-`brass_plugin` crate) rather than a runtime builtin, so it ships as a
-library under `libraries/`. A distributed toolchain finds `libraries/`
-beside its binary automatically; when running from a repo checkout, build
-the plugin once with `libraries/build.sh` and point `BRASS_INCLUDE` at
-that directory (one entry serves every library that lives there):
+Spawn and control child processes. Unlike the `core` modules above this
+lives in the on-disk `std` tree: its native half is a Rust plugin (a
+`cdylib` built against the `brass_plugin` crate) rather than a runtime
+builtin. A distributed toolchain binds the `std` package automatically
+(`<bin>/../std`); when running from a repo checkout, build the plugins once
+with `std/build.sh` and declare the package (the path is the directory
+CONTAINING `std/`; one entry serves the whole tree):
 
 ```
-BRASS_INCLUDE=/path/to/brass/libraries
+BRASS_PACKAGES=std=/path/to/brass
 ```
-
 `Command` is a builder: each method mutates the command and returns it, so
 calls chain. `spawn` starts the process. A standard stream configured as
 `Stdio.Pipe` is reachable through the `Child` as a `File`
@@ -211,14 +215,13 @@ const child = Command.new("sh")
     .stdout(Stdio.Pipe)
     .spawn()!
 ```
-
 `wait` blocks for exit and nothing else, so a child writing more to a pipe
 than the OS buffers (about 64KiB on Linux) blocks on the full pipe while
 `wait` blocks on the child. Read the piped streams before waiting, or use
 `output`, which reads them while the child runs and cannot deadlock:
 
 ```brass norun
-import process.{ Command, Stdio }
+import std.process.{ Command, Stdio }
 
 let child = Command.new("git")
     .args(["log", "--oneline"])
@@ -231,7 +234,6 @@ let result = child.output()!
 print(to_text(result.stdout)!)
 println("exit: {result.code}")
 ```
-
 Waiting is idempotent: a second `wait` returns the same code, and a piped
 stream stays readable afterwards, since the pipe still holds what the child
 wrote before it exited.
@@ -239,20 +241,14 @@ wrote before it exited.
 Everything here runs on either back end: a piped stream is an `fs` `File`,
 and the fs plugin executes natively under the interpreter too.
 
-## `path` (a library, not `std`)
+## `std.path`
 
 ```brass norun
-import path.{ Path }
+import std.path.{ Path }
 ```
-
-Filesystem paths. Like `process` this is a library, not `std`: asking the
-operating system what exists needs native code, so its other half is a plugin
-built by `libraries/build.sh`.
-
-```
-BRASS_INCLUDE=/path/to/brass/libraries
-```
-
+Filesystem paths. Like `std.process` this lives on disk rather than in the
+compiler: asking the operating system what exists needs native code, so its
+other half is a plugin built by `std/build.sh`.
 A `Path` is a sequence of components, absolute exactly when its first component
 is the root `/`. Empty and repeated separators are dropped when a path is
 parsed, so `/usr//lib/` and `/usr/lib` are the same path. Every method that
@@ -293,7 +289,7 @@ file you are writing is `Path.parse(_PATH)`; an imported module reads its
 own, not yours.
 
 ```brass norun
-import path.{ Path }
+import std.path.{ Path }
 
 const here = Path.parse(_PATH).parent()
 for entry in here.join("assets").entries()! {
@@ -305,16 +301,15 @@ for entry in here.join("assets").entries()! {
     }
 }
 ```
-
-## `fs` (a library, not `std`)
+## `std.fs`
 
 ```brass norun
-import fs.{ File, read_file, write_file, create_dir, remove_dir }
+import std.fs.{ File, read_file, write_file, create_dir, remove_dir }
 ```
-
-File handles, byte I/O, and directories. Like the other libraries this is a
-plugin under `libraries/`, with the same setup: automatic for a distributed
-toolchain, `libraries/build.sh` + `BRASS_INCLUDE` from a repo checkout.
+File handles, byte I/O, and directories. Like the other native-backed
+modules this is a plugin under `std/`, with the same setup: automatic for a
+distributed toolchain, `std/build.sh` + `BRASS_PACKAGES=std=...` from a
+repo checkout.
 
 | Function / method            | Signature                                   | Behavior                                        |
 | ---------------------------- | ------------------------------------------- | ----------------------------------------------- |
@@ -338,15 +333,15 @@ toolchain, `libraries/build.sh` + `BRASS_INCLUDE` from a repo checkout.
 | `File.from_fd(fd)`           | `(int64) -> File`                           | adopt an open descriptor (a pipe, a socket)     |
 | `File.stdin/stdout/stderr()` | `() -> File`                                | the standard streams                            |
 
-`size()` is answered by the `path` library (a stat by name needs no open
+`size()` is answered by `std.path` (a stat by name needs no open
 descriptor), so it works exactly for files opened by path; an adopted
 descriptor or standard stream has no path to ask about and reports an error.
-`File.from_fd` is how the `process` and `net` libraries hand their pipes and
+`File.from_fd` is how `std.process` and `std.net` hand their pipes and
 sockets to the ordinary read/write/close methods.
 
-**Every path a function in this library takes may be a string or a `Path`**:
+**Every path a function in this module takes may be a string or a `Path`**:
 `File.open`, `read_file`, `write_file`, `create_dir`, `remove_dir`. A path
-built with the `path` library needs no `to_string()` on the way in. (The arm
+built with `std.path` needs no `to_string()` on the way in. (The arm
 that fits the argument is the only one compiled, so neither form costs the
 other anything.)
 
@@ -385,16 +380,16 @@ program is JIT-compiled or interpreted, so the old "the REPL refuses file
 I/O" rule is gone (only `spawn` remains JIT-only). The playground has no
 filesystem, so the examples here are not runnable in it.
 
-## `env` (a library, not `std`)
+## `std.env`
 
 ```brass norun
-import env.{ args, var, vars, path_separator, current_dir }
+import std.env.{ args, var, vars, path_separator, current_dir }
 ```
-
 The process environment: command-line arguments, environment variables, and
-the working directory. A plugin under `libraries/`, with the same setup as
-the others: automatic for a distributed toolchain, `libraries/build.sh` +
-`BRASS_INCLUDE` from a repo checkout. Not runnable in the playground.
+the working directory. A plugin under `std/`, with the same setup as the
+others: automatic for a distributed toolchain, `std/build.sh` +
+`BRASS_PACKAGES=std=...` from a repo checkout. Not runnable in the
+playground.
 
 | Function           | Signature             | Behavior                                           |
 | ------------------ | --------------------- | -------------------------------------------------- |
@@ -402,7 +397,7 @@ the others: automatic for a distributed toolchain, `libraries/build.sh` +
 | `var(name)`        | `(string) -> string!` | an unset variable is an error, not `""`            |
 | `vars()`           | `() -> HashMap`       | every variable, as a `string -> string` map        |
 | `path_separator()` | `() -> string`        | path-list separator (`:` on Unix, `;` on Windows)  |
-| `current_dir()`    | `() -> Path!`         | the working directory, as a `path` `Path`          |
+| `current_dir()`    | `() -> Path!`         | the working directory, as a `std.path` `Path`      |
 
 Everything after the program file on the command line belongs to the
 program, verbatim, flags included, with no separator needed:
@@ -410,19 +405,17 @@ program, verbatim, flags included, with no separator needed:
 ```sh
 brass main.cz --verbose input.txt
 ```
-
 gives `args() == ["main.cz", "--verbose", "input.txt"]`: the program file
 as written, then the arguments (index `0` is the program, as in C's `argv`).
 The same holds for `brass repl main.cz ...`. In an interactive REPL
 session, or under an embedder that passes no arguments, `args()` is empty.
 
-## `hash` (a library, not `std`)
+## `std.hash`
 
 ```brass norun
-import hash.{ sha256, hmac_sha256, hex, equal, Hasher }
+import std.hash.{ sha256, hmac_sha256, hex, equal, Hasher }
 ```
-
-Message digests (MD5, SHA-1, SHA-2) and HMAC. A plugin under `libraries/`
+Message digests (MD5, SHA-1, SHA-2) and HMAC. A plugin under `std/`
 wrapping the RustCrypto implementations, since these algorithms are built
 from wrapping 32/64-bit arithmetic, which Brass does not have; a Brass
 implementation would be a hand-masked emulation whose failure mode is a
@@ -435,7 +428,6 @@ bytes with the prelude's `to_bytes`, and render the result with `hex`:
 println(hex(sha256(to_bytes("abc"))))
 // ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
 ```
-
 | Function                       | Signature                       | Digest size      |
 | ------------------------------ | ------------------------------- | ---------------- |
 | `md5(data)`                    | `(uint8[]) -> uint8[]`          | 16 bytes         |
@@ -458,7 +450,6 @@ h.update(chunk)!
 h.update(next)!
 println(hex(h.finalize()!))
 ```
-
 **Security.** `md5` and `sha1` are broken against collision attacks: use them
 only to interoperate with something that already speaks them (a published MD5
 checksum, a git object id), never to decide whether two inputs are "the same".
@@ -470,12 +461,11 @@ All of these are **fast** hashes: storing a password needs a purpose-built
 slow KDF (argon2, scrypt, bcrypt), which this library deliberately does not
 offer, so that a fast hash cannot be mistaken for one.
 
-## `regex` (a library, not `std`)
+## `std.regex`
 
 ```brass norun
-import regex.{ Regex, escape }
+import std.regex.{ Regex, escape }
 ```
-
 Regular expressions, on Rust's `regex` engine: a finite automaton, so matching
 is **linear** in the subject's length however the pattern is written: a regex
 over untrusted input cannot blow up the way a backtracking engine does. The
@@ -511,7 +501,6 @@ if let m = date.find("due 2026-07-13, ok") {
 }
 println(date.replace_all("2026-07-13", "$year/$2"))   // 2026/07
 ```
-
 ### API
 
 `Regex.new(pattern) -> Regex!` is where a bad pattern is reported; every method
@@ -540,14 +529,13 @@ compile a pattern **once** and keep it: compiling inside a loop grows the
 process. That is the right way to use any regex engine, since compilation
 costs far more than matching.
 
-## `semver` (a library, not `std`)
+## `std.semver`
 
 ```brass norun
-import semver.{ Version, sort }
+import std.semver.{ Version, sort }
 ```
-
 [Semantic Versioning 2.0.0](https://semver.org): parse a version, render it
-back, and order two of them. Pure Brass on top of `regex` (it has no native
+back, and order two of them. Pure Brass on top of `std.regex` (it has no native
 half of its own), and it parses with the **official pattern from semver.org
 verbatim**, so what it accepts is exactly what the spec defines: no leading
 zeros, an optional dot-separated pre-release, optional build metadata, and
@@ -559,7 +547,6 @@ println("{v.major}.{v.minor}.{v.patch}")        // 1.4.2
 println(v.prerelease)                           // rc.1  (null when absent)
 println(v.compare(Version.parse("1.4.2")!))     // -1: a pre-release is LOWER
 ```
-
 `Version` is `{ major, minor, patch: int64, prerelease, build: string? }`.
 The optional components are `null` when absent, which the grammar keeps
 distinct from empty.
@@ -583,18 +570,16 @@ in ASCII order; if all shared identifiers are equal, the shorter list precedes.
 **Build metadata is ignored** (§10), so `1.0.0+a` and `1.0.0+b` compare equal;
 compare `to_string()` if textual identity is what you want.
 
-## `net` (a library, not `std`)
+## `std.net`
 
 ```brass norun
-import net.{ Tcp, TcpListener, Udp, TlsStream }
+import std.net.{ Tcp, TcpListener, Udp, TlsStream }
 ```
-
-TCP and UDP sockets plus TLS client connections. Like `process` and `path`
-this is a library: talking to the operating system's sockets needs native
-code, which arrives as a plugin under `libraries/`, and the setup is the
-same: automatic for a distributed toolchain, `libraries/build.sh` +
-`BRASS_INCLUDE` from a repo checkout. Networking does not run in the
-playground.
+TCP and UDP sockets plus TLS client connections. Like `std.process` and
+`std.path` this needs native code, which arrives as a plugin under `std/`,
+and the setup is the same: automatic for a distributed toolchain,
+`std/build.sh` + `BRASS_PACKAGES=std=...` from a repo checkout. Networking
+does not run in the playground.
 
 Under the hood a plain socket is a `File` (an OS file descriptor) held
 privately by each record: a connection cannot `accept` and a listener
@@ -636,7 +621,7 @@ its sender's address. The prelude helpers `to_bytes(s) -> uint8[]` and
 `to_text(bytes) -> string!` convert between strings and socket bytes.
 
 ```brass norun
-import net.{ Tcp, TcpListener }
+import std.net.{ Tcp, TcpListener }
 
 let listener = TcpListener.bind("127.0.0.1", 0)!
 let port = int64.parse(listener.local_addr()!.split(":")[1])!
@@ -646,7 +631,6 @@ let server = listener.accept()!
 client.write(to_bytes("hello"))!
 println(to_text(server.read(64)!)!)   // hello
 ```
-
 Two practical notes for concurrent servers. A spawned closure should capture
 the **port** (a copied scalar), not the listener: a shared listener is
 auto-guarded by a cown lock that a blocking `accept` would then hold. And
@@ -667,22 +651,19 @@ CAs, no server side yet). `TlsStream` mirrors `Tcp`, so code written against
 | `conn.close()`                  | `() -> void!`                   | sends the TLS close notification                           |
 
 ```brass norun
-import net.{ TlsStream }
+import std.net.{ TlsStream }
 
 let conn = TlsStream.connect("example.com", 443)!
 conn.write(to_bytes("GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"))!
 println(to_text(conn.read(16)!)!)   // HTTP/1.1 200 OK
 conn.close()!
 ```
-
 Everything here runs on either back end: sockets are `fs`
 `File`s and the plugins execute natively under the interpreter too.
 
-## `std.collections`
+## `core.collections`
 
-```brass
-import std.collections.{ HashMap }
-```
+Part of the implicit prelude: `HashMap` needs no import.
 
 An open-addressing (linear-probing) hash map. Keys may be of any type that
 renders to a stable string and compares with `==` (integers, strings,
@@ -706,16 +687,15 @@ arguments**: the key/value types are inferred from the first `set` or
 | `m.pairs()`                 | `-> [K, V][]`           | same order as `keys`            |
 | `m.clear()`                 | remove every pair       | keeps capacity and types        |
 
-## `data.json` (a library, not `std`)
+## `std.data.json`
 
 ```brass norun
-import data.json.{ JsonValue }
+import std.data.json.{ JsonValue }
 ```
-
 A JSON value tree, parser, accessors, serializer, and a reflective decoder.
 The whole surface hangs off `JsonValue`, so the type is the only name to import.
-A pure-brass library (no plugin) under `libraries/`, with the same setup
-as the others: automatic for a distributed toolchain, `BRASS_INCLUDE`
+A pure-brass module (no plugin) under `std/`, with the same setup as the
+others: automatic for a distributed toolchain, `BRASS_PACKAGES=std=...`
 from a repo checkout.
 
 ```brass norun
@@ -727,7 +707,6 @@ type JsonValue =
     | Array { value: JsonValue[] }
     | Object { values: _JsonObject }   // a string -> JsonValue HashMap
 ```
-
 An `Object` keeps its members in a `HashMap` (a refinement pinning the key
 to `string` and the value to `JsonValue`), so `get` is a hash lookup. One
 consequence: `stringify` renders object members in the map's slot order,
@@ -746,7 +725,7 @@ not the source document's ordering (stable for a given input).
 Decoding a whole document into a typed structure combines `parse` and `into`:
 
 ```brass norun
-import data.json.{ JsonValue }
+import std.data.json.{ JsonValue }
 
 type Address = { city: string, zip: int64 }
 type User = { name: string, age: int64, address: Address }

@@ -86,9 +86,9 @@ A few points:
   `Vec2.new(...)` available with no separate import.
 - A name beginning with `_` (like `_helper`) is private to its module and
   cannot be imported.
-- The top-level standard library is an implicit prelude: `sqrt`, `println`,
-  and the array/string helpers need no import. Nested standard-library
-  modules are not in the prelude and are imported explicitly, e.g.
-  `import std.collections.{ HashMap }`.
+- The embedded `core` library is an implicit prelude: `sqrt`, `println`,
+  `HashMap`, and the array/string helpers need no import. The shipped
+  `std/` tree is imported explicitly with the `std.` prefix, e.g.
+  `import std.fs.{ read_file }`.
 
 The full rules are in the [modules reference](/references/modules/).

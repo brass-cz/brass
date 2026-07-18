@@ -725,7 +725,7 @@ fn reanchor_module_paths(
         // Embedded modules (prelude, nested std) have no location to refresh,
         // and a plugin wrapper's `_PATH` is its label -- its library is pinned
         // by an Absolute stamp, so a hit means it did not move.
-        if m.is_prelude || m.path.first().is_some_and(|s| s == "std") {
+        if m.is_prelude || m.path.first().is_some_and(|s| s == "core") {
             continue;
         }
         if matches!(m.path.as_slice(), [p] if p == "main") {
@@ -755,6 +755,7 @@ fn reanchor_module_paths(
 fn cached_context_seed(
     key: &Option<[u8; 20]>,
     ctx: &[LoadedModule],
+    module_hashes: Option<&[(String, [u8; 20])]>,
     phase_name: &'static str,
 ) -> Option<brass_typeck::ContextTables> {
     if let Some(key) = key
@@ -767,15 +768,195 @@ fn cached_context_seed(
     let t = std::time::Instant::now();
     let (ctx_program, ctx_errors) = lower(ctx);
     let seed = if ctx_errors.is_empty() {
-        brass_typeck::context_seed(&ctx_program)
+        // An exact-key miss usually means an EDIT somewhere in the context.
+        // The incremental sidecar of the previous build of this same context
+        // (same module-path list) tells which modules changed: everything
+        // else's tables are retained as a partial seed and only the changed
+        // modules -- plus their transitive importers, which may observe the
+        // change -- re-infer.
+        let incremental = module_hashes.and_then(|hashes| {
+            if !brass_cache::enabled() {
+                return None;
+            }
+            let id = context_identity(CACHE_FLAVOR, hashes);
+            let prior = brass_cache::load_context_bundle(&id)?;
+            let keep = clean_context_modules(ctx, hashes, &prior.module_hashes);
+            if keep.is_empty() {
+                return None;
+            }
+            tracing::debug!(
+                target: "brass::perf",
+                kept = keep.len(),
+                total = ctx.len(),
+                "incremental context rebuild"
+            );
+            let mut partial = prior.seed;
+            if !partial.retain_modules(&ctx_program, &keep) {
+                tracing::debug!(
+                    target: "brass::perf",
+                    "incremental context rebuild rejected changed HIR identity"
+                );
+                return None;
+            }
+            brass_typeck::context_seed_with(&ctx_program, Some(&partial))
+        });
+        match incremental {
+            Some(seed) => Some(seed),
+            None => brass_typeck::context_seed(&ctx_program),
+        }
     } else {
         None
     };
     brass_utils::perf_phase(phase_name, t.elapsed());
     if let (Some(key), Some(seed), true) = (key, &seed, brass_cache::enabled()) {
         brass_cache::save_context(key, seed);
+        if let Some(hashes) = module_hashes {
+            brass_cache::save_context_bundle(
+                &context_identity(CACHE_FLAVOR, hashes),
+                &brass_cache::ContextBundle {
+                    module_hashes: hashes.to_vec(),
+                    seed: seed.clone(),
+                },
+            );
+        }
     }
     seed
+}
+
+/// The context's IDENTITY: the frontend flavor and its module-path list,
+/// contents excluded, so an edited context still finds its own previous
+/// build's sidecar without crossing into a frontend with different rewrites.
+fn context_identity(flavor: &str, module_hashes: &[(String, [u8; 20])]) -> [u8; 20] {
+    let mut paths: Vec<&str> = module_hashes.iter().map(|(p, _)| p.as_str()).collect();
+    paths.sort_unstable();
+    let mut buf = flavor.as_bytes().to_vec();
+    buf.push(0);
+    for p in paths {
+        buf.extend_from_slice(p.as_bytes());
+        buf.push(0);
+    }
+    brass_cache::content_hash(&buf)
+}
+
+/// The source-map base encoded by the `_PATH` declaration injected at the
+/// start of every loaded module.
+fn module_source_base(module: &LoadedModule) -> Option<usize> {
+    match module.ast.items.first()? {
+        TopLevel::Stmt(Stmt::Let {
+            pat: brass_parser::ast::Pattern::Binding(name, span),
+            is_const: true,
+            ..
+        }) if name == brass_resolve::MODULE_PATH_CONST => Some(span.lo),
+        _ => None,
+    }
+}
+
+/// Hash each module's own source by its injected source base. Source entries
+/// are discovered before recursive imports while modules are appended after
+/// them, so their vector positions are deliberately unrelated.
+fn context_module_hashes(
+    modules: &[LoadedModule],
+    sources: &brass_resolve::SourceMap,
+) -> Option<Vec<(String, [u8; 20])>> {
+    modules
+        .iter()
+        .map(|module| {
+            let base = module_source_base(module)?;
+            let source = sources.locate(base)?.src;
+            Some((
+                module.path.join("."),
+                brass_cache::content_hash(source.as_bytes()),
+            ))
+        })
+        .collect()
+}
+
+/// Find the loaded module that owns `offset`, independent of module graph
+/// order. Generated rewrites retain the injected source base.
+fn module_path_at(
+    modules: &[LoadedModule],
+    sources: &brass_resolve::SourceMap,
+    offset: usize,
+) -> Option<Vec<String>> {
+    let located = sources.locate(offset)?;
+    let base = offset.checked_sub(located.local)?;
+    modules
+        .iter()
+        .find(|module| module_source_base(module) == Some(base))
+        .map(|module| module.path.clone())
+}
+
+/// The context modules whose retained tables are still valid: source hash
+/// unchanged since `prior`, and no (transitive) import of a changed module.
+/// The import edges are matched conservatively by PATH TEXT -- an import's
+/// written path may be package-relative, so a dirty module counts as a
+/// target whenever its dotted path could resolve the import -- and a dirty
+/// implicit-prelude module dirties everything (it is visible with no
+/// import). Over-matching only re-infers more than strictly needed.
+fn clean_context_modules(
+    ctx: &[LoadedModule],
+    now: &[(String, [u8; 20])],
+    prior: &[(String, [u8; 20])],
+) -> HashSet<Vec<String>> {
+    let prior_map: HashMap<&str, &[u8; 20]> = prior.iter().map(|(p, h)| (p.as_str(), h)).collect();
+    let mut dirty: HashSet<String> = now
+        .iter()
+        .filter(|(p, h)| prior_map.get(p.as_str()) != Some(&h))
+        .map(|(p, _)| p.clone())
+        .collect();
+    if dirty.is_empty() {
+        // Identical context under a missed exact key (e.g. the entry list
+        // changed): everything is reusable.
+        return ctx.iter().map(|m| m.path.clone()).collect();
+    }
+    if ctx
+        .iter()
+        .any(|m| m.is_prelude && dirty.contains(&m.path.join(".")))
+    {
+        return HashSet::new();
+    }
+    // A written import path may name a dirty module in several shapes:
+    // absolute (`std.package_manager.manifest`), package-relative
+    // (`manifest` from a sibling), or with a trailing item name
+    // (`manifest.Manifest`). Match on segment-boundary suffixes both ways.
+    let may_target = |written: &str, dirty_path: &str| {
+        let strip = |whole: &str, suffix: &str| {
+            whole == suffix
+                || (whole.len() > suffix.len()
+                    && whole.ends_with(suffix)
+                    && whole.as_bytes()[whole.len() - suffix.len() - 1] == b'.')
+        };
+        strip(dirty_path, written)
+            || strip(written, dirty_path)
+            || match written.rsplit_once('.') {
+                Some((module_part, _item)) => strip(dirty_path, module_part),
+                None => false,
+            }
+    };
+    loop {
+        let mut changed = false;
+        for m in ctx {
+            let mp = m.path.join(".");
+            if dirty.contains(&mp) {
+                continue;
+            }
+            let imports_dirty = m.ast.imports.iter().any(|imp| {
+                let written = imp.path.join(".");
+                dirty.iter().any(|d| may_target(&written, d))
+            });
+            if imports_dirty {
+                dirty.insert(mp);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    ctx.iter()
+        .filter(|m| !dirty.contains(&m.path.join(".")))
+        .map(|m| m.path.clone())
+        .collect()
 }
 
 /// A finished front-end analysis in thread-transportable form: the final
@@ -1313,41 +1494,35 @@ impl LazyState {
     }
 }
 
-/// Fall back to the whole-analysis verdict: drain the event stream, join the
-/// checker, and either report its diagnostics or -- when it succeeded but
-/// the streaming path could not be used (a restart, an executor-side
-/// assembly failure) -- assemble its payload and run the program eagerly.
+/// Fall back to the whole-analysis verdict: reclaim the checker thread and
+/// re-run the pipeline EAGERLY, in process. The streaming analysis's payload
+/// is never executed or reported from -- its lazy profile types some calls
+/// from signatures without recording their instances' channel entries or
+/// per-instance diagnostics, so only a genuinely eager analysis is a whole
+/// verdict. The re-run is cache-assisted: a keyed re-pass that completed
+/// eagerly on the checker thread has already persisted the full analysis,
+/// which this load then hits.
 #[cfg(jit_backend)]
+#[allow(clippy::too_many_arguments)]
 fn finish_eagerly(
     rt: &tokio::runtime::Runtime,
     checker: tokio::task::JoinHandle<Result<AnalyzedProgram, Vec<String>>>,
-    paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    paused: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     mut events: tokio::sync::mpsc::UnboundedReceiver<brass_typeck::stream::CheckEvent>,
+    label: &str,
+    src: &str,
+    root: &Path,
 ) -> Result<(), u8> {
-    // The whole-analysis verdict needs the whole analysis: release the
-    // checker's held background queue so it can finish.
+    // Reclaim the thread: stop it at the next boundary (releasing the held
+    // background queue so it can reach one), drain its events, and join.
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
     paused.store(false, std::sync::atomic::Ordering::Relaxed);
     while events.blocking_recv().is_some() {}
-    let payload = rt
+    let _ = rt
         .block_on(checker)
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()));
-    let checked = payload.and_then(assemble_checked).map_err(print_diags)?;
-    execute(
-        &checked.program,
-        &checked.expr_types,
-        &checked.view_args,
-        &checked.sum_views,
-        &checked.call_locations,
-        &checked.lift_errs,
-        &checked.fields_loops,
-        &checked.type_names,
-        &checked.typeof_types,
-        &checked.null_props,
-    )
-    .map_err(|e| {
-        report_runtime_error(&e);
-        1
-    })
+    run_fresh_eager(label, src, root)
 }
 
 /// Compile and prime EVERY recorded deferred target, to a fixpoint: called
@@ -1565,23 +1740,29 @@ fn resolve_deferred(
                 }
                 return addr;
             }
-            Err(brass_engine::MonoStop::MissingBody {
-                symbol: miss,
-                type_args,
-            }) => {
-                if lowering.is_lowered(&miss) || !program.functions.contains_key(&miss) {
-                    eprintln!("error: lazy compilation cannot supply `{miss}`");
+            Err(brass_engine::MonoStop::MissingBodies(demands)) => {
+                let mut progressed = false;
+                for (miss, type_args) in demands {
+                    if lowering.is_lowered(&miss) || !program.functions.contains_key(&miss) {
+                        continue;
+                    }
+                    if !lazy.demand(&miss, type_args) {
+                        return fatal_exit(
+                            lazy,
+                            &format!("error: the check of `{miss}` did not complete"),
+                        );
+                    }
+                    exit_if_fatal(lazy, bodies, sources);
+                    let channels = lazy.channels(call_locations);
+                    lowering.add_function(program, tables, &miss, &channels);
+                    progressed = true;
+                }
+                // A batch that supplied nothing new would come straight
+                // back: a pipeline bug, not a user error -- fail readably.
+                if !progressed {
+                    eprintln!("error: lazy compilation cannot supply the demanded bodies");
                     return 0;
                 }
-                if !lazy.demand(&miss, type_args) {
-                    return fatal_exit(
-                        lazy,
-                        &format!("error: the check of `{miss}` did not complete"),
-                    );
-                }
-                exit_if_fatal(lazy, bodies, sources);
-                let channels = lazy.channels(call_locations);
-                lowering.add_function(program, tables, &miss, &channels);
             }
             Err(brass_engine::MonoStop::Fail(e)) => {
                 // The same transient-vs-final rule as start-up: retry once
@@ -1655,6 +1836,17 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         Ok(front) => front,
         Err(diags) => return Err(print_diags(diags)),
     };
+    // Lower on this side first: the module graph decides the route. A keyed
+    // (`-> infer!`) call anywhere in it restarts the analysis over a
+    // specialization-rewritten program, which a lazy run only ever survives
+    // by falling back to the eager verdict -- after paying for its own gate
+    // first. Route such a program to the eager pipeline before any thread
+    // starts (which also persists the full cache, so its repeat runs hit
+    // the fastest path). Lowering errors report through the same eager path.
+    let (program, lower_errors) = lower(&front.modules);
+    if lower_errors.is_empty() && brass_typeck::has_keyed_calls(&program) {
+        return run_fresh_eager(&label, &src, &root);
+    }
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
     let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
     // A prior stopped run's PARTIAL cache: the checker resumes from it
@@ -1694,11 +1886,10 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
     // Front-pass diagnostics (qualified uses, spawn ownership) are not
     // rendered here: the checker reports them with the rest, eager-identical.
     if !front.errors.is_empty() {
-        return finish_eagerly(&rt, checker, paused.clone(), events_rx);
+        return finish_eagerly(&rt, checker, &stop, &paused, events_rx, &label, &src, &root);
     }
-    let (program, lower_errors) = lower(&front.modules);
     if !lower_errors.is_empty() {
-        return finish_eagerly(&rt, checker, paused.clone(), events_rx);
+        return finish_eagerly(&rt, checker, &stop, &paused, events_rx, &label, &src, &root);
     }
     let call_locations = call_site_locations(&front.modules, &front.sources);
     let bodies = BodySpans::new(&program);
@@ -1730,13 +1921,31 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
     let resume_entry: Option<&Path> = resumed.then_some(entry_path.as_path());
     let settled = lazy.wait_gate(program.inits.len(), program.functions.contains_key("main"));
     if lazy.restarted {
-        return finish_eagerly(&rt, checker, lazy.paused.clone(), lazy.events);
+        return finish_eagerly(
+            &rt,
+            checker,
+            &lazy.stop,
+            &lazy.paused,
+            lazy.events,
+            &label,
+            &src,
+            &root,
+        );
     }
     match judge_fatal(&mut lazy, &bodies, &front.sources) {
         FatalVerdict::Clean => {}
         FatalVerdict::Fatal(code) => return Err(code),
         FatalVerdict::Restarted => {
-            return finish_eagerly(&rt, checker, lazy.paused.clone(), lazy.events);
+            return finish_eagerly(
+                &rt,
+                checker,
+                &lazy.stop,
+                &lazy.paused,
+                lazy.events,
+                &label,
+                &src,
+                &root,
+            );
         }
     }
     if !settled {
@@ -1750,7 +1959,16 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
             lazy.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             return run_fresh_eager(&label, &src, &root);
         }
-        return finish_eagerly(&rt, checker, lazy.paused.clone(), lazy.events);
+        return finish_eagerly(
+            &rt,
+            checker,
+            &lazy.stop,
+            &lazy.paused,
+            lazy.events,
+            &label,
+            &src,
+            &root,
+        );
     }
 
     // Demand-driven compilation: methods and inits lower up front, function
@@ -1809,8 +2027,12 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                                 return finish_eagerly(
                                     &rt,
                                     checker,
-                                    lazy.paused.clone(),
+                                    &lazy.stop,
+                                    &lazy.paused,
                                     lazy.events,
+                                    &label,
+                                    &src,
+                                    &root,
                                 );
                             }
                             match judge_fatal(&mut lazy, &bodies, &front.sources) {
@@ -1820,8 +2042,12 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                                     return finish_eagerly(
                                         &rt,
                                         checker,
-                                        lazy.paused.clone(),
+                                        &lazy.stop,
+                                        &lazy.paused,
                                         lazy.events,
+                                        &label,
+                                        &src,
+                                        &root,
                                     );
                                 }
                             }
@@ -1837,8 +2063,12 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                                 return finish_eagerly(
                                     &rt,
                                     checker,
-                                    lazy.paused.clone(),
+                                    &lazy.stop,
+                                    &lazy.paused,
                                     lazy.events,
+                                    &label,
+                                    &src,
+                                    &root,
                                 );
                             }
                         }
@@ -1858,26 +2088,48 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                     }
                     break 'rebuild built;
                 }
-                Err(brass_engine::MonoStop::MissingBody { symbol, type_args }) => {
-                    tracing::debug!(target: "brass::perf", %symbol, "lazy: missing body");
-                    if demanded.contains(&symbol) || !program.functions.contains_key(&symbol) {
-                        // The demand cannot be satisfied: not a function of
-                        // the program, or supplied already yet reported
-                        // missing again. A pipeline bug, not a user error --
-                        // fail readably.
-                        if resumed {
-                            // Reclaimability: the paused checker thread must exit before `rt`
-                            // drops (it joins blocking tasks), and this path abandons it.
-                            lazy.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                            return run_fresh_eager(&label, &src, &root);
+                Err(brass_engine::MonoStop::MissingBodies(demands)) => {
+                    tracing::debug!(target: "brass::perf", count = demands.len(), "lazy: missing bodies");
+                    let mut progressed = false;
+                    for (symbol, type_args) in demands {
+                        if demanded.contains(&symbol) || !program.functions.contains_key(&symbol) {
+                            continue;
                         }
-                        eprintln!("error: lazy compilation cannot supply `{symbol}`");
-                        return Err(1);
-                    }
-                    if !lazy.demand(&symbol, type_args) {
-                        if lazy.restarted {
-                            return finish_eagerly(&rt, checker, lazy.paused.clone(), lazy.events);
+                        if !lazy.demand(&symbol, type_args) {
+                            if lazy.restarted {
+                                return finish_eagerly(
+                                    &rt,
+                                    checker,
+                                    &lazy.stop,
+                                    &lazy.paused,
+                                    lazy.events,
+                                    &label,
+                                    &src,
+                                    &root,
+                                );
+                            }
+                            match judge_fatal(&mut lazy, &bodies, &front.sources) {
+                                FatalVerdict::Clean => {}
+                                FatalVerdict::Fatal(code) => return Err(code),
+                                FatalVerdict::Restarted => {
+                                    return finish_eagerly(
+                                        &rt,
+                                        checker,
+                                        &lazy.stop,
+                                        &lazy.paused,
+                                        lazy.events,
+                                        &label,
+                                        &src,
+                                        &root,
+                                    );
+                                }
+                            }
+                            eprintln!("error: lazy compilation cannot supply `{symbol}`");
+                            return Err(1);
                         }
+                        // The demanded body joined the needed set: its held
+                        // diagnostics, if any, are now fatal -- before its
+                        // code could ever run.
                         match judge_fatal(&mut lazy, &bodies, &front.sources) {
                             FatalVerdict::Clean => {}
                             FatalVerdict::Fatal(code) => return Err(code),
@@ -1885,27 +2137,34 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                                 return finish_eagerly(
                                     &rt,
                                     checker,
-                                    lazy.paused.clone(),
+                                    &lazy.stop,
+                                    &lazy.paused,
                                     lazy.events,
+                                    &label,
+                                    &src,
+                                    &root,
                                 );
                             }
                         }
-                        eprintln!("error: lazy compilation cannot supply `{symbol}`");
+                        let channels = lazy.channels(&call_locations);
+                        built.add_function(&program, &tables, &symbol, &channels);
+                        demanded.push(symbol);
+                        progressed = true;
+                    }
+                    if !progressed {
+                        // No demand in the batch could be satisfied: not
+                        // functions of the program, or supplied already yet
+                        // reported missing again. A pipeline bug, not a user
+                        // error -- fail readably.
+                        if resumed {
+                            // Reclaimability: the paused checker thread must exit before `rt`
+                            // drops (it joins blocking tasks), and this path abandons it.
+                            lazy.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return run_fresh_eager(&label, &src, &root);
+                        }
+                        eprintln!("error: lazy compilation cannot supply the demanded bodies");
                         return Err(1);
                     }
-                    // The demanded body joined the needed set: its held
-                    // diagnostics, if any, are now fatal -- before its code
-                    // could ever run.
-                    match judge_fatal(&mut lazy, &bodies, &front.sources) {
-                        FatalVerdict::Clean => {}
-                        FatalVerdict::Fatal(code) => return Err(code),
-                        FatalVerdict::Restarted => {
-                            return finish_eagerly(&rt, checker, lazy.paused.clone(), lazy.events);
-                        }
-                    }
-                    let channels = lazy.channels(&call_locations);
-                    built.add_function(&program, &tables, &symbol, &channels);
-                    demanded.push(symbol);
                 }
                 Err(brass_engine::MonoStop::Fail(e)) => {
                     // Monomorphization can fail TRANSIENTLY under lazy
@@ -1924,7 +2183,16 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                         lazy.pump_blocking();
                         lazy.pump_pending();
                         if lazy.restarted {
-                            return finish_eagerly(&rt, checker, lazy.paused.clone(), lazy.events);
+                            return finish_eagerly(
+                                &rt,
+                                checker,
+                                &lazy.stop,
+                                &lazy.paused,
+                                lazy.events,
+                                &label,
+                                &src,
+                                &root,
+                            );
                         }
                         match judge_fatal(&mut lazy, &bodies, &front.sources) {
                             FatalVerdict::Clean => {}
@@ -1933,8 +2201,12 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                                 return finish_eagerly(
                                     &rt,
                                     checker,
-                                    lazy.paused.clone(),
+                                    &lazy.stop,
+                                    &lazy.paused,
                                     lazy.events,
+                                    &label,
+                                    &src,
+                                    &root,
                                 );
                             }
                         }
@@ -1947,7 +2219,16 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                         FatalVerdict::Clean => {}
                         FatalVerdict::Fatal(code) => return Err(code),
                         FatalVerdict::Restarted => {
-                            return finish_eagerly(&rt, checker, lazy.paused.clone(), lazy.events);
+                            return finish_eagerly(
+                                &rt,
+                                checker,
+                                &lazy.stop,
+                                &lazy.paused,
+                                lazy.events,
+                                &label,
+                                &src,
+                                &root,
+                            );
                         }
                     }
                     // A resumed snapshot may simply lack an entry the prior
@@ -1987,13 +2268,31 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
     lazy.pump_pending();
     if lazy.restarted {
         drop(mono);
-        return finish_eagerly(&rt, checker, lazy.paused.clone(), lazy.events);
+        return finish_eagerly(
+            &rt,
+            checker,
+            &lazy.stop,
+            &lazy.paused,
+            lazy.events,
+            &label,
+            &src,
+            &root,
+        );
     }
     match judge_fatal(&mut lazy, &bodies, &front.sources) {
         FatalVerdict::Clean => {}
         FatalVerdict::Fatal(code) => return Err(code),
         FatalVerdict::Restarted => {
-            return finish_eagerly(&rt, checker, lazy.paused.clone(), lazy.events);
+            return finish_eagerly(
+                &rt,
+                checker,
+                &lazy.stop,
+                &lazy.paused,
+                lazy.events,
+                &label,
+                &src,
+                &root,
+            );
         }
     }
     install_jit_panic_guard();
@@ -2372,12 +2671,22 @@ fn check_front(
             .map(|(_, src)| brass_cache::content_hash(src.as_bytes())),
     );
 
+    // Per-module (dotted path, source hash) pairs for the incremental context
+    // rebuild. Each module is matched to its source through the injected span
+    // base; dependency traversal gives modules and sources different orders.
+    let ctx_module_hashes = context_module_hashes(&modules[..ctx_end], &sources);
     // The context seed: the analysis tables of every module EXCEPT the entry,
     // reused so the full check below re-infers only the entry. Looked up in the
     // shared on-disk store when caching is enabled; rebuilt (and stored) from a
-    // context-only run otherwise. A context with diagnostics yields no seed and
-    // the full run reports everything as before.
-    let ctx_seed = cached_context_seed(&ctx_key, &modules[..ctx_end], "front/context-check");
+    // context-only run otherwise -- incrementally when the previous build of
+    // this same context is on disk. A context with diagnostics yields no seed
+    // and the full run reports everything as before.
+    let ctx_seed = cached_context_seed(
+        &ctx_key,
+        &modules[..ctx_end],
+        ctx_module_hashes.as_deref(),
+        "front/context-check",
+    );
 
     tracing::debug!(modules = modules.len(), "lowering module graph to HIR");
     let t = std::time::Instant::now();
@@ -2425,7 +2734,15 @@ fn check_front(
     // after specialization (a keyed call would otherwise report as an
     // undeclared method); a genuine error re-surfaces in the second pass.
     let mut program = program;
-    if !analysis.keyed_calls.is_empty() {
+    // No re-pass once the consumer stopped the session (its program already
+    // ran to completion): the specialization verdict would serve nobody --
+    // the driver never executes from this payload, the full-cache save is
+    // suppressed for a stopped run anyway, and the driver's exit would
+    // otherwise block on a whole eager re-analysis. The lazy run that DOES
+    // need the specializations sees `Restarted` before execution and falls
+    // back to the eager pipeline.
+    let repass_wanted = !sched.as_deref().is_some_and(|s| s.stopped());
+    if !analysis.keyed_calls.is_empty() && repass_wanted {
         // The re-pass context is the pre-pass context PLUS the injected
         // specializations -- a deterministic function of the context sources
         // and the requested (receiver, method, key) set. Extending the context
@@ -2448,10 +2765,58 @@ fn check_front(
             brass_cache::content_hash(&keyed)
         });
         match specialize_keyed(&mut modules, &program, &analysis) {
-            Ok(()) => {
+            Ok(injected) => {
+                // The specialization rewrote some modules in place, so their
+                // loaded sources no longer describe their ASTs. For the
+                // incremental sidecar, fold the specialization identity into
+                // the TOUCHED modules' hashes (injection targets plus every
+                // module containing a rewritten call site -- a keyed call's
+                // span lies in its module's source segment, and sources and
+                // modules are pushed in the same load order) and add a
+                // synthetic path entry, so the keyed context's sidecar is
+                // distinct from the plain one yet diffs the same way.
+                let mut touched = injected;
+                let attributable = modules
+                    .iter()
+                    .all(|module| module_source_base(module).is_some());
+                if attributable {
+                    for span in analysis.keyed_calls.keys() {
+                        if let Some(path) = module_path_at(&modules, &sources, span.lo) {
+                            touched.insert(path);
+                        }
+                    }
+                }
+                let repass_hashes: Option<Vec<(String, [u8; 20])>> = ctx_module_hashes
+                    .as_ref()
+                    .filter(|_| attributable)
+                    .map(|hashes| {
+                        let mut spec_buf = Vec::new();
+                        for s in &spec_symbols {
+                            spec_buf.extend_from_slice(s.as_bytes());
+                            spec_buf.push(0);
+                        }
+                        let spec_hash = brass_cache::content_hash(&spec_buf);
+                        let touched_paths: HashSet<String> =
+                            touched.iter().map(|t| t.join(".")).collect();
+                        let mut v: Vec<(String, [u8; 20])> = hashes
+                            .iter()
+                            .map(|(p, h)| {
+                                if touched_paths.contains(p) {
+                                    let mut buf = h.to_vec();
+                                    buf.extend_from_slice(&spec_hash);
+                                    (p.clone(), brass_cache::content_hash(&buf))
+                                } else {
+                                    (p.clone(), *h)
+                                }
+                            })
+                            .collect();
+                        v.push(("(keyed-specializations)".to_string(), spec_hash));
+                        v
+                    });
                 let repass_seed = cached_context_seed(
                     &repass_key,
                     &modules[..modules.len() - 1],
+                    repass_hashes.as_deref(),
                     "front/keyed-context-check",
                 );
                 let t = std::time::Instant::now();
@@ -2462,15 +2827,16 @@ fn check_front(
                 program = program2;
                 // The injected specializations and rewritten call sites moved
                 // spans: a streaming consumer starts over on the re-pass.
-                analysis = match sched.as_deref_mut() {
-                    Some(s) => {
-                        s.emit(brass_typeck::stream::CheckEvent::Restarted);
-                        // No resume: the rewrite moved spans, the snapshot
-                        // describes a program that no longer exists.
-                        brass_typeck::analyze_streaming(&program, repass_seed.as_ref(), s, None)
-                    }
-                    None => brass_typeck::analyze_with(&program, repass_seed.as_ref()),
-                };
+                // The re-pass itself is EAGER even under a streaming session
+                // -- the driver always falls back to the whole-analysis
+                // verdict on `Restarted` (execution cannot survive the span
+                // rewrite), so streaming it would serve nobody, and the
+                // eager result is complete enough to persist as the full
+                // cache the fallback then loads.
+                if let Some(s) = sched.as_deref_mut() {
+                    s.emit(brass_typeck::stream::CheckEvent::Restarted);
+                }
+                analysis = brass_typeck::analyze_with(&program, repass_seed.as_ref());
                 phase("front/keyed-repass", t);
             }
             Err(e) => errors.push(e),
@@ -2555,11 +2921,14 @@ fn check_front(
 /// the checker keyed, inject them into their defining modules' ASTs, and
 /// rewrite each keyed call site to its specialization. After this the program
 /// is fully concrete: the second checking/lowering pass sees ordinary methods.
+/// Returns the module paths the injection touched (generated methods and
+/// synthetic imports); call-site rewrites are the caller's to attribute (it
+/// owns the span-to-module mapping).
 fn specialize_keyed(
     modules: &mut [LoadedModule],
     program: &Program,
     analysis: &brass_typeck::Analysis,
-) -> Result<(), (String, Span)> {
+) -> Result<HashSet<Vec<String>>, (String, Span)> {
     // Deduplicate the requested (receiver, method, key) roots.
     let mut roots: Vec<brass_typesys::KeyedNeed> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -2607,12 +2976,15 @@ fn specialize_keyed(
             }
         }
     }
+    let mut touched: HashSet<Vec<String>> = HashSet::new();
     for g in generated {
         if let Some(m) = modules.iter_mut().find(|m| m.path == g.module) {
             m.ast.items.push(TopLevel::Fun(g.decl));
+            touched.insert(g.module);
         }
     }
     for (module_path, imports) in synthetic_imports {
+        touched.insert(module_path.clone());
         if let Some(m) = modules.iter_mut().find(|m| m.path == module_path) {
             for (from_module, name) in imports {
                 m.ast.imports.push(brass_parser::ast::ImportDecl {
@@ -2644,7 +3016,7 @@ fn specialize_keyed(
             }
         }
     }
-    Ok(())
+    Ok(touched)
 }
 
 /// Rewrite `recv.m(..)` calls whose span is in `renames` to `recv.<new>(..)`.
@@ -2772,6 +3144,18 @@ fn call_site_locations(
                 && let Some(parent) = c.parent()
             {
                 prefixes.push(format!("{}/", parent.display()));
+            }
+        }
+    }
+    // A package root serves modules under `<root>/<name>/...`, so the root
+    // itself is the prefix to strip (`std=/toolchain` renders the standard
+    // library as `std/fs.cz`).
+    if let Ok(pkgs) = std::env::var("BRASS_PACKAGES") {
+        for entry in pkgs.split(':').filter(|e| !e.is_empty()) {
+            if let Some((_, path)) = entry.split_once('=')
+                && let Ok(c) = Path::new(path).canonicalize()
+            {
+                prefixes.push(format!("{}/", c.display()));
             }
         }
     }
@@ -3116,7 +3500,10 @@ fn brace_balanced(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::program_file_index;
+    use super::{context_identity, context_module_hashes, module_path_at, program_file_index};
+    use brass_hir::LoadedModule;
+    use brass_parser::Span;
+    use brass_parser::ast::Module;
     use std::ffi::OsString;
 
     fn argv(args: &[&str]) -> Vec<OsString> {
@@ -3145,5 +3532,47 @@ mod tests {
         // After `--`, clap treats every token positionally. The manual split
         // must make the same choice or a file literally named `repl` is lost.
         assert_eq!(program_file_index(&argv(&["--", "repl", "arg"])), Some(2));
+    }
+
+    fn loaded(path: &str, base: usize) -> LoadedModule {
+        let mut ast = Module {
+            imports: Vec::new(),
+            items: Vec::new(),
+        };
+        brass_resolve::inject_module_path(&mut ast, path, Span::new(base, base));
+        LoadedModule {
+            is_prelude: false,
+            path: vec![path.to_string()],
+            ast,
+        }
+    }
+
+    #[test]
+    fn context_hashes_follow_source_bases_not_module_order() {
+        // Recursive loading records a parent source before its dependency but
+        // appends the dependency module first. Hash ownership follows spans.
+        let mut sources = brass_resolve::SourceMap::default();
+        let a = sources.add(None, "a".to_string(), "source a".to_string());
+        let b = sources.add(None, "b".to_string(), "source b".to_string());
+        let modules = vec![loaded("b", b), loaded("a", a)];
+
+        let hashes = context_module_hashes(&modules, &sources).expect("attributable modules");
+        assert_eq!(hashes[0].0, "b");
+        assert_eq!(hashes[0].1, brass_cache::content_hash(b"source b"));
+        assert_eq!(hashes[1].0, "a");
+        assert_eq!(hashes[1].1, brass_cache::content_hash(b"source a"));
+        assert_eq!(
+            module_path_at(&modules, &sources, a + 1),
+            Some(vec!["a".into()])
+        );
+    }
+
+    #[test]
+    fn context_bundle_identity_separates_frontend_flavors() {
+        let modules = vec![("core.io".to_string(), [7; 20])];
+        assert_ne!(
+            context_identity("jit", &modules),
+            context_identity("repl", &modules)
+        );
     }
 }

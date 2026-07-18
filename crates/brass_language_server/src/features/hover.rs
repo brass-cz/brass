@@ -151,15 +151,9 @@ fn import_hover(doc: &Document, full: &FullAnalysis, local: usize, global: usize
     }
 
     // The loader canonicalized the import in `main_ast`, so a bare single-name
-    // import already has its name split off into `names`. A bare prelude
-    // module keeps its written path but is stored under `std.<name>`.
-    let target: Vec<String> = if brass_resolve::is_prelude_path(&imp.path) {
-        std::iter::once("std".to_string())
-            .chain(imp.path.iter().cloned())
-            .collect()
-    } else {
-        imp.path.clone()
-    };
+    // import already has its name split off into `names`. A bare core
+    // module keeps its written path but is stored under `core.<name>`.
+    let target = brass_resolve::qualified_core_path(&imp.path);
 
     let named = imp
         .names
