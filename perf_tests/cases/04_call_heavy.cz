@@ -1,0 +1,25 @@
+// Call-dense hot loop: a tiny function called once per iteration. The lazy
+// back end reaches cross-function calls through per-function stubs, while the
+// eager whole-module compile can resolve (and inline) the callee directly, so
+// this isolates the call/stub indirection overhead on a warm path.
+
+fun mix(x: int64) -> int64 {
+    return (x * 48271) % 2147483647
+}
+
+fun accumulate(acc: int64, x: int64) -> int64 {
+    return (acc + x) % 1000000007
+}
+
+fun main() {
+    println("begin")
+    let x: int64 = 1
+    let acc: int64 = 0
+    let i: int64 = 0
+    while i < 60000000 {
+        x = mix(x)
+        acc = accumulate(acc, x)
+        i += 1
+    }
+    println("checksum = {acc}")
+}

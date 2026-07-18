@@ -1,0 +1,10 @@
+// Arithmetic helpers imported by 05_cross_module.cz. Kept in a separate
+// module so every call in the benchmark's hot loop crosses a module boundary.
+
+fun mix(x: int64) -> int64 {
+    return (x * 48271) % 2147483647
+}
+
+fun accumulate(acc: int64, x: int64) -> int64 {
+    return (acc + x) % 1000000007
+}

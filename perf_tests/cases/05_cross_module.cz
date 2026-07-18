@@ -1,0 +1,19 @@
+// Cross-module call-dense hot loop: the same workload as 04_call_heavy, but
+// the callees live in an imported module. Lazy compilation materializes each
+// module's functions separately and routes cross-module calls through stub
+// indirection, so this is the known worst case for the lazy warm path.
+
+import mathmod.ops.{ mix, accumulate }
+
+fun main() {
+    println("begin")
+    let x: int64 = 1
+    let acc: int64 = 0
+    let i: int64 = 0
+    while i < 60000000 {
+        x = mix(x)
+        acc = accumulate(acc, x)
+        i += 1
+    }
+    println("checksum = {acc}")
+}

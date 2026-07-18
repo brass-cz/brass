@@ -1,0 +1,35 @@
+// Closure-dense loop: indirect calls through closure values held in locals,
+// plus the array combinators (map/filter/fold) that take closures as
+// arguments. Closure bodies are separate compiled units, so this measures
+// indirect-call dispatch under both pipelines.
+
+fun main() {
+    println("begin")
+    let step = (x: int64) -> (x * 48271) % 2147483647
+    let fold_mod = (a: int64, b: int64) -> (a + b) % 1000000007
+
+    let x: int64 = 1
+    let acc: int64 = 0
+    let i: int64 = 0
+    while i < 20000000 {
+        x = step(x)
+        acc = fold_mod(acc, x)
+        i += 1
+    }
+    println("closure loop = {acc}")
+
+    // Combinators re-run over a small array many times: each iteration makes
+    // several indirect calls per element through the passed closures.
+    let nums = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3]
+    let total: int64 = 0
+    let j = 0
+    while j < 200000 {
+        let r = nums
+            .filter((v) -> v > 2)
+            .map((v) -> v * 7)
+            .fold(0, (a, b) -> a + b)
+        total = (total + r) % 1000000007
+        j += 1
+    }
+    println("combinators = {total}")
+}

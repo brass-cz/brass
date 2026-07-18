@@ -1,0 +1,15 @@
+// Self-recursion: naive Fibonacci. Every call re-enters the same function, so
+// once the body is compiled there is no further laziness to exploit; measures
+// whether self-calls pay any indirection under the lazy back end.
+
+fun fib(n: int64) -> int64 {
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fun main() {
+    println("begin")
+    println("fib(34) = {fib(34)}")
+}

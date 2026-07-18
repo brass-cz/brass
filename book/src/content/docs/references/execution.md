@@ -36,11 +36,18 @@ A normal run reports errors in the code it needs:
 Consequently, a successful run is not a complete whole-program verdict. Use
 `brass check` in CI and whenever all code must be validated.
 
+In one known case the demand-driven pipeline stops a program that the
+whole-program commands accept: a very deep call chain of unannotated returns
+whose inferred type differs from the default integer width. The run fails
+with a defined error naming the function whose return type to annotate;
+annotating it (or running with `--eager`) resolves the program.
+
 ### Complete checking and compilation
 
 `brass check program.cz` checks the complete program without running it and
 prints nothing on success. `brass --eager program.cz` performs the same
-complete check, compiles the program as one optimized unit, and then runs it.
+complete check before anything runs, then executes the program; native code
+is still optimized and translated on first use, exactly as in a normal run.
 The interpreter and REPL also check eagerly.
 
 A valid full `.czcache` skips checking on an unchanged program. A partial

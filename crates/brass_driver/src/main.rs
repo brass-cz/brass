@@ -1871,10 +1871,11 @@ fn resolve_deferred(
 ///    gates execution.
 /// 3. Any diagnostic that arrives before the program starts aborts the run
 ///    with the checker's full, eager-identical report. Once the program
-///    ran, the still-running checker (working through what execution never
-///    needed) is drained at exit, and anything it found is reported with a
-///    non-zero exit: lazy checking defers WHEN errors surface, never
-///    WHETHER.
+///    ran, the run's verdict is the executed path's alone: the checker is
+///    stopped at the next body boundary and whatever it held for code the
+///    run never needed is discarded by policy (pinned by
+///    `e2e_tests/lazy/dead_code_error.cz`) -- the whole-program verdict is
+///    `brass check`'s (or `--eager`'s) job.
 /// 4. A keyed-specialization restart or an executor-side assembly failure
 ///    falls back to [`finish_eagerly`] -- behaviorally the eager pipeline.
 ///

@@ -292,8 +292,8 @@ reading results that tasks mutate.
 
 - `brass file.cz`: demand-driven check, native compile, and run.
 - `brass check file.cz`: complete check without execution; use in CI.
-- `brass --eager file.cz`: complete check and whole-program optimization,
-  then run; useful for compute-heavy or benchmarked programs.
+- `brass --eager file.cz`: complete check before anything runs, then run;
+  native compilation is first-use in both modes.
 - `brass repl`: eager interpreter session. Concurrency is unavailable.
 - `czfmt --write file.cz`: format source. `czls`: language server.
 - `.czcache` may be a full check or a partial normal-run snapshot; file

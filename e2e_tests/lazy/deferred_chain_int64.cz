@@ -1,0 +1,83 @@
+// @lazy: fail
+// @eager: pass
+//
+// An unannotated-return chain of int64 functions deeper than the deferred
+// runtime's adaptation window: call sites past it are compiled against the
+// default int32 return and cannot adapt when the deferred instance resolves
+// as int64, so the lazy pipeline stops resolution with a defined error
+// (never a miscompile) while the whole-program pipelines accept any depth.
+// An int32 chain of the same shape runs lazily at any depth.
+fun c0(x: int64) { return c1(x) + 1 }
+fun c1(x: int64) { return c2(x) + 1 }
+fun c2(x: int64) { return c3(x) + 1 }
+fun c3(x: int64) { return c4(x) + 1 }
+fun c4(x: int64) { return c5(x) + 1 }
+fun c5(x: int64) { return c6(x) + 1 }
+fun c6(x: int64) { return c7(x) + 1 }
+fun c7(x: int64) { return c8(x) + 1 }
+fun c8(x: int64) { return c9(x) + 1 }
+fun c9(x: int64) { return c10(x) + 1 }
+fun c10(x: int64) { return c11(x) + 1 }
+fun c11(x: int64) { return c12(x) + 1 }
+fun c12(x: int64) { return c13(x) + 1 }
+fun c13(x: int64) { return c14(x) + 1 }
+fun c14(x: int64) { return c15(x) + 1 }
+fun c15(x: int64) { return c16(x) + 1 }
+fun c16(x: int64) { return c17(x) + 1 }
+fun c17(x: int64) { return c18(x) + 1 }
+fun c18(x: int64) { return c19(x) + 1 }
+fun c19(x: int64) { return c20(x) + 1 }
+fun c20(x: int64) { return c21(x) + 1 }
+fun c21(x: int64) { return c22(x) + 1 }
+fun c22(x: int64) { return c23(x) + 1 }
+fun c23(x: int64) { return c24(x) + 1 }
+fun c24(x: int64) { return c25(x) + 1 }
+fun c25(x: int64) { return c26(x) + 1 }
+fun c26(x: int64) { return c27(x) + 1 }
+fun c27(x: int64) { return c28(x) + 1 }
+fun c28(x: int64) { return c29(x) + 1 }
+fun c29(x: int64) { return c30(x) + 1 }
+fun c30(x: int64) { return c31(x) + 1 }
+fun c31(x: int64) { return c32(x) + 1 }
+fun c32(x: int64) { return c33(x) + 1 }
+fun c33(x: int64) { return c34(x) + 1 }
+fun c34(x: int64) { return c35(x) + 1 }
+fun c35(x: int64) { return c36(x) + 1 }
+fun c36(x: int64) { return c37(x) + 1 }
+fun c37(x: int64) { return c38(x) + 1 }
+fun c38(x: int64) { return c39(x) + 1 }
+fun c39(x: int64) { return c40(x) + 1 }
+fun c40(x: int64) { return c41(x) + 1 }
+fun c41(x: int64) { return c42(x) + 1 }
+fun c42(x: int64) { return c43(x) + 1 }
+fun c43(x: int64) { return c44(x) + 1 }
+fun c44(x: int64) { return c45(x) + 1 }
+fun c45(x: int64) { return c46(x) + 1 }
+fun c46(x: int64) { return c47(x) + 1 }
+fun c47(x: int64) { return c48(x) + 1 }
+fun c48(x: int64) { return c49(x) + 1 }
+fun c49(x: int64) { return c50(x) + 1 }
+fun c50(x: int64) { return c51(x) + 1 }
+fun c51(x: int64) { return c52(x) + 1 }
+fun c52(x: int64) { return c53(x) + 1 }
+fun c53(x: int64) { return c54(x) + 1 }
+fun c54(x: int64) { return c55(x) + 1 }
+fun c55(x: int64) { return c56(x) + 1 }
+fun c56(x: int64) { return c57(x) + 1 }
+fun c57(x: int64) { return c58(x) + 1 }
+fun c58(x: int64) { return c59(x) + 1 }
+fun c59(x: int64) { return c60(x) + 1 }
+fun c60(x: int64) { return c61(x) + 1 }
+fun c61(x: int64) { return c62(x) + 1 }
+fun c62(x: int64) { return c63(x) + 1 }
+fun c63(x: int64) { return c64(x) + 1 }
+fun c64(x: int64) { return c65(x) + 1 }
+fun c65(x: int64) { return c66(x) + 1 }
+fun c66(x: int64) { return c67(x) + 1 }
+fun c67(x: int64) { return c68(x) + 1 }
+fun c68(x: int64) { return c69(x) + 1 }
+fun c69(x: int64) { return x }
+
+fun main() {
+    println("chain = {c0(1)}")
+}

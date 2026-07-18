@@ -1,0 +1,17 @@
+// Baseline: one arithmetic hot loop directly in main, no user function calls.
+// Both pipelines must compile main before anything runs, so this measures raw
+// JIT code quality and startup on a minimal program; lazy and eager should be
+// nearly identical here.
+
+fun main() {
+    println("begin")
+    let x: int64 = 1
+    let acc: int64 = 0
+    let i: int64 = 0
+    while i < 150000000 {
+        x = (x * 48271) % 2147483647
+        acc = (acc + x) % 1000000007
+        i += 1
+    }
+    println("checksum = {acc}")
+}

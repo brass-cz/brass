@@ -112,7 +112,17 @@ normal native run:
 - a function no executed path reaches is not compiled;
 - functions reachable by a spawned task are compiled before that task starts.
 
-With `--eager`, the whole checked program is compiled as one optimized unit.
-This costs more before execution but enables direct calls and cross-function
-inlining. The [performance guide](/guides/performance/#when-to-use---eager)
-describes when that trade-off is useful.
+In a wide program (more than a few dozen concrete instances), first-use
+compilation works on small groups of functions rather than single ones:
+functions are grouped in discovery order, so a group's members tend to call
+each other, and entering any member compiles its whole group. Grouping
+amortizes the fixed per-compilation overhead that would otherwise dominate,
+while a group no executed path enters is still never compiled. A dead branch
+that shares a group with executed code may therefore be compiled; it still
+never runs.
+
+`--eager` uses the same first-use native compilation. Its difference is when
+checking happens, not what native code is produced: the complete check (and
+IR preparation for every checked instance) finishes before execution begins.
+The [performance guide](/guides/performance/#when-to-use---eager) describes
+when that is the right tool.

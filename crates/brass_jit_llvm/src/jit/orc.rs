@@ -195,13 +195,14 @@ impl MaterializerState {
         let symbols = unsafe {
             LLVMOrcMaterializationResponsibilityGetRequestedSymbols(responsibility, &mut count)
         };
-        let result = if count != 1 || symbols.is_null() {
-            Err(format!(
-                "lazy materialization expected one symbol, received {count}"
-            ))
+        let result = if count == 0 || symbols.is_null() {
+            Err("lazy materialization received no symbols".to_string())
         } else {
-            // SAFETY: the array has one element and its string-pool entry is
-            // retained for the duration of this callback.
+            // A grouped unit claims several implementations but one emitted
+            // module defines them all, so any requested member identifies the
+            // group; resolve through the first.
+            // SAFETY: the array has at least one element and its string-pool
+            // entry is retained for the duration of this callback.
             let name = unsafe {
                 let entry = *symbols;
                 CStr::from_ptr(LLVMOrcSymbolStringPoolEntryStr(entry))
@@ -466,30 +467,56 @@ impl OrcJit {
         self.define(unit)
     }
 
+    /// [`register_lazy_group`](Self::register_lazy_group) for one function.
+    /// Production callers always register groups; the single-symbol form
+    /// remains as the minimal harness for the materialization tests.
+    #[cfg(test)]
     pub(crate) fn register_lazy(&mut self, symbol: &str) -> Result<LazyFunction, String> {
-        let request = LazyFunction {
+        self.register_lazy_group(std::slice::from_ref(&symbol.to_string()))?;
+        Ok(LazyFunction {
             symbol: symbol.to_string(),
             implementation: lazy_implementation_symbol(symbol),
-        };
-        let impl_name = c_string(&request.implementation)?;
-        // SAFETY: this retained entry is consumed by the custom unit below.
-        let impl_entry = unsafe { LLVMOrcLLJITMangleAndIntern(self.jit, impl_name.as_ptr()) };
-        // Read the linker-mangled spelling before transferring the entry.
-        // SAFETY: `impl_entry` is retained and points at a NUL-terminated pool string.
-        let linker_name = unsafe {
-            CStr::from_ptr(LLVMOrcSymbolStringPoolEntryStr(impl_entry))
-                .to_string_lossy()
-                .into_owned()
-        };
-        self.state.requests.insert(linker_name, request.clone());
+        })
+    }
 
-        let mut provided = [LLVMOrcCSymbolFlagsMapPair {
-            Name: impl_entry,
-            Flags: callable_flags(),
-        }];
-        let unit_name = c_string(&format!("lazy:{}", request.symbol))?;
-        // SAFETY: the unit takes ownership of `impl_entry`; the callback context
-        // points at stable boxed state owned by this JIT.
+    /// Register a GROUP of lazily materialized functions: every symbol keeps
+    /// its own call-through stub (callers defer per function exactly as
+    /// before), but all of the group's implementations are claimed by one
+    /// materialization unit, satisfied by one emitted module that defines
+    /// them all. Entering any member's stub therefore compiles the whole
+    /// group at once, amortizing the per-module fixed cost (pass-pipeline
+    /// setup, instruction selection, linking) that dominates when many small
+    /// functions materialize individually.
+    pub(crate) fn register_lazy_group(&mut self, symbols: &[String]) -> Result<(), String> {
+        if symbols.is_empty() {
+            return Ok(());
+        }
+        let mut provided = Vec::with_capacity(symbols.len());
+        for symbol in symbols {
+            let request = LazyFunction {
+                symbol: symbol.clone(),
+                implementation: lazy_implementation_symbol(symbol),
+            };
+            let impl_name = c_string(&request.implementation)?;
+            // SAFETY: this retained entry is consumed by the custom unit below.
+            let impl_entry = unsafe { LLVMOrcLLJITMangleAndIntern(self.jit, impl_name.as_ptr()) };
+            // Read the linker-mangled spelling before transferring the entry.
+            // SAFETY: `impl_entry` is retained and points at a NUL-terminated pool string.
+            let linker_name = unsafe {
+                CStr::from_ptr(LLVMOrcSymbolStringPoolEntryStr(impl_entry))
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            self.state.requests.insert(linker_name, request);
+            provided.push(LLVMOrcCSymbolFlagsMapPair {
+                Name: impl_entry,
+                Flags: callable_flags(),
+            });
+        }
+        let unit_name = c_string(&format!("lazy:{}+{}", symbols[0], symbols.len() - 1))?;
+        // SAFETY: the unit takes ownership of every retained entry in
+        // `provided`; the callback context points at stable boxed state owned
+        // by this JIT.
         let implementation_unit = unsafe {
             LLVMOrcCreateCustomMaterializationUnit(
                 unit_name.as_ptr(),
@@ -504,18 +531,21 @@ impl OrcJit {
         };
         self.define(implementation_unit)?;
 
-        let public_name = c_string(&request.symbol)?;
-        let implementation_name = c_string(&request.implementation)?;
-        // SAFETY: both retained entries are consumed by `LLVMOrcLazyReexports`.
-        let mut aliases = [unsafe {
-            LLVMOrcCSymbolAliasMapPair {
-                Name: LLVMOrcLLJITMangleAndIntern(self.jit, public_name.as_ptr()),
-                Entry: LLVMOrcCSymbolAliasMapEntry {
-                    Name: LLVMOrcLLJITMangleAndIntern(self.jit, implementation_name.as_ptr()),
-                    Flags: callable_flags(),
-                },
-            }
-        }];
+        let mut aliases = Vec::with_capacity(symbols.len());
+        for symbol in symbols {
+            let public_name = c_string(symbol)?;
+            let implementation_name = c_string(&lazy_implementation_symbol(symbol))?;
+            // SAFETY: both retained entries are consumed by `LLVMOrcLazyReexports`.
+            aliases.push(unsafe {
+                LLVMOrcCSymbolAliasMapPair {
+                    Name: LLVMOrcLLJITMangleAndIntern(self.jit, public_name.as_ptr()),
+                    Entry: LLVMOrcCSymbolAliasMapEntry {
+                        Name: LLVMOrcLLJITMangleAndIntern(self.jit, implementation_name.as_ptr()),
+                        Flags: callable_flags(),
+                    },
+                }
+            });
+        }
         // SAFETY: all managers and the source dylib belong to this live JIT;
         // the unit takes ownership of the retained alias entries.
         let aliases = unsafe {
@@ -527,8 +557,7 @@ impl OrcJit {
                 aliases.len(),
             )
         };
-        self.define(aliases)?;
-        Ok(request)
+        self.define(aliases)
     }
 
     pub(crate) fn lookup(&mut self, symbol: &str) -> Result<usize, String> {
@@ -804,6 +833,91 @@ mod tests {
 
         assert_eq!(result, (22, 22, 11));
         assert_eq!(generated, ["bar", "foo"]);
+        jit.check_reported_errors().expect("no asynchronous errors");
+    }
+
+    /// A grouped registration keeps one stub per symbol but materializes the
+    /// whole group on the first call to any member: the one emitted module
+    /// defines every implementation, and a later call to another member finds
+    /// its body already linked without invoking Rust again.
+    #[test]
+    fn lazy_group_materializes_once_for_all_members() {
+        let context = OrcContext::new();
+        let mut jit = OrcJit::new(&context).expect("ORC JIT");
+        jit.register_lazy_group(&["foo".to_string(), "bar".to_string()])
+            .expect("group stubs");
+
+        let entry_module = context.context().create_module("entry_module");
+        let i32t = context.context().i32_type();
+        let callee_ty = i32t.fn_type(&[], false);
+        let entry_ty = i32t.fn_type(&[i32t.into()], false);
+        let entry = entry_module.add_function("entry", entry_ty, None);
+        let foo_decl = entry_module.add_function("foo", callee_ty, None);
+        let bar_decl = entry_module.add_function("bar", callee_ty, None);
+        let builder = context.context().create_builder();
+        let start = context.context().append_basic_block(entry, "start");
+        let call_foo = context.context().append_basic_block(entry, "call_foo");
+        let call_bar = context.context().append_basic_block(entry, "call_bar");
+        builder.position_at_end(start);
+        let choose_foo = builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                entry.get_nth_param(0).unwrap().into_int_value(),
+                i32t.const_zero(),
+                "choose_foo",
+            )
+            .unwrap();
+        builder
+            .build_conditional_branch(choose_foo, call_foo, call_bar)
+            .unwrap();
+        builder.position_at_end(call_foo);
+        let foo_value = builder
+            .build_call(foo_decl, &[], "foo_value")
+            .unwrap()
+            .try_as_basic_value()
+            .basic()
+            .unwrap();
+        builder.build_return(Some(&foo_value)).unwrap();
+        builder.position_at_end(call_bar);
+        let bar_value = builder
+            .build_call(bar_decl, &[], "bar_value")
+            .unwrap()
+            .try_as_basic_value()
+            .basic()
+            .unwrap();
+        builder.build_return(Some(&bar_value)).unwrap();
+        jit.add_eager_module(OrcModule::from_inkwell(entry_module))
+            .expect("entry module");
+
+        let mut generated = Vec::new();
+        let mut materialize = |request: &LazyFunction| {
+            generated.push(request.symbol.clone());
+            // One module defining BOTH implementations, whichever was asked.
+            let module = context.context().create_module("group");
+            let ty = context.context().i32_type().fn_type(&[], false);
+            for (name, value) in [("foo", 11u64), ("bar", 22u64)] {
+                let function = module.add_function(&lazy_implementation_symbol(name), ty, None);
+                let builder = context.context().create_builder();
+                builder.position_at_end(context.context().append_basic_block(function, "entry"));
+                builder
+                    .build_return(Some(&context.context().i32_type().const_int(value, false)))
+                    .unwrap();
+            }
+            Ok(OrcModule::from_inkwell(module))
+        };
+        type Entry = unsafe extern "C" fn(i32) -> i32;
+        let result = jit.with_materializer(&mut materialize, |jit| {
+            let address = jit.lookup("entry").expect("entry address");
+            // SAFETY: `entry` was emitted above with the matching C ABI.
+            let entry: Entry = unsafe { std::mem::transmute(address) };
+            // SAFETY: the JIT and callback remain installed for every call.
+            let first = unsafe { entry(0) };
+            let second = unsafe { entry(1) };
+            (first, second)
+        });
+
+        assert_eq!(result, (22, 11));
+        assert_eq!(generated, ["bar"]);
         jit.check_reported_errors().expect("no asynchronous errors");
     }
 }

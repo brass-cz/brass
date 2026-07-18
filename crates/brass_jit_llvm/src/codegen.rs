@@ -110,9 +110,13 @@ struct MirState<'ctx> {
     /// [`LlvmCodegen::instance_fn`] declares referenced instances on demand
     /// instead of `begin_program` declaring all of them into every module.
     lazy_signatures: Option<std::rc::Rc<HashMap<String, FunctionType<'ctx>>>>,
-    /// Unoptimized one-function modules waiting behind ORC call-through stubs.
-    /// Declared before `orc` so they are disposed while its context is live.
+    /// Unoptimized function-group modules waiting behind ORC call-through
+    /// stubs, keyed by the group's first public symbol. Declared before `orc`
+    /// so they are disposed while its context is live.
     lazy_modules: HashMap<String, OrcModule>,
+    /// Which group module defines each public symbol: entering any member's
+    /// stub materializes its whole group (see `OrcJit::register_lazy_group`).
+    lazy_groups: HashMap<String, String>,
     /// The warm lazy-run ORC session. Cold deferred-monomorphization runs keep
     /// using MCJIT until their mutable lowering service is migrated as well.
     orc: Option<OrcJit>,
@@ -2092,24 +2096,46 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         let signatures = std::rc::Rc::new(signatures);
         let region_barriers = brass_engine::program_uses_with(program);
 
+        // Small programs keep one module per function: materialization stays
+        // observable at function granularity (a dead runtime branch is never
+        // optimized or isel'd) and the per-module fixed cost is negligible at
+        // this size. Past the threshold that fixed cost (O2 pipeline setup,
+        // instruction selection, linking per module) dominates wide programs,
+        // so functions are grouped in monomorphization order -- demand order
+        // from the entry roots, so members of a group tend to call each
+        // other. One module (and one materialization) per group amortizes the
+        // fixed cost, and a sparse run still skips every group it never
+        // enters; only within an entered group does a dead branch now pay
+        // compilation it previously deferred.
+        const LAZY_GROUP_THRESHOLD: usize = 32;
+        const LAZY_GROUP_FUNCTIONS: usize = 16;
+        let group_size = if program.functions.len() > LAZY_GROUP_THRESHOLD {
+            LAZY_GROUP_FUNCTIONS
+        } else {
+            1
+        };
         let mut pending =
             HashMap::with_capacity_and_hasher(program.functions.len(), Default::default());
+        let mut groups =
+            HashMap::with_capacity_and_hasher(program.functions.len(), Default::default());
         let mut perf = brass_utils::PerfLog::start("back/codegen-fn");
-        for function in &program.functions {
-            let started = std::time::Instant::now();
-            let public = mangle_fn(&function.symbol);
-            let module = self.lazy_function_module(
+        for chunk in program.functions.chunks(group_size) {
+            let key = mangle_fn(&chunk[0].symbol);
+            let module = self.lazy_group_module(
                 program,
-                function,
-                &public,
+                chunk,
                 signatures.clone(),
                 region_barriers,
+                &mut perf,
             )?;
-            perf.item(function.symbol.clone(), started.elapsed());
-            pending.insert(public, module);
+            for function in chunk {
+                groups.insert(mangle_fn(&function.symbol), key.clone());
+            }
+            pending.insert(key, module);
         }
         perf.report();
         self.mir.lazy_modules = pending;
+        self.mir.lazy_groups = groups;
         self.mir.lazy_has_main = program.lookup("main").is_some();
         self.mir.lazy_precompile = brass_engine::spawn_precompile(program)
             .unwrap_or_default()
@@ -2140,8 +2166,9 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             )));
         jit.define_absolute(runtime_symbols)?;
         jit.add_eager_module(OrcModule::from_inkwell(support))?;
-        for function in &program.functions {
-            jit.register_lazy(&mangle_fn(&function.symbol))?;
+        for chunk in program.functions.chunks(group_size) {
+            let publics: Vec<String> = chunk.iter().map(|f| mangle_fn(&f.symbol)).collect();
+            jit.register_lazy_group(&publics)?;
         }
         Ok(())
     }
@@ -2161,10 +2188,12 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             .orc
             .take()
             .ok_or("execute called before lazy ORC preparation")?;
+        let groups = &self.mir.lazy_groups;
         let modules = &mut self.mir.lazy_modules;
         let mut materialize = |request: &crate::jit::orc::LazyFunction| {
+            let key = groups.get(&request.symbol).unwrap_or(&request.symbol);
             modules
-                .remove(&request.symbol)
+                .remove(key)
                 .ok_or_else(|| format!("lazy module for `{}` is unavailable", request.symbol))
         };
         let result = jit.with_materializer(&mut materialize, |jit| {
@@ -2197,13 +2226,18 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         result
     }
 
-    fn lazy_function_module(
+    /// Emit one lazy GROUP module: the bodies of `functions`, each defined
+    /// under its implementation symbol. A group-mate referenced by another
+    /// member resolves to the local definition directly (no stub round trip);
+    /// instances outside the group stay external declarations resolved
+    /// through their public stubs.
+    fn lazy_group_module(
         &self,
         program: &MonoProgram,
-        function: &MonoFunction,
-        public: &str,
+        functions: &[MonoFunction],
         signatures: std::rc::Rc<HashMap<String, FunctionType<'ctx>>>,
         region_barriers: bool,
+        perf: &mut brass_utils::PerfLog,
     ) -> Result<OrcModule, String> {
         let mut codegen = LlvmCodegen::new_backend(self.ctx, self.program);
         // Globals belong to the support module; this one only references them.
@@ -2211,14 +2245,23 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         codegen.mir.lazy_signatures = Some(signatures);
         codegen.region_barriers = region_barriers;
         codegen.declare_globals(program);
-        codegen.codegen_function(program, function);
-        let definition = codegen
-            .module
-            .get_function(public)
-            .ok_or_else(|| format!("generated function `{public}` is missing"))?;
-        definition
-            .as_global_value()
-            .set_name(&lazy_implementation_symbol(public));
+        for function in functions {
+            let started = std::time::Instant::now();
+            codegen.codegen_function(program, function);
+            perf.item(function.symbol.clone(), started.elapsed());
+        }
+        // Rename after every body is emitted: a member emitted later must
+        // still find the earlier definitions in the function map.
+        for function in functions {
+            let public = mangle_fn(&function.symbol);
+            let definition = codegen
+                .module
+                .get_function(&public)
+                .ok_or_else(|| format!("generated function `{public}` is missing"))?;
+            definition
+                .as_global_value()
+                .set_name(&lazy_implementation_symbol(&public));
+        }
         codegen.mark_small_functions_alwaysinline();
         codegen
             .module
