@@ -2,7 +2,7 @@
 //! Records use structural compatibility; sum types are
 //! nominal.
 
-use std::collections::HashMap;
+use fxhash::FxHashMap as HashMap;
 
 use brass_hir::{NominalType, Substitution, Type, passing_modes_match, split_passing_mode};
 

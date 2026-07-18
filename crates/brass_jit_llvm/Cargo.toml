@@ -7,6 +7,7 @@ edition.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+fxhash.workspace = true
 tracing.workspace = true
 brass_parser.workspace = true
 brass_hir.workspace = true

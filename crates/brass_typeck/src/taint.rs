@@ -14,7 +14,7 @@
 //! for a call that did not need it; under-tainting would surface as a
 //! mid-run restart, so precision loses to safety here.
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use brass_hir::{Program, TypeKind};
 use brass_parser::ast::Expr;
@@ -50,7 +50,7 @@ impl ExprVisitor for Calls<'_> {
 
 /// The names of every declared keyed (`-> infer!`) method.
 fn keyed_method_names(program: &Program) -> HashSet<String> {
-    let mut keyed_names: HashSet<String> = HashSet::new();
+    let mut keyed_names: HashSet<String> = HashSet::default();
     let mut each_method = |methods: &HashMap<String, brass_hir::MethodInfo>| {
         for (name, m) in methods {
             if brass_hir::keyed_return(m.decl.ret.as_ref()) {
@@ -110,7 +110,7 @@ pub fn has_keyed_calls(program: &Program) -> bool {
 pub(crate) fn keyed_reachable(program: &Program) -> HashSet<String> {
     let keyed_names = keyed_method_names(program);
     if keyed_names.is_empty() {
-        return HashSet::new();
+        return HashSet::default();
     }
 
     // Nodes: free functions (keyed by symbol) and methods (keyed by a
@@ -126,7 +126,7 @@ pub(crate) fn keyed_reachable(program: &Program) -> HashSet<String> {
         let mut v = Calls {
             keyed,
             direct: false,
-            names: HashSet::new(),
+            names: HashSet::default(),
         };
         walk::walk_block(body, &mut v);
         (v.direct, v.names)

@@ -10,7 +10,7 @@
 //! the language server converts everything to diagnostics and analyzes the
 //! recovered graph anyway.
 
-use std::collections::HashSet;
+use fxhash::FxHashSet as HashSet;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -116,8 +116,8 @@ pub fn assemble(entry_path: &Path, entry_src: &str, root: &Path, search: &Search
         .collect();
 
     let mut load_errors = Vec::new();
-    let mut visited = HashSet::new();
-    let mut stack = HashSet::new();
+    let mut visited = HashSet::default();
+    let mut stack = HashSet::default();
     for (target, span) in canonicalize_imports(&[], root, &mut entry_ast.imports, search) {
         load_module(
             &target,

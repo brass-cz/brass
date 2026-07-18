@@ -2,7 +2,7 @@
 //! finding the identifier under the cursor, finding the tightest typed
 //! expression at an offset, and turning a global span into an LSP `Location`.
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use brass_hir::{FunInfo, Type, TypedExpr, TypedExprKind};
 use brass_parser::ast::{
@@ -325,7 +325,7 @@ pub fn collect_bindings(generic: &Type, concrete: &Type, out: &mut HashMap<u32, 
 
 /// The inference variable ids occurring anywhere in `ty`.
 pub fn free_vars(ty: &Type) -> HashSet<u32> {
-    let mut vars = HashSet::new();
+    let mut vars = HashSet::default();
     fn go(ty: &Type, vars: &mut HashSet<u32>) {
         match ty {
             Type::Unknown(id) => {

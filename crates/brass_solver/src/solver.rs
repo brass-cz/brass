@@ -8,7 +8,7 @@
 //! stays with the checker's counter (kept in sync with the ids HIR already
 //! assigned), so `record_var` registers a kind for an externally minted id.
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use brass_hir::{NominalType, Substitution, Type};
 
@@ -72,7 +72,7 @@ impl Solver {
     pub fn new() -> Self {
         Self {
             subst: Subst::new(),
-            var_kinds: HashMap::new(),
+            var_kinds: HashMap::default(),
             next_var: 0,
         }
     }
@@ -105,7 +105,7 @@ impl Solver {
     /// variables are followed and excluded). Recurses into every type component,
     /// including a nominal type's generic substitution (e.g. `Result` payloads).
     pub fn free_vars(&self, ty: &Type) -> HashSet<u32> {
-        let mut out = HashSet::new();
+        let mut out = HashSet::default();
         self.collect_free(ty, &mut out);
         out
     }
@@ -280,7 +280,7 @@ mod tests {
         let mut solver = Solver::new();
         let v = solver.fresh(InferenceVarKind::Source);
         let id_ty = Type::Fun(vec![v.clone()], Box::new(v.clone()));
-        let scheme = solver.generalize(&HashSet::new(), &id_ty);
+        let scheme = solver.generalize(&HashSet::default(), &id_ty);
         assert_eq!(scheme.vars.len(), 1, "the one free var is generalized");
 
         let Type::Fun(p1, r1) = solver.instantiate(&scheme) else {
@@ -327,7 +327,7 @@ mod tests {
         let mut solver = Solver::new();
         let t = solver.fresh(InferenceVarKind::Source);
         let res = Type::result(t.clone(), Type::Str);
-        let scheme = solver.generalize(&HashSet::new(), &res);
+        let scheme = solver.generalize(&HashSet::default(), &res);
         assert_eq!(scheme.vars.len(), 1);
         let inst = solver.instantiate(&scheme);
         let (ok, err) = match &inst {

@@ -5,7 +5,8 @@
 //! `unknown_N` (see [`crate::render`]), which is the contract for displaying a
 //! function type that inference has left partly open.
 
-use std::collections::{BTreeMap, HashMap};
+use fxhash::FxHashMap as HashMap;
+use std::collections::BTreeMap;
 
 use brass_hir::{
     CallableSignature, NominalType, Substitution, Type, TypeInfo, TypeKind, TypeScheme,
@@ -428,7 +429,7 @@ pub(crate) fn typedef_method_signatures(
     info: &TypeInfo,
     substitution: &Substitution,
 ) -> HashMap<String, CallableSignature> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     let Some(scheme) = full.schemes.get(&info.name) else {
         return out;
     };

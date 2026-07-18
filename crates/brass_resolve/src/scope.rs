@@ -1,7 +1,7 @@
 //! A generic lexical scope chain used for name resolution by later passes
 //! (type checking and code generation).
 
-use std::collections::HashMap;
+use fxhash::FxHashMap as HashMap;
 
 pub struct Scope<T> {
     frames: Vec<HashMap<String, T>>,
@@ -10,7 +10,7 @@ pub struct Scope<T> {
 impl<T> Default for Scope<T> {
     fn default() -> Self {
         Scope {
-            frames: vec![HashMap::new()],
+            frames: vec![HashMap::default()],
         }
     }
 }
@@ -21,7 +21,7 @@ impl<T> Scope<T> {
     }
 
     pub fn push(&mut self) {
-        self.frames.push(HashMap::new());
+        self.frames.push(HashMap::default());
     }
 
     pub fn pop(&mut self) {

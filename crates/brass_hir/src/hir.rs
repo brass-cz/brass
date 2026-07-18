@@ -3,7 +3,7 @@
 //! runtime. Records and sum types keep their members (as AST nodes, lowered
 //! on demand by codegen); this is the "typed HIR" the back end consumes.
 
-use std::collections::HashMap;
+use fxhash::FxHashMap as HashMap;
 use std::rc::Rc;
 
 use brass_parser::Span;
@@ -304,7 +304,7 @@ pub struct Program {
     /// their public names are visible in every module with no import. All other
     /// cross-module names -- including the nested standard-library modules --
     /// are visible only where imported.
-    pub prelude_modules: std::collections::HashSet<Vec<String>>,
+    pub prelude_modules: fxhash::FxHashSet<Vec<String>>,
     /// Names each module brings into scope via `import` (the bare names from
     /// every `import a.b.{ x, y }` in that module). Used by name resolution to
     /// enforce per-module visibility: a public name defined in another module

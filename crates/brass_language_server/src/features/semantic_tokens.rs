@@ -7,7 +7,7 @@
 //! parse of the document. Line comments -- which the lexer discards -- are
 //! recovered by a direct scan so they highlight too.
 
-use std::collections::HashSet;
+use fxhash::FxHashSet as HashSet;
 
 use brass_parser::ast::{Member, Module, TopLevel, TypeBody};
 use brass_parser::parse;

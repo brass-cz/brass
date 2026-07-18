@@ -19,7 +19,8 @@
 //! into monomorphization, the real program lookups. Unresolved positions bind a
 //! fresh variable so the surrounding constraints still solve.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use fxhash::FxHashMap as HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use brass_hir::{FloatKind, IntKind, Program, Type, TypeInfo, TypeKind};
 use brass_mir::{Literal, MirBody, MirStmt, Operand, Place, Projection, Rvalue, Terminator};
@@ -345,7 +346,7 @@ impl BodyTyper {
             solver: Solver::new(),
             locals: Vec::new(),
             lits: Vec::new(),
-            requirements: HashMap::new(),
+            requirements: HashMap::default(),
             errors: Vec::new(),
         }
     }

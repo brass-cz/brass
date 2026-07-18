@@ -9,8 +9,8 @@
 //! untouched items are carried over from the previous version, their spans
 //! shifted by the byte delta their (byte-identical) source moved.
 
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use brass_parser::Span;
@@ -70,7 +70,7 @@ pub fn split(module: &Module, main_src: &str, base: usize) -> Vec<Item> {
     for top in &module.items {
         match top {
             TopLevel::Fun(f) => {
-                let mut refs = HashSet::new();
+                let mut refs = HashSet::default();
                 for p in &f.params {
                     refs_param(p, &mut refs);
                 }
@@ -88,7 +88,7 @@ pub fn split(module: &Module, main_src: &str, base: usize) -> Vec<Item> {
                 ));
             }
             TopLevel::Type(t) => {
-                let mut refs = HashSet::new();
+                let mut refs = HashSet::default();
                 refs_type_decl(t, &mut refs);
                 items.push(make_item(
                     t.name.clone(),
@@ -107,8 +107,8 @@ pub fn split(module: &Module, main_src: &str, base: usize) -> Vec<Item> {
         for s in &init_stmts[1..] {
             span = span.merge(s.span());
         }
-        let mut refs = HashSet::new();
-        let mut defines = HashSet::new();
+        let mut refs = HashSet::default();
+        let mut defines = HashSet::default();
         for s in &init_stmts {
             refs_stmt(s, &mut refs);
             collect_stmt_defines(s, &mut defines);
@@ -135,7 +135,7 @@ fn make_item(
     let text = main_src.get(lo..hi).unwrap_or("");
     let mut h = DefaultHasher::new();
     text.hash(&mut h);
-    let mut defines = HashSet::new();
+    let mut defines = HashSet::default();
     defines.insert(name.clone());
     Item {
         name,
@@ -222,8 +222,8 @@ pub fn diff(prev: &ItemCache, new_items: &[Item]) -> Diff {
     // Changed = source hash differs from the same-named previous item. Collect the
     // names those changed items *define* (an item's own name, or the globals of a
     // changed `<init>`), so a user of a changed global is re-checked too.
-    let mut changed_names: HashSet<&str> = HashSet::new();
-    let mut changed_defs: HashSet<&str> = HashSet::new();
+    let mut changed_names: HashSet<&str> = HashSet::default();
+    let mut changed_defs: HashSet<&str> = HashSet::default();
     for (name, &i) in &new_by_name {
         let pi = prev_by_name[name];
         if new_items[i].hash != prev.items[pi].hash {
@@ -236,7 +236,7 @@ pub fn diff(prev: &ItemCache, new_items: &[Item]) -> Diff {
 
     // Affected = changed items plus every item that references a name *defined* by a
     // changed item.
-    let mut affected: HashSet<usize> = HashSet::new();
+    let mut affected: HashSet<usize> = HashSet::default();
     for (name, &i) in &new_by_name {
         let is_changed = changed_names.contains(name.as_str());
         let uses_changed = new_items[i]
@@ -296,7 +296,7 @@ fn forward_closure(
 }
 
 fn index_by_name(items: &[Item]) -> HashMap<String, usize> {
-    let mut map = HashMap::new();
+    let mut map = HashMap::default();
     for (i, it) in items.iter().enumerate() {
         map.insert(it.name.clone(), i);
     }
@@ -307,7 +307,7 @@ fn index_by_name(items: &[Item]) -> HashMap<String, usize> {
 /// the `<init>` item declares), for resolving an item's `refs` to the item that
 /// provides the name.
 fn index_by_defines(items: &[Item]) -> HashMap<String, usize> {
-    let mut map = HashMap::new();
+    let mut map = HashMap::default();
     for (i, it) in items.iter().enumerate() {
         for d in &it.defines {
             map.insert(d.clone(), i);

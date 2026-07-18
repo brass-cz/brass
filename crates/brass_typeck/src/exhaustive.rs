@@ -2,7 +2,7 @@
 //! of a sum type must cover every variant unless a catch-all (wildcard or
 //! whole-value binding) is present.
 
-use std::collections::HashSet;
+use fxhash::FxHashSet as HashSet;
 
 use brass_hir::{Program, Type, TypeInfo, TypeKind, TypedProgram, peel_modes};
 use brass_parser::Span;
@@ -119,7 +119,7 @@ impl ExhaustiveVisitor<'_> {
     /// checking every distinct nominal id keeps a polymorphic match safe for all
     /// of them instead of letting the last sidecar entry decide coverage.
     fn scrutinee_sum_ids(&self, scrutinee: &Expr) -> Vec<i32> {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         self.typed
             .expressions
             .iter()
@@ -137,7 +137,7 @@ impl ExhaustiveVisitor<'_> {
             return;
         };
         let all: Vec<String> = variants.iter().map(|v| v.name.clone()).collect();
-        let mut covered: HashSet<String> = HashSet::new();
+        let mut covered: HashSet<String> = HashSet::default();
         let mut catch_all = false;
         for a in arms {
             match &a.pattern {

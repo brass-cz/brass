@@ -8,8 +8,8 @@
 //! they reach another thread (moved when unique, frozen when read-only, or cowned
 //! when mutated), so transferring the closure pointer across threads is sound.
 
+use fxhash::FxHashMap as HashMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -26,7 +26,7 @@ thread_local! {
     /// closure body and the spawner's own access) does not deadlock against the
     /// non-recursive spinlock. Reentrancy is inherently per-thread, so a
     /// thread-local needs no synchronization and adds no cross-thread contention.
-    static LOCK_DEPTH: RefCell<HashMap<usize, u32>> = RefCell::new(HashMap::new());
+    static LOCK_DEPTH: RefCell<HashMap<usize, u32>> = RefCell::new(HashMap::default());
 }
 
 /// The current thread's reentrancy depth for `obj`.

@@ -465,7 +465,7 @@ impl<'a> Checker<'a> {
             return None;
         }
         let scheme = self.schemes.get(n.name())?.clone();
-        let mut map: HashMap<u32, Type> = HashMap::new();
+        let mut map: HashMap<u32, Type> = HashMap::default();
         for p in &scheme.params {
             let fresh = self.fresh_unknown();
             map.insert(*p, fresh);

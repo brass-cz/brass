@@ -25,7 +25,7 @@ pub(super) fn const_type(lit: &brass_mir::Literal) -> Result<Type, String> {
 /// Whether a type is in the typed back end's scope: scalars, and records whose
 /// fields are all supported (a fully-resolved field-type substitution).
 pub(super) fn is_supported(ty: &Type) -> bool {
-    is_supported_rec(ty, &mut HashSet::new())
+    is_supported_rec(ty, &mut HashSet::default())
 }
 
 /// `is_supported` with a guard against self-referential record types (e.g.
@@ -83,7 +83,7 @@ pub(super) fn resolve_nominal(program: &Program, ty: &Type) -> Type {
             _ => ty.clone(),
         }
     }
-    go(program, ty, &mut HashSet::new())
+    go(program, ty, &mut HashSet::default())
 }
 
 /// Whether a sum variant's field can be laid out by the typed back end. An

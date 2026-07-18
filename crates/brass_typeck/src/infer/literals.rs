@@ -93,7 +93,7 @@ impl<'a> Checker<'a> {
         scopes: &mut ScopeStack,
     ) -> Substitution {
         let mut substitution = Substitution::empty();
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         for (name, expr) in fields {
             if !seen.insert(name) {
                 self.errors.push(TypeError {

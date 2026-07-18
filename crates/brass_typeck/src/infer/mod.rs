@@ -8,7 +8,7 @@
 //! can still be deferred to the runtime without accepting contradictions against
 //! explicit types.
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::rc::Rc;
 
 use brass_hir::{
@@ -413,13 +413,51 @@ impl Checker<'_> {
     }
 }
 
-fn check_method_bodies(checker: &mut Checker, program: &Program) {
+/// Whether the scheme pre-pass can skip co-checking `info`'s method bodies:
+/// the pre-pass exists only to build [`TypeScheme`]s, so any body whose check
+/// cannot influence a scheme is wasted work there. Sums never contribute (a
+/// scheme is record-only). A record whose fields and bodied method signatures
+/// (parameters and annotated returns) all resolve to fully-known types
+/// generalizes to a parameterless scheme the declarations already spell out
+/// -- the co-check would only link inference variables that do not exist.
+/// An unannotated return keeps the co-check: its full-pass reconciliation can
+/// differ in shape from the precomputed light-pass type the scheme would
+/// otherwise fall back to.
+fn scheme_pass_skips(info: &TypeInfo) -> bool {
+    match &info.kind {
+        TypeKind::Sum { .. } => true,
+        TypeKind::Record { fields, methods } => {
+            fields.iter().all(|f| {
+                f.resolved_ty
+                    .as_ref()
+                    .is_some_and(brass_hir::is_fully_known)
+            }) && methods.values().all(|m| {
+                m.decl.body.is_none()
+                    || (m.signature.params.iter().all(|p| {
+                        p.name == "self"
+                            || p.resolved_ty
+                                .as_ref()
+                                .is_some_and(brass_hir::is_fully_known)
+                    }) && m
+                        .signature
+                        .ret_ty
+                        .as_ref()
+                        .is_some_and(brass_hir::is_fully_known))
+            })
+        }
+    }
+}
+
+fn check_method_bodies(checker: &mut Checker, program: &Program, schemes_only: bool) {
     let mut perf = brass_utils::PerfLog::start("typeck/method-body");
     checker.co_checking = true;
     for t in program.types.values() {
         // A seeded run reads the context's schemes and co-checked returns from
         // the seed; only the entry's own types are co-checked here.
         if checker.seeded_module(&t.module) {
+            continue;
+        }
+        if schemes_only && scheme_pass_skips(t) {
             continue;
         }
         checker.current_module = t.module.clone();
@@ -514,7 +552,7 @@ fn seed_schemes(
     pre.precompute_global_bindings();
     pre.precompute_function_returns();
     pre.precompute_method_returns();
-    check_method_bodies(&mut pre, program);
+    check_method_bodies(&mut pre, program, true);
     pre.build_schemes()
 }
 
@@ -588,7 +626,7 @@ pub(crate) fn analyze_inner(
     // free of any concrete use. The bodies below are checked against the seeded
     // schemes; this rebuild replaces them with the ones this pass linked.
     let t = std::time::Instant::now();
-    check_method_bodies(&mut checker, program);
+    check_method_bodies(&mut checker, program, false);
     checker.schemes = checker.build_schemes();
     phase("typeck/method-bodies", t);
     if let Some(ctl) = ctl.as_deref_mut() {
@@ -615,7 +653,7 @@ pub(crate) fn analyze_inner(
             checker.in_entry_main = false;
 
             let t = std::time::Instant::now();
-            checker.const_scopes = vec![HashSet::new()];
+            checker.const_scopes = vec![HashSet::default()];
             for init in &program.inits {
                 check_init_body(&mut checker, init);
             }
@@ -656,7 +694,7 @@ pub(crate) fn analyze_inner(
             // inits are the entry code the lazy driver needs first, in
             // execution (module-load) order.
             let t = std::time::Instant::now();
-            checker.const_scopes = vec![HashSet::new()];
+            checker.const_scopes = vec![HashSet::default()];
             for (i, init) in program.inits.iter().enumerate() {
                 // A resumed run's snapshot settled the leading inits: their
                 // delivered state was seeded, so announce and move on.
@@ -695,16 +733,16 @@ pub(crate) fn analyze_inner(
                 }
                 symbols.into()
             };
-            let mut done: HashSet<String> = HashSet::new();
+            let mut done: HashSet<String> = HashSet::default();
             // The concrete argument types each priority request carried: the
             // demanded body is checked at ITS INSTANCE (see
             // `check_function_body_at`) rather than the open signature frame.
             // A queue body without a request keeps the definitional pass.
-            let mut demanded_at: HashMap<String, Vec<Type>> = HashMap::new();
+            let mut demanded_at: HashMap<String, Vec<Type>> = HashMap::default();
             // Bodies the consumer explicitly asked for. These are the only
             // ones checked while the scheduler is paused; `main` counts as
             // requested (the gate waits on it without sending a request).
-            let mut priority: HashSet<String> = HashSet::new();
+            let mut priority: HashSet<String> = HashSet::default();
             priority.insert("main".to_string());
             let mut perf = brass_utils::PerfLog::start("typeck/fn-bodies");
             loop {
@@ -727,9 +765,7 @@ pub(crate) fn analyze_inner(
                         done.remove(&request.symbol);
                     }
                     if fresh || revived {
-                        if !request.type_args.is_empty() {
-                            demanded_at.insert(request.symbol.clone(), request.type_args);
-                        }
+                        demanded_at.insert(request.symbol.clone(), request.type_args);
                         priority.insert(request.symbol.clone());
                         queue.push_front(request.symbol);
                     }
@@ -779,13 +815,19 @@ pub(crate) fn analyze_inner(
                     continue;
                 }
                 let fn_started = std::time::Instant::now();
-                match &instance_args {
+                let instance_ret = match &instance_args {
                     Some(args) => check_function_body_at(&mut checker, &symbol, f, args),
-                    None => check_function_body(&mut checker, &symbol, f),
-                }
+                    None => {
+                        check_function_body(&mut checker, &symbol, f);
+                        None
+                    }
+                };
                 let errs = crate::exhaustive::check_block(program, &checker.typed, &f.decl.body);
                 checker.errors.extend(errs);
                 perf.item(symbol.clone(), fn_started.elapsed());
+                if let (Some(args), Some(ret)) = (instance_args, instance_ret) {
+                    checker.instance_returns.insert((symbol.clone(), args), ret);
+                }
                 let delta = flush_delta(&checker, &mut ctl.state, false);
                 ctl.sched.emit(stream::CheckEvent::BodyChecked(
                     stream::BodyId::Function(symbol),
@@ -995,13 +1037,36 @@ fn contains_structural_record(ty: &Type) -> bool {
     }
 }
 
-fn check_function_body_at(checker: &mut Checker, symbol: &str, f: &FunInfo, arg_types: &[Type]) {
+/// Check a demanded body at its concrete instance. Returns the instance's
+/// resolved return type when it can serve as a runtime-deferral contract:
+/// the body is UNANNOTATED (an annotation is already a contract), the pass
+/// reported no new errors, and the reconciled return resolved fully known.
+/// The caller streams it to the consumer, whose monomorphizer may then
+/// compile call sites to this instance as runtime-resolved calls without
+/// lowering the body at all -- the fallibility guard (`!`/`error()` bodies
+/// change the ABI away from this plain return) lives on the consumer side,
+/// next to the annotated deferral's identical rule.
+fn check_function_body_at(
+    checker: &mut Checker,
+    symbol: &str,
+    f: &FunInfo,
+    arg_types: &[Type],
+) -> Option<Type> {
     tracing::debug!(function = %f.signature.name, "inferring function body at demanded types");
     checker.current_module = f.module.clone();
     let frame = checker.signature_call_frame(&f.signature.params, arg_types, &[], None);
     let mut scopes = vec![frame];
     checker.in_entry_main = symbol == "main";
-    checker.check_block_root(&f.decl.body, &mut scopes, f.signature.ret_ty.as_ref());
+    let errors_before = checker.errors.len();
+    let full = checker.check_block_root(&f.decl.body, &mut scopes, f.signature.ret_ty.as_ref());
+    if f.signature.ret_ty.is_some() || checker.errors.len() != errors_before {
+        return None;
+    }
+    // Only a reconciled full return serves as a contract. `None` covers more
+    // than one shape (no returns at all, a propagating body whose shape only
+    // the light assembly builds), so no contract is claimed for it.
+    let ret = checker.resolve(&full?);
+    brass_hir::is_fully_known(&ret).then_some(ret)
 }
 
 /// One module initializer's dedicated pass -- the per-init core both body
@@ -1023,7 +1088,7 @@ fn check_init_body(checker: &mut Checker, init: &ModuleInit) {
         .stmts
         .iter()
         .flat_map(|s| {
-            let mut acc = HashSet::new();
+            let mut acc = HashSet::default();
             collect_closure_writes_stmt(s, false, &mut acc);
             acc
         })
@@ -1145,6 +1210,17 @@ fn flush_delta(
     for span in poisoned {
         state.typeof_types.remove(&span);
         delta.typeof_types_removed.push(span);
+    }
+    // Clean call-site elaborations can discover contracts for nested
+    // unannotated callees before their dedicated body pass. Stream each new
+    // instance so runtime resolution can keep the whole call chain deferred.
+    for (key, ret) in &checker.instance_returns {
+        if state.instance_returns.get(key) != Some(ret) {
+            delta
+                .instance_returns
+                .push((key.0.clone(), key.1.clone(), ret.clone()));
+            state.instance_returns.insert(key.clone(), ret.clone());
+        }
     }
     // The errors reported in this window (raw report order; the final
     // analysis sorts and dedups the full set).
@@ -1286,7 +1362,11 @@ struct Checker<'a> {
     /// caller's own variables, an open return must stay the shared table entry
     /// so later pinning reaches every reader, and an erroring body keeps
     /// reporting at every call site.
-    elaboration_memo: HashMap<String, Type>,
+    elaboration_memo: HashMap<(String, Vec<Type>), Type>,
+    /// Fully-known returns from clean call-site elaborations of unannotated
+    /// functions. Unlike the memo, these are part of the streaming contract:
+    /// nested callees can remain runtime-deferred when their caller resolves.
+    instance_returns: HashMap<(String, Vec<Type>), Type>,
     /// Free functions that can transitively reach a reflective keyed
     /// (`-> infer!`) method call (see `taint::keyed_reachable`). The lazy
     /// profile never types a call to one from its signature alone: the keyed
@@ -1419,22 +1499,22 @@ impl<'a> Checker<'a> {
             return_contexts: Vec::new(),
             return_values: Vec::new(),
             last_returns: Vec::new(),
-            global_defs: HashMap::new(),
-            global_scopes: HashMap::new(),
-            function_returns: HashMap::new(),
-            method_returns: HashMap::new(),
-            method_return_props: HashSet::new(),
-            co_method_returns: HashMap::new(),
+            global_defs: HashMap::default(),
+            global_scopes: HashMap::default(),
+            function_returns: HashMap::default(),
+            method_returns: HashMap::default(),
+            method_return_props: HashSet::default(),
+            co_method_returns: HashMap::default(),
             co_checking: false,
             current_co_method: None,
-            co_return_links: HashMap::new(),
-            instantiating: HashSet::new(),
+            co_return_links: HashMap::default(),
+            instantiating: HashSet::default(),
             entry_only: false,
-            recursed: HashSet::new(),
-            error_sites: HashSet::new(),
+            recursed: HashSet::default(),
+            error_sites: HashSet::default(),
             elaborations: 0,
             elaboration_budget_reported: false,
-            shape_constraints: HashMap::new(),
+            shape_constraints: HashMap::default(),
             solver: {
                 // Fresh variables must not collide with the ids lowering
                 // embedded in the program's resolved types (see
@@ -1446,32 +1526,33 @@ impl<'a> Checker<'a> {
                 s
             },
             current_module: Vec::new(),
-            reported_result_shadow: HashSet::new(),
+            reported_result_shadow: HashSet::default(),
             lazy_profile: false,
-            elaboration_memo: HashMap::new(),
-            keyed_tainted: HashSet::new(),
+            elaboration_memo: HashMap::default(),
+            instance_returns: HashMap::default(),
+            keyed_tainted: HashSet::default(),
             seeded_set: None,
-            generic_error_returns: HashSet::new(),
-            schemes: HashMap::new(),
+            generic_error_returns: HashSet::default(),
+            schemes: HashMap::default(),
             fixed_array_binding: false,
             call_expected: None,
-            keyed_calls: HashMap::new(),
-            typeof_types: HashMap::new(),
-            typeof_poisoned: HashSet::new(),
-            prop_kinds: HashMap::new(),
-            sum_view_seen: HashMap::new(),
-            sum_view_poisoned: HashSet::new(),
-            lift_kinds: HashMap::new(),
-            lift_poisoned: HashSet::new(),
+            keyed_calls: HashMap::default(),
+            typeof_types: HashMap::default(),
+            typeof_poisoned: HashSet::default(),
+            prop_kinds: HashMap::default(),
+            sum_view_seen: HashMap::default(),
+            sum_view_poisoned: HashSet::default(),
+            lift_kinds: HashMap::default(),
+            lift_poisoned: HashSet::default(),
             narrowed_bindings: Vec::new(),
-            closure_write_targets: HashSet::new(),
+            closure_write_targets: HashSet::default(),
             rows: brass_typesys::RowInfo::analyze(program),
-            view_args: HashSet::new(),
-            lift_errs: HashSet::new(),
-            sum_views: HashMap::new(),
-            fields_loops: HashMap::new(),
-            type_names: HashMap::new(),
-            null_props: HashSet::new(),
+            view_args: HashSet::default(),
+            lift_errs: HashSet::default(),
+            sum_views: HashMap::default(),
+            fields_loops: HashMap::default(),
+            type_names: HashMap::default(),
+            null_props: HashSet::default(),
             in_entry_main: false,
             static_divergence: false,
         }
@@ -1575,7 +1656,7 @@ impl<'a> Checker<'a> {
         scopes: &mut ScopeStack,
         ret: Option<&Type>,
     ) -> Option<Type> {
-        let saved = std::mem::replace(&mut self.const_scopes, vec![HashSet::new()]);
+        let saved = std::mem::replace(&mut self.const_scopes, vec![HashSet::default()]);
         let saved_narrowed = std::mem::take(&mut self.narrowed_bindings);
         let saved_closure_writes = std::mem::replace(
             &mut self.closure_write_targets,
@@ -1641,8 +1722,8 @@ impl<'a> Checker<'a> {
     /// only a condition whose truthiness the type alone decides (a present member
     /// vs an absent one) can make a fall-through dead.
     fn check_block(&mut self, b: &Block, scopes: &mut ScopeStack) {
-        scopes.push(HashMap::new());
-        self.const_scopes.push(HashSet::new());
+        scopes.push(HashMap::default());
+        self.const_scopes.push(HashSet::default());
         let mut unreachable = false;
         for s in &b.stmts {
             let mark = self.errors.len();
@@ -1939,8 +2020,8 @@ impl<'a> Checker<'a> {
                     });
                     self.fresh_unknown()
                 });
-                scopes.push(HashMap::new());
-                self.const_scopes.push(HashSet::new());
+                scopes.push(HashMap::default());
+                self.const_scopes.push(HashSet::default());
                 // Check the loop variable's pattern against the element type, so a
                 // destructuring of the wrong arity is a diagnostic here rather than
                 // an out-of-bounds tuple read in the back end.

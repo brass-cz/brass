@@ -4,7 +4,6 @@
 //! address into the runtime dispatch tables, and runs the program (module
 //! initializers in order, then `main`).
 
-use inkwell::context::Context;
 use inkwell::execution_engine::ExecutionEngine;
 use inkwell::module::Module;
 
@@ -20,15 +19,15 @@ use brass_runtime::symbols;
 #[allow(clippy::too_many_arguments)] // mirrors the checker's channel outputs
 pub fn run(
     program: &Program,
-    expr_types: &std::collections::HashMap<brass_hir::Span, brass_hir::Type>,
-    view_args: &std::collections::HashSet<brass_hir::Span>,
-    sum_views: &std::collections::HashMap<brass_hir::Span, brass_hir::Type>,
-    call_locations: &std::collections::HashMap<brass_hir::Span, (String, u32, u32)>,
-    lift_errs: &std::collections::HashSet<brass_hir::Span>,
-    fields_loops: &std::collections::HashMap<brass_hir::Span, Vec<String>>,
-    type_names: &std::collections::HashMap<brass_hir::Span, String>,
-    typeof_types: &std::collections::HashMap<brass_hir::Span, brass_hir::Type>,
-    null_props: &std::collections::HashSet<brass_hir::Span>,
+    expr_types: &fxhash::FxHashMap<brass_hir::Span, brass_hir::Type>,
+    view_args: &fxhash::FxHashSet<brass_hir::Span>,
+    sum_views: &fxhash::FxHashMap<brass_hir::Span, brass_hir::Type>,
+    call_locations: &fxhash::FxHashMap<brass_hir::Span, (String, u32, u32)>,
+    lift_errs: &fxhash::FxHashSet<brass_hir::Span>,
+    fields_loops: &fxhash::FxHashMap<brass_hir::Span, Vec<String>>,
+    type_names: &fxhash::FxHashMap<brass_hir::Span, String>,
+    typeof_types: &fxhash::FxHashMap<brass_hir::Span, brass_hir::Type>,
+    null_props: &fxhash::FxHashSet<brass_hir::Span>,
 ) -> Result<(), String> {
     let mir = lower_checked(
         program,
@@ -58,13 +57,20 @@ pub fn run(
 /// Compile and run an already-monomorphized program: the back half of
 /// [`run`], shared with the lazy pipeline (which builds its `MonoProgram`
 /// through demand-driven lowering instead of the whole-program pass).
-/// Rejects a program whose `main` fell outside the typed subset, builds one
-/// LLVM context/backend, and drives codegen + execution.
+/// Rejects a program whose `main` fell outside the typed subset, then
+/// compiles and executes through the same ORC per-function pipeline the
+/// warm lazy path uses: IR is still emitted for every instance up front
+/// (so codegen-level refusals keep their whole-program coverage), but
+/// optimization and instruction selection run on demand, so an eager run
+/// no longer pays a full-module finalize for functions it never executes.
+/// The single-module MCJIT sequence survives only inside the cold
+/// deferred-monomorphization path, which the ORC session cannot host yet.
 pub fn run_mono(program: &Program, mono: &brass_engine::MonoProgram) -> Result<(), String> {
     require_main(program, mono)?;
-    let context = Context::create();
-    let mut backend = crate::LlvmCodegen::new_backend(&context, program);
-    brass_engine::Engine::run(&mut backend, mono)
+    let context = crate::jit::orc::OrcContext::new();
+    let mut backend = crate::LlvmCodegen::new_backend(context.context(), program);
+    backend.prepare_lazy_orc(&context, mono)?;
+    backend.execute_lazy_orc()
 }
 
 /// Compile and run an already-checked program through the lazy JIT.
@@ -85,7 +91,7 @@ pub fn run_lazy(program: &Program, channels: &brass_mir::CheckerChannels) -> Res
                 // report actionable.
                 let mut demands: Vec<String> = missing
                     .iter()
-                    .map(|(base, args)| {
+                    .map(|(base, args, _)| {
                         let args: Vec<String> = args.iter().map(|t| t.display()).collect();
                         format!("{base}({})", args.join(", "))
                     })

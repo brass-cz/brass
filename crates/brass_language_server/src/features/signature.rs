@@ -8,7 +8,7 @@
 //! unknown_0 = int32, unknown_1 = string
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use brass_hir::{FunInfo, Type};
 
@@ -101,7 +101,7 @@ pub fn function_markdown(full: &FullAnalysis, f: &FunInfo, call_args: Option<&[T
 
     // Bind the signature's variables to the concrete arguments of the call
     // under the cursor.
-    let mut bound: HashMap<u32, Type> = HashMap::new();
+    let mut bound: HashMap<u32, Type> = HashMap::default();
     if let Some(args) = call_args {
         for (i, param) in param_types.iter().enumerate() {
             if let (Some(generic), Some(concrete)) = (param, args.get(i)) {

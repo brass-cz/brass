@@ -38,7 +38,8 @@ pub use mono::{
     boundary_record_type, boundary_record_type_by_id, boundary_record_type_by_name,
     boundary_record_type_from_fields, check_instances, closure_symbol, cond_static_truthiness,
     float_kind_name, instance_symbol, int_kind_name, is_comparison, method_symbol, monomorphize,
-    monomorphize_entry, monomorphize_instance, monomorphize_instance_deferred, numeric_conv_ret,
+    monomorphize_entry, monomorphize_entry_with_returns, monomorphize_instance,
+    monomorphize_instance_deferred, monomorphize_instance_deferred_with_returns, numeric_conv_ret,
     operand_type_of, parse_structural_descriptor, prim_method_instance, static_symbol,
     unwrap_nullable,
 };

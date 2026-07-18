@@ -28,15 +28,15 @@ pub use value::Value;
 #[allow(clippy::too_many_arguments)] // mirrors the checker's channel outputs
 pub fn run(
     program: &Program,
-    expr_types: &std::collections::HashMap<brass_hir::Span, brass_hir::Type>,
-    view_args: &std::collections::HashSet<brass_hir::Span>,
-    sum_views: &std::collections::HashMap<brass_hir::Span, brass_hir::Type>,
-    call_locations: &std::collections::HashMap<brass_hir::Span, (String, u32, u32)>,
-    lift_errs: &std::collections::HashSet<brass_hir::Span>,
-    fields_loops: &std::collections::HashMap<brass_hir::Span, Vec<String>>,
-    type_names: &std::collections::HashMap<brass_hir::Span, String>,
-    typeof_types: &std::collections::HashMap<brass_hir::Span, brass_hir::Type>,
-    null_props: &std::collections::HashSet<brass_hir::Span>,
+    expr_types: &fxhash::FxHashMap<brass_hir::Span, brass_hir::Type>,
+    view_args: &fxhash::FxHashSet<brass_hir::Span>,
+    sum_views: &fxhash::FxHashMap<brass_hir::Span, brass_hir::Type>,
+    call_locations: &fxhash::FxHashMap<brass_hir::Span, (String, u32, u32)>,
+    lift_errs: &fxhash::FxHashSet<brass_hir::Span>,
+    fields_loops: &fxhash::FxHashMap<brass_hir::Span, Vec<String>>,
+    type_names: &fxhash::FxHashMap<brass_hir::Span, String>,
+    typeof_types: &fxhash::FxHashMap<brass_hir::Span, brass_hir::Type>,
+    null_props: &fxhash::FxHashSet<brass_hir::Span>,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let mir = brass_mir::lower_program_with_types(

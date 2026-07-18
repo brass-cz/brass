@@ -153,6 +153,7 @@ dependencies = [
  "brass_parser",
  "brass_resolve",
  "brass_typeck",
+ "fxhash",
  "postcard",
  "serde",
  "sha1",
@@ -177,6 +178,7 @@ dependencies = [
  "brass_typesys",
  "brass_utils",
  "clap",
+ "fxhash",
  "inkwell",
  "tokio",
  "tracing",
@@ -193,6 +195,7 @@ dependencies = [
  "brass_typeck",
  "brass_typesys",
  "brass_utils",
+ "fxhash",
  "tracing",
 ]
 
@@ -202,6 +205,7 @@ version = "0.1.0"
 dependencies = [
  "brass_metadata",
  "brass_parser",
+ "fxhash",
 ]
 
 [[package]]
@@ -209,6 +213,7 @@ name = "brass_hir"
 version = "0.1.0"
 dependencies = [
  "brass_parser",
+ "fxhash",
  "serde",
 ]
 
@@ -222,6 +227,7 @@ dependencies = [
  "brass_parser",
  "brass_runtime",
  "brass_utils",
+ "fxhash",
  "inkwell",
  "llvm-sys",
  "tracing",
@@ -241,6 +247,7 @@ dependencies = [
  "brass_typeck",
  "brass_utils",
  "dashmap",
+ "fxhash",
  "serde_json",
  "tokio",
  "tower-lsp-server",
@@ -307,6 +314,9 @@ dependencies = [
 [[package]]
 name = "brass_metadata"
 version = "0.1.0"
+dependencies = [
+ "fxhash",
+]
 
 [[package]]
 name = "brass_mir"
@@ -314,12 +324,14 @@ version = "0.1.0"
 dependencies = [
  "brass_hir",
  "brass_parser",
+ "fxhash",
 ]
 
 [[package]]
 name = "brass_parser"
 version = "0.1.0"
 dependencies = [
+ "fxhash",
  "serde",
 ]
 
@@ -367,6 +379,7 @@ dependencies = [
  "brass_parser",
  "brass_plugin_host",
  "brass_utils",
+ "fxhash",
 ]
 
 [[package]]
@@ -376,6 +389,7 @@ dependencies = [
  "brass_hir",
  "brass_parser",
  "brass_plugin_host",
+ "fxhash",
 ]
 
 [[package]]
@@ -384,6 +398,7 @@ version = "0.1.0"
 dependencies = [
  "brass_plugin_host",
  "brass_utils",
+ "fxhash",
 ]
 
 [[package]]
@@ -391,6 +406,7 @@ name = "brass_solver"
 version = "0.1.0"
 dependencies = [
  "brass_hir",
+ "fxhash",
  "tracing",
 ]
 
@@ -403,6 +419,7 @@ dependencies = [
  "brass_solver",
  "brass_typesys",
  "brass_utils",
+ "fxhash",
  "serde",
  "tracing",
 ]
@@ -414,6 +431,7 @@ dependencies = [
  "brass_hir",
  "brass_parser",
  "brass_solver",
+ "fxhash",
  "tracing",
 ]
 
@@ -838,6 +856,15 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "fxhash"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c31b6d751ae2c7f11320402d34e41349dd1016f8d5d45e48c4312bc8625af50c"
+dependencies = [
+ "byteorder",
 ]
 
 [[package]]

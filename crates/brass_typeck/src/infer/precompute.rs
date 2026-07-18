@@ -68,7 +68,7 @@ impl<'a> Checker<'a> {
         owner: &str,
         params: impl IntoIterator<Item = (&'p str, brass_parser::Span)>,
     ) {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         for (name, span) in params {
             if !seen.insert(name) {
                 self.errors.push(TypeError {
@@ -563,7 +563,7 @@ or drop the `!`"
     /// solver's solution for each field and method signature and quantifies the
     /// inference variables still free across them -- the inferred type parameters.
     pub(super) fn build_schemes(&self) -> HashMap<String, TypeScheme> {
-        let mut out = HashMap::new();
+        let mut out = HashMap::default();
         for info in self.program.types.values() {
             if let TypeKind::Record { .. } = &info.kind {
                 // A seeded context type keeps the scheme the seed carried: its
@@ -585,7 +585,7 @@ or drop the `!`"
         let TypeKind::Record { fields, methods } = &info.kind else {
             return TypeScheme::default();
         };
-        let mut params: HashSet<u32> = HashSet::new();
+        let mut params: HashSet<u32> = HashSet::default();
         let resolved = |this: &Self, t: Option<&Type>| t.map(|t| this.resolve(t));
         let mut field_types = Vec::with_capacity(fields.len());
         for field in fields {
@@ -909,7 +909,7 @@ or drop the `!`"
                 continue;
             }
             let mut env = self.globals_visible_from(&init.path);
-            let mut own: HashMap<String, Type> = HashMap::new();
+            let mut own: HashMap<String, Type> = HashMap::default();
             for stmt in &init.stmts {
                 let Stmt::Let { pat, ty, value, .. } = stmt else {
                     continue;
@@ -945,7 +945,7 @@ or drop the `!`"
     /// ones its imports bring in (under the LOCAL name, so a rename resolves),
     /// then its own, which shadow both.
     pub(super) fn globals_visible_from(&self, module: &[String]) -> HashMap<String, Type> {
-        let mut out: HashMap<String, Type> = HashMap::new();
+        let mut out: HashMap<String, Type> = HashMap::default();
         let mut core_paths: Vec<&Vec<String>> = self
             .global_defs
             .keys()

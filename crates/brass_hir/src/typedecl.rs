@@ -15,7 +15,7 @@
 //! itself (`a: Self.b`, `b: Self.a`, or `a: Self.a[]`) is a circular
 //! unification and is rejected rather than expanded forever.
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use brass_parser::Span;
 use brass_parser::ast::{TypeBody, TypeDecl, TypeExpr};
@@ -78,7 +78,7 @@ pub(crate) fn resolve_type_decls(
     // field. Slot variables become the type's parameters; field variables let
     // `Self.field` and the occurs-check refer to a field before it is resolved.
     type FieldDecls = Vec<(String, Option<TypeExpr>)>;
-    let mut meta: HashMap<String, TypeMeta> = HashMap::new();
+    let mut meta: HashMap<String, TypeMeta> = HashMap::default();
     for (symbol, info) in program.types.iter() {
         let (is_record, slot_names, field_texprs): (bool, Vec<String>, FieldDecls) =
             match &info.kind {
@@ -144,10 +144,10 @@ pub(crate) fn resolve_type_decls(
         import_origins: &program.import_origins,
         import_renames: &program.import_renames,
         next_unknown,
-        resolved: HashMap::new(),
-        alias_resolved: HashMap::new(),
-        gray: HashSet::new(),
-        alias_gray: HashSet::new(),
+        resolved: HashMap::default(),
+        alias_resolved: HashMap::default(),
+        gray: HashSet::default(),
+        alias_gray: HashSet::default(),
         errors: Vec::new(),
     };
 
@@ -157,7 +157,7 @@ pub(crate) fn resolve_type_decls(
         .filter(|(_, m)| m.is_record)
         .map(|(s, _)| s.clone())
         .collect();
-    let mut field_results: HashMap<(String, String), Type> = HashMap::new();
+    let mut field_results: HashMap<(String, String), Type> = HashMap::default();
     for sym in &record_syms {
         let field_names: Vec<String> = meta[sym].fields.iter().map(|(n, _, _)| n.clone()).collect();
         for fname in field_names {
@@ -507,8 +507,8 @@ impl Resolver<'_> {
             return Type::Unknown(self.fresh());
         }
         // Pin map: slot variable / field name -> the type it is fixed to.
-        let mut slot_pins: HashMap<u32, Type> = HashMap::new();
-        let mut field_pins: HashMap<String, Type> = HashMap::new();
+        let mut slot_pins: HashMap<u32, Type> = HashMap::default();
+        let mut field_pins: HashMap<String, Type> = HashMap::default();
         for (fname, fte) in entries {
             let t = self.resolve_texpr(owner, module, fte);
             let slot = self.meta[&bsym].slot_var(fname);

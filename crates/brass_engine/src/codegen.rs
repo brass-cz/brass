@@ -87,8 +87,8 @@ pub fn batch_spawns(program: &MonoProgram) -> bool {
     })
 }
 
-fn spawn_moved_locals(f: &MonoFunction) -> std::collections::HashSet<LocalId> {
-    let mut moved = std::collections::HashSet::new();
+fn spawn_moved_locals(f: &MonoFunction) -> fxhash::FxHashSet<LocalId> {
+    let mut moved = fxhash::FxHashSet::default();
     let mut scan = |rv: &Rvalue| {
         if let Rvalue::Call(Callee::Builtin(name), args) = rv
             && name == "spawn"
@@ -150,7 +150,7 @@ fn spawn_reachable_instances(program: &MonoProgram) -> Option<Vec<String>> {
                 continue;
             }
             let local = args.first().and_then(Operand::as_local)?;
-            let mut visiting = std::collections::HashSet::new();
+            let mut visiting = fxhash::FxHashSet::default();
             trace_closure_local(program, f, local, &mut roots, &mut visiting)?;
         }
     }
@@ -227,7 +227,7 @@ fn trace_closure_local(
     f: &MonoFunction,
     local: LocalId,
     out: &mut Vec<String>,
-    visiting: &mut std::collections::HashSet<LocalId>,
+    visiting: &mut fxhash::FxHashSet<LocalId>,
 ) -> Option<()> {
     if !visiting.insert(local) {
         return Some(());

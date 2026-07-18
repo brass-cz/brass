@@ -37,7 +37,7 @@ pub(super) fn seed_returned_aggregate(
     }
     // `dest -> src` for every `dest = Use(src)` copy, so a seed on a binding can
     // be carried back to the temporary it copied.
-    let mut copy_of: HashMap<LocalId, LocalId> = HashMap::new();
+    let mut copy_of: HashMap<LocalId, LocalId> = HashMap::default();
     for block in &body.blocks {
         for stmt in &block.stmts {
             if let MirStmt::Assign(dest, Rvalue::Use(Operand::Local(src))) = stmt {
@@ -135,7 +135,7 @@ pub(super) fn result_concrete_ok(t: &Type) -> Option<Type> {
 /// Those synthetic returns carry only the `Err` payload for the enclosing
 /// callable; their `Ok` payload belongs to the callee that produced the Result.
 pub(super) fn propagated_result_returns(body: &MirBody) -> HashSet<(usize, LocalId)> {
-    let mut tested_results: HashMap<LocalId, LocalId> = HashMap::new();
+    let mut tested_results: HashMap<LocalId, LocalId> = HashMap::default();
     for block in &body.blocks {
         for stmt in &block.stmts {
             if let MirStmt::Assign(test, Rvalue::Call(Callee::Builtin(name), args)) = stmt
@@ -147,7 +147,7 @@ pub(super) fn propagated_result_returns(body: &MirBody) -> HashSet<(usize, Local
         }
     }
 
-    let mut returns = HashSet::new();
+    let mut returns = HashSet::default();
     for block in &body.blocks {
         if let Terminator::CondBranch {
             cond: Operand::Local(test),
@@ -171,7 +171,7 @@ pub(super) fn propagated_result_returns(body: &MirBody) -> HashSet<(usize, Local
 /// USER-written `return null` in a fallible body is not of this shape and
 /// keeps its meaning (an Ok payload that may be null).
 pub(super) fn null_prop_returns(body: &MirBody) -> HashSet<usize> {
-    let mut present_tests: HashSet<LocalId> = HashSet::new();
+    let mut present_tests: HashSet<LocalId> = HashSet::default();
     for block in &body.blocks {
         for stmt in &block.stmts {
             if let MirStmt::Assign(test, Rvalue::Call(Callee::Builtin(name), _)) = stmt
@@ -181,7 +181,7 @@ pub(super) fn null_prop_returns(body: &MirBody) -> HashSet<usize> {
             }
         }
     }
-    let mut returns = HashSet::new();
+    let mut returns = HashSet::default();
     for block in &body.blocks {
         if let Terminator::CondBranch {
             cond: Operand::Local(test),
@@ -239,8 +239,8 @@ pub(super) fn returns_only_err_constructions(
 /// resolve by iterating to a fixed point (the chains are shallow: a
 /// branch-merge result local at most).
 pub(super) fn err_construction_locals(body: &MirBody) -> HashSet<LocalId> {
-    let mut err_only: HashSet<LocalId> = HashSet::new();
-    let mut poisoned: HashSet<LocalId> = HashSet::new();
+    let mut err_only: HashSet<LocalId> = HashSet::default();
+    let mut poisoned: HashSet<LocalId> = HashSet::default();
     loop {
         let mut changed = false;
         for block in &body.blocks {
@@ -307,7 +307,7 @@ pub(super) fn body_has_error_source(body: &MirBody) -> bool {
 /// the wrong layout.
 pub(super) fn collect_indirect_args(body: &MirBody) -> HashMap<LocalId, Vec<Vec<Operand>>> {
     let alias = use_aliases(body);
-    let mut out: HashMap<LocalId, Vec<Vec<Operand>>> = HashMap::new();
+    let mut out: HashMap<LocalId, Vec<Vec<Operand>>> = HashMap::default();
     for block in &body.blocks {
         for stmt in &block.stmts {
             let (MirStmt::Assign(_, rv) | MirStmt::Eval(rv)) = stmt else {
@@ -363,7 +363,7 @@ pub(super) fn collect_record_field_closures(
     body: &MirBody,
 ) -> HashMap<LocalId, (LocalId, String, String)> {
     let alias = use_aliases(body);
-    let mut out: HashMap<LocalId, (LocalId, String, String)> = HashMap::new();
+    let mut out: HashMap<LocalId, (LocalId, String, String)> = HashMap::default();
     for block in &body.blocks {
         for stmt in &block.stmts {
             let MirStmt::Assign(dest, Rvalue::Record { ty, fields }) = stmt else {
@@ -389,7 +389,7 @@ pub(super) fn collect_closure_passes(
     body: &MirBody,
 ) -> HashMap<LocalId, (String, Vec<Operand>, usize)> {
     let alias = use_aliases(body);
-    let mut out: HashMap<LocalId, (String, Vec<Operand>, usize)> = HashMap::new();
+    let mut out: HashMap<LocalId, (String, Vec<Operand>, usize)> = HashMap::default();
     for block in &body.blocks {
         for stmt in &block.stmts {
             let (MirStmt::Assign(_, rv) | MirStmt::Eval(rv)) = stmt else {
@@ -416,7 +416,7 @@ pub(super) fn collect_closure_passes(
 /// type of an empty array literal `[]` from how it is later filled.
 pub(super) fn collect_array_pushes(body: &MirBody) -> HashMap<LocalId, Operand> {
     let alias = use_aliases(body);
-    let mut out: HashMap<LocalId, Operand> = HashMap::new();
+    let mut out: HashMap<LocalId, Operand> = HashMap::default();
     for block in &body.blocks {
         for stmt in &block.stmts {
             let (MirStmt::Assign(_, rv) | MirStmt::Eval(rv)) = stmt else {
@@ -443,7 +443,7 @@ pub(super) fn collect_array_pushes(body: &MirBody) -> HashMap<LocalId, Operand> 
 
 /// Map each `dst` of an `Assign(dst, Use(Local(src)))` to `src`.
 pub(super) fn use_aliases(body: &MirBody) -> HashMap<LocalId, LocalId> {
-    let mut alias: HashMap<LocalId, LocalId> = HashMap::new();
+    let mut alias: HashMap<LocalId, LocalId> = HashMap::default();
     for block in &body.blocks {
         for stmt in &block.stmts {
             if let MirStmt::Assign(dst, Rvalue::Use(Operand::Local(src))) = stmt {

@@ -3,7 +3,7 @@
 //! locals are boxed in heap cells so that writes through the closure and
 //! through the enclosing scope share state (the accumulator/counter examples).
 
-use std::collections::HashSet;
+use fxhash::FxHashSet as HashSet;
 
 use brass_parser::ast::*;
 
@@ -55,11 +55,11 @@ pub fn collect_pat_names(p: &Pattern, out: &mut HashSet<String>) {
 /// The set of identifiers referenced free in any closure inside `body`
 /// (excluding each closure's own params/locals).
 pub fn closure_free_vars(body: &Block) -> HashSet<String> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     each_closure_block(body, &mut |params, cbody| {
         let mut bound: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
         collect_bound_block(cbody, &mut bound);
-        let mut refs = HashSet::new();
+        let mut refs = HashSet::default();
         idents_block(cbody, &mut refs);
         for r in refs {
             if !bound.contains(&r) {
@@ -74,7 +74,7 @@ pub fn closure_free_vars(body: &Block) -> HashSet<String> {
 pub fn free_vars_of(params: &[Param], body: &Block) -> Vec<String> {
     let mut bound: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
     collect_bound_block(body, &mut bound);
-    let mut refs = HashSet::new();
+    let mut refs = HashSet::default();
     idents_block(body, &mut refs);
     let mut v: Vec<String> = refs.into_iter().filter(|r| !bound.contains(r)).collect();
     v.sort();

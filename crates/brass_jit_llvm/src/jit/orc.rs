@@ -7,8 +7,8 @@
 //! time. All raw ownership transfer is kept in this module; callers deal in
 //! owning [`OrcModule`] values and ordinary Rust callbacks.
 
+use fxhash::FxHashMap as HashMap;
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_void};
 use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -395,7 +395,7 @@ impl OrcJit {
             jit,
             context: thread_safe_context,
             data_layout,
-            requests: HashMap::new(),
+            requests: HashMap::default(),
             callback: ptr::null_mut(),
             errors: Vec::new(),
         });

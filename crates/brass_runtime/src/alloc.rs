@@ -403,7 +403,7 @@ pub unsafe extern "C-unwind" fn pp_str_const(ptr: *const u8, len: i64) -> *mut H
 /// materialization (module constant data) may call this; transient buffers
 /// must use [`pp_str_const`] -- a reused address would alias another literal.
 pub unsafe extern "C-unwind" fn pp_str_intern(ptr: *const u8, len: i64) -> *mut Header {
-    use std::collections::HashMap;
+    use fxhash::FxHashMap as HashMap;
     use std::sync::{Mutex, OnceLock};
 
     static INTERNED: OnceLock<Mutex<HashMap<(usize, i64), usize>>> = OnceLock::new();

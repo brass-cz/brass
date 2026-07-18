@@ -2,7 +2,7 @@
 //! required when S has every field and method of T with compatible types.
 //! Sum types are nominal and excluded.
 
-use std::collections::HashMap;
+use fxhash::FxHashMap as HashMap;
 
 use brass_hir::{
     CallableSignature, MethodInfo, NominalType, ParamInfo, PassingMode, Program,

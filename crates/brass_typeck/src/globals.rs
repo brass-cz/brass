@@ -10,7 +10,7 @@
 //! names are resolved regardless of order, and imported globals belong to a
 //! module that is initialized earlier by the import topological order.
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use brass_hir::Program;
 use brass_parser::Span;
@@ -28,7 +28,7 @@ pub fn check(program: &Program) -> Vec<TypeError> {
 
 fn check_module(stmts: &[Stmt], errors: &mut Vec<TypeError>) {
     // First-definition index of each global binding name in this module.
-    let mut def_index: HashMap<String, usize> = HashMap::new();
+    let mut def_index: HashMap<String, usize> = HashMap::default();
     for (i, stmt) in stmts.iter().enumerate() {
         if let Stmt::Let { pat, .. } = stmt {
             for name in pattern_names(pat) {
@@ -42,7 +42,7 @@ fn check_module(stmts: &[Stmt], errors: &mut Vec<TypeError>) {
     }
     for (i, stmt) in stmts.iter().enumerate() {
         let mut refs = Vec::new();
-        collect_stmt_refs(stmt, &globals, &HashSet::new(), &mut refs);
+        collect_stmt_refs(stmt, &globals, &HashSet::default(), &mut refs);
         for (name, span) in refs {
             // A reference to a global whose definition is at or after the
             // current statement is a forward (or self) reference.

@@ -24,7 +24,7 @@
 //!   those revisions and removals explicitly, and the terminal delta -- the
 //!   one flushed after the finalize re-resolution -- settles every entry.
 
-use std::collections::HashMap;
+use fxhash::FxHashMap as HashMap;
 
 use brass_hir::{Program, Type, TypedProgram};
 use brass_parser::Span;
@@ -74,6 +74,12 @@ pub struct ChannelDelta {
     /// possibly duplicated across re-checked bodies; the final `Analysis`
     /// carries the sorted, deduplicated set).
     pub errors: Vec<TypeError>,
+    /// The resolved return type of an UNANNOTATED body elaborated at a concrete
+    /// instance (`(symbol, type_args, return)`): the consumer's monomorphizer
+    /// uses it to compile the call site as a runtime-deferred call without
+    /// lowering the body. Emitted only for a clean elaboration whose return
+    /// resolved fully known; an annotated body already has a contract.
+    pub instance_returns: Vec<(String, Vec<Type>, Type)>,
 }
 
 impl ChannelDelta {
@@ -183,7 +189,7 @@ pub(crate) struct StreamCtl<'s> {
     /// them, and `state` was seeded with everything their passes delivered,
     /// so they are announced as immediately settled (like seeded bodies).
     /// A priority request naming one forces its real pass instead.
-    pub(crate) skip_fns: std::collections::HashSet<String>,
+    pub(crate) skip_fns: fxhash::FxHashSet<String>,
     /// How many leading module initializers the snapshot settled.
     pub(crate) skip_inits: usize,
 }
@@ -198,13 +204,14 @@ pub(crate) struct FlushState {
     pub(crate) errors_seen: usize,
     pub(crate) agg: AggState,
     pub(crate) expr_flushed: HashMap<Span, Type>,
-    pub(crate) view_args: std::collections::HashSet<Span>,
-    pub(crate) lift_errs: std::collections::HashSet<Span>,
-    pub(crate) null_props: std::collections::HashSet<Span>,
-    pub(crate) fields_loops: std::collections::HashSet<Span>,
+    pub(crate) view_args: fxhash::FxHashSet<Span>,
+    pub(crate) lift_errs: fxhash::FxHashSet<Span>,
+    pub(crate) null_props: fxhash::FxHashSet<Span>,
+    pub(crate) fields_loops: fxhash::FxHashSet<Span>,
     pub(crate) sum_views: HashMap<Span, Type>,
     pub(crate) type_names: HashMap<Span, String>,
     pub(crate) typeof_types: HashMap<Span, Type>,
+    pub(crate) instance_returns: HashMap<(String, Vec<Type>), Type>,
 }
 
 /// Everything a stopped streaming run had settled, in serializable form:
@@ -321,6 +328,9 @@ impl FlushState {
                 .iter()
                 .map(|(s, t)| (*s, t.clone()))
                 .collect(),
+            // Contracts are deliberately not snapshotted. A resumed run
+            // re-elaborates a demanded instance before deferring it again.
+            instance_returns: HashMap::default(),
         }
     }
 }
@@ -556,7 +566,7 @@ fn is_seedable_empty_array(ty: &Type) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use fxhash::FxHashSet as HashSet;
 
     use super::*;
     use crate::{TypeError, analyze, analyze_streaming};
@@ -738,7 +748,7 @@ mod tests {
         state.expr_flushed = merged.expr_types.clone();
         state.sum_views = merged.sum_views.clone();
         state.view_args = merged.view_args.clone();
-        let fields: HashMap<Span, Vec<String>> = HashMap::new();
+        let fields: HashMap<Span, Vec<String>> = HashMap::default();
         let snap = state.snapshot(vec!["make".into(), "main".into()], 1, &fields);
         let back = FlushState::from_snapshot(&snap);
         assert_eq!(back.expr_flushed, state.expr_flushed);
@@ -779,6 +789,44 @@ mod tests {
                 BodyId::Function("main".into()),
                 BodyId::Function("a_one".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn zero_argument_request_reports_an_instance_return() {
+        let program = lower(
+            "fun answer() { return 42 }\n\
+             fun main() { println(0) }\n",
+        );
+        let mut rec = Recorder {
+            requests: vec!["answer".to_string()],
+            events: Vec::new(),
+        };
+
+        analyze_streaming(&program, None, &mut rec, None);
+
+        // An empty argument list is a concrete zero-argument instance, not a
+        // request for the open definitional pass. Its resolved return is the
+        // contract the lazy monomorphizer needs to defer the body.
+        let returns: Vec<_> = rec
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                CheckEvent::BodyChecked(BodyId::Function(symbol), delta) if symbol == "answer" => {
+                    Some(delta.instance_returns.as_slice())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(returns.len(), 1);
+        assert_eq!(
+            returns[0],
+            &(
+                "answer".to_string(),
+                Vec::new(),
+                Type::Int(brass_hir::IntKind::I32),
+            )
         );
     }
 }

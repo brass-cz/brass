@@ -41,7 +41,6 @@ for path in $(find std -type f | grep -E '\.(cz|so|dylib|dll)$'); do
 done
 
 env -u BRASS_INCLUDE -u BRASS_PACKAGES "$tmp/bin/brass" check "$tmp/bin/czpm"
-#rm -f "$tmp/bin/czpm.czcache"
 
 #
 # make tarball

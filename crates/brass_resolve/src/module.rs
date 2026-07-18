@@ -2,7 +2,7 @@
 //! is public. The file-system module graph is resolved by
 //! the driver; this checks the resulting program for import errors.
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use brass_hir::LoadedModule;
 use brass_parser::Span;
@@ -29,7 +29,7 @@ pub fn check_imports(modules: &[LoadedModule]) -> Vec<ResolveError> {
         // is rejected: resolution gives the rename precedence over the bare
         // tables (see `resolve_qualified`), so letting it coexist with a local
         // declaration would silently shadow that declaration.
-        let mut declared: HashSet<String> = HashSet::new();
+        let mut declared: HashSet<String> = HashSet::default();
         for item in &m.ast.items {
             match item {
                 TopLevel::Fun(f) => {
@@ -59,7 +59,7 @@ pub fn check_imports(modules: &[LoadedModule]) -> Vec<ResolveError> {
         // The same local name imported from two different modules is a local
         // ambiguity in the importing module: neither
         // origin wins, so a bare use cannot be resolved.
-        let mut origins: HashMap<&str, Vec<String>> = HashMap::new();
+        let mut origins: HashMap<&str, Vec<String>> = HashMap::default();
         for imp in &m.ast.imports {
             let key = imp.path.join(".");
             for name in &imp.names {
@@ -139,7 +139,7 @@ pub fn check_imports(modules: &[LoadedModule]) -> Vec<ResolveError> {
 /// Public top-level type and function names exported by each loaded module,
 /// keyed by the module's dotted path.
 pub(crate) fn collect_exports(modules: &[LoadedModule]) -> HashMap<String, HashSet<String>> {
-    let mut exports: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut exports: HashMap<String, HashSet<String>> = HashMap::default();
     for m in modules {
         let names = exports.entry(m.path.join(".")).or_default();
         for item in &m.ast.items {
@@ -154,7 +154,7 @@ pub(crate) fn collect_exports(modules: &[LoadedModule]) -> HashMap<String, HashS
                 // like any other: the module's own resolution already treats it as
                 // a declaration, so it exports too.
                 TopLevel::Stmt(Stmt::Let { pat, .. }) => {
-                    let mut bound = HashSet::new();
+                    let mut bound = HashSet::default();
                     collect_pattern_names(pat, &mut bound);
                     names.extend(bound.into_iter().filter(|n| is_public(n)));
                 }

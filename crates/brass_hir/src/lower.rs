@@ -2,7 +2,7 @@
 //! type ids (Result is fixed at id 0) and variant tags, and gathering each
 //! module's top-level statements for initialization.
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::rc::Rc;
 
 use brass_parser::Span;
@@ -20,13 +20,13 @@ pub struct LowerError {
 
 /// Collect all modules into a `Program`. Errors list duplicate declarations.
 pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
-    let mut types: HashMap<String, TypeInfo> = HashMap::new();
-    let mut functions: HashMap<String, FunInfo> = HashMap::new();
+    let mut types: HashMap<String, TypeInfo> = HashMap::default();
+    let mut functions: HashMap<String, FunInfo> = HashMap::default();
     let mut inits = Vec::new();
-    let mut module_imports: HashMap<Vec<String>, Vec<String>> = HashMap::new();
-    let mut import_origins: HashMap<Vec<String>, HashMap<String, Vec<String>>> = HashMap::new();
-    let mut import_renames: HashMap<Vec<String>, HashMap<String, String>> = HashMap::new();
-    let mut module_aliases: HashMap<Vec<String>, HashMap<String, Vec<String>>> = HashMap::new();
+    let mut module_imports: HashMap<Vec<String>, Vec<String>> = HashMap::default();
+    let mut import_origins: HashMap<Vec<String>, HashMap<String, Vec<String>>> = HashMap::default();
+    let mut import_renames: HashMap<Vec<String>, HashMap<String, String>> = HashMap::default();
+    let mut module_aliases: HashMap<Vec<String>, HashMap<String, Vec<String>>> = HashMap::default();
     let mut errors = Vec::new();
     let mut next_id: i32 = 1; // 0 is reserved for Result
     // `fun T.m(...)` method implementations, resolved to their receiver type
@@ -181,7 +181,7 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
         .entry("Result".to_string())
         .or_insert_with(result_type);
 
-    let mut primitive_methods: HashMap<(String, String), String> = HashMap::new();
+    let mut primitive_methods: HashMap<(String, String), String> = HashMap::default();
     inject_method_impls(
         &method_impls,
         &mut types,
@@ -193,7 +193,7 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
     // Build reverse-alias table: for items stored under their bare name
     // (unique program-wide), record qualify(name, module) -> bare_name so
     // marker-based resolution can reach them.
-    let mut symbol_aliases: HashMap<String, String> = HashMap::new();
+    let mut symbol_aliases: HashMap<String, String> = HashMap::default();
     for (symbol, info) in &types {
         if symbol == &info.name && !info.module.is_empty() {
             let qualified = crate::hir::qualify(&info.name, &info.module);
@@ -227,7 +227,7 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
         module_aliases,
         symbol_aliases,
         primitive_methods,
-        type_aliases: HashMap::new(),
+        type_aliases: HashMap::default(),
         next_infer_var: 0,
     };
     resolve_program_annotations(&mut program, &alias_decls, &mut errors);
@@ -411,7 +411,7 @@ fn name_module_counts(
     modules: &[LoadedModule],
     extract: impl Fn(&TopLevel) -> Option<&String>,
 ) -> HashMap<String, usize> {
-    let mut per_name: HashMap<String, HashSet<Vec<String>>> = HashMap::new();
+    let mut per_name: HashMap<String, HashSet<Vec<String>>> = HashMap::default();
     for m in modules {
         for item in &m.ast.items {
             if let Some(name) = extract(item) {
@@ -454,7 +454,7 @@ fn type_info(
             TypeKind::Record { fields, methods }
         }
         TypeBody::Sum(variants) => {
-            let mut seen = HashSet::new();
+            let mut seen = HashSet::default();
             TypeKind::Sum {
                 variants: variants
                     .iter()
@@ -508,10 +508,10 @@ fn split_members(
     errors: &mut Vec<LowerError>,
 ) -> (Vec<FieldInfo>, HashMap<String, MethodInfo>, Vec<String>) {
     let mut fields = Vec::new();
-    let mut methods = HashMap::new();
+    let mut methods = HashMap::default();
     let mut slots = Vec::new();
-    let mut field_names = HashSet::new();
-    let mut method_names = HashSet::new();
+    let mut field_names = HashSet::default();
+    let mut method_names = HashSet::default();
     for m in members {
         match m {
             Member::Field(f) => {
@@ -603,7 +603,7 @@ fn result_type() -> TypeInfo {
                         ty: None,
                         resolved_ty: None,
                     }],
-                    methods: HashMap::new(),
+                    methods: HashMap::default(),
                 },
                 VariantInfo {
                     name: "Err".into(),
@@ -613,7 +613,7 @@ fn result_type() -> TypeInfo {
                         ty: None,
                         resolved_ty: None,
                     }],
-                    methods: HashMap::new(),
+                    methods: HashMap::default(),
                 },
             ],
         },

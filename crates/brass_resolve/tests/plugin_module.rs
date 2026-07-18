@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use brass_plugin_host::{PluginFunction, PluginManifest, ValueType, fixture};
 use brass_resolve::plugin::{synthesize_plugin_module, synthesize_source};
+use brass_resolve::{inject_module_path, reinject_plugin_path};
 
 /// A manifest holding one exported function of `name` taking no arguments and
 /// returning nothing, optionally documented.
@@ -98,6 +99,27 @@ fn fixture_manifest_synthesizes_wrappers() {
 
     // The whole module parses.
     brass_parser::parse(&src).expect("synthesized module parses");
+}
+
+/// A cached synthesized module keeps its spans but receives the library path
+/// found by the current machine's normal import resolution.
+#[test]
+fn synthesized_wrapper_paths_can_be_reanchored() {
+    let src = synthesize_source(&manifest_of(&["run"], None), "/build/libprocess.so")
+        .expect("synthesize");
+    let mut ast = brass_parser::parse(&src).expect("parse synthesized module");
+    inject_module_path(
+        &mut ast,
+        "<plugin:/build/libprocess.so>",
+        brass_parser::Span::new(0, 0),
+    );
+
+    reinject_plugin_path(&mut ast, "/installed/libprocess.so");
+
+    let ast = format!("{ast:?}");
+    assert!(!ast.contains("/build/libprocess.so"), "{ast}");
+    assert!(ast.contains("/installed/libprocess.so"), "{ast}");
+    assert!(ast.contains("<plugin:/installed/libprocess.so>"), "{ast}");
 }
 
 /// The library path is embedded in a Brass string literal, where `{` opens

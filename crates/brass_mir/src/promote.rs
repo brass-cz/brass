@@ -26,7 +26,7 @@
 //!   through `Use`-copy aliases, must be one of the whitelisted read forms.
 //!   Anything unrecognized keeps the per-evaluation allocation.
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::builder::BodyBuilder;
 use crate::cfg::{MirBody, MirStmt, Terminator};
@@ -151,7 +151,7 @@ fn safe_params(program: &MirProgram) -> HashMap<String, Vec<bool>> {
 /// would alias a different value at some uses.
 fn uses_are_read_only(body: &MirBody, root: LocalId, safe: &HashMap<String, Vec<bool>>) -> bool {
     // Grow the alias set to a fixpoint before classifying uses.
-    let mut tracked: HashSet<LocalId> = HashSet::from([root]);
+    let mut tracked: HashSet<LocalId> = HashSet::from_iter([root]);
     loop {
         let mut grew = false;
         for block in &body.blocks {
@@ -170,7 +170,7 @@ fn uses_are_read_only(body: &MirBody, root: LocalId, safe: &HashMap<String, Vec<
     }
 
     let tracked_op = |op: &Operand| matches!(op, Operand::Local(a) if tracked.contains(a));
-    let mut assigns: HashMap<LocalId, usize> = HashMap::new();
+    let mut assigns: HashMap<LocalId, usize> = HashMap::default();
     for block in &body.blocks {
         for stmt in &block.stmts {
             match stmt {

@@ -9,7 +9,7 @@
 //! [`LoadError`]s (attributed to the triggering import's span in the entry
 //! file) and lets each caller decide.
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::path::{Path, PathBuf};
 
 use brass_hir::LoadedModule;
@@ -113,6 +113,10 @@ struct SourceEntry {
     base: usize,
     /// `None` for an embedded core module (no file on disk).
     path: Option<PathBuf>,
+    /// The canonical import path when this entry is a synthesized native
+    /// plugin module. Its library path is deliberately separate: caches can
+    /// re-resolve the import on another machine instead of persisting it.
+    plugin_module: Option<Vec<String>>,
     /// Display name for diagnostics: the file path, or `<core/name>` for an
     /// embedded core module.
     label: String,
@@ -137,6 +141,27 @@ impl SourceMap {
         self.entries.push(SourceEntry {
             base,
             path,
+            plugin_module: None,
+            label,
+            src,
+        });
+        base
+    }
+
+    /// Reserve and record a synthesized native plugin module.
+    fn add_plugin(
+        &mut self,
+        path: PathBuf,
+        module_path: Vec<String>,
+        label: String,
+        src: String,
+    ) -> usize {
+        let base = self.next_base;
+        self.next_base = base + src.len() + 1;
+        self.entries.push(SourceEntry {
+            base,
+            path: Some(path),
+            plugin_module: Some(module_path),
             label,
             src,
         });
@@ -166,6 +191,30 @@ impl SourceMap {
         self.entries
             .iter()
             .filter_map(|e| Some((e.path.as_deref()?, e.src.as_str())))
+    }
+
+    /// Parsed source files, excluding synthesized native plugin modules.
+    /// Analysis caches stamp these from `src`; plugins have their own logical
+    /// module identity and binary-content stamp.
+    pub fn source_files(&self) -> impl Iterator<Item = (&std::path::Path, &str)> {
+        self.entries
+            .iter()
+            .filter(|e| e.plugin_module.is_none())
+            .filter_map(|e| Some((e.path.as_deref()?, e.src.as_str())))
+    }
+
+    /// Native plugin modules as `(canonical import path, loaded library)`.
+    /// The import path is the relocatable identity; the file path names the
+    /// exact library whose manifest produced the synthesized source.
+    pub fn plugins(&self) -> impl Iterator<Item = (&[String], &Path)> {
+        self.entries.iter().filter_map(|e| {
+            Some((
+                e.plugin_module.as_deref()?,
+                e.path
+                    .as_deref()
+                    .expect("plugin entries have a library path"),
+            ))
+        })
     }
 
     pub fn locate(&self, off: usize) -> Option<Located<'_>> {
@@ -236,7 +285,7 @@ impl SearchPaths {
 
 fn package_paths(value: Option<std::ffi::OsString>) -> HashMap<String, PathBuf> {
     let Some(value) = value else {
-        return HashMap::new();
+        return HashMap::default();
     };
     std::env::split_paths(&value)
         .filter_map(|entry| {
@@ -340,6 +389,107 @@ pub fn reinject_module_path(ast: &mut Module, location: &str) {
             *segs = vec![StrSeg::Lit(location.to_string())];
             return;
         }
+    }
+}
+
+/// Replace the library operand in every synthesized plugin forwarding call,
+/// preserving all spans and therefore every cached checker channel keyed by
+/// them. The caller has already identified `ast` as a plugin module; ordinary
+/// source modules are never rewritten by this operation.
+pub fn reinject_plugin_path(ast: &mut Module, library: &str) {
+    reinject_module_path(ast, &format!("<plugin:{library}>"));
+    for item in &mut ast.items {
+        if let TopLevel::Fun(fun) = item {
+            reinject_plugin_path_block(&mut fun.body, library);
+        }
+    }
+}
+
+fn reinject_plugin_path_block(block: &mut brass_parser::ast::Block, library: &str) {
+    for stmt in &mut block.stmts {
+        match stmt {
+            Stmt::Let {
+                value: Some(value), ..
+            } => reinject_plugin_path_expr(value, library),
+            Stmt::Assign { target, value, .. } => {
+                reinject_plugin_path_expr(target, library);
+                reinject_plugin_path_expr(value, library);
+            }
+            Stmt::Expr(expr) | Stmt::Return(Some(expr), _) => {
+                reinject_plugin_path_expr(expr, library)
+            }
+            Stmt::While { cond, body, .. } => {
+                reinject_plugin_path_expr(cond, library);
+                reinject_plugin_path_block(body, library);
+            }
+            Stmt::For { iter, body, .. } => {
+                reinject_plugin_path_expr(iter, library);
+                reinject_plugin_path_block(body, library);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn reinject_plugin_path_expr(expr: &mut Expr, library: &str) {
+    match expr {
+        Expr::Call(callee, args, _) => {
+            if let Expr::Ident(name, _) = &**callee
+                && brass_hir::plugin_builtin_return(name).is_some()
+                && let Some(brass_parser::ast::Arg {
+                    expr: Expr::Str(segments, _),
+                }) = args.first_mut()
+            {
+                *segments = vec![StrSeg::Lit(library.to_string())];
+            }
+            reinject_plugin_path_expr(callee, library);
+            for arg in args {
+                reinject_plugin_path_expr(&mut arg.expr, library);
+            }
+        }
+        Expr::Field(base, _, _) | Expr::Unary(_, base, _) | Expr::ErrorProp(base, _) => {
+            reinject_plugin_path_expr(base, library)
+        }
+        Expr::Binary(_, left, right, _)
+        | Expr::Index(left, right, _)
+        | Expr::Range(left, right, _) => {
+            reinject_plugin_path_expr(left, library);
+            reinject_plugin_path_expr(right, library);
+        }
+        Expr::Array(items, _) => items
+            .iter_mut()
+            .for_each(|item| reinject_plugin_path_expr(item, library)),
+        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => fields
+            .iter_mut()
+            .for_each(|(_, value)| reinject_plugin_path_expr(value, library)),
+        Expr::Str(segments, _) => segments.iter_mut().for_each(|segment| {
+            if let StrSeg::Expr(expr) = segment {
+                reinject_plugin_path_expr(expr, library);
+            }
+        }),
+        Expr::If(cond, then, otherwise, _) => {
+            reinject_plugin_path_expr(cond, library);
+            reinject_plugin_path_block(then, library);
+            if let Some(otherwise) = otherwise {
+                reinject_plugin_path_expr(otherwise, library);
+            }
+        }
+        Expr::IfLet(_, scrutinee, then, otherwise, _) => {
+            reinject_plugin_path_expr(scrutinee, library);
+            reinject_plugin_path_block(then, library);
+            if let Some(otherwise) = otherwise {
+                reinject_plugin_path_expr(otherwise, library);
+            }
+        }
+        Expr::Match(scrutinee, arms, _) => {
+            reinject_plugin_path_expr(scrutinee, library);
+            for arm in arms {
+                reinject_plugin_path_expr(&mut arm.body, library);
+            }
+        }
+        Expr::Block(block, _) => reinject_plugin_path_block(block, library),
+        Expr::Closure(_, body, _) => reinject_plugin_path_expr(body, library),
+        _ => {}
     }
 }
 
@@ -665,7 +815,7 @@ fn load_synthesized(
     // cache stamps the `.so` itself: a rebuilt plugin (new manifest, new
     // native code) must invalidate a cache whose wrapper was synthesized from
     // the old one.
-    let base = sources.add(Some(lib.to_path_buf()), label.clone(), src.clone());
+    let base = sources.add_plugin(lib.to_path_buf(), path.to_vec(), label.clone(), src.clone());
     match parse_with_base(&src, base) {
         Ok(mut ast) => {
             inject_module_path(&mut ast, &label, Span::new(base, base));

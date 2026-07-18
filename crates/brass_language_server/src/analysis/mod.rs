@@ -11,7 +11,7 @@
 pub mod items;
 pub mod world;
 
-use std::collections::HashSet;
+use fxhash::FxHashSet as HashSet;
 use std::path::PathBuf;
 
 use brass_hir::{LoadedModule, Program, TypedProgram, lower};
@@ -27,9 +27,7 @@ use world::SourceMap;
 /// One entry per context this server session has seen; a context is the
 /// prelude plus a project's dependencies, so there are few and they are small.
 static CONTEXT_SEEDS: std::sync::OnceLock<
-    std::sync::Mutex<
-        std::collections::HashMap<[u8; 20], std::sync::Arc<brass_typeck::ContextTables>>,
-    >,
+    std::sync::Mutex<fxhash::FxHashMap<[u8; 20], std::sync::Arc<brass_typeck::ContextTables>>>,
 > = std::sync::OnceLock::new();
 
 /// The context seed for `world`: from this process's memory, then the on-disk
@@ -92,15 +90,15 @@ pub struct FullAnalysis {
     pub typed: TypedProgram,
     /// Per record-type generalized scheme, keyed by type name; rendered by hover
     /// to show a method's signature over the type's inferred parameters.
-    pub schemes: std::collections::HashMap<String, brass_hir::TypeScheme>,
+    pub schemes: fxhash::FxHashMap<String, brass_hir::TypeScheme>,
     /// The checker's inferred return type per free-function symbol. A function
     /// with no `-> T` annotation has none in its signature, so hover reads it
     /// here rather than reverse-engineering it from call sites.
-    pub function_returns: std::collections::HashMap<String, brass_hir::Type>,
+    pub function_returns: fxhash::FxHashMap<String, brass_hir::Type>,
     /// The same for methods, keyed by (type name, method name). An annotated
     /// `-> T!` return leaves its Err payload open, so this is where the Err type
     /// a method actually produces lives.
-    pub method_returns: std::collections::HashMap<(String, String), brass_hir::Type>,
+    pub method_returns: fxhash::FxHashMap<(String, String), brass_hir::Type>,
     pub sources: SourceMap,
     pub main_base: usize,
     pub main_ast: Module,
@@ -266,9 +264,9 @@ fn run_pipeline(
 ) -> (
     Program,
     TypedProgram,
-    std::collections::HashMap<String, brass_hir::TypeScheme>,
-    std::collections::HashMap<String, brass_hir::Type>,
-    std::collections::HashMap<(String, String), brass_hir::Type>,
+    fxhash::FxHashMap<String, brass_hir::TypeScheme>,
+    fxhash::FxHashMap<String, brass_hir::Type>,
+    fxhash::FxHashMap<(String, String), brass_hir::Type>,
     Vec<(String, Span)>,
 ) {
     let mut modules = context.to_vec();

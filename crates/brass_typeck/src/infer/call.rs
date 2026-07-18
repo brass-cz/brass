@@ -1204,7 +1204,7 @@ impl<'a> Checker<'a> {
     /// sites). Used to point a callee-body re-elaboration failure at the
     /// caller's value instead of a span inside the callee.
     fn reattribute_errors(&mut self, before: usize, frame: &str, span: brass_parser::Span) {
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::default();
         let kept: Vec<TypeError> = self
             .errors
             .split_off(before)

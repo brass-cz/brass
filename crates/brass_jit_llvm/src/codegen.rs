@@ -4,7 +4,7 @@
 //! into the runtime. Captured locals are boxed in heap cells so
 //! closures observe each other's writes.
 
-use std::collections::HashMap;
+use fxhash::FxHashMap as HashMap;
 
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
@@ -12,7 +12,7 @@ use inkwell::context::Context;
 use inkwell::module::{Linkage, Module};
 use inkwell::types::{BasicTypeEnum, FunctionType};
 use inkwell::values::BasicValueEnum;
-use inkwell::values::{FloatValue, FunctionValue, GlobalValue, IntValue, PointerValue};
+use inkwell::values::{BasicValue, FloatValue, FunctionValue, GlobalValue, IntValue, PointerValue};
 use inkwell::{FloatPredicate, IntPredicate, OptimizationLevel};
 
 use brass_engine::{Codegen as EngineCodegen, MonoFunction, MonoProgram, closure_symbol};
@@ -146,20 +146,20 @@ pub struct LlvmCodegen<'ctx, 'p> {
     /// `HashMap<string, string>`) both print as the bare name -- and a shared key
     /// hands one instance's glue to the other, releasing a scalar field as a heap
     /// pointer.
-    destructors: std::collections::HashMap<String, FunctionValue<'ctx>>,
+    destructors: fxhash::FxHashMap<String, FunctionValue<'ctx>>,
     /// Per-type recursive `to_string` renderers (`pp_fn_tostr_*`) for records and
     /// sums, memoized by mangled type name. Emitting one before its body lets a
     /// self-referential type recurse through a call; cleared per module like
     /// destructors (the function is local to the module that defines it).
-    to_string_fns: std::collections::HashMap<String, FunctionValue<'ctx>>,
+    to_string_fns: fxhash::FxHashMap<String, FunctionValue<'ctx>>,
     /// Per-type deep-copy functions (`fn(*Header) -> *Header`): a fresh, independent
     /// copy of an aggregate value (recursing into managed fields/elements), used to
     /// pass a non-reference argument by value. Memoized to terminate on recursive
     /// types and cleared per module.
-    deep_copy_fns: std::collections::HashMap<String, FunctionValue<'ctx>>,
+    deep_copy_fns: fxhash::FxHashMap<String, FunctionValue<'ctx>>,
     /// Per-type cycle-collector trace functions: visit a value's
     /// managed children. Memoized like destructors, cleared per module.
-    tracers: std::collections::HashMap<String, Option<FunctionValue<'ctx>>>,
+    tracers: fxhash::FxHashMap<String, Option<FunctionValue<'ctx>>>,
     /// Whether to emit region write barriers (set in `begin_program` when the
     /// program uses `with`), so a sequential program pays no barrier cost.
     region_barriers: bool,
@@ -180,10 +180,10 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             program,
             fns: FnCache::default(),
             cur_fn: None,
-            destructors: std::collections::HashMap::new(),
-            to_string_fns: std::collections::HashMap::new(),
-            deep_copy_fns: std::collections::HashMap::new(),
-            tracers: std::collections::HashMap::new(),
+            destructors: fxhash::FxHashMap::default(),
+            to_string_fns: fxhash::FxHashMap::default(),
+            deep_copy_fns: fxhash::FxHashMap::default(),
+            tracers: fxhash::FxHashMap::default(),
             region_barriers: false,
             mir: MirState::default(),
         }
@@ -1047,9 +1047,9 @@ const FREEZE_GLOBALS_FN: &str = "__pp_freeze_globals";
 /// initializer) and heap-pointer-typed -- the ones auto-frozen after init. A global written by any non-initializer instance is
 /// mutable and left thread-local (the auto-cown candidates).
 fn immutable_heap_globals(program: &MonoProgram) -> Vec<String> {
-    use std::collections::HashSet;
+    use fxhash::FxHashSet as HashSet;
     let inits: HashSet<&str> = program.init_symbols.iter().map(|s| s.as_str()).collect();
-    let mut mutated: HashSet<&str> = HashSet::new();
+    let mut mutated: HashSet<&str> = HashSet::default();
     for f in &program.functions {
         if inits.contains(f.symbol.as_str()) {
             continue;
@@ -2079,7 +2079,8 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         // LLVM signature of each instance (the single context makes the types
         // reusable across modules) and whether the program uses `with`.
         // Modules then declare only the instances their one body references.
-        let mut signatures = HashMap::with_capacity(program.functions.len());
+        let mut signatures =
+            HashMap::with_capacity_and_hasher(program.functions.len(), Default::default());
         for f in &program.functions {
             let fty = if f.is_closure {
                 self.abi.typed_closure_fn_type(&f.type_args, &f.ret)
@@ -2091,7 +2092,8 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         let signatures = std::rc::Rc::new(signatures);
         let region_barriers = brass_engine::program_uses_with(program);
 
-        let mut pending = HashMap::with_capacity(program.functions.len());
+        let mut pending =
+            HashMap::with_capacity_and_hasher(program.functions.len(), Default::default());
         let mut perf = brass_utils::PerfLog::start("back/codegen-fn");
         for function in &program.functions {
             let started = std::time::Instant::now();
@@ -2502,7 +2504,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
                 .map(|(c, o)| (c.index(), o))
                 .collect()
         } else {
-            HashMap::new()
+            HashMap::default()
         };
         let env = is_closure.then(|| f.get_nth_param(0).unwrap().into_pointer_value());
 
@@ -4152,13 +4154,58 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
         // type encoding crosses the boundary. The indirect call is typed with
         // the site's recorded signature, which is the instance's own ABI --
         // instances are keyed by caller argument types.
-        let (sym_ptr, sym_len) = self.global_str(symbol);
-        let (ty_ptr, ty_len) = self.global_str("");
+        //
+        // The resolved address is cached in a module-private slot per
+        // instance symbol: resolution is idempotent (the resolver compiles
+        // the instance once and answers with the same address forever), so
+        // every call after the first is a load plus an indirect call instead
+        // of a string-keyed `pp_resolve` round trip -- the difference between
+        // a hot cross-function loop running at eager speed or 50x slower.
+        // Threads racing the first call each resolve and store the same
+        // address (monotonic atomics; a failed resolution stores 0, which
+        // the next call simply retries).
         let i64t = self.abi.i64t();
         let ptr = self.abi.ptr();
+        let slot_name = format!("pp_addr_{}", mangle_fn(symbol));
+        let slot = self.module.get_global(&slot_name).unwrap_or_else(|| {
+            let g = self.module.add_global(i64t, None, &slot_name);
+            g.set_linkage(Linkage::Private);
+            g.set_initializer(&i64t.const_zero());
+            g
+        });
+        let slot_ptr = slot.as_pointer_value();
+        let func = self.cur_fn.unwrap();
+        let cached = self
+            .builder
+            .build_load(i64t, slot_ptr, "dc_cached")
+            .unwrap()
+            .into_int_value();
+        let cached_inst = cached.as_instruction_value().unwrap();
+        cached_inst.set_alignment(8).unwrap();
+        cached_inst
+            .set_atomic_ordering(inkwell::AtomicOrdering::Monotonic)
+            .unwrap();
+        let hit_bb = self.builder.get_insert_block().unwrap();
+        let miss_bb = self.ctx.append_basic_block(func, "dc_resolve");
+        let ready_bb = self.ctx.append_basic_block(func, "dc_ready");
+        let unresolved = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                cached,
+                i64t.const_zero(),
+                "dc_miss",
+            )
+            .unwrap();
+        self.builder
+            .build_conditional_branch(unresolved, miss_bb, ready_bb)
+            .unwrap();
+        self.builder.position_at_end(miss_bb);
+        let (sym_ptr, sym_len) = self.global_str(symbol);
+        let (ty_ptr, ty_len) = self.global_str("");
         let resolve_ty = i64t.fn_type(&[ptr.into(), i64t.into(), ptr.into(), i64t.into()], false);
         let resolve = self.abi.runtime_fn(&self.module, "pp_resolve", resolve_ty);
-        let addr = self
+        let resolved = self
             .builder
             .build_call(
                 resolve,
@@ -4174,6 +4221,16 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
             .try_as_basic_value()
             .unwrap_basic()
             .into_int_value();
+        let store = self.builder.build_store(slot_ptr, resolved).unwrap();
+        store.set_alignment(8).unwrap();
+        store
+            .set_atomic_ordering(inkwell::AtomicOrdering::Monotonic)
+            .unwrap();
+        self.builder.build_unconditional_branch(ready_bb).unwrap();
+        self.builder.position_at_end(ready_bb);
+        let addr_phi = self.builder.build_phi(i64t, "dc_addr").unwrap();
+        addr_phi.add_incoming(&[(&cached, hit_bb), (&resolved, miss_bb)]);
+        let addr = addr_phi.as_basic_value().into_int_value();
         // 0 means the resolver could not supply the instance (its check
         // failed, or resolution ran on a thread that cannot compile); the
         // resolver reports the real diagnostic itself, this trap only keeps

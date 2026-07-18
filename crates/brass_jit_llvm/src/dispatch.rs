@@ -103,8 +103,8 @@ pub fn with_dispatcher<R>(dispatcher: &mut RuntimeDispatcher, body: impl FnOnce(
 /// (see the driver's spawn drain), and this cache is how those answers
 /// cross threads. Keyed by instance symbol (the empty-type-string flavor of
 /// [`pp_resolve`]).
-static RESOLVED: std::sync::LazyLock<std::sync::RwLock<std::collections::HashMap<String, usize>>> =
-    std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+static RESOLVED: std::sync::LazyLock<std::sync::RwLock<fxhash::FxHashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(fxhash::FxHashMap::default()));
 
 /// Record a resolved deferred-site address for every thread to read.
 pub fn prime_resolved(symbol: &str, addr: usize) {

@@ -11,7 +11,7 @@
 //! names no target dependency, exactly as [`crate::Codegen`] does for the static
 //! path.
 
-use std::collections::HashMap;
+use fxhash::FxHashMap as HashMap;
 
 use crate::mono::{MonoFunction, MonoProgram};
 

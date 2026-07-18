@@ -1781,6 +1781,92 @@ fn cached_lazy_run_compiles_only_entry_reachable_functions() {
     );
 }
 
+/// A zero-argument demand is still a concrete function instance. Its inferred
+/// return contract must keep an unexecuted runtime branch out of the startup
+/// compilation set just like a parameterized function's contract does.
+#[test]
+fn fresh_lazy_run_defers_unannotated_zero_argument_function() {
+    let main = setup(
+        "fresh_lazy_zero_argument_deferral",
+        &[(
+            "main.cz",
+            "fun skipped() { return 141 }\n\
+             fun main() {\n\
+                 if _argv().len() == 1 {\n\
+                     println(42)\n\
+                 } else {\n\
+                     println(skipped())\n\
+                 }\n\
+             }\n",
+        )],
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_brass"))
+        .arg(&main)
+        .env("BRASS_CACHE", "off")
+        .env("BRASS_LOG", "brass::perf=trace")
+        .output()
+        .expect("run fresh lazy program");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+
+    // The branch is runtime-dependent, so the caller contains the call site;
+    // only the inferred contract keeps the callee body out of startup codegen.
+    let compiled: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("back/codegen-fn:"))
+        .collect();
+    assert!(
+        compiled.iter().all(|line| !line.contains("skipped")),
+        "unexecuted zero-argument function was compiled: {stderr}"
+    );
+}
+
+/// Resolving one unannotated function must not pull an unexecuted
+/// unannotated descendant into the same runtime compilation batch.
+#[test]
+fn fresh_lazy_runtime_resolution_keeps_nested_unannotated_call_deferred() {
+    let main = setup(
+        "fresh_lazy_nested_unannotated_deferral",
+        &[(
+            "main.cz",
+            "fun leaf(v) { return v + 100 }\n\
+             fun root(v) {\n\
+                 if _argv().len() == 1 {\n\
+                     return v\n\
+                 } else {\n\
+                     return leaf(v)\n\
+                 }\n\
+             }\n\
+             fun main() { println(root(42)) }\n",
+        )],
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_brass"))
+        .arg(&main)
+        .env("BRASS_CACHE", "off")
+        .env("BRASS_LOG", "brass::perf=debug")
+        .output()
+        .expect("run fresh lazy program");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+
+    let runtime_compiled: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("lazy: runtime compile"))
+        .collect();
+    assert!(
+        runtime_compiled.iter().any(|line| line.contains("root")),
+        "executed root was not runtime-compiled: {stderr}"
+    );
+    assert!(
+        runtime_compiled.iter().all(|line| !line.contains("leaf")),
+        "unexecuted nested callee was runtime-compiled: {stderr}"
+    );
+}
+
 /// Static reachability includes both arms of a runtime branch, but ORC should
 /// optimize and emit native code only for the arm that execution enters.
 #[test]

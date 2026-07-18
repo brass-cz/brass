@@ -10,8 +10,8 @@
 //! so aliasing matches the language's reference semantics, and `RefCell` gives the
 //! in-place field/element mutation `obj.f = v` and `arr[i] = v` perform.
 
+use fxhash::FxHashMap as HashMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use brass_hir::Type;

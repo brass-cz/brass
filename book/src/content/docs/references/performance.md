@@ -135,13 +135,21 @@ path or modification time:
 - a package file relative to the named `BRASS_PACKAGES` root -- the standard
   library's own sources among them, under the implicitly bound `std`
   package.
+- a native plugin by its canonical import path and binary contents. A hit
+  resolves the import again under the current roots, checks the discovered
+  `.so`, `.dylib`, or `.dll`, and injects its current path into the cached
+  wrapper before lowering.
 
 On load, the cache is used only when the compiler tag matches (version, cache
 format, release channel and commit; a working-tree build additionally pins its
 own executable's modification time, since its commit does not identify its
 source) and every recorded reference resolves to a file with the recorded
-contents. Any mismatch falls back to the full pipeline silently, so a cache
-can never make a build wrong, only faster.
+contents. Any mismatch falls back to the full pipeline silently.
+
+One resolution-boundary limitation remains: a module cached from an include
+root's `.cz` file does not notice a native plugin newly added under an earlier
+include root. Plugin-backed entries do re-run ordinary source/plugin resolution,
+so the reverse change (a `.cz` file newly shadowing a cached plugin) is rejected.
 
 Content is what makes the scheme sound *and* portable: whichever file the
 current roots resolve a reference to, equal bytes are the identical program,
@@ -160,10 +168,13 @@ directory is ignored) and atomic (temporary file + rename).
 
 Because stamps are origin-relative and content-addressed, a cache written when
 a release is packed validates wherever the archive is unpacked: `czpm` ships
-with its `bin/czpm.czcache`, whose stamps resolve through the installed
-`std/` next to it, so the package manager starts warm from its first
-run. A released compiler is identified by channel and commit, so every install
-of the same release reproduces the packing machine's tag.
+with its `bin/czpm.czcache`, whose source and plugin imports resolve through
+the installed `std/` next to it, so the package manager starts warm from its
+first run. Plugin wrappers store a logical import marker rather than the
+packing machine's absolute library path; loading replaces it with the path
+found in the installed toolchain. A released compiler is identified by channel
+and commit, so every install of the same release reproduces the packing
+machine's tag.
 
 ### Why the cache unit is the whole program
 
@@ -197,6 +208,7 @@ speed and size. A file is:
 "PPCACHE\0"                      8-byte magic
 len: u8, tag: [u8; len]          compiler tag (version/channel/commit/format;
                                  plus exe-mtime on working-tree builds only)
+checksum: [u8; 20]               SHA-1 of the postcard body
 payload                          postcard-encoded body
 ```
 

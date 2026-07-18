@@ -21,8 +21,8 @@ mod stmt;
 
 pub use stmt::resolve_simple_type;
 
+use fxhash::FxHashMap as HashMap;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 
 use brass_hir::{Program, Type, TypeKind};
 use brass_parser::Span;
@@ -50,10 +50,10 @@ pub struct LowerTables {
     mutation: brass_hir::MutationInfo,
     /// Every sum-variant name in the program, used to tell a binding pattern
     /// (`x`) from a unit-variant pattern (`Red`) during match lowering.
-    variant_names: std::collections::HashSet<String>,
+    variant_names: fxhash::FxHashSet<String>,
     /// Names each module's init binds as module-level globals (top-level
     /// `let`s), used to key global storage per defining module.
-    module_globals: HashMap<Vec<String>, std::collections::HashSet<String>>,
+    module_globals: HashMap<Vec<String>, fxhash::FxHashSet<String>>,
     /// Defining module of each standard-library global (the implicit prelude:
     /// `INT64_MAX` etc. are visible everywhere without an import). First
     /// definition in sorted module order wins, deterministically.
@@ -62,7 +62,7 @@ pub struct LowerTables {
 
 impl LowerTables {
     pub fn new(program: &Program) -> Self {
-        let mut variant_names = std::collections::HashSet::new();
+        let mut variant_names = fxhash::FxHashSet::default();
         for info in program.types.values() {
             if let TypeKind::Sum { variants } = &info.kind {
                 for v in &variants[..] {
@@ -70,8 +70,8 @@ impl LowerTables {
                 }
             }
         }
-        let mut module_globals: HashMap<Vec<String>, std::collections::HashSet<String>> =
-            HashMap::new();
+        let mut module_globals: HashMap<Vec<String>, fxhash::FxHashSet<String>> =
+            HashMap::default();
         for init in &program.inits {
             let names = module_globals.entry(init.path.clone()).or_default();
             for s in &init.stmts {
@@ -80,7 +80,7 @@ impl LowerTables {
                 }
             }
         }
-        let mut prelude_globals: HashMap<String, Vec<String>> = HashMap::new();
+        let mut prelude_globals: HashMap<String, Vec<String>> = HashMap::default();
         let mut core_paths: Vec<&Vec<String>> = module_globals
             .keys()
             .filter(|p| p.first().is_some_and(|seg| seg == "core"))
@@ -118,7 +118,7 @@ pub(crate) struct ProgramCtx<'p> {
     /// itself stays type-free -- the checker decided, this set is the channel.
     /// Empty when lowering without a checked program, so no view is ever
     /// emitted then (tests, deferred re-lowering keep full values).
-    view_args: &'p std::collections::HashSet<Span>,
+    view_args: &'p fxhash::FxHashSet<Span>,
     /// Value expressions the checker accepted as a declared sum subtype at a
     /// flow site, keyed by the expression's span, mapped to the PARENT sum
     /// instance the site required. Lowering rebuilds exactly these values as
@@ -134,7 +134,7 @@ pub(crate) struct ProgramCtx<'p> {
     /// `expr!` sites whose propagated Err payload is re-raised wrapped into
     /// the prelude `Error` (gaining the site's location); the propagation arm
     /// rebuilds the value. Empty when lowering without a checked program.
-    lift_errs: &'p std::collections::HashSet<Span>,
+    lift_errs: &'p fxhash::FxHashSet<Span>,
     /// Field lists of `for f in fields(x)` loops, keyed by the loop statement's
     /// span: the checker resolved the record type and checked one expanded copy
     /// per field; lowering unrolls the same copies (`brass_hir::expand`).
@@ -152,7 +152,7 @@ pub(crate) struct ProgramCtx<'p> {
     /// propagates `Result.Null`, instead of the `Result` tag-test shape. Empty
     /// when lowering without a checked program (tests, deferred re-lowering),
     /// where a nullable `!` is therefore unsupported.
-    null_props: &'p std::collections::HashSet<Span>,
+    null_props: &'p fxhash::FxHashSet<Span>,
     closures: RefCell<Vec<MirClosure>>,
     next_closure: Cell<u32>,
 }
@@ -163,14 +163,14 @@ impl<'p> ProgramCtx<'p> {
         program: &'p Program,
         tables: &'p LowerTables,
         expr_types: &'p HashMap<Span, Type>,
-        view_args: &'p std::collections::HashSet<Span>,
+        view_args: &'p fxhash::FxHashSet<Span>,
         sum_views: &'p HashMap<Span, Type>,
         call_locations: &'p HashMap<Span, (String, u32, u32)>,
-        lift_errs: &'p std::collections::HashSet<Span>,
+        lift_errs: &'p fxhash::FxHashSet<Span>,
         fields_loops: &'p HashMap<Span, Vec<String>>,
         type_names: &'p HashMap<Span, String>,
         typeof_types: &'p HashMap<Span, Type>,
-        null_props: &'p std::collections::HashSet<Span>,
+        null_props: &'p fxhash::FxHashSet<Span>,
     ) -> Self {
         ProgramCtx {
             program,
@@ -517,7 +517,7 @@ pub(crate) struct FnLower<'a, 'p> {
     /// [`ScopeBinding`] (a parameter binds plainly even when a shadowing `let`
     /// of the same name is promoted). Reads/writes of a cell binding go through
     /// the cell's element 0; the closure captures the shared cell pointer.
-    pub(crate) cells: std::collections::HashSet<String>,
+    pub(crate) cells: fxhash::FxHashSet<String>,
 }
 
 /// A name bound in a lexical scope: its local slot, plus whether this
@@ -538,9 +538,9 @@ impl<'a, 'p> FnLower<'a, 'p> {
             module,
             self_type,
             abort_error_prop: false,
-            scopes: vec![HashMap::new()],
+            scopes: vec![HashMap::default()],
             loops: Vec::new(),
-            cells: std::collections::HashSet::new(),
+            cells: fxhash::FxHashSet::default(),
         }
     }
 
@@ -558,7 +558,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
     // ----- scopes -----
 
     pub(crate) fn push_scope(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(HashMap::default());
     }
 
     pub(crate) fn pop_scope(&mut self) {
@@ -726,10 +726,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
 /// Collect the global names a top-level `let` pattern binds, mirroring the
 /// binding forms `store_global_pattern` writes (a bare name, or an array
 /// pattern destructured element-wise).
-fn collect_global_names(
-    pat: &brass_parser::ast::Pattern,
-    out: &mut std::collections::HashSet<String>,
-) {
+fn collect_global_names(pat: &brass_parser::ast::Pattern, out: &mut fxhash::FxHashSet<String>) {
     use brass_parser::ast::Pattern;
     match pat {
         Pattern::Binding(name, _) => {
@@ -766,15 +763,15 @@ pub fn lower_body(
     params: &[Param],
     body: &Block,
 ) -> (MirBody, Vec<MirClosure>) {
-    let no_types = HashMap::new();
-    let no_views = std::collections::HashSet::new();
-    let no_sum_views = HashMap::new();
-    let no_call_locations = HashMap::new();
-    let no_lift_errs = std::collections::HashSet::new();
-    let no_fields_loops = HashMap::new();
-    let no_type_names = HashMap::new();
-    let no_typeof_types = HashMap::new();
-    let no_null_props = std::collections::HashSet::new();
+    let no_types = HashMap::default();
+    let no_views = fxhash::FxHashSet::default();
+    let no_sum_views = HashMap::default();
+    let no_call_locations = HashMap::default();
+    let no_lift_errs = fxhash::FxHashSet::default();
+    let no_fields_loops = HashMap::default();
+    let no_type_names = HashMap::default();
+    let no_typeof_types = HashMap::default();
+    let no_null_props = fxhash::FxHashSet::default();
     let tables = LowerTables::new(program);
     let ctx = ProgramCtx::new(
         program,
@@ -833,15 +830,15 @@ fn lower_one(
 pub fn lower_program(program: &Program) -> MirProgram {
     lower_program_with_types(
         program,
-        &HashMap::new(),
-        &std::collections::HashSet::new(),
-        &HashMap::new(),
-        &HashMap::new(),
-        &std::collections::HashSet::new(),
-        &HashMap::new(),
-        &HashMap::new(),
-        &HashMap::new(),
-        &std::collections::HashSet::new(),
+        &HashMap::default(),
+        &fxhash::FxHashSet::default(),
+        &HashMap::default(),
+        &HashMap::default(),
+        &fxhash::FxHashSet::default(),
+        &HashMap::default(),
+        &HashMap::default(),
+        &HashMap::default(),
+        &fxhash::FxHashSet::default(),
     )
 }
 
@@ -851,14 +848,14 @@ pub fn lower_program(program: &Program) -> MirProgram {
 /// growing channel state).
 pub struct CheckerChannels<'a> {
     pub expr_types: &'a HashMap<Span, Type>,
-    pub view_args: &'a std::collections::HashSet<Span>,
+    pub view_args: &'a fxhash::FxHashSet<Span>,
     pub sum_views: &'a HashMap<Span, Type>,
     pub call_locations: &'a HashMap<Span, (String, u32, u32)>,
-    pub lift_errs: &'a std::collections::HashSet<Span>,
+    pub lift_errs: &'a fxhash::FxHashSet<Span>,
     pub fields_loops: &'a HashMap<Span, Vec<String>>,
     pub type_names: &'a HashMap<Span, String>,
     pub typeof_types: &'a HashMap<Span, Type>,
-    pub null_props: &'a std::collections::HashSet<Span>,
+    pub null_props: &'a fxhash::FxHashSet<Span>,
 }
 
 /// A partially lowered MIR program for the lazy pipeline. Methods and module
@@ -875,7 +872,7 @@ pub struct CheckerChannels<'a> {
 /// exactly as un-promoted code always is.
 pub struct SubsetLowering {
     pub mir: MirProgram,
-    lowered: std::collections::HashSet<String>,
+    lowered: fxhash::FxHashSet<String>,
     next_closure: u32,
 }
 
@@ -901,7 +898,7 @@ impl SubsetLowering {
         mir.closures = closures;
         SubsetLowering {
             mir,
-            lowered: std::collections::HashSet::new(),
+            lowered: fxhash::FxHashSet::default(),
             next_closure,
         }
     }
@@ -971,7 +968,7 @@ fn lower_function_into(
     ctx: &ProgramCtx,
     out: &mut MirProgram,
     info: &brass_hir::FunInfo,
-    null_props: &std::collections::HashSet<Span>,
+    null_props: &fxhash::FxHashSet<Span>,
 ) {
     // The entry `main` (the root module's bare `main` symbol) is the
     // program: a failed `expr!` there aborts with the error instead of
@@ -1072,14 +1069,14 @@ fn lower_methods_into(ctx: &ProgramCtx, out: &mut MirProgram, program: &Program)
 pub fn lower_program_with_types(
     program: &Program,
     expr_types: &HashMap<Span, Type>,
-    view_args: &std::collections::HashSet<Span>,
+    view_args: &fxhash::FxHashSet<Span>,
     sum_views: &HashMap<Span, Type>,
     call_locations: &HashMap<Span, (String, u32, u32)>,
-    lift_errs: &std::collections::HashSet<Span>,
+    lift_errs: &fxhash::FxHashSet<Span>,
     fields_loops: &HashMap<Span, Vec<String>>,
     type_names: &HashMap<Span, String>,
     typeof_types: &HashMap<Span, Type>,
-    null_props: &std::collections::HashSet<Span>,
+    null_props: &fxhash::FxHashSet<Span>,
 ) -> MirProgram {
     let tables = LowerTables::new(program);
     let ctx = ProgramCtx::new(
@@ -1170,7 +1167,7 @@ fn lower_method(
 fn function_fallible(
     ret: Option<&brass_parser::ast::TypeExpr>,
     body: &Block,
-    null_props: &std::collections::HashSet<Span>,
+    null_props: &fxhash::FxHashSet<Span>,
 ) -> bool {
     match ret {
         Some(brass_parser::ast::TypeExpr::Fallible(..)) => true,

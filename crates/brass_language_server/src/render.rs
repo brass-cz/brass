@@ -7,7 +7,8 @@
 //! has each unannotated slot shown as a distinct `unknown_N`, numbered in the
 //! order the parameters (then the return) occur.
 
-use std::collections::{BTreeMap, HashMap};
+use fxhash::FxHashMap as HashMap;
+use std::collections::BTreeMap;
 
 use brass_hir::{
     CallableSignature, FieldInfo, Substitution, Type, TypeInfo, TypeKind, VariantInfo,
@@ -40,7 +41,7 @@ impl UnknownNamer {
     /// variables from zero while slot variables keep their `Self.<slot>` names.
     fn fresh_child(&self) -> Self {
         Self {
-            by_id: HashMap::new(),
+            by_id: HashMap::default(),
             next: 0,
             fixed: self.fixed.clone(),
         }

@@ -975,7 +975,7 @@ fn completion_offers_include_and_package_modules() {
     std::fs::write(geo_dir.join("vec.cz"), "fun dot() { return 0 }\n")
         .expect("write nested include module");
     let search = brass_resolve::SearchPaths {
-        packages: std::collections::HashMap::from([(
+        packages: fxhash::FxHashMap::from_iter([(
             "mypkg".to_string(),
             std::path::PathBuf::from("/nonexistent"),
         )]),

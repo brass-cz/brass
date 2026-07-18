@@ -18,7 +18,7 @@
 //! and other Value-based stdlib primitives) is rejected, so the back end only
 //! sees validated, concretely-typed MIR.
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use brass_hir::{
     FloatKind, IntKind, NominalType, Program, RESULT_TYPE_ID, Substitution, Type, TypeKind,
@@ -431,8 +431,12 @@ pub enum MonoStop {
     /// collects EVERY missing body it can see -- a missing call's result is
     /// left unresolved and the walk continues -- so the caller lowers them
     /// all and retries: the retry count is the call graph's depth, not its
-    /// node count. Never empty.
-    MissingBodies(Vec<(String, Vec<Type>)>),
+    /// node count. Never empty. The third element is whether the demand
+    /// NEEDS the lowered body: `false` marks an unannotated
+    /// deferral candidate, where the caller may instead answer with the
+    /// checker's instance return (see `Monomorphizer::instance_returns`)
+    /// and never lower the body at all.
+    MissingBodies(Vec<(String, Vec<Type>, bool)>),
     /// Monomorphization genuinely failed (the same rejection
     /// [`monomorphize`] reports for the entry).
     Fail(String),
@@ -452,9 +456,24 @@ pub fn monomorphize_entry<'m>(
     program: &'m Program,
     defer: bool,
 ) -> Result<MonoProgram<'m>, MonoStop> {
+    monomorphize_entry_with_returns(mir, program, defer, HashMap::default())
+}
+
+/// [`monomorphize_entry`] with the checker's instance-return contracts for
+/// UNANNOTATED functions (see `Monomorphizer::instance_returns`): a call
+/// whose contract is present compiles as a runtime-deferred site instead of
+/// demanding the body, so a statically live but never-executed call tree is
+/// neither lowered nor handed to LLVM.
+pub fn monomorphize_entry_with_returns<'m>(
+    mir: &'m MirProgram,
+    program: &'m Program,
+    defer: bool,
+    instance_returns: HashMap<(String, Vec<Type>), Type>,
+) -> Result<MonoProgram<'m>, MonoStop> {
     let mut mono = Monomorphizer::new(mir, program);
+    mono.instance_returns = instance_returns;
     if defer {
-        mono.defer = Some(HashMap::new());
+        mono.defer = Some(HashMap::default());
     }
     let mut init_symbols = Vec::with_capacity(mir.inits.len());
     for (i, init) in mir.inits.iter().enumerate() {
@@ -554,8 +573,31 @@ pub fn monomorphize_instance_deferred<'m>(
     type_args: Vec<Type>,
     globals: &[(String, Type)],
 ) -> Result<MonoProgram<'m>, MonoStop> {
+    monomorphize_instance_deferred_with_returns(
+        mir,
+        program,
+        base,
+        type_args,
+        globals,
+        HashMap::default(),
+    )
+}
+
+/// [`monomorphize_instance_deferred`] with checker-reported return contracts
+/// for unannotated callees. This keeps calls discovered while resolving one
+/// deferred instance runtime-deferred themselves instead of pulling their
+/// bodies into the current compilation batch.
+pub fn monomorphize_instance_deferred_with_returns<'m>(
+    mir: &'m MirProgram,
+    program: &'m Program,
+    base: &str,
+    type_args: Vec<Type>,
+    globals: &[(String, Type)],
+    instance_returns: HashMap<(String, Vec<Type>), Type>,
+) -> Result<MonoProgram<'m>, MonoStop> {
     let mut mono = Monomorphizer::new(mir, program);
-    mono.defer = Some(HashMap::new());
+    mono.defer = Some(HashMap::default());
+    mono.instance_returns = instance_returns;
     // Global types are discovered by typing init bodies, which a
     // single-instance run never does: the caller passes the startup run's
     // complete table (every init typed before execution began), or a body
@@ -630,14 +672,21 @@ struct Monomorphizer<'m, 'p> {
     /// cleanly are rolled back to the root's watermark: they came from dead
     /// branches or recovered probes, and dead code needs no body. A
     /// `RefCell` because the probes only hold `&self`.
-    missing_demands: std::cell::RefCell<Vec<(String, Vec<Type>)>>,
+    missing_demands: std::cell::RefCell<Vec<(String, Vec<Type>, bool)>>,
+    /// Checker-reported instance returns for UNANNOTATED functions, keyed by
+    /// `(base symbol, argument types)`: the runtime-deferral contract that
+    /// lets a call to such a function compile as a runtime-resolved site
+    /// without the body ever being lowered (see `deferrable`). Populated by
+    /// the lazy driver from the streamed `instance_returns` deltas; empty
+    /// everywhere else.
+    instance_returns: HashMap<(String, Vec<Type>), Type>,
 }
 
 impl<'m, 'p> Monomorphizer<'m, 'p> {
     /// Build a monomorphizer over a MIR program: index functions, record methods,
     /// and closures so instances can be created on demand.
     fn new(mir: &'m MirProgram, program: &'p Program) -> Self {
-        let mut by_method: HashMap<(&str, &str), &MirMethod> = HashMap::new();
+        let mut by_method: HashMap<(&str, &str), &MirMethod> = HashMap::default();
         for m in &mir.methods {
             // Record methods carry no variant. A whole-sum method (`fun Sum.m`)
             // is duplicated into every variant by HIR lowering, so any one copy
@@ -657,15 +706,16 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 .collect(),
             by_method,
             by_closure: mir.closures.iter().map(|c| (c.id, c)).collect(),
-            global_types: HashMap::new(),
-            instances: HashMap::new(),
-            in_progress: HashMap::new(),
-            assumed_rets: HashMap::new(),
+            global_types: HashMap::default(),
+            instances: HashMap::default(),
+            in_progress: HashMap::default(),
+            assumed_rets: HashMap::default(),
             instance_log: Vec::new(),
             rows: None,
             defer: None,
             closure_depth: 0,
             missing_demands: std::cell::RefCell::new(Vec::new()),
+            instance_returns: HashMap::default(),
         }
     }
 
@@ -745,11 +795,19 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
 
     /// Record a demand for `base` at `arg_types` (deduplicated): one of the
     /// missing bodies this pass collects (see `missing_demands`).
-    fn note_missing(&self, base: &str, arg_types: &[Type]) {
+    /// `needs_body` demands merge with OR: one site that must have the
+    /// lowered body (a closure site, a non-deferrable shape) outweighs any
+    /// number of deferral-candidate sites for the same instance.
+    fn note_missing(&self, base: &str, arg_types: &[Type], needs_body: bool) {
         let mut demands = self.missing_demands.borrow_mut();
-        if !demands.iter().any(|(b, a)| b == base && a == arg_types) {
-            demands.push((base.to_string(), arg_types.to_vec()));
+        if let Some(d) = demands
+            .iter_mut()
+            .find(|(b, a, _)| b == base && a == arg_types)
+        {
+            d.2 |= needs_body;
+            return;
         }
+        demands.push((base.to_string(), arg_types.to_vec(), needs_body));
     }
 
     /// Instantiate a free function `base` for `type_args` (memoized).
@@ -762,7 +820,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             // Record what a demand-driven caller (the lazy pipeline, which
             // lowers function bodies into the MIR program on demand) would
             // need to make this call instantiable.
-            self.note_missing(base, &type_args);
+            self.note_missing(base, &type_args, true);
             return Err(format!("unknown function `{base}`"));
         };
         let sig_ret = self
@@ -1239,7 +1297,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         // Without the gate, the `!`-on-declared-subtype REBUILD -- an Ok/Err
         // reconstruction of the OPERAND, consumed by the propagation test --
         // would note the operand's Ok payload as this callable's.
-        let mut returned: HashSet<LocalId> = HashSet::new();
+        let mut returned: HashSet<LocalId> = HashSet::default();
         for (idx, block) in body.blocks.iter().enumerate() {
             if null_prop_blocks.contains(&idx) {
                 continue;
@@ -2233,7 +2291,8 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             && !self.by_fn.contains_key(base)
             && self.program.functions.contains_key(base)
         {
-            self.note_missing(base, &arg_types);
+            let needs_body = !self.unannotated_deferral_candidate(base, &arg_types);
+            self.note_missing(base, &arg_types, needs_body);
             return Err(format!("missing body `{base}` (demanded)"));
         }
         let sym = self.instantiate_fn(base, arg_types)?;
@@ -2253,14 +2312,32 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             return None;
         }
         let info = self.program.functions.get(base)?;
-        let ret = info.signature.ret_ty.clone()?;
+        let ret = match info.signature.ret_ty.clone() {
+            Some(ret) => {
+                if brass_mir::constructs_error_block(&info.decl.body) {
+                    return None;
+                }
+                ret
+            }
+            // An UNANNOTATED callee defers through the checker's
+            // instance-return contract (the demanded pass at exactly these
+            // argument types), under a stricter fallibility rule: `!` and
+            // `error()` both reshape the ABI (`Result`, nullable) away from
+            // the plain reported return, so any fallibility keeps the body
+            // on the compile-it path.
+            None => {
+                if brass_mir::fallible_block(&info.decl.body) {
+                    return None;
+                }
+                self.instance_returns
+                    .get(&(base.to_string(), arg_types.to_vec()))?
+                    .clone()
+            }
+        };
         if !brass_hir::is_fully_known(&ret) || !is_supported(&ret) {
             return None;
         }
         if !self.self_describing(&ret) {
-            return None;
-        }
-        if brass_mir::constructs_error_block(&info.decl.body) {
             return None;
         }
         if !arg_types.iter().all(brass_hir::is_fully_known) {
@@ -2291,6 +2368,25 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             params,
             ret,
         })
+    }
+
+    /// Whether a missing `base` at `arg_types` could compile as a
+    /// runtime-deferred call once the checker reports the instance's return
+    /// type: the shape half of the unannotated arm of `deferrable`, checked
+    /// before any contract exists so the demand can be flagged as
+    /// not-needing-the-body. Mirrors `deferrable`'s guards minus the return
+    /// checks (those run when the contract arrives).
+    fn unannotated_deferral_candidate(&self, base: &str, arg_types: &[Type]) -> bool {
+        if self.defer.is_none() || self.closure_depth > 0 || self.by_fn.contains_key(base) {
+            return false;
+        }
+        let Some(info) = self.program.functions.get(base) else {
+            return false;
+        };
+        info.signature.ret_ty.is_none()
+            && !brass_mir::fallible_block(&info.decl.body)
+            && arg_types.iter().all(brass_hir::is_fully_known)
+            && info.decl.params.len() == arg_types.len()
     }
 
     /// Type a `print`/`println` call: void, accepted only for a printable

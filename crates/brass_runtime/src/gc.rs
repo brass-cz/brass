@@ -17,7 +17,7 @@
 //! `schedule_tick`). The driver also calls `pp_gc_collect` once before exit to
 //! sweep whatever remains.
 
-use std::collections::HashMap;
+use fxhash::FxHashMap as HashMap;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -108,7 +108,7 @@ pub type TraceFn = extern "C-unwind" fn(*mut Header, extern "C-unwind" fn(*mut H
 /// candidate set.
 fn registry() -> &'static Mutex<HashMap<usize, usize>> {
     static R: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
-    R.get_or_init(|| Mutex::new(HashMap::new()))
+    R.get_or_init(|| Mutex::new(HashMap::default()))
 }
 
 /// Objects to free after a collection pass, gathered so freeing never happens while

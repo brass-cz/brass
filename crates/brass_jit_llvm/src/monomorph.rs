@@ -9,7 +9,7 @@
 //! is shared with the driver so it can resolve each symbol's JIT address for the
 //! runtime dispatch tables.
 
-use std::collections::HashMap;
+use fxhash::FxHashMap as HashMap;
 
 use brass_hir::{FloatKind, IntKind, Type};
 use inkwell::values::FunctionValue;

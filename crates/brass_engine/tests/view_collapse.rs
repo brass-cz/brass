@@ -46,11 +46,11 @@ fn three_shapes_collapse_to_one_display_instance() {
     // needed here) and monomorphize from the zero-parameter roots.
     let mir = brass_mir::lower_program_with_types(
         &program,
-        &std::collections::HashMap::new(),
+        &fxhash::FxHashMap::default(),
         &analysis.view_args,
         &analysis.sum_views,
-        &std::collections::HashMap::new(),
-        &std::collections::HashSet::new(),
+        &fxhash::FxHashMap::default(),
+        &fxhash::FxHashSet::default(),
         &analysis.fields_loops,
         &analysis.type_names,
         &analysis.typeof_types,

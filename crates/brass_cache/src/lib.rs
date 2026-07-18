@@ -23,19 +23,18 @@
 //! so the same on-disk files no longer describe the same program). Source
 //! files are named RELATIVE to the root each was resolved under (the entry
 //! file's directory, an include root, a package root), never by machine path
-//! -- so a cache survives the whole project moving. Native plugin libraries
-//! are the exception: the synthesized wrapper embeds the library's absolute
-//! path (the runtime dlopens exactly that string), so their stamps are pinned
-//! `Absolute` and a cache involving plugins misses after a move instead of
-//! re-lowering wrappers that would open the old location. Any mismatch, short
-//! read, or decode error falls back to the full pipeline -- the cache can
-//! never make a build wrong, only faster.
+//! -- so a cache survives the whole project moving. Native plugins are keyed
+//! by their canonical import path and binary contents. A hit resolves that
+//! import again under the current roots, rejects a cached plugin that was
+//! replaced or shadowed, and rewrites the cached wrapper to the library path
+//! it found. Any mismatch, short read, or decode error falls back to the full
+//! pipeline.
 //!
-//! Known accepted limit: a module served by an include-root file at save time
-//! that a native plugin under an EARLIER root would now shadow (or the
-//! reverse, a project `.cz` newly shadowing a plugin) is not re-judged by the
-//! stamps; the wrapper/file distinction is only re-checked through the entry
-//! and package guards above.
+//! Known accepted limit: a cache whose module was served by an include-root
+//! source file does not re-judge whether a native plugin newly added under an
+//! earlier include root would now shadow it. Plugin-backed cache entries do
+//! re-run full source/plugin resolution; source-backed entries still validate
+//! their recorded `.cz` reference directly.
 //!
 //! The format is binary (postcard: varint-packed serde, no field names), chosen
 //! for load speed and size; it is not meant to be read by humans, and no
@@ -50,7 +49,7 @@ use brass_parser::Span;
 
 /// Bumped whenever the payload layout changes, so an old file is discarded by
 /// the header check instead of misread by postcard (which carries no schema).
-pub const FORMAT_VERSION: u16 = 3;
+pub const FORMAT_VERSION: u16 = 4;
 
 /// Leading magic, so a foreign file is rejected before any decoding.
 const MAGIC: &[u8; 8] = b"PPCACHE\0";
@@ -148,17 +147,7 @@ impl FileStamp {
                 .collect();
             Some(parts.join("/"))
         };
-        // A native plugin library is pinned to its absolute path: the
-        // synthesized wrapper in the cached AST embeds this exact string as
-        // the runtime's dlopen target, so validating the stamp anywhere else
-        // would re-lower wrappers that open the OLD location.
-        let relocatable = !matches!(
-            canon.extension().and_then(|e| e.to_str()),
-            Some("so" | "dylib" | "dll")
-        );
-        let origin = if !relocatable {
-            StampOrigin::Absolute(canon.display().to_string())
-        } else if let Some(rel) = rel_under(&roots.entry_dir) {
+        let origin = if let Some(rel) = rel_under(&roots.entry_dir) {
             StampOrigin::Entry(rel)
         } else if let Some((name, rel)) = roots
             .search
@@ -234,6 +223,71 @@ impl FileStamp {
     }
 }
 
+/// One native plugin used by the cached program. `module` is resolved through
+/// the current import roots on every hit, so the cache stores no machine path;
+/// the length and hash ensure the discovered library is the one whose manifest
+/// shaped the cached wrapper and its checked signature.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct PluginStamp {
+    module: Vec<String>,
+    len: u64,
+    sha1: [u8; 20],
+}
+
+impl PluginStamp {
+    /// Stamp the library whose synthesized module was loaded as `module`.
+    pub fn of(module: &[String], library: &Path) -> Option<Self> {
+        let bytes = std::fs::read(library).ok()?;
+        Some(Self {
+            module: module.to_vec(),
+            len: bytes.len() as u64,
+            sha1: sha1(&bytes),
+        })
+    }
+
+    /// The canonical import path used to rediscover this plugin.
+    pub fn module(&self) -> &[String] {
+        &self.module
+    }
+
+    /// Resolve and validate the current library through ordinary import
+    /// precedence. A `.cz` source now shadowing the plugin is a cache miss.
+    fn resolve(&self, root: &Path, search: &brass_resolve::SearchPaths) -> Option<PathBuf> {
+        let brass_resolve::ModuleFile::Plugin(library) =
+            brass_resolve::resolve_module_file(root, search, &self.module)?
+        else {
+            return None;
+        };
+        if !std::fs::metadata(&library).is_ok_and(|meta| meta.len() == self.len) {
+            return None;
+        }
+        let bytes = std::fs::read(&library).ok()?;
+        (sha1(&bytes) == self.sha1).then(|| {
+            library
+                .canonicalize()
+                .unwrap_or_else(|_| library.to_path_buf())
+        })
+    }
+}
+
+/// Clone modules for serialization and replace every plugin wrapper's current
+/// library path with its stable import identity. Cache loading always resolves
+/// and injects a real path before the AST can reach lowering or execution.
+pub fn modules_for_cache(
+    modules: &[LoadedModule],
+    plugins: &[PluginStamp],
+) -> Option<Vec<LoadedModule>> {
+    let mut cached = modules.to_vec();
+    for plugin in plugins {
+        let module = cached.iter_mut().find(|m| m.path == plugin.module)?;
+        brass_resolve::reinject_plugin_path(
+            &mut module.ast,
+            &format!("@plugin:{}", plugin.module.join(".")),
+        );
+    }
+    Some(cached)
+}
+
 fn sha1(bytes: &[u8]) -> [u8; 20] {
     use sha1::{Digest, Sha1};
 
@@ -274,6 +328,9 @@ pub struct Payload {
     /// paths would break relocation, and a package's CONTENT is already
     /// covered by its stamps.
     pub packages: Vec<String>,
+    /// Native libraries keyed by logical import and contents, never by their
+    /// build-machine path.
+    pub plugins: Vec<PluginStamp>,
     /// The final module graph: post-resolution, post-rewrite, post-keyed
     /// specialization. Re-lowering these reproduces the checked program.
     pub modules: Vec<LoadedModule>,
@@ -408,7 +465,7 @@ pub fn load(entry: &Path, flavor: &str, search: &brass_resolve::SearchPaths) -> 
     let path = cache_path(entry);
     let bytes = std::fs::read(&path).ok()?;
     let body = decode_file(&bytes, &cache_tag(flavor)?)?;
-    let payload: Payload = postcard::from_bytes(body).ok()?;
+    let mut payload: Payload = postcard::from_bytes(body).ok()?;
     // The first dep must BE the file the user named: same length, same hash.
     // `still_valid` alone would only prove the recorded file exists somewhere.
     let entry_bytes = std::fs::read(entry).ok()?;
@@ -427,6 +484,17 @@ pub fn load(entry: &Path, flavor: &str, search: &brass_resolve::SearchPaths) -> 
             return None;
         }
     }
+    for plugin in &payload.plugins {
+        let Some(library) = plugin.resolve(&roots.entry_dir, search) else {
+            tracing::debug!(target: "brass::perf", "cache: plugin {} changed, ignoring {}", plugin.module.join("."), path.display());
+            return None;
+        };
+        let module = payload
+            .modules
+            .iter_mut()
+            .find(|module| module.path == plugin.module)?;
+        brass_resolve::reinject_plugin_path(&mut module.ast, &library.display().to_string());
+    }
     Some(payload)
 }
 
@@ -440,6 +508,7 @@ pub fn load(entry: &Path, flavor: &str, search: &brass_resolve::SearchPaths) -> 
 pub struct PartialPayload {
     pub deps: Vec<FileStamp>,
     pub packages: Vec<String>,
+    pub plugins: Vec<PluginStamp>,
     pub snapshot: brass_typeck::stream::StreamSnapshot,
 }
 
@@ -465,6 +534,12 @@ pub fn load_partial(
     for dep in &payload.deps {
         if !dep.still_valid(&roots) {
             tracing::debug!(target: "brass::perf", "partial cache: {:?} changed, ignoring", dep.origin);
+            return None;
+        }
+    }
+    for plugin in &payload.plugins {
+        if plugin.resolve(&roots.entry_dir, search).is_none() {
+            tracing::debug!(target: "brass::perf", "partial cache: plugin {} changed, ignoring", plugin.module.join("."));
             return None;
         }
     }
@@ -599,4 +674,34 @@ pub fn save_context_bundle(id: &[u8; 20], bundle: &ContextBundle) {
         return;
     };
     write_atomic(&path, &encode_file(&tag, &body));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_file, encode_file};
+
+    /// Framing accepts an intact body and rejects same-size corruption before
+    /// postcard can interpret bytes as a shape-valid payload.
+    #[test]
+    fn cache_frame_rejects_corrupted_body() {
+        let tag = "compiler/format/flavor";
+        let body = b"serialized payload";
+        let mut encoded = encode_file(tag, body);
+        assert_eq!(decode_file(&encoded, tag), Some(body.as_slice()));
+
+        let last = encoded.last_mut().expect("encoded body");
+        *last ^= 0xff;
+        assert_eq!(decode_file(&encoded, tag), None);
+    }
+
+    /// Every header field is bounds-checked, so an interrupted short write is
+    /// a cache miss rather than a panic or a partially decoded payload.
+    #[test]
+    fn cache_frame_rejects_truncation() {
+        let tag = "compiler/format/flavor";
+        let encoded = encode_file(tag, b"serialized payload");
+        for end in 0..encoded.len() {
+            assert_eq!(decode_file(&encoded[..end], tag), None, "length {end}");
+        }
+    }
 }

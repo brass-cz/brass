@@ -14,7 +14,7 @@
 //! interpreter: with a file it runs the file, with none it starts an interactive
 //! session. Argument parsing is `clap`'s derive interface.
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -308,7 +308,7 @@ fn auto_acquire_modules(modules: &mut [LoadedModule]) -> Vec<(String, Span)> {
             }
         }
 
-        let mut globals: HashSet<String> = HashSet::new();
+        let mut globals: HashSet<String> = HashSet::default();
         for m in modules.iter() {
             for item in &m.ast.items {
                 if let TopLevel::Stmt(Stmt::Let { pat, .. }) = item {
@@ -341,7 +341,7 @@ fn auto_acquire_modules(modules: &mut [LoadedModule]) -> Vec<(String, Span)> {
                 span: brass_parser::Span::new(0, 0),
             });
         }
-        let mut mutated: HashSet<String> = HashSet::new();
+        let mut mutated: HashSet<String> = HashSet::default();
         for g in &globals {
             if bodies.iter().any(|b| mutates(b, g)) {
                 mutated.insert(g.clone());
@@ -477,7 +477,7 @@ fn report_spawn_ownership(modules: &[LoadedModule]) -> Vec<String> {
         if !init_stmts.is_empty() {
             warn(
                 &mut out,
-                analyze_spawns_stmts(&init_stmts, &HashSet::new()),
+                analyze_spawns_stmts(&init_stmts, &HashSet::default()),
                 &format!(" in module `{}`", m.path.join(".")),
             );
         }
@@ -775,6 +775,7 @@ fn cached_context_seed(
     key: &Option<[u8; 20]>,
     ctx: &[LoadedModule],
     module_hashes: Option<&[(String, [u8; 20])]>,
+    prior: Option<&brass_cache::ContextBundle>,
     phase_name: &'static str,
 ) -> Option<brass_typeck::ContextTables> {
     if let Some(key) = key
@@ -792,14 +793,18 @@ fn cached_context_seed(
         // (same module-path list) tells which modules changed: everything
         // else's tables are retained as a partial seed and only the changed
         // modules -- plus their transitive importers, which may observe the
-        // change -- re-infer.
+        // change -- re-infer. When no sidecar is on disk, an in-memory
+        // `prior` bundle the caller just built serves the same way: the
+        // keyed re-pass hands in the plain context it inferred moments ago,
+        // so even a cache-cold run only re-infers the specialized modules.
         let incremental = module_hashes.and_then(|hashes| {
-            if !brass_cache::enabled() {
-                return None;
-            }
-            let id = context_identity(CACHE_FLAVOR, hashes);
-            let prior = brass_cache::load_context_bundle(&id)?;
-            let keep = clean_context_modules(ctx, hashes, &prior.module_hashes);
+            let disk = if brass_cache::enabled() {
+                brass_cache::load_context_bundle(&context_identity(CACHE_FLAVOR, hashes))
+            } else {
+                None
+            };
+            let bundle = disk.as_ref().or(prior)?;
+            let keep = clean_context_modules(ctx, hashes, &bundle.module_hashes);
             if keep.is_empty() {
                 return None;
             }
@@ -809,7 +814,7 @@ fn cached_context_seed(
                 total = ctx.len(),
                 "incremental context rebuild"
             );
-            let mut partial = prior.seed;
+            let mut partial = bundle.seed.clone();
             if !partial.retain_modules(&ctx_program, &keep) {
                 tracing::debug!(
                     target: "brass::perf",
@@ -932,7 +937,7 @@ fn clean_context_modules(
         .iter()
         .any(|m| m.is_prelude && dirty.contains(&m.path.join(".")))
     {
-        return HashSet::new();
+        return HashSet::default();
     }
     // A written import path may name a dirty module in several shapes:
     // absolute (`std.package_manager.manifest`), package-relative
@@ -1128,6 +1133,10 @@ impl brass_typeck::stream::Scheduler for ThreadScheduler {
 #[derive(Default)]
 struct MergedChannels {
     expr_types: HashMap<Span, brass_hir::Type>,
+    /// Checker-reported instance returns of demanded UNANNOTATED bodies,
+    /// keyed by `(symbol, argument types)`: the runtime-deferral contracts
+    /// `monomorphize_entry_with_returns` compiles call sites against.
+    instance_returns: HashMap<(String, Vec<brass_hir::Type>), brass_hir::Type>,
     view_args: HashSet<Span>,
     sum_views: HashMap<Span, brass_hir::Type>,
     lift_errs: HashSet<Span>,
@@ -1165,6 +1174,9 @@ impl MergedChannels {
                 .iter()
                 .map(|(s, t)| (*s, t.clone()))
                 .collect(),
+            // Contracts are not snapshotted: a resumed run's repeat demand
+            // revives the real instance pass, which re-emits them.
+            instance_returns: HashMap::default(),
             view_args: snap.view_args.iter().copied().collect(),
             sum_views: snap
                 .sum_views
@@ -1199,6 +1211,9 @@ impl MergedChannels {
             self.typeof_types.remove(s);
         }
         self.expr_types.extend(d.expr_types);
+        for (symbol, args, ret) in d.instance_returns {
+            self.instance_returns.insert((symbol, args), ret);
+        }
         self.view_args.extend(d.view_args);
         self.sum_views.extend(d.sum_views);
         self.lift_errs.extend(d.lift_errs);
@@ -1707,14 +1722,39 @@ fn resolve_deferred(
         lowering.add_function(program, tables, &sig.base, &channels);
     }
     loop {
-        match brass_engine::monomorphize_instance_deferred(
+        match brass_engine::monomorphize_instance_deferred_with_returns(
             &lowering.mir,
             program,
             &sig.base,
             sig.type_args.clone(),
             globals,
+            lazy.merged.instance_returns.clone(),
         ) {
             Ok(mono) => {
+                // An UNANNOTATED instance was deferred against the checker's
+                // reported return; the monomorphized body is the authority.
+                // A mismatch would make the already-compiled call site an
+                // ill-typed indirect call, so it fails resolution (defined,
+                // pre-execution of the instance) instead of miscompiling.
+                let unannotated = program
+                    .functions
+                    .get(&sig.base)
+                    .is_some_and(|f| f.signature.ret_ty.is_none());
+                if unannotated
+                    && let Some(f) = mono.lookup(symbol)
+                    && f.ret != sig.ret
+                {
+                    eprintln!(
+                        "error: deferred instance `{}` resolved with return type `{}` \
+                         but its call site was compiled for `{}`; annotate the return \
+                         type of `{}`",
+                        symbol,
+                        f.ret.display(),
+                        sig.ret.display(),
+                        sig.base
+                    );
+                    return 0;
+                }
                 targets.extend(mono.deferred.clone());
                 let batch_spawns = brass_engine::batch_spawns(&mono);
                 // Emit every new instance's module BEFORE resolving the one
@@ -1761,17 +1801,29 @@ fn resolve_deferred(
             }
             Err(brass_engine::MonoStop::MissingBodies(demands)) => {
                 let mut progressed = false;
-                for (miss, type_args) in demands {
+                for (miss, type_args, needs_body) in demands {
                     if lowering.is_lowered(&miss) || !program.functions.contains_key(&miss) {
                         continue;
                     }
-                    if !lazy.demand(&miss, type_args) {
+                    if !lazy.demand(&miss, type_args.clone()) {
                         return fatal_exit(
                             lazy,
                             &format!("error: the check of `{miss}` did not complete"),
                         );
                     }
                     exit_if_fatal(lazy, bodies, sources);
+                    if !needs_body
+                        && lazy
+                            .merged
+                            .instance_returns
+                            .contains_key(&(miss.clone(), type_args))
+                    {
+                        // The checker supplied the missing unannotated return
+                        // contract. Retry with it instead of lowering the body;
+                        // the call remains deferred until execution reaches it.
+                        progressed = true;
+                        continue;
+                    }
                     let channels = lazy.channels(call_locations);
                     lowering.add_function(program, tables, &miss, &channels);
                     progressed = true;
@@ -1910,17 +1962,17 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
     if !lower_errors.is_empty() {
         return finish_eagerly(&rt, checker, &stop, &paused, events_rx, &label, &src, &root);
     }
-    let call_locations = call_site_locations(&front.modules, &front.sources);
+    let call_locations = call_site_locations(&front.modules, &front.sources, &search);
     let bodies = BodySpans::new(&program);
 
     let mut lazy = LazyState {
         events: events_rx,
         requests: requests_tx,
         merged: MergedChannels::default(),
-        checked_fns: HashSet::new(),
+        checked_fns: HashSet::default(),
         inits_checked: 0,
         held: Vec::new(),
-        needed: HashSet::from(["main".to_string()]),
+        needed: HashSet::from_iter(["main".to_string()]),
         stop,
         paused,
         restarted: false,
@@ -2023,7 +2075,12 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         // trusted. Rebuilding once per missing body would re-lower every
         // method for each round.
         loop {
-            match brass_engine::monomorphize_entry(&built.mir, &program, true) {
+            match brass_engine::monomorphize_entry_with_returns(
+                &built.mir,
+                &program,
+                true,
+                lazy.merged.instance_returns.clone(),
+            ) {
                 Ok(mono) => {
                     // A `main` that fell outside the typed subset can be
                     // TRANSIENT under lazy checking -- most prominently a
@@ -2110,8 +2167,25 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                 Err(brass_engine::MonoStop::MissingBodies(demands)) => {
                     tracing::debug!(target: "brass::perf", count = demands.len(), "lazy: missing bodies");
                     let mut progressed = false;
-                    for (symbol, type_args) in demands {
-                        if demanded.contains(&symbol) || !program.functions.contains_key(&symbol) {
+                    for (symbol, type_args, needs_body) in demands {
+                        if !program.functions.contains_key(&symbol) {
+                            continue;
+                        }
+                        if demanded.contains(&symbol) {
+                            // Checked before, but the body was withheld: the
+                            // first demand was answered with a deferral
+                            // contract alone. A repeat demand means a site
+                            // needs the real body after all (a second
+                            // instance, a non-deferrable site, a contract
+                            // the deferral rules rejected): lower it now --
+                            // the next rebuilt mono pass re-derives every
+                            // call against the lowered body.
+                            if built.is_lowered(&symbol) {
+                                continue;
+                            }
+                            let channels = lazy.channels(&call_locations);
+                            built.add_function(&program, &tables, &symbol, &channels);
+                            progressed = true;
                             continue;
                         }
                         if !lazy.demand(&symbol, type_args) {
@@ -2165,8 +2239,18 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                                 );
                             }
                         }
-                        let channels = lazy.channels(&call_locations);
-                        built.add_function(&program, &tables, &symbol, &channels);
+                        // A deferral candidate's first demand only CHECKS the
+                        // body: the checker's instance-return contract (just
+                        // merged from its delta) lets the next mono pass
+                        // compile the call as a runtime-deferred site, so a
+                        // statically live but never-executed tree is neither
+                        // lowered nor compiled. When the contract did not
+                        // materialize, the next round's repeat demand lowers
+                        // the body through the branch above.
+                        if needs_body {
+                            let channels = lazy.channels(&call_locations);
+                            built.add_function(&program, &tables, &symbol, &channels);
+                        }
                         demanded.push(symbol);
                         progressed = true;
                     }
@@ -2274,9 +2358,19 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
             }
         }
     };
-    // Deterministic inputs: the re-run reproduces the loop's successful pass.
-    let Ok(mono) = brass_engine::monomorphize_entry(&lowering.mir, &program, true) else {
+    // Deterministic inputs: the re-run reproduces the loop's successful pass
+    // (the same instance-return contracts included -- without them a
+    // deferred unannotated call would re-demand its body here).
+    let Ok(mono) = brass_engine::monomorphize_entry_with_returns(
+        &lowering.mir,
+        &program,
+        true,
+        lazy.merged.instance_returns.clone(),
+    ) else {
         eprintln!("error: lazy compilation diverged between passes");
+        // The checker may still be paused; a plain return would deadlock the
+        // runtime drop joining its blocking task.
+        lazy.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         return Err(1);
     };
 
@@ -2437,31 +2531,36 @@ fn run_fresh_eager(label: &str, src: &str, root: &Path) -> Result<(), u8> {
     })
 }
 
-/// Stamp every loaded source for a cache payload's validity guard, exactly
-/// as the full-cache save does: `.cz` sources from the parsed text (a
-/// re-read would race an editor), native plugin libraries from the file.
-/// `None` when anything cannot be stamped -- the build is then uncacheable.
-#[cfg(jit_backend)]
+/// Every relocatable input guard shared by full and partial caches. Source
+/// files retain their origin-relative stamps; plugins retain a logical import
+/// path plus binary hash and are rediscovered by normal resolution on load.
+struct CacheStamps {
+    sources: Vec<brass_cache::FileStamp>,
+    plugins: Vec<brass_cache::PluginStamp>,
+}
+
+/// Stamp every loaded source and plugin for a cache payload. Source text is
+/// the exact text parsed, while plugin bytes come from the library whose
+/// manifest produced the synthesized module. `None` makes the build
+/// uncacheable rather than publishing incomplete guards.
 fn stamp_sources(
     entry: &Path,
     sources: &brass_resolve::SourceMap,
     search: &brass_resolve::SearchPaths,
-) -> Option<Vec<brass_cache::FileStamp>> {
+) -> Option<CacheStamps> {
     let roots = brass_cache::StampRoots::new(entry, search);
-    let mut deps = Vec::new();
-    for (path, text) in sources.sourced() {
-        let native = matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("so" | "dylib" | "dll")
-        );
-        let stamp = if native {
-            brass_cache::FileStamp::of(path, &roots)
-        } else {
-            Some(brass_cache::FileStamp::of_text(path, text, &roots))
-        };
-        deps.push(stamp?);
-    }
-    Some(deps)
+    let source_stamps = sources
+        .source_files()
+        .map(|(path, text)| brass_cache::FileStamp::of_text(path, text, &roots))
+        .collect();
+    let plugins = sources
+        .plugins()
+        .map(|(module, library)| brass_cache::PluginStamp::of(module, library))
+        .collect::<Option<Vec<_>>>()?;
+    Some(CacheStamps {
+        sources: source_stamps,
+        plugins,
+    })
 }
 
 /// Persist a stopped run's settled state as the PARTIAL cache, so the next
@@ -2490,15 +2589,16 @@ fn save_partial_cache(
     snapshot
         .checked
         .retain(|symbol| !errored.contains(symbol.as_str()));
-    let Some(deps) = stamp_sources(entry, sources, search) else {
+    let Some(stamps) = stamp_sources(entry, sources, search) else {
         return;
     };
     brass_cache::save_partial(
         entry,
         PARTIAL_CACHE_FLAVOR,
         &brass_cache::PartialPayload {
-            deps,
+            deps: stamps.sources,
             packages: brass_cache::package_names(search),
+            plugins: stamps.plugins,
             snapshot,
         },
     );
@@ -2706,6 +2806,7 @@ fn check_front(
         &ctx_key,
         &modules[..ctx_end],
         ctx_module_hashes.as_deref(),
+        None,
         "front/context-check",
     );
 
@@ -2834,10 +2935,23 @@ fn check_front(
                         v.push(("(keyed-specializations)".to_string(), spec_hash));
                         v
                     });
+                // The plain context this run inferred moments ago doubles as
+                // the incremental prior: on a cache-cold run there is no
+                // keyed sidecar on disk, and without it the re-pass would
+                // re-infer the WHOLE context even though only the
+                // specialization-touched modules changed.
+                let plain_prior = match (ctx_seed, &ctx_module_hashes) {
+                    (Some(seed), Some(hashes)) => Some(brass_cache::ContextBundle {
+                        module_hashes: hashes.clone(),
+                        seed,
+                    }),
+                    _ => None,
+                };
                 let repass_seed = cached_context_seed(
                     &repass_key,
                     &modules[..modules.len() - 1],
                     repass_hashes.as_deref(),
+                    plain_prior.as_ref(),
                     "front/keyed-context-check",
                 );
                 let t = std::time::Instant::now();
@@ -2873,7 +2987,7 @@ fn check_front(
     }
 
     let expr_types = brass_typeck::stream::aggregate_result_types(&analysis.typed, &program);
-    let call_locations = call_site_locations(&modules, &sources);
+    let call_locations = call_site_locations(&modules, &sources, search);
     let channels = brass_cache::Channels {
         expr_types: expr_types.into_iter().collect(),
         view_args: analysis.view_args.into_iter().collect(),
@@ -2890,47 +3004,28 @@ fn check_front(
     // missing channels into future runs. Only a run the checker finished may
     // persist.
     let stopped = sched.as_deref().is_some_and(|s| s.interrupted());
-    // Persist the clean analysis for the next run. Every on-disk source in
-    // the map is stamped (the embedded stdlib has no path and is covered by
-    // the compiler tag in the header): `.cz` sources from the very text that
-    // was parsed -- a re-read would race an editor saving during the analysis
-    // -- and native plugin libraries from the file itself (their entry's text
-    // is the synthesized wrapper, not the library). The entry file is the
-    // first path-bearing source (the stdlib precedes it pathless), which is
-    // the load-time entry-identity contract. A file that cannot be stamped
-    // anymore makes the build uncacheable rather than wrongly cacheable.
+    // Persist the clean analysis for the next run. Source stamps use the exact
+    // parsed text; plugin stamps use the logical module path and current binary
+    // contents. The serialized module clone replaces plugin paths with stable
+    // import identities; loading resolves and injects real paths before
+    // lowering. Anything that cannot be stamped makes the build uncacheable.
     if brass_cache::enabled() && !stopped {
         let t = std::time::Instant::now();
-        let roots = brass_cache::StampRoots::new(&entry_path, search);
-        let mut deps = Vec::new();
-        let mut stampable = true;
-        for (path, text) in sources.sourced() {
-            let native = matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("so" | "dylib" | "dll")
-            );
-            let stamp = if native {
-                brass_cache::FileStamp::of(path, &roots)
-            } else {
-                Some(brass_cache::FileStamp::of_text(path, text, &roots))
-            };
-            match stamp {
-                Some(stamp) => deps.push(stamp),
-                None => stampable = false,
-            }
-        }
-        if stampable {
+        if let Some(stamps) = stamp_sources(&entry_path, &sources, search)
+            && let Some(cached_modules) = brass_cache::modules_for_cache(&modules, &stamps.plugins)
+        {
             let payload = brass_cache::Payload {
-                deps,
+                deps: stamps.sources,
                 packages: brass_cache::package_names(search),
-                modules,
+                plugins: stamps.plugins,
+                modules: cached_modules,
                 warnings,
                 channels,
             };
             brass_cache::save(&entry_path, CACHE_FLAVOR, &payload);
             phase("front/cache-save", t);
             return Ok(AnalyzedProgram {
-                modules: payload.modules,
+                modules,
                 channels: payload.channels,
             });
         }
@@ -2952,7 +3047,7 @@ fn specialize_keyed(
 ) -> Result<HashSet<Vec<String>>, (String, Span)> {
     // Deduplicate the requested (receiver, method, key) roots.
     let mut roots: Vec<brass_typesys::KeyedNeed> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = fxhash::FxHashSet::default();
     for (recv, method, key) in analysis.keyed_calls.values() {
         let sym = format!("{recv}.{method}:{}", brass_hir::type_key(key));
         if seen.insert(sym) {
@@ -2984,7 +3079,8 @@ fn specialize_keyed(
     // of the key type into the receiver's module. Collected per module first so
     // one import covers every specialization that needs it.
     use brass_hir::Type;
-    let mut synthetic_imports: HashMap<Vec<String>, Vec<(Vec<String>, String)>> = HashMap::new();
+    let mut synthetic_imports: HashMap<Vec<String>, Vec<(Vec<String>, String)>> =
+        HashMap::default();
     for g in &generated {
         if let Type::Record(n) | Type::Sum(n) = &g.key
             && let Some(info) = program.type_by_id(n.id)
@@ -2997,7 +3093,7 @@ fn specialize_keyed(
             }
         }
     }
-    let mut touched: HashSet<Vec<String>> = HashSet::new();
+    let mut touched: HashSet<Vec<String>> = HashSet::default();
     for g in generated {
         if let Some(m) = modules.iter_mut().find(|m| m.path == g.module) {
             m.ast.items.push(TopLevel::Fun(g.decl));
@@ -3023,7 +3119,7 @@ fn specialize_keyed(
         }
     }
     // Rewrite the keyed call sites to their specializations.
-    let renames: std::collections::HashMap<Span, String> = analysis
+    let renames: fxhash::FxHashMap<Span, String> = analysis
         .keyed_calls
         .iter()
         .map(|(span, (_, method, key))| (*span, brass_typesys::mangled_name(method, key)))
@@ -3043,14 +3139,14 @@ fn specialize_keyed(
 /// Rewrite `recv.m(..)` calls whose span is in `renames` to `recv.<new>(..)`.
 fn rewrite_calls_block(
     b: &mut brass_parser::ast::Block,
-    renames: &std::collections::HashMap<Span, String>,
+    renames: &fxhash::FxHashMap<Span, String>,
 ) {
     for s in &mut b.stmts {
         rewrite_calls_stmt(s, renames);
     }
 }
 
-fn rewrite_calls_stmt(s: &mut Stmt, renames: &std::collections::HashMap<Span, String>) {
+fn rewrite_calls_stmt(s: &mut Stmt, renames: &fxhash::FxHashMap<Span, String>) {
     match s {
         Stmt::Let { value: Some(v), .. } => rewrite_calls_expr(v, renames),
         Stmt::Assign { target, value, .. } => {
@@ -3070,10 +3166,7 @@ fn rewrite_calls_stmt(s: &mut Stmt, renames: &std::collections::HashMap<Span, St
     }
 }
 
-fn rewrite_calls_expr(
-    e: &mut brass_parser::ast::Expr,
-    renames: &std::collections::HashMap<Span, String>,
-) {
+fn rewrite_calls_expr(e: &mut brass_parser::ast::Expr, renames: &fxhash::FxHashMap<Span, String>) {
     use brass_parser::ast::{Expr, StrSeg};
     match e {
         Expr::Call(callee, args, span) => {
@@ -3137,6 +3230,7 @@ fn rewrite_calls_expr(
 fn call_site_locations(
     modules: &[LoadedModule],
     sources: &brass_resolve::SourceMap,
+    search: &brass_resolve::SearchPaths,
 ) -> HashMap<Span, (String, u32, u32)> {
     let mut spans: Vec<Span> = Vec::new();
     for m in modules {
@@ -3159,27 +3253,32 @@ fn call_site_locations(
     {
         prefixes.push(format!("{}/", c.display()));
     }
-    if let Ok(inc) = std::env::var("BRASS_INCLUDE") {
-        for root in inc.split(':').filter(|r| !r.is_empty()) {
-            if let Ok(c) = Path::new(root).canonicalize()
-                && let Some(parent) = c.parent()
-            {
-                prefixes.push(format!("{}/", parent.display()));
-            }
+    for root in &search.includes {
+        if let Ok(c) = root.canonicalize()
+            && let Some(parent) = c.parent()
+        {
+            prefixes.push(format!("{}/", parent.display()));
         }
     }
     // A package root serves modules under `<root>/<name>/...`, so the root
     // itself is the prefix to strip (`std=/toolchain` renders the standard
     // library as `std/fs.cz`).
-    if let Ok(pkgs) = std::env::var("BRASS_PACKAGES") {
-        for entry in pkgs.split(':').filter(|e| !e.is_empty()) {
-            if let Some((_, path)) = entry.split_once('=')
-                && let Ok(c) = Path::new(path).canonicalize()
-            {
-                prefixes.push(format!("{}/", c.display()));
-            }
+    for root in search.packages.values() {
+        if let Ok(c) = root.canonicalize() {
+            prefixes.push(format!("{}/", c.display()));
         }
     }
+    let plugin_labels: Vec<(String, String)> = sources
+        .plugins()
+        .map(|(module, library)| {
+            let library = library
+                .canonicalize()
+                .unwrap_or_else(|_| library.to_path_buf())
+                .display()
+                .to_string();
+            (library, format!("<plugin:{}>", module.join(".")))
+        })
+        .collect();
     let relativize = |label: &str| -> String {
         // Canonicalize the label's path first (a plugin label wraps one), so
         // the caller's spelling (`../../x.cz`) does not leak into the
@@ -3189,7 +3288,13 @@ fn call_site_locations(
             .and_then(|r| r.strip_suffix('>'))
         {
             match std::fs::canonicalize(inner) {
-                Ok(c) => format!("<plugin:{}>", c.display()),
+                Ok(c) => {
+                    let path = c.display().to_string();
+                    plugin_labels
+                        .iter()
+                        .find_map(|(library, label)| (library == &path).then(|| label.clone()))
+                        .unwrap_or_else(|| format!("<plugin:{path}>"))
+                }
                 Err(_) => label.to_string(),
             }
         } else {
@@ -3203,7 +3308,7 @@ fn call_site_locations(
         }
         label
     };
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for span in spans {
         if let Some(loc) = sources.locate(span.lo) {
             let (line, col) = brass_parser::line_col(loc.src, loc.local);

@@ -343,9 +343,9 @@ impl<'a> Checker<'a> {
         let resolved = self.resolve(ty);
         if let Some((ok, err)) = resolved.result_payloads() {
             return match variant {
-                "Ok" => HashMap::from([("value".to_string(), ok.clone())]),
-                "Err" => HashMap::from([("error".to_string(), err.clone())]),
-                _ => HashMap::new(),
+                "Ok" => HashMap::from_iter([("value".to_string(), ok.clone())]),
+                "Err" => HashMap::from_iter([("error".to_string(), err.clone())]),
+                _ => HashMap::default(),
             };
         }
         if let Type::Sum(name) = &resolved {

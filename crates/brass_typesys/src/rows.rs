@@ -27,7 +27,8 @@
 //! converts the argument into the row's *view* (see [`view_type`]), collapsing
 //! every argument shape with the same view into one compiled instance.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::BTreeMap;
 
 use brass_hir::{Program, Type, TypeKind};
 use brass_parser::ast::{Arg, Block, Expr, Pattern, Stmt, StrSeg, TypeExpr};
@@ -198,7 +199,7 @@ struct LocalScan {
 
 fn analyze_rows(program: &Program) -> RowInfo {
     // Phase 1: scan every body once, collecting local rows and forward edges.
-    let mut fn_scans: HashMap<String, Vec<Option<LocalScan>>> = HashMap::new();
+    let mut fn_scans: HashMap<String, Vec<Option<LocalScan>>> = HashMap::default();
     for f in program.functions.values() {
         let scans = scan_params(
             program,
@@ -209,7 +210,7 @@ fn analyze_rows(program: &Program) -> RowInfo {
         );
         fn_scans.insert(f.symbol.clone(), scans);
     }
-    let mut method_scans: HashMap<(String, String), Vec<Option<LocalScan>>> = HashMap::new();
+    let mut method_scans: HashMap<(String, String), Vec<Option<LocalScan>>> = HashMap::default();
     for info in program.types.values() {
         let methods: Vec<(&String, &brass_hir::MethodInfo)> = match &info.kind {
             TypeKind::Record { methods, .. } => methods.iter().collect(),
@@ -367,7 +368,7 @@ fn scan_params(
                 module,
                 param: &p.name,
                 forced_ret: ret_ty.and_then(forced_return_type),
-                guarded: HashSet::new(),
+                guarded: HashSet::default(),
                 out: LocalScan {
                     row: Row::default(),
                     eligible: true,

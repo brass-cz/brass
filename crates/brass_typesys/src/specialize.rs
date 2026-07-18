@@ -24,7 +24,7 @@
 //! injects them, rewrites the keyed call sites to their specializations, and
 //! runs the normal pipeline over the fully concrete program.
 
-use std::collections::HashMap;
+use fxhash::FxHashMap as HashMap;
 
 use brass_parser::ast::*;
 
@@ -78,7 +78,7 @@ pub struct Generated {
 /// construct the specializer cannot handle.
 pub fn specialize_all(program: &Program, roots: &[KeyedNeed]) -> Result<Vec<Generated>, String> {
     let mut out = Vec::new();
-    let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut done: fxhash::FxHashSet<String> = fxhash::FxHashSet::default();
     let mut work: Vec<KeyedNeed> = roots.to_vec();
     // Bounded by the distinct (recv, method, key) triples the program's type
     // graph can reach -- finite -- so the worklist drains.
@@ -170,7 +170,7 @@ impl Specializer<'_> {
             stmts: b
                 .stmts
                 .iter()
-                .flat_map(|s| self.stmt(s, &HashMap::new()))
+                .flat_map(|s| self.stmt(s, &HashMap::default()))
                 .collect(),
             span: b.span,
         }
@@ -433,7 +433,7 @@ impl Specializer<'_> {
     }
 
     fn arm_bindings(&self, pat: &Pattern, scrut: &Expr) -> Bindings {
-        let mut binds = HashMap::new();
+        let mut binds = HashMap::default();
         // Only the top match on `self` is typed here (the scrutinee is the
         // receiver); nested matches contribute no field types.
         if (matches!(scrut, Expr::SelfExpr(_)) || matches!(scrut, Expr::Ident(n, _) if n == "self"))

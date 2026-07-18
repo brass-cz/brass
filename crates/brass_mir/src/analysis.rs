@@ -6,7 +6,7 @@
 //! identifiers it references but does not itself bind; lowering keeps those that
 //! are bound in the enclosing scope as the closure's captured operands.
 
-use std::collections::HashSet;
+use fxhash::FxHashSet as HashSet;
 
 use brass_parser::Span;
 use brass_parser::ast::*;
@@ -17,8 +17,8 @@ use brass_parser::ast::*;
 /// made on a per-closure copy. Read-only captures stay by-value. The cell is modeled
 /// as a one-element array, reusing the array machinery (alloc, indexed get/set, RC).
 pub fn cell_promotions(body: &Block) -> HashSet<String> {
-    let mut captured = HashSet::new();
-    let mut mutated = HashSet::new();
+    let mut captured = HashSet::default();
+    let mut mutated = HashSet::default();
     promo_block(body, &mut captured, &mut mutated);
     captured.intersection(&mutated).cloned().collect()
 }
@@ -105,7 +105,7 @@ fn closure_as_block(body: &Expr) -> Block {
 /// block, loop body, or match/if-let arm goes out of scope with it.
 pub fn free_vars_of(params: &[Param], body: &Block) -> Vec<String> {
     let mut bound: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
-    let mut free = HashSet::new();
+    let mut free = HashSet::default();
     free_block(body, &mut bound, &mut free);
     let mut out: Vec<String> = free.into_iter().collect();
     out.sort();
@@ -311,7 +311,7 @@ fn block_exprs(b: &Block, f: &mut impl FnMut(&Expr)) {
 /// `error(...)` or the `expr!` propagation operator. Mirrors codegen's
 /// `fallible_block` so MIR records the same fallibility bit.
 pub fn fallible_block(b: &Block) -> bool {
-    scan_block(b, Props::Count(&HashSet::new()))
+    scan_block(b, Props::Count(&HashSet::default()))
 }
 
 /// Like [`fallible_block`], but an `expr!` whose span is in `null_props` (a

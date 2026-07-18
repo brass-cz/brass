@@ -63,6 +63,7 @@ impl<'a> Checker<'a> {
         if params.len() != arg_types.len() {
             return fallback_ret;
         }
+        let unannotated = declared_ret.is_none();
         // A previous elaboration of this callee at the same fully-resolved
         // argument types already recorded the body's channel entries and
         // settled its return; reuse it (see `Checker::elaboration_memo`).
@@ -126,6 +127,10 @@ impl<'a> Checker<'a> {
         {
             let resolved = self.resolve(&ret);
             if brass_hir::is_fully_known(&resolved) {
+                if unannotated {
+                    self.instance_returns
+                        .insert((symbol.to_string(), memo_key.1.clone()), resolved.clone());
+                }
                 self.elaboration_memo.insert(memo_key, resolved);
             }
         }
@@ -135,26 +140,26 @@ impl<'a> Checker<'a> {
     /// The memo key for re-elaborating a callable at these argument types, or
     /// `None` when any argument is not fully resolved (elaborating at an open
     /// argument constrains the caller's variables, which a memo hit must not
-    /// skip). `Debug` rendering is used because it spells out the whole type
-    /// -- nominal ids and full substitutions included -- where `display`
-    /// hides `_`-prefixed members and would collide two instantiations of one
-    /// nominal.
+    /// skip). The resolved argument types are kept structurally -- hashing
+    /// them directly is much cheaper than rendering them to a string, and the
+    /// structural comparison distinguishes two instantiations of one nominal
+    /// the way a full `Debug` rendering would (ids and substitutions
+    /// included).
     fn elaboration_memo_key(
         &self,
         kind: &str,
         callable: &str,
         arg_types: &[Type],
-    ) -> Option<String> {
-        use std::fmt::Write;
-        let mut memo_key = format!("{kind}:{callable}");
+    ) -> Option<(String, Vec<Type>)> {
+        let mut resolved_args = Vec::with_capacity(arg_types.len());
         for arg in arg_types {
             let resolved = self.resolve(arg);
             if !brass_hir::is_fully_known(&resolved) {
                 return None;
             }
-            let _ = write!(memo_key, "\u{1}{resolved:?}");
+            resolved_args.push(resolved);
         }
-        Some(memo_key)
+        Some((format!("{kind}:{callable}"), resolved_args))
     }
 
     /// Choose an inferred-return body's return type: the full check's
@@ -590,7 +595,7 @@ impl<'a> Checker<'a> {
 /// (`entries : _Entry<K, V>[]` vs `entries : _Entry<string, string>[]` gives `K
 /// -> string`, `V -> string`). Used to instantiate a method's scheme at a call.
 pub(super) fn scheme_instance_map(scheme: &TypeScheme, recv: &NominalType) -> HashMap<u32, Type> {
-    let mut map = HashMap::new();
+    let mut map = HashMap::default();
     for (fname, fty) in &scheme.fields {
         if let Some(actual) = recv.substitution.get(fname) {
             match_scheme_param(fty, actual, &scheme.params, &mut map);

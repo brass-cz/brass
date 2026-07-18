@@ -24,7 +24,8 @@
 //! guard a caller's local that it hands to such a function, so a spawn hidden in
 //! a helper still serializes the caller's own accesses.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use brass_parser::Span;
 use brass_parser::ast::*;
@@ -106,7 +107,7 @@ const READONLY_BUILTINS: &[&str] = &["println", "print"];
 /// "alias"), which can only upgrade freeze to cown -- extra locking, never a race.
 pub fn mutates(body: &Block, var: &str) -> bool {
     let mut found = false;
-    let mut aliases = HashSet::new();
+    let mut aliases = HashSet::default();
     aliases.insert(var.to_string());
     scan_block(body, &mut aliases, &mut found);
     found
@@ -168,7 +169,7 @@ fn scan_stmt(s: &Stmt, aliases: &mut HashSet<String>, found: &mut bool) {
 /// in `names`. Used for the conservative alias rule: an initializer that touches
 /// a known handle may alias its object.
 fn expr_mentions_any(e: &Expr, names: &HashSet<String>) -> bool {
-    let mut refs = HashSet::new();
+    let mut refs = HashSet::default();
     crate::closure::idents_stmts(&[Stmt::Expr(e.clone())], &mut refs);
     refs.iter().any(|r| names.contains(r))
 }
@@ -270,9 +271,9 @@ fn root_ident(e: &Expr) -> Option<&str> {
 /// are also excluded: they belong to the inner scope, so a nested spawn's loop
 /// counter is not mistaken for a capture of this one.
 pub fn captured(body: &Block, bound: &HashSet<String>) -> HashSet<String> {
-    let mut refs = HashSet::new();
+    let mut refs = HashSet::default();
     crate::closure::idents_block(body, &mut refs);
-    let mut nested = HashSet::new();
+    let mut nested = HashSet::default();
     collect_nested_closure_bindings(body, &mut nested);
     refs.into_iter()
         .filter(|r| !bound.contains(r) && !nested.contains(r))
@@ -375,7 +376,7 @@ fn analyze_block(
 /// initializer that mentions a known handle. Matches the alias rule `mutates`
 /// applies (see there for why over-approximating is safe).
 fn alias_closure(fn_scope: &Block, var: &str) -> HashSet<String> {
-    let mut handles: HashSet<String> = HashSet::new();
+    let mut handles: HashSet<String> = HashSet::default();
     handles.insert(var.to_string());
     loop {
         let before = handles.len();
@@ -578,14 +579,14 @@ fn spawn_closure_body(stmt: &Stmt) -> Option<Block> {
 fn closure_bound_in(stmt: &Stmt) -> HashSet<String> {
     let expr = match stmt {
         Stmt::Expr(e) | Stmt::Let { value: Some(e), .. } => e,
-        _ => return HashSet::new(),
+        _ => return HashSet::default(),
     };
     if let Expr::Call(_, args, _) = expr
         && let Some(Expr::Closure(params, body, _)) = args.first().map(|a| &a.expr)
     {
         return crate::closure::bound_names(params, &closure_block(body));
     }
-    HashSet::new()
+    HashSet::default()
 }
 
 fn closure_block(body: &Expr) -> Block {
@@ -599,7 +600,7 @@ fn closure_block(body: &Expr) -> Block {
 }
 
 fn stmts_reference(stmts: &[Stmt], var: &str) -> bool {
-    let mut refs = HashSet::new();
+    let mut refs = HashSet::default();
     crate::closure::idents_stmts(stmts, &mut refs);
     refs.contains(var)
 }
@@ -649,11 +650,11 @@ fn closure_bindings_of(stmts: &[Stmt], name: &str, out: &mut Vec<(Vec<Param>, Bl
 ///    makes `p` spawn-captured in `f` too), like the write-through-parameter
 ///    analysis in `brass_hir::mutation`.
 pub fn spawn_capture_summaries(fns: &[(String, Vec<String>, &Block)]) -> SpawnSummaries {
-    let mut summaries: SpawnSummaries = HashMap::new();
+    let mut summaries: SpawnSummaries = HashMap::default();
 
     // Step 1: direct captures of a parameter by a spawn site in the body.
     for (name, params, body) in fns {
-        let mut captured_params: HashSet<usize> = HashSet::new();
+        let mut captured_params: HashSet<usize> = HashSet::default();
         each_scope_spawn_body(&body.stmts, &body.stmts, &mut |cbody, bound| {
             for cap in captured(cbody, bound) {
                 if let Some(i) = params.iter().position(|p| *p == cap) {
@@ -673,7 +674,7 @@ pub fn spawn_capture_summaries(fns: &[(String, Vec<String>, &Block)]) -> SpawnSu
     loop {
         let mut changed = false;
         for (name, params, body) in fns {
-            let mut found: HashSet<usize> = HashSet::new();
+            let mut found: HashSet<usize> = HashSet::default();
             each_call(&stmts_block(&body.stmts), &mut |callee, recv, args| {
                 let Some(indices) = summaries.get(callee) else {
                     return;
@@ -716,7 +717,7 @@ fn each_scope_spawn_body(
     all: &[Stmt],
     f: &mut impl FnMut(&Block, &HashSet<String>),
 ) {
-    let mut vars = HashSet::new();
+    let mut vars = HashSet::default();
     spawned_var_names(stmts, &mut vars);
     for name in &vars {
         let mut bindings = Vec::new();
@@ -908,7 +909,7 @@ fn pre_scan_scope(
     mutated_globals: &HashSet<String>,
     errors: &mut Vec<SpawnError>,
 ) {
-    let mut spawned = HashSet::new();
+    let mut spawned = HashSet::default();
     spawned_var_names(stmts, &mut spawned);
     for stmt in stmts {
         match spawn_arg(stmt) {
@@ -1197,7 +1198,7 @@ fn process_scope(
     collect_local_bindings(stmts, &mut locals);
 
     // ---- analysis over the pristine scope ----
-    let mut spawned_vars = HashSet::new();
+    let mut spawned_vars = HashSet::default();
     spawned_var_names(stmts, &mut spawned_vars);
 
     // Union of every site's cowned captures in this scope (literal sites plus
@@ -1251,7 +1252,7 @@ fn each_scope_site_shallow(
     all: &[Stmt],
     f: &mut impl FnMut(&Block, &HashSet<String>),
 ) {
-    let mut vars = HashSet::new();
+    let mut vars = HashSet::default();
     spawned_var_names(stmts, &mut vars);
     for name in &vars {
         let mut bindings = Vec::new();
@@ -1369,7 +1370,7 @@ fn collect_alias_roots(
             _ => None,
         };
         if let Some((name, value)) = binding {
-            let mut mentioned = HashSet::new();
+            let mut mentioned = HashSet::default();
             crate::closure::idents_stmts(&[Stmt::Expr(value.clone())], &mut mentioned);
             let mut roots: BTreeSet<String> = BTreeSet::new();
             for m in &mentioned {
@@ -1958,11 +1959,15 @@ mod tests {
     }
 
     fn decisions(src: &str) -> Vec<CaptureDecision> {
-        analyze_spawns(&main_body(src), &HashSet::new())
+        analyze_spawns(&main_body(src), &HashSet::default())
     }
 
     fn acquire(body: &mut Block) -> Vec<SpawnError> {
-        auto_acquire(&mut body.stmts, &HashSet::new(), &SpawnSummaries::new())
+        auto_acquire(
+            &mut body.stmts,
+            &HashSet::default(),
+            &SpawnSummaries::default(),
+        )
     }
 
     /// Render a statement list compactly for structural assertions.
@@ -2188,7 +2193,7 @@ mod tests {
         let Expr::Block(b, _) = outer_body.as_ref() else {
             panic!("expected block body");
         };
-        let caps = captured(b, &HashSet::new());
+        let caps = captured(b, &HashSet::default());
         assert!(
             !caps.contains("i"),
             "the inner closure's local `i` must not be a capture of the outer spawn: {caps:?}"
@@ -2289,7 +2294,7 @@ mod tests {
             panic!("expected fun");
         };
         let params: HashSet<String> = f.params.iter().map(|p| p.name.clone()).collect();
-        let errors = auto_acquire(&mut f.body.stmts, &params, &SpawnSummaries::new());
+        let errors = auto_acquire(&mut f.body.stmts, &params, &SpawnSummaries::default());
         assert_eq!(errors.len(), 1, "expected one spawn error: {errors:?}");
     }
 
@@ -2318,12 +2323,12 @@ mod tests {
         let summaries = spawn_capture_summaries(&borrowed);
         assert_eq!(
             summaries.get("start"),
-            Some(&HashSet::from([0])),
+            Some(&HashSet::from_iter([0])),
             "start spawns a task capturing its parameter 0"
         );
         assert_eq!(
             summaries.get("outer"),
-            Some(&HashSet::from([0])),
+            Some(&HashSet::from_iter([0])),
             "outer forwards its parameter into start's captured position"
         );
     }
@@ -2333,11 +2338,11 @@ mod tests {
         // With `start` summarized, a caller's local handed to it must be
         // promoted to a cown and the caller's own accesses guarded -- the spawn
         // in the helper races the caller otherwise.
-        let mut summaries = SpawnSummaries::new();
-        summaries.insert("start".to_string(), HashSet::from([0]));
+        let mut summaries = SpawnSummaries::default();
+        summaries.insert("start".to_string(), HashSet::from_iter([0]));
         let mut body =
             main_body("fun main() {\n    let c = make()\n    start(c)\n    c.add(1)\n}\n");
-        let errors = auto_acquire(&mut body.stmts, &HashSet::new(), &summaries);
+        let errors = auto_acquire(&mut body.stmts, &HashSet::default(), &summaries);
         assert!(errors.is_empty());
         assert!(
             contains_call(&body.stmts, "_cown"),

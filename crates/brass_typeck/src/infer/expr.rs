@@ -153,7 +153,7 @@ impl<'a> Checker<'a> {
         scopes: &mut ScopeStack,
     ) -> Type {
         self.report_duplicate_params("closure", params);
-        let mut closure_scope: HashMap<String, Type> = HashMap::new();
+        let mut closure_scope: HashMap<String, Type> = HashMap::default();
         let mut param_types = Vec::with_capacity(params.len());
         for (i, p) in params.iter().enumerate() {
             let expected = want_params
@@ -179,7 +179,7 @@ impl<'a> Checker<'a> {
         self.infer_expr_light(body, &inferred_env, &mut light_props);
         let mut closure_scopes = scopes.clone();
         closure_scopes.push(closure_scope);
-        self.const_scopes.push(HashSet::new());
+        self.const_scopes.push(HashSet::default());
         self.return_contexts
             .push(ReturnContext::Explicit(want_ret.clone()));
         self.return_values.push(Vec::new());
@@ -579,7 +579,7 @@ impl<'a> Checker<'a> {
                 self.infer_expr_light(body, &inferred_env, &mut propagated);
                 let mut closure_scopes = scopes.clone();
                 closure_scopes.push(closure_scope);
-                self.const_scopes.push(HashSet::new());
+                self.const_scopes.push(HashSet::default());
                 self.return_contexts.push(ReturnContext::Inferred);
                 self.return_values.push(Vec::new());
                 let body_val = self.check_expr(body, &mut closure_scopes);
@@ -734,8 +734,8 @@ impl<'a> Checker<'a> {
                 let scrut_ty = self.check_expr(scrut, scopes);
                 self.check_pattern_against(&scrut_ty, pat);
                 let mut then_scopes = scopes.clone();
-                then_scopes.push(HashMap::new());
-                self.const_scopes.push(HashSet::new());
+                then_scopes.push(HashMap::default());
+                self.const_scopes.push(HashSet::default());
                 // A plain binding on a nullable scrutinee is a presence test, so on
                 // the then-arm the value is proven non-null: bind it at the unwrapped
                 // type (e.g. `if let p = T.from(v)` gives `p: T`), so `p.field` is
@@ -759,8 +759,8 @@ impl<'a> Checker<'a> {
                 for arm in arms {
                     self.check_pattern_against(&scrut_ty, &arm.pattern);
                     let mut arm_scopes = scopes.clone();
-                    arm_scopes.push(HashMap::new());
-                    self.const_scopes.push(HashSet::new());
+                    arm_scopes.push(HashMap::default());
+                    self.const_scopes.push(HashSet::default());
                     self.bind_pattern(&arm.pattern, &scrut_ty, &mut arm_scopes);
                     let arm_ty = self.check_expr(&arm.body, &mut arm_scopes);
                     self.const_scopes.pop();
@@ -932,8 +932,8 @@ impl<'a> Checker<'a> {
     /// yields nothing. (The HM checker's `infer_block_value` has always done this
     /// for a trailing `return`; the two now agree.)
     fn check_block_expr(&mut self, b: &Block, scopes: &mut ScopeStack) -> Type {
-        scopes.push(HashMap::new());
-        self.const_scopes.push(HashSet::new());
+        scopes.push(HashMap::default());
+        self.const_scopes.push(HashSet::default());
         let mut last = Type::Void;
         let mut diverges = false;
         for s in &b.stmts {

@@ -10,5 +10,6 @@ name = "czfmt"
 path = "src/main.rs"
 
 [dependencies]
+fxhash.workspace = true
 brass_parser.workspace = true
 brass_metadata.workspace = true

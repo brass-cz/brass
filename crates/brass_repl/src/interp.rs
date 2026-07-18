@@ -14,8 +14,8 @@
 //! program is already monomorphized, every operand's concrete type is known and is
 //! consulted for width/sign-correct integer arithmetic and for rendering.
 
+use fxhash::FxHashMap as HashMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::io::Write;
 use std::rc::Rc;
 
@@ -59,7 +59,7 @@ impl<'p, 'm> Interp<'p, 'm> {
             program,
             hir,
             out,
-            globals: HashMap::new(),
+            globals: HashMap::default(),
             depth: 0,
         }
     }
@@ -280,7 +280,7 @@ impl<'p, 'm> Interp<'p, 'm> {
             }
             Rvalue::Call(callee, args) => self.eval_call(f, frame, callee, args, dest_ty),
             Rvalue::Record { fields, .. } => {
-                let mut map = HashMap::with_capacity(fields.len());
+                let mut map = HashMap::with_capacity_and_hasher(fields.len(), Default::default());
                 for (name, op) in fields {
                     let fty = record_field_type(dest_ty, name);
                     let v = self.eval_operand(f, frame, op, &fty)?;
@@ -305,7 +305,7 @@ impl<'p, 'm> Interp<'p, 'm> {
                 let Value::Record(src_map) = src else {
                     return Ok(Value::Null);
                 };
-                let mut map = HashMap::new();
+                let mut map = HashMap::default();
                 for name in record_field_names(&target) {
                     if let Some(v) = src_map.borrow().get(&name) {
                         map.insert(name, v.clone());
@@ -330,7 +330,7 @@ impl<'p, 'm> Interp<'p, 'm> {
                     Value::Record(map) => Some(map.clone()),
                     _ => None,
                 };
-                let mut map = HashMap::new();
+                let mut map = HashMap::default();
                 for (name, fty, plan) in brass_engine::view_field_plans(dest_ty, &src_ty) {
                     let v = match (&plan, &src_map) {
                         (brass_engine::ViewFieldPlan::Copy, Some(m)) => {
@@ -349,7 +349,7 @@ impl<'p, 'm> Interp<'p, 'm> {
             Rvalue::Variant {
                 variant, fields, ..
             } => {
-                let mut map = HashMap::with_capacity(fields.len());
+                let mut map = HashMap::with_capacity_and_hasher(fields.len(), Default::default());
                 for (name, op) in fields {
                     let fty = operand_type_of(op, &f.local_types);
                     let v = self.eval_operand(f, frame, op, &fty)?;
@@ -1334,7 +1334,7 @@ fn result_err(msg: &str) -> Value {
 }
 
 fn make_variant(variant: &str, fields: &[(&str, Value)]) -> Value {
-    let mut m = HashMap::with_capacity(fields.len());
+    let mut m = HashMap::with_capacity_and_hasher(fields.len(), Default::default());
     for (k, v) in fields {
         m.insert((*k).to_string(), v.clone());
     }

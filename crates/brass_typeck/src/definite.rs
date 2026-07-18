@@ -10,7 +10,8 @@
 //! continue) drop out of the join, and loop bodies are checked but do not
 //! contribute facts (they may run zero times).
 
-use std::collections::{BTreeSet, HashMap};
+use fxhash::FxHashMap as HashMap;
+use std::collections::BTreeSet;
 
 use brass_hir::{Program, TypeInfo, TypeKind};
 use brass_parser::Span;
@@ -180,7 +181,7 @@ impl<'p, 'e> Walker<'p, 'e> {
     }
 
     fn walk_block(&mut self, b: &Block) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(HashMap::default());
         for stmt in &b.stmts {
             self.walk_stmt(stmt);
         }
@@ -278,7 +279,8 @@ impl<'p, 'e> Walker<'p, 'e> {
                     }
                     self.walk_expr(arg);
                     let snapshot = self.state.clone();
-                    self.scopes.push(HashMap::from([(fvar.to_string(), None)]));
+                    self.scopes
+                        .push(HashMap::from_iter([(fvar.to_string(), None)]));
                     self.walk_block(fbody);
                     self.scopes.pop();
                     self.state = snapshot;
@@ -330,7 +332,7 @@ impl<'p, 'e> Walker<'p, 'e> {
             fieldwise_block: String::new(),
         });
         self.state.states.push(InitState::Partial(BTreeSet::new()));
-        self.scopes.push(HashMap::from([
+        self.scopes.push(HashMap::from_iter([
             (var.to_string(), None),
             (ret_name, Some(cur)),
         ]));
@@ -508,7 +510,7 @@ impl<'p, 'e> Walker<'p, 'e> {
             Expr::IfLet(pat, scrut, then, els, _) => {
                 self.walk_expr(scrut);
                 let before = self.state.clone();
-                self.scopes.push(HashMap::new());
+                self.scopes.push(HashMap::default());
                 self.shadow_pattern(pat);
                 self.walk_block(then);
                 self.scopes.pop();
@@ -525,7 +527,7 @@ impl<'p, 'e> Walker<'p, 'e> {
                 let mut joined: Option<FlowState> = None;
                 for arm in arms {
                     self.state = before.clone();
-                    self.scopes.push(HashMap::new());
+                    self.scopes.push(HashMap::default());
                     self.shadow_pattern(&arm.pattern);
                     self.walk_expr(&arm.body);
                     self.scopes.pop();

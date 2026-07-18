@@ -25,7 +25,7 @@
 //! contributes principled let-polymorphism and structural reconciliation, kept
 //! permissive where it cannot be certain so it never rejects a valid program.
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use brass_hir::{
     FloatKind, FunInfo, IntKind, MethodInfo, Program, Type, TypeInfo, TypeKind, int_literal_kind,
@@ -94,7 +94,7 @@ impl<'p> Hm<'p> {
                 s.seed_var_counter(program.next_infer_var);
                 s
             },
-            globals: HashMap::new(),
+            globals: HashMap::default(),
             scopes: Vec::new(),
             module: Vec::new(),
             ret: Type::Void,
@@ -124,7 +124,7 @@ impl<'p> Hm<'p> {
         for (symbol, ty) in schemes {
             // Annotated signatures have no inference variables, so generalizing
             // over an empty environment quantifies any unannotated positions.
-            let scheme = self.solver.generalize(&HashSet::new(), &ty);
+            let scheme = self.solver.generalize(&HashSet::default(), &ty);
             self.globals.insert(symbol, scheme);
         }
     }
@@ -308,7 +308,7 @@ impl<'p> Hm<'p> {
     ) {
         self.module = module;
         self.self_type = self_ty;
-        self.scopes = vec![HashMap::new()];
+        self.scopes = vec![HashMap::default()];
         self.lit_vars.clear();
         // Isolate this body's transient inference: a function's public type is
         // its (pre-built) global scheme, and a method's is re-derived per call
@@ -385,7 +385,7 @@ impl<'p> Hm<'p> {
     /// The inference variables free in the current environment; generalization
     /// must not quantify these (they are shared with bindings still in scope).
     fn env_free(&self) -> HashSet<u32> {
-        let mut out = HashSet::new();
+        let mut out = HashSet::default();
         for scope in &self.scopes {
             for scheme in scope.values() {
                 // Only the non-quantified part of a scheme is "free" in the env.
@@ -407,7 +407,7 @@ impl<'p> Hm<'p> {
 
     /// Report a parameter name that appears twice in `params`.
     fn check_duplicate_params(&mut self, params: &[brass_parser::ast::Param], context: &str) {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         for p in params {
             if !seen.insert(p.name.as_str()) {
                 self.error(
@@ -534,7 +534,7 @@ impl<'p> Hm<'p> {
     // ----- statements -----
 
     fn infer_block(&mut self, block: &Block) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(HashMap::default());
         for stmt in &block.stmts {
             self.infer_stmt(stmt);
         }
@@ -660,7 +660,7 @@ impl<'p> Hm<'p> {
                 // open (permissive for unmodelled iterables).
                 let elem = brass_hir::index_element(&self.solver.resolve(&iter_ty))
                     .unwrap_or_else(|| self.solver.fresh(InferenceVarKind::Source));
-                self.scopes.push(HashMap::new());
+                self.scopes.push(HashMap::default());
                 self.bind_pattern(pat, &elem);
                 for stmt in &body.stmts {
                     self.infer_stmt(stmt);
@@ -709,7 +709,7 @@ impl<'p> Hm<'p> {
             Expr::Call(callee, args, span) => self.infer_call(callee, args, *span),
             Expr::Closure(params, body, _) => {
                 self.check_duplicate_params(params, "closure");
-                self.scopes.push(HashMap::new());
+                self.scopes.push(HashMap::default());
                 let param_tys: Vec<Type> = params
                     .iter()
                     .map(|p| {
@@ -1078,7 +1078,7 @@ impl<'p> Hm<'p> {
                 let st = self.infer_expr(scrut);
                 let result = self.solver.fresh(InferenceVarKind::Source);
                 for arm in arms {
-                    self.scopes.push(HashMap::new());
+                    self.scopes.push(HashMap::default());
                     self.bind_pattern(&arm.pattern, &st);
                     let body = self.infer_expr(&arm.body);
                     self.scopes.pop();
@@ -1094,7 +1094,7 @@ impl<'p> Hm<'p> {
             // then-branch; the branches agree on the value type.
             Expr::IfLet(pat, scrut, then, els, span) => {
                 let st = self.infer_expr(scrut);
-                self.scopes.push(HashMap::new());
+                self.scopes.push(HashMap::default());
                 // A plain binding on a nullable scrutinee narrows to the non-null
                 // type on the then-arm (the value is proven present).
                 let bind_ty = match (pat, &self.solver.resolve(&st)) {
@@ -1495,7 +1495,7 @@ impl<'p> Hm<'p> {
     /// whatever follows a `return` is unreachable, so the block still yields
     /// nothing.
     fn infer_block_value(&mut self, block: &Block) -> Type {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(HashMap::default());
         let mut value = Type::Void;
         let mut diverges = false;
         for (i, stmt) in block.stmts.iter().enumerate() {

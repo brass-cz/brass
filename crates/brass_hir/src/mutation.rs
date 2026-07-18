@@ -13,7 +13,7 @@
 //! language server's type display so all three agree on which arguments are
 //! borrowed and which are copied.
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use brass_parser::ast::{Arg, Block, Expr, Pattern, Stmt, StrSeg, TypeExpr};
 
@@ -153,9 +153,9 @@ fn all_methods(
 /// it terminates.
 fn write_through_fixpoint(program: &Program) -> MutationInfo {
     let mut info = MutationInfo {
-        functions: HashMap::new(),
-        method_args: HashMap::new(),
-        self_write_through_methods: HashSet::new(),
+        functions: HashMap::default(),
+        method_args: HashMap::default(),
+        self_write_through_methods: HashSet::default(),
         param_calls: collect_param_calls(program),
     };
     // Seed free functions and method args with the explicit `ref(mut(T))`
@@ -428,7 +428,7 @@ fn collect_param_calls(program: &Program) -> HashMap<String, Vec<ParamCall>> {
             false
         }
     }
-    let mut map = HashMap::new();
+    let mut map = HashMap::default();
     for f in program.functions.values() {
         let param_names: Vec<String> = f.signature.params.iter().map(|p| p.name.clone()).collect();
         // Track every parameter so shadowing is respected uniformly.
@@ -579,7 +579,7 @@ impl PlaceSink for WriteSink {
 type Roots = HashMap<String, bool>;
 
 fn root_set(root: &str, rebind_counts: bool) -> Roots {
-    HashMap::from([(root.to_string(), rebind_counts)])
+    HashMap::from_iter([(root.to_string(), rebind_counts)])
 }
 
 /// Events reported by the shared traversal. Each hook returns `true` to stop

@@ -157,3 +157,143 @@ fn analysis_cache_misses_when_the_plugin_library_changes() {
         "the new manifest lacks `repeat`: {stderr}"
     );
 }
+
+/// A plugin-backed cache stores the canonical import and binary hash, not the
+/// packing machine's library path. Moving the complete program therefore hits
+/// the cache and dispatches through the library at its new location.
+#[test]
+fn analysis_cache_reanchors_a_relocated_plugin() {
+    let (dir, plugin) = project_dir_with(
+        "plugin_cache_relocate",
+        "import plugins.mathx.{ add }\nprintln(add(40, 2))\n",
+    );
+    let cache = dir.join("main.czcache");
+    let _ = fs::remove_file(&cache);
+
+    // Eager checking deterministically publishes a complete cache.
+    let (ok, stdout, stderr) = run(&["--eager"], &dir);
+    assert!(ok, "cold run failed: {stdout}\n{stderr}");
+    assert_eq!(stdout, "42\n");
+    let plugin = plugin.canonicalize().expect("canonical plugin path");
+    let cache_bytes = fs::read(&cache).expect("read generated cache");
+    assert!(
+        !cache_bytes
+            .windows(plugin.as_os_str().as_encoded_bytes().len())
+            .any(|window| window == plugin.as_os_str().as_encoded_bytes()),
+        "cache embeds the packing location {}",
+        plugin.display()
+    );
+
+    // Rename rather than copy so the old absolute path cannot accidentally
+    // satisfy a stale wrapper or stamp.
+    let moved = dir.with_file_name("plugin_cache_relocate_moved");
+    let _ = fs::remove_dir_all(&moved);
+    fs::rename(&dir, &moved).expect("move plugin program");
+    let out = Command::new(env!("CARGO_BIN_EXE_brass"))
+        .arg(moved.join("main.cz"))
+        .env("BRASS_LOG", "brass::perf=debug")
+        .output()
+        .expect("run moved program");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "moved run failed: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+    assert!(stderr.contains("front/cache-hit"), "cache missed: {stderr}");
+}
+
+/// The release layout discovers `std` from the running binary. A cache packed
+/// beside that binary must repeat the same resolution after the entire
+/// toolchain is installed elsewhere.
+#[test]
+fn distributed_plugin_cache_survives_installation() {
+    let dist = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("plugin_cache_distribution");
+    let original = dist.join("packed");
+    let installed = dist.join("installed");
+    let _ = fs::remove_dir_all(&dist);
+    fs::create_dir_all(original.join("bin")).expect("create distribution bin");
+    fs::create_dir_all(original.join("std")).expect("create distribution std");
+    fs::copy(env!("CARGO_BIN_EXE_brass"), original.join("bin/brass"))
+        .expect("copy distributed driver");
+    let entry = original.join("bin/czpm");
+    fs::write(&entry, "import std.mathx.{ add }\nprintln(add(40, 2))\n")
+        .expect("write distributed entry");
+    let plugin = original.join("std").join(format!(
+        "{}mathx{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    ));
+    fs::copy(brass_plugin_host::fixture::build_testlib(), &plugin)
+        .expect("copy distributed plugin");
+
+    let run_at = |root: &Path, eager: bool| -> std::process::Output {
+        // A parallel test can briefly inherit the just-closed copy handle
+        // between fork and exec on Linux; retry only that transient ETXTBSY.
+        for _ in 0..50 {
+            let mut command = Command::new(root.join("bin/brass"));
+            if eager {
+                command.arg("--eager");
+            }
+            match command
+                .arg(root.join("bin/czpm"))
+                .env("BRASS_LOG", "brass::perf=debug")
+                .output()
+            {
+                Ok(output) => return output,
+                Err(error) if error.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(error) => panic!("run distributed driver: {error}"),
+            }
+        }
+        panic!("distributed driver remained busy")
+    };
+
+    let out = run_at(&original, true);
+    assert!(
+        out.status.success(),
+        "packed run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+    let plugin = plugin.canonicalize().expect("canonical packed plugin");
+    let cache = fs::read(entry.with_extension("czcache")).expect("read packed cache");
+    assert!(
+        !cache
+            .windows(plugin.as_os_str().as_encoded_bytes().len())
+            .any(|window| window == plugin.as_os_str().as_encoded_bytes()),
+        "distributed cache embeds {}",
+        plugin.display()
+    );
+
+    // Installation removes the packing location, so a hit can only succeed by
+    // resolving `std.mathx` relative to the installed binary.
+    fs::rename(&original, &installed).expect("install distribution");
+    let out = run_at(&installed, false);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "installed run failed: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+    assert!(stderr.contains("front/cache-hit"), "cache missed: {stderr}");
+}
+
+/// Resolution is authoritative on every hit. A source module introduced at
+/// the same import path outranks the cached plugin and forces fresh analysis.
+#[test]
+fn analysis_cache_misses_when_source_shadows_plugin() {
+    let (dir, _) = project_dir_with(
+        "plugin_cache_source_shadow",
+        "import plugins.mathx.{ add }\nprintln(add(40, 2))\n",
+    );
+    let _ = fs::remove_file(dir.join("plugins/mathx.cz"));
+    let _ = fs::remove_file(dir.join("main.czcache"));
+    let (ok, stdout, stderr) = run(&["--eager"], &dir);
+    assert!(ok, "cold run failed: {stdout}\n{stderr}");
+    assert_eq!(stdout, "42\n");
+
+    fs::write(
+        dir.join("plugins/mathx.cz"),
+        "fun add(a: int64, b: int64) -> int64 { return 99 }\n",
+    )
+    .expect("add shadowing source module");
+    let (ok, stdout, stderr) = run(&["--eager"], &dir);
+    assert!(ok, "shadowed run failed: {stdout}\n{stderr}");
+    assert_eq!(stdout, "99\n", "the cached plugin must not remain selected");
+}

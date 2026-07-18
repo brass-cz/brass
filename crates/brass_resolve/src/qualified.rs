@@ -16,7 +16,7 @@
 //! collides with a declared or imported name is rejected up front -- the two
 //! readings of `name.member` could not be told apart at use sites.
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use brass_hir::LoadedModule;
 use brass_parser::Span;
@@ -67,8 +67,8 @@ fn rewrite_module(
         }
     }
 
-    let mut aliases: HashSet<String> = HashSet::new();
-    let mut alias_paths: HashMap<String, String> = HashMap::new();
+    let mut aliases: HashSet<String> = HashSet::default();
+    let mut alias_paths: HashMap<String, String> = HashMap::default();
     for imp in &m.ast.imports {
         let Some(alias) = imp.alias.clone() else {
             continue;
@@ -106,7 +106,7 @@ fn rewrite_module(
         alias_paths: &alias_paths,
         exports,
         errors,
-        scopes: vec![HashSet::new()],
+        scopes: vec![HashSet::default()],
     };
     for item in &mut m.ast.items {
         match item {
@@ -177,7 +177,7 @@ impl Rewriter<'_> {
     }
 
     fn push(&mut self) {
-        self.scopes.push(HashSet::new());
+        self.scopes.push(HashSet::default());
     }
 
     fn pop(&mut self) {
@@ -236,7 +236,7 @@ impl Rewriter<'_> {
                     self.expr(v);
                 }
                 // The binding is visible only after its initializer.
-                let mut names = HashSet::new();
+                let mut names = HashSet::default();
                 collect_pattern_names(pat, &mut names);
                 for n in names {
                     self.bind(&n);
@@ -366,7 +366,7 @@ impl Rewriter<'_> {
             Expr::IfLet(pat, scrut, then, els, _) => {
                 self.expr(scrut);
                 self.push();
-                let mut names = HashSet::new();
+                let mut names = HashSet::default();
                 collect_pattern_names(pat, &mut names);
                 for n in names {
                     self.bind(&n);
@@ -381,7 +381,7 @@ impl Rewriter<'_> {
                 self.expr(scrut);
                 for arm in arms {
                     self.push();
-                    let mut names = HashSet::new();
+                    let mut names = HashSet::default();
                     collect_pattern_names(&arm.pattern, &mut names);
                     for n in names {
                         self.bind(&n);

@@ -5,7 +5,7 @@
 //! and end-to-end checks run the full HIR lowering so call routing, types, and
 //! `error(...)` resolve as they do in the real pipeline.
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use brass_hir::{LoadedModule, Program};
 use brass_mir::{MirBody, body_to_string, lower_body, lower_program, program_to_string};
@@ -14,17 +14,17 @@ use brass_parser::ast::{FunDecl, TopLevel};
 /// An empty program, for lowering bodies that need no call/type resolution.
 fn empty_program() -> Program {
     Program {
-        types: HashMap::new(),
-        functions: HashMap::new(),
+        types: HashMap::default(),
+        functions: HashMap::default(),
         inits: Vec::new(),
-        prelude_modules: HashSet::new(),
-        module_imports: HashMap::new(),
-        import_origins: HashMap::new(),
-        import_renames: HashMap::new(),
-        module_aliases: HashMap::new(),
-        symbol_aliases: HashMap::new(),
-        primitive_methods: HashMap::new(),
-        type_aliases: HashMap::new(),
+        prelude_modules: HashSet::default(),
+        module_imports: HashMap::default(),
+        import_origins: HashMap::default(),
+        import_renames: HashMap::default(),
+        module_aliases: HashMap::default(),
+        symbol_aliases: HashMap::default(),
+        primitive_methods: HashMap::default(),
+        type_aliases: HashMap::default(),
         next_infer_var: 0,
     }
 }

@@ -130,7 +130,7 @@ fn render_named_fields(
     program: &Program,
     header: &str,
     fields: &[(String, Type)],
-    values: &std::collections::HashMap<String, Value>,
+    values: &fxhash::FxHashMap<String, Value>,
     depth: usize,
 ) -> Result<String, String> {
     if fields.is_empty() {

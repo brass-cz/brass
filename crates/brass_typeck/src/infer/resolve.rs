@@ -96,8 +96,7 @@ impl<'a> Checker<'a> {
         // Pin each entry to a resolved type: a slot variable, or a field override.
         let mut slot_pins: std::collections::BTreeMap<u32, Type> =
             std::collections::BTreeMap::new();
-        let mut field_pins: std::collections::HashMap<String, Type> =
-            std::collections::HashMap::new();
+        let mut field_pins: fxhash::FxHashMap<String, Type> = fxhash::FxHashMap::default();
         for (fname, fte) in entries {
             let t = self.resolve_type(fte)?;
             if let Some((_, v)) = slots.iter().find(|(n, _)| n == fname) {

@@ -21,7 +21,7 @@
 //! to recover the type. Analysis therefore happens inside this module (via the
 //! document's analyzer) rather than being passed in.
 
-use std::collections::HashSet;
+use fxhash::FxHashSet as HashSet;
 use std::path::Path;
 
 use brass_hir::{Type, TypeInfo, TypeKind};
@@ -174,7 +174,7 @@ fn import_path_items(
         }
     }
 
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     names
         .into_iter()
         .filter(|n| n.starts_with(prefix) && seen.insert(n.clone()))
@@ -653,7 +653,7 @@ fn filter_prefix(items: Vec<CompletionItem>, prefix: &str) -> Vec<CompletionItem
 }
 
 fn dedup_by_label(mut items: Vec<CompletionItem>) -> Vec<CompletionItem> {
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     items.retain(|i| seen.insert(i.label.clone()));
     items
 }
@@ -675,7 +675,7 @@ fn symbol_items(analyzer: &DocAnalyzer, doc: &Document, doc_path: &Path) -> Vec<
         items.push(item((*f).to_string(), CompletionItemKind::FUNCTION, None));
     }
 
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     items.retain(|i| seen.insert(i.label.clone()));
     items
 }

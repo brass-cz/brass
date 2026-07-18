@@ -24,7 +24,7 @@ mod walk;
 pub use brass_solver::{solver, unify};
 pub use taint::has_keyed_calls;
 
-use std::collections::{HashMap, HashSet};
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use brass_hir::{MethodInfo, NominalInfo, Program, TypeKind, TypedProgram, resolve};
 use brass_parser::Span;
@@ -44,45 +44,45 @@ pub struct Analysis {
     /// Per record-type generalized scheme (inferred type parameters and the
     /// field/method signatures over them), keyed by the type's source name. The
     /// language server renders a method generically from this.
-    pub schemes: std::collections::HashMap<String, brass_hir::TypeScheme>,
+    pub schemes: fxhash::FxHashMap<String, brass_hir::TypeScheme>,
     /// The inferred return type of every free function, keyed by symbol. An
     /// unannotated return is absent from the signature table, so this is where
     /// the checker's answer lives.
-    pub function_returns: std::collections::HashMap<String, brass_hir::Type>,
+    pub function_returns: fxhash::FxHashMap<String, brass_hir::Type>,
     /// The same for methods, keyed by (type name, method name).
-    pub method_returns: std::collections::HashMap<(String, String), brass_hir::Type>,
+    pub method_returns: fxhash::FxHashMap<(String, String), brass_hir::Type>,
     /// The run's cross-module tables, reusable as a context seed when this was
     /// a context-only, error-free run (see [`infer::ContextTables`]).
     pub context_tables: infer::ContextTables,
     /// Spans of anonymous structural arguments that passed the callee's row
     /// check for a view-eligible parameter (`brass_typesys::rows`); MIR
     /// lowering converts exactly these arguments into the parameter's view.
-    pub view_args: std::collections::HashSet<Span>,
+    pub view_args: fxhash::FxHashSet<Span>,
     /// Value expressions accepted as a declared sum subtype at a flow site
     /// (span -> the parent sum's table symbol); MIR lowering rebuilds exactly
     /// these values as the parent.
-    pub sum_views: std::collections::HashMap<Span, brass_hir::Type>,
+    pub sum_views: fxhash::FxHashMap<Span, brass_hir::Type>,
     /// `expr!` sites whose propagated Err payload is re-raised wrapped into
     /// the prelude `Error`; MIR's propagation arm rebuilds the value.
-    pub lift_errs: std::collections::HashSet<Span>,
+    pub lift_errs: fxhash::FxHashSet<Span>,
     /// Field lists of checker-approved `for f in fields(x)` loops, keyed by the
     /// loop statement's span; MIR lowering unrolls the same expanded copies the
     /// checker typed (see `brass_hir::expand`).
-    pub fields_loops: std::collections::HashMap<Span, Vec<String>>,
+    pub fields_loops: fxhash::FxHashMap<Span, Vec<String>>,
     /// Resolved type names of `typeof(x)` calls, keyed by the call span; MIR
     /// lowering replaces each call with the string constant.
-    pub type_names: std::collections::HashMap<Span, String>,
+    pub type_names: fxhash::FxHashMap<Span, String>,
     /// Reflective (`-> infer!`) method calls keyed by expectation: call span ->
     /// (receiver type, method, target key). The driver specializes each and
     /// rewrites the call to the concrete method.
-    pub keyed_calls: std::collections::HashMap<Span, (String, String, brass_hir::Type)>,
+    pub keyed_calls: fxhash::FxHashMap<Span, (String, String, brass_hir::Type)>,
     /// Resolved binding types of `typeof`-bearing local annotations, keyed by
     /// the annotation span; MIR seeds the slot from this.
-    pub typeof_types: std::collections::HashMap<Span, brass_hir::Type>,
+    pub typeof_types: fxhash::FxHashMap<Span, brass_hir::Type>,
     /// Spans of `expr!` operators whose operand is a nullable rather than a
     /// `Result` (the null case propagates as `Result.Null`); MIR lowering
     /// emits the presence-test shape for exactly these spans.
-    pub null_props: std::collections::HashSet<Span>,
+    pub null_props: fxhash::FxHashSet<Span>,
 }
 
 /// Run all static checks. Returns the errors found (sorted by position).
@@ -721,7 +721,7 @@ mod tests {
     use brass_hir::{Constness, IntKind, LoadedModule, Program, Type, TypedExprKind, lower};
     use brass_parser::ast::BinOp;
     use brass_parser::parse;
-    use std::collections::HashSet;
+    use fxhash::FxHashSet as HashSet;
 
     fn errs(src: &str) -> Vec<String> {
         let ast = parse(src).expect("parse");
@@ -798,7 +798,7 @@ mod tests {
                 "type B = { value: string }\nfun make() { return B { value: \"b\" } }\n",
             ),
         ]);
-        let keep = HashSet::from([vec!["b".to_string()]]);
+        let keep = HashSet::from_iter([vec!["b".to_string()]]);
 
         assert!(!seed.retain_modules(&current, &keep));
         assert_eq!(seed.covered, None);
@@ -818,7 +818,7 @@ mod tests {
             (&["a"], "fun helper() { return 0 }\n"),
             (&["b"], "fun helper() { return 1 }\n"),
         ]);
-        let keep = HashSet::from([vec!["b".to_string()]]);
+        let keep = HashSet::from_iter([vec!["b".to_string()]]);
 
         assert!(!seed.retain_modules(&current, &keep));
         assert_eq!(seed.covered, None);

@@ -4,7 +4,7 @@
 //! `self` are also rejected when their receiver is a const binding with a known
 //! record type.
 
-use std::collections::HashMap;
+use fxhash::FxHashMap as HashMap;
 
 use brass_hir::{
     MutationInfo, NominalInfo, ParamInfo, Program, Type, TypeInfo, TypeKind, mutates_root,
@@ -136,7 +136,7 @@ impl ConstChecker<'_> {
         // is only visible to later top-level statements, not earlier ones.
         for init in &self.program.inits {
             self.current_module = init.path.clone();
-            let mut scopes = vec![HashMap::new()];
+            let mut scopes = vec![HashMap::default()];
             for stmt in &init.stmts {
                 self.check_stmt(stmt, &mut scopes);
             }
@@ -147,7 +147,7 @@ impl ConstChecker<'_> {
     /// A later top-level `let` that reuses a name shadows
     /// an earlier const, matching the order-sensitive init scope.
     fn global_consts(&self) -> HashMap<String, Binding> {
-        let mut consts = HashMap::new();
+        let mut consts = HashMap::default();
         for init in &self.program.inits {
             for stmt in &init.stmts {
                 let Stmt::Let {
@@ -174,7 +174,7 @@ impl ConstChecker<'_> {
     }
 
     fn check_block(&mut self, block: &Block, scopes: &mut ConstScopes) {
-        scopes.push(HashMap::new());
+        scopes.push(HashMap::default());
         for stmt in &block.stmts {
             self.check_stmt(stmt, scopes);
         }
@@ -257,7 +257,7 @@ impl ConstChecker<'_> {
                 };
                 // Every name a destructuring loop variable binds takes the same
                 // constness: they are all parts of the one element.
-                let mut frame = HashMap::new();
+                let mut frame = HashMap::default();
                 for n in pat.bound_names() {
                     frame.insert(n.to_string(), binding.clone());
                 }
@@ -690,7 +690,7 @@ fn type_method<'a>(info: &'a TypeInfo, method: &str) -> Option<&'a brass_hir::Me
 /// self-mutating method, is rejected); every other parameter binds as a mutable
 /// local (it owns its copy, or is a `ref(mut(T))` mutable reference).
 fn param_scope(params: &[brass_hir::ParamInfo], is_method: bool) -> HashMap<String, Binding> {
-    let mut scope = HashMap::new();
+    let mut scope = HashMap::default();
     if is_method {
         scope.insert("self".to_string(), Binding::Mutable);
     }

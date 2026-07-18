@@ -374,7 +374,7 @@ pub(super) fn required_arg_count(params: &[ParamInfo]) -> usize {
 }
 
 pub(super) fn env_from_scopes(scopes: &ScopeStack) -> HashMap<String, Type> {
-    let mut env = HashMap::new();
+    let mut env = HashMap::default();
     for scope in scopes {
         for (name, ty) in scope {
             env.insert(name.clone(), ty.clone());
@@ -452,7 +452,7 @@ pub(super) fn expr_always_returns(e: &Expr) -> bool {
 /// not tracked (a closure-local `let` of the same name over-approximates),
 /// which only re-widens more than strictly needed -- never less.
 pub(super) fn closure_write_targets_block(b: &Block) -> HashSet<String> {
-    let mut acc = HashSet::new();
+    let mut acc = HashSet::default();
     for s in &b.stmts {
         collect_closure_writes_stmt(s, false, &mut acc);
     }

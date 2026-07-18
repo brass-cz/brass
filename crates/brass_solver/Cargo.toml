@@ -6,5 +6,6 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+fxhash.workspace = true
 brass_hir.workspace = true
 tracing.workspace = true

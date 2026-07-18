@@ -92,6 +92,8 @@ tracing = "0.1"
 # the default features (`fmt`, `ansi`) give the stderr formatter.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+fxhash = "0.2"
+
 [profile.release]
 lto = true
 

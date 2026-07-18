@@ -288,7 +288,7 @@ impl Monomorphizer<'_, '_> {
                                 .filter(|s| self.program.functions.contains_key(*s))
                         };
                         if let Some(symbol) = demand {
-                            self.note_missing(symbol, &[]);
+                            self.note_missing(symbol, &[], true);
                         }
                         return Ok(None);
                     }

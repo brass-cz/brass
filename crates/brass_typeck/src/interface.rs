@@ -2,7 +2,7 @@
 //! every field and method of A with compatible types. For a sum type, every
 //! variant must satisfy the interface.
 
-use std::collections::HashMap;
+use fxhash::FxHashMap as HashMap;
 
 use brass_hir::{FieldInfo, MethodInfo, Program, TypeKind};
 
@@ -74,7 +74,7 @@ pub fn check(program: &Program) -> Vec<TypeError> {
                         &v.fields,
                         &v.methods,
                         &iv.fields,
-                        &HashMap::new(),
+                        &HashMap::default(),
                         program,
                         info.span,
                         true,
@@ -159,7 +159,7 @@ fn check_parent_field_conflicts(
     errors: &mut Vec<TypeError>,
 ) {
     // field name -> (parent interface name, resolved field type)
-    let mut seen: HashMap<&str, (&str, &brass_hir::Type)> = HashMap::new();
+    let mut seen: HashMap<&str, (&str, &brass_hir::Type)> = HashMap::default();
     for iface_name in interfaces {
         let Some(iface) = program.types.get(iface_name) else {
             continue;
