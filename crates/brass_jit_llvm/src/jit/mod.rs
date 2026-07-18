@@ -10,5 +10,6 @@
 //! [`crate::codegen`].
 
 pub mod engine;
+pub(crate) mod orc;
 
-pub use engine::{run, run_mono};
+pub use engine::{run, run_lazy, run_mono};

@@ -1730,6 +1730,183 @@ fn lazy_runs_persist_and_reuse_a_cache() {
     assert_eq!(run(), first);
 }
 
+/// A full analysis cache skips the checker, but the default run must retain
+/// entry-rooted JIT reachability: an unrelated zero-argument function is not
+/// another compilation root merely because its signature needs no arguments.
+#[test]
+fn cached_lazy_run_compiles_only_entry_reachable_functions() {
+    let main = setup(
+        "cached_lazy_reachability",
+        &[(
+            "main.cz",
+            "fun selected() -> int64 { return 42 }\n\
+             fun skipped() -> int64 { return 141 }\n\
+             fun main() { println(selected()) }\n",
+        )],
+    );
+
+    // Produce a complete cache deterministically before exercising the lazy
+    // cache-hit path; a short lazy first run may instead save a partial cache.
+    let checked = Command::new(env!("CARGO_BIN_EXE_brass"))
+        .arg("check")
+        .arg(&main)
+        .output()
+        .expect("check program");
+    assert!(
+        checked.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_brass"))
+        .arg(&main)
+        .env("BRASS_LOG", "brass::perf=trace")
+        .output()
+        .expect("run cached program");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+    assert!(stderr.contains("front/cache-hit"), "stderr: {stderr}");
+    let compiled: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("back/codegen-fn:"))
+        .collect();
+    assert!(
+        compiled.iter().any(|line| line.contains("selected")),
+        "entry-reachable function was not compiled: {stderr}"
+    );
+    assert!(
+        compiled.iter().all(|line| !line.contains("skipped")),
+        "unreachable zero-argument function was compiled: {stderr}"
+    );
+}
+
+/// Static reachability includes both arms of a runtime branch, but ORC should
+/// optimize and emit native code only for the arm that execution enters.
+#[test]
+fn cached_lazy_run_materializes_only_the_executed_branch() {
+    let main = setup(
+        "cached_lazy_runtime_branch",
+        &[(
+            "main.cz",
+            "fun selected() -> int64 { return 42 }\n\
+             fun skipped() -> int64 { return 141 }\n\
+             fun main() {\n\
+                 if _argv().len() == 1 {\n\
+                     println(selected())\n\
+                 } else {\n\
+                     println(skipped())\n\
+                 }\n\
+             }\n",
+        )],
+    );
+
+    let checked = Command::new(env!("CARGO_BIN_EXE_brass"))
+        .arg("check")
+        .arg(&main)
+        .output()
+        .expect("check program");
+    assert!(
+        checked.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_brass"))
+        .arg(&main)
+        .env("BRASS_LOG", "brass::perf=trace")
+        .output()
+        .expect("run cached program");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+    let materialized: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("back/orc-materialize"))
+        .collect();
+    assert!(
+        materialized
+            .iter()
+            .any(|line| line.contains("pp_fn_selected")),
+        "executed branch was not materialized: {stderr}"
+    );
+    assert!(
+        materialized
+            .iter()
+            .all(|line| !line.contains("pp_fn_skipped")),
+        "unexecuted runtime branch was materialized: {stderr}"
+    );
+}
+
+/// A spawning program precompiles exactly what its workers can statically
+/// reach (spawned closures and their call graphs, before the spawn runs);
+/// main-thread-only code keeps demand-driven materialization, so a dead main
+/// branch is still never compiled.
+#[test]
+fn cached_lazy_spawn_precompiles_only_worker_reachable_code() {
+    let main = setup(
+        "cached_lazy_spawn_reachability",
+        &[(
+            "main.cz",
+            "fun worker_task() -> int64 { return 7 }\n\
+             fun main_selected() -> int64 { return 42 }\n\
+             fun main_skipped() -> int64 { return 141 }\n\
+             fun main() {\n\
+                 let base = 100\n\
+                 spawn(() -> { println(worker_task() + base) })\n\
+                 sync()\n\
+                 if _argv().len() == 1 {\n\
+                     println(main_selected())\n\
+                 } else {\n\
+                     println(main_skipped())\n\
+                 }\n\
+             }\n",
+        )],
+    );
+
+    let checked = Command::new(env!("CARGO_BIN_EXE_brass"))
+        .arg("check")
+        .arg(&main)
+        .output()
+        .expect("check program");
+    assert!(
+        checked.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_brass"))
+        .arg(&main)
+        .env("BRASS_LOG", "brass::perf=trace")
+        .output()
+        .expect("run cached program");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "107\n42\n");
+    let materialized: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("back/orc-materialize"))
+        .collect();
+    assert!(
+        materialized
+            .iter()
+            .any(|line| line.contains("pp_fn_worker_5f_task")),
+        "worker-reachable function was not materialized: {stderr}"
+    );
+    assert!(
+        materialized
+            .iter()
+            .any(|line| line.contains("pp_fn_main_5f_selected")),
+        "executed main branch was not materialized: {stderr}"
+    );
+    assert!(
+        materialized
+            .iter()
+            .all(|line| !line.contains("pp_fn_main_5f_skipped")),
+        "main-only dead branch was materialized despite the spawn: {stderr}"
+    );
+}
+
 #[test]
 fn czcache_is_entry_specific() {
     let main = setup(

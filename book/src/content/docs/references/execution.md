@@ -20,7 +20,8 @@ signature is annotation-determined compiles into a _deferred site_; the
 first time execution actually reaches it, the function is monomorphized and
 compiled on the spot, waiting for the checker first if its body is still
 being inferred. A `spawn` pre-compiles everything the spawned task could
-reach, since worker threads never compile.
+statically reach before the spawn runs, since worker threads never compile;
+code only the main thread can reach stays on demand.
 
 A lazy run's verdict covers **what the run executes**:
 
@@ -44,9 +45,17 @@ A lazy run's verdict covers **what the run executes**:
 
 `brass check` always checks **eagerly**: the whole program, on the calling
 thread, before reporting; it prints nothing when the program is well-typed.
-`--eager` gives a run the same check-everything-first behavior. The
-interpreter back end, `brass repl`, and a `.czcache` hit (an already-checked
-program) are also eager.
+`--eager` gives a run the same check-everything-first behavior and also
+compiles the whole program as one optimized unit before running it. The
+interpreter back end and `brass repl` are eager too.
+
+A `.czcache` hit (an already-checked program, see
+[Performance & caching](/references/performance/)) skips checking entirely
+but keeps compilation demand-driven: monomorphization starts from the
+initializers and `main` only, and each reachable function is optimized and
+translated to native code the first time execution calls it. See the
+[performance guide](/guides/performance/) for choosing between the lazy
+default and `--eager`.
 
 Execution then instantiates every reachable function at the concrete types it
 is used with (**monomorphization**) and runs the program:
@@ -113,7 +122,7 @@ interpreter.
 
 ```bash
 brass program.cz         # lazy check + run (JIT)
-brass --eager program.cz # whole-program check, then run
+brass --eager program.cz # whole-program check + compile, then run
 brass check program.cz   # check only (always whole-program)
 brass repl [program.cz]  # interpreter / interactive REPL
 czls                       # LSP server (hover, diagnostics, completion,

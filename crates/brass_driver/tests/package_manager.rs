@@ -224,5 +224,72 @@ fn git_dependencies_clone_and_checkout_in_the_cache() {
     );
     assert!(!scaffold.join("bad-name").exists());
 
+    // A package's own name is not an import segment (a depender names the
+    // package with its own dependency key), so a hyphenated name still runs,
+    // locating its entry file. `run` spawns `brass` by name, hence the PATH.
+    let hyphen = dir.join("hyphen");
+    std::fs::create_dir_all(&hyphen).expect("create hyphenated package");
+    std::fs::write(
+        hyphen.join("package.toml"),
+        "[package]\nname = \"my-app\"\nauthor = \"\"\nlicense = \"MIT\"\n\n[dependencies]\n",
+    )
+    .expect("write hyphenated manifest");
+    std::fs::write(hyphen.join("my-app.cz"), "println(\"hyphen ok\")\n")
+        .expect("write hyphenated entry");
+    let exe_dir = Path::new(env!("CARGO_BIN_EXE_brass"))
+        .parent()
+        .expect("brass binary directory");
+    let path_env = format!(
+        "{}:{}",
+        exe_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let ran = Command::new(env!("CARGO_BIN_EXE_brass"))
+        .current_dir(&hyphen)
+        .env("BRASS_PACKAGES", std_package_env())
+        .env("HOME", &home)
+        .env("PATH", &path_env)
+        .arg(&launcher)
+        .args(["run"])
+        .output()
+        .expect("run hyphenated package");
+    assert!(
+        ran.status.success(),
+        "hyphenated package name failed to run:\n{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&ran.stdout).contains("hyphen ok"),
+        "entry did not run: {:?}",
+        String::from_utf8_lossy(&ran.stdout)
+    );
+
+    // Dependency names ARE import segments and stay identifier-only, and the
+    // manifest error must surface its own message through czpm's file-context
+    // wrapper rather than being replaced by it.
+    std::fs::write(
+        hyphen.join("package.toml"),
+        "[package]\nname = \"my-app\"\nauthor = \"\"\nlicense = \"MIT\"\n\n[dependencies]\nbad-dep = { path = \"nowhere\" }\n",
+    )
+    .expect("write bad-dependency manifest");
+    let refused = Command::new(env!("CARGO_BIN_EXE_brass"))
+        .current_dir(&hyphen)
+        .env("BRASS_PACKAGES", std_package_env())
+        .env("HOME", &home)
+        .env("PATH", &path_env)
+        .arg(&launcher)
+        .args(["run"])
+        .output()
+        .expect("run with a bad dependency name");
+    assert!(
+        !refused.status.success(),
+        "bad dependency name was accepted"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("is not a legal identifier"),
+        "the manifest error's cause was swallowed:\n{stderr}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

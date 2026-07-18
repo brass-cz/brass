@@ -520,8 +520,25 @@ fn execute(
     type_names: &HashMap<Span, String>,
     typeof_types: &HashMap<Span, brass_hir::Type>,
     null_props: &HashSet<Span>,
+    lazy: bool,
 ) -> Result<(), String> {
     install_jit_panic_guard();
+    if lazy {
+        return brass_jit_llvm::run_lazy(
+            program,
+            &brass_mir::CheckerChannels {
+                expr_types,
+                view_args,
+                sum_views,
+                call_locations,
+                lift_errs,
+                fields_loops,
+                type_names,
+                typeof_types,
+                null_props,
+            },
+        );
+    }
     brass_jit_llvm::run(
         program,
         expr_types,
@@ -551,6 +568,7 @@ fn execute(
     type_names: &HashMap<Span, String>,
     typeof_types: &HashMap<Span, brass_hir::Type>,
     null_props: &HashSet<Span>,
+    _lazy: bool,
 ) -> Result<(), String> {
     brass_repl::run(
         program,
@@ -643,8 +661,8 @@ fn drive(mode: Mode, file: &str) -> Result<(), u8> {
     // checker thread while this thread compiles and executes the program,
     // demand-first (see [`run_lazy`]). `check`, `repl`, `--eager`, and the
     // interpreter-only builds (including wasm, which cannot spawn threads)
-    // check eagerly on this thread. A cache hit skips both -- the program
-    // is already fully checked and runs the ordinary way.
+    // check eagerly on this thread. A cache hit skips checking but keeps the
+    // entry-rooted JIT, so a warm run does not compile unrelated roots.
     let lazy = cfg!(jit_backend) && matches!(mode, Mode::Run { eager: false });
     let checked = if lazy {
         match load_cached(file, &root) {
@@ -674,6 +692,7 @@ fn drive(mode: Mode, file: &str) -> Result<(), u8> {
             &checked.type_names,
             &checked.typeof_types,
             &checked.null_props,
+            lazy,
         )
         .map_err(|e| {
             report_runtime_error(&e);
@@ -2410,6 +2429,7 @@ fn run_fresh_eager(label: &str, src: &str, root: &Path) -> Result<(), u8> {
         &checked.type_names,
         &checked.typeof_types,
         &checked.null_props,
+        false,
     )
     .map_err(|e| {
         report_runtime_error(&e);
@@ -2522,6 +2542,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         &checked.type_names,
         &checked.typeof_types,
         &checked.null_props,
+        false,
     )
     .map_err(|e| {
         report_runtime_error(&e);

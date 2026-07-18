@@ -25,8 +25,8 @@ mod runtime;
 
 pub use codegen::{
     Codegen, ViewFieldPlan, batch_spawns, element_type, program_uses_with, rc_managed,
-    record_field_names, record_field_type, record_from_succeeds, result_ok_type, str_const,
-    strip_wrappers, view_field_plans,
+    record_field_names, record_field_type, record_from_succeeds, result_ok_type, spawn_precompile,
+    str_const, strip_wrappers, view_field_plans,
 };
 pub use engine::Engine;
 pub use mir_infer::{

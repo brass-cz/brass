@@ -30,31 +30,20 @@ pub fn run(
     typeof_types: &std::collections::HashMap<brass_hir::Span, brass_hir::Type>,
     null_props: &std::collections::HashSet<brass_hir::Span>,
 ) -> Result<(), String> {
-    let t = std::time::Instant::now();
-    let mir = brass_mir::lower_program_with_types(
+    let mir = lower_checked(
         program,
-        expr_types,
-        view_args,
-        sum_views,
-        call_locations,
-        lift_errs,
-        fields_loops,
-        type_names,
-        typeof_types,
-        null_props,
+        &brass_mir::CheckerChannels {
+            expr_types,
+            view_args,
+            sum_views,
+            call_locations,
+            lift_errs,
+            fields_loops,
+            type_names,
+            typeof_types,
+            null_props,
+        },
     );
-    tracing::debug!(
-        target: "brass::perf",
-        "back/lower-mir: total {:.3}ms",
-        t.elapsed().as_secs_f64() * 1000.0
-    );
-    // Debugging aid: dump the lowered MIR when requested
-    // (BRASS_LOG_TYPE=mir) -- the first thing needed when monomorphization
-    // rejects a checked program. Guarded so the rendering only runs when the
-    // target is enabled.
-    if tracing::enabled!(target: "brass::mir", tracing::Level::TRACE) {
-        tracing::trace!(target: "brass::mir", "\n{}", brass_mir::program_to_string(&mir));
-    }
     let t = std::time::Instant::now();
     let mono = brass_engine::monomorphize(&mir, program)
         .map_err(|e| format!("typed lowering failed: {e}"))?;
@@ -72,9 +61,86 @@ pub fn run(
 /// Rejects a program whose `main` fell outside the typed subset, builds one
 /// LLVM context/backend, and drives codegen + execution.
 pub fn run_mono(program: &Program, mono: &brass_engine::MonoProgram) -> Result<(), String> {
-    // No Value fallback: a program outside the typed subset is rejected. The
-    // skip reason names the first offending construct -- without it the user
-    // sees only the generic sentence for a program the checker accepted.
+    require_main(program, mono)?;
+    let context = Context::create();
+    let mut backend = crate::LlvmCodegen::new_backend(&context, program);
+    brass_engine::Engine::run(&mut backend, mono)
+}
+
+/// Compile and run an already-checked program through the lazy JIT.
+///
+/// Module initializers and `main` are the only roots. Their statically
+/// reachable call graph is compiled as one module, while unrelated
+/// zero-argument functions are left out. The ordinary eager path retains its
+/// all-roots validation behavior.
+pub fn run_lazy(program: &Program, channels: &brass_mir::CheckerChannels) -> Result<(), String> {
+    let mir = lower_checked(program, channels);
+    let t = std::time::Instant::now();
+    let mono =
+        brass_engine::monomorphize_entry(&mir, program, false).map_err(|stop| match stop {
+            brass_engine::MonoStop::MissingBodies(missing) => {
+                // A full cache never leaves a reachable body unlowered, so
+                // reaching this is a pipeline bug: name every demanded body
+                // (with the argument types that demanded it) to make the
+                // report actionable.
+                let mut demands: Vec<String> = missing
+                    .iter()
+                    .map(|(base, args)| {
+                        let args: Vec<String> = args.iter().map(|t| t.display()).collect();
+                        format!("{base}({})", args.join(", "))
+                    })
+                    .collect();
+                demands.sort();
+                demands.dedup();
+                format!(
+                    "typed lowering failed: entry-reachable bodies are missing: {}",
+                    demands.join(", ")
+                )
+            }
+            brass_engine::MonoStop::Fail(error) => format!("typed lowering failed: {error}"),
+        })?;
+    tracing::debug!(
+        target: "brass::perf",
+        "back/monomorphize: total {:.3}ms",
+        t.elapsed().as_secs_f64() * 1000.0
+    );
+    require_main(program, &mono)?;
+    let context = crate::jit::orc::OrcContext::new();
+    let mut backend = crate::LlvmCodegen::new_backend(context.context(), program);
+    backend.prepare_lazy_orc(&context, &mono)?;
+    backend.execute_lazy_orc()
+}
+
+fn lower_checked(
+    program: &Program,
+    channels: &brass_mir::CheckerChannels,
+) -> brass_mir::MirProgram {
+    let t = std::time::Instant::now();
+    let mir = brass_mir::lower_program_with_types(
+        program,
+        channels.expr_types,
+        channels.view_args,
+        channels.sum_views,
+        channels.call_locations,
+        channels.lift_errs,
+        channels.fields_loops,
+        channels.type_names,
+        channels.typeof_types,
+        channels.null_props,
+    );
+    tracing::debug!(
+        target: "brass::perf",
+        "back/lower-mir: total {:.3}ms",
+        t.elapsed().as_secs_f64() * 1000.0
+    );
+    // MIR is rendered only on request because it can dwarf ordinary logs.
+    if tracing::enabled!(target: "brass::mir", tracing::Level::TRACE) {
+        tracing::trace!(target: "brass::mir", "\n{}", brass_mir::program_to_string(&mir));
+    }
+    mir
+}
+
+fn require_main(program: &Program, mono: &brass_engine::MonoProgram) -> Result<(), String> {
     if program.functions.contains_key("main") && mono.lookup("main").is_none() {
         return Err(match &mono.main_skip {
             Some(reason) => {
@@ -83,9 +149,7 @@ pub fn run_mono(program: &Program, mono: &brass_engine::MonoProgram) -> Result<(
             None => "program uses constructs outside the typed (Value-free) subset".to_string(),
         });
     }
-    let context = Context::create();
-    let mut backend = crate::LlvmCodegen::new_backend(&context, program);
-    brass_engine::Engine::run(&mut backend, mono)
+    Ok(())
 }
 
 /// Map every runtime primitive the module declares to its host address. This

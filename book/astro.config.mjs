@@ -82,6 +82,7 @@ export default defineConfig({
             { label: "Modules", slug: "guides/modules" },
             { label: "Reflection", slug: "guides/reflection" },
             { label: "Concurrency", slug: "guides/concurrency" },
+            { label: "Performance", slug: "guides/performance" },
             { label: "Package manager", slug: "guides/packages" },
             { label: "LLM agents", slug: "guides/llm" },
           ],

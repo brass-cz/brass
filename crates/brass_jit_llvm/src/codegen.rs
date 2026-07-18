@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
-use inkwell::module::Module;
-use inkwell::types::BasicTypeEnum;
+use inkwell::module::{Linkage, Module};
+use inkwell::types::{BasicTypeEnum, FunctionType};
 use inkwell::values::BasicValueEnum;
 use inkwell::values::{FloatValue, FunctionValue, GlobalValue, IntValue, PointerValue};
 use inkwell::{FloatPredicate, IntPredicate, OptimizationLevel};
@@ -20,6 +20,7 @@ use brass_hir::{FloatKind, IntKind, NominalType, Program, Type, TypeKind};
 use brass_mir::{BlockId, ClosureId, LocalId};
 use brass_parser::ast::*;
 
+use crate::jit::orc::{OrcContext, OrcJit, OrcModule, lazy_implementation_symbol};
 use crate::layout::Abi;
 use crate::monomorph::*;
 
@@ -103,6 +104,24 @@ struct MirState<'ctx> {
     /// state.
     in_runtime_module: bool,
     runtime_modules: Vec<Module<'ctx>>,
+    /// The LLVM signature of every monomorphized instance, keyed by mangled
+    /// name and shared by all of a lazy run's function modules (one context
+    /// serves them all). Present only in lazy per-function codegen, where
+    /// [`LlvmCodegen::instance_fn`] declares referenced instances on demand
+    /// instead of `begin_program` declaring all of them into every module.
+    lazy_signatures: Option<std::rc::Rc<HashMap<String, FunctionType<'ctx>>>>,
+    /// Unoptimized one-function modules waiting behind ORC call-through stubs.
+    /// Declared before `orc` so they are disposed while its context is live.
+    lazy_modules: HashMap<String, OrcModule>,
+    /// The warm lazy-run ORC session. Cold deferred-monomorphization runs keep
+    /// using MCJIT until their mutable lowering service is migrated as well.
+    orc: Option<OrcJit>,
+    lazy_has_main: bool,
+    /// Public symbols whose modules must be materialized before execution:
+    /// code a spawned worker thread may enter. Workers cannot run the Rust
+    /// materializer (it lives on the main thread), so their whole statically
+    /// reachable set is compiled up front; everything else stays lazy.
+    lazy_precompile: Vec<String>,
 }
 
 /// The LLVM code generator: holds the LLVM context, module, and builder plus the
@@ -389,7 +408,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             .ctx
             .void_type()
             .fn_type(&[self.abi.ptr().into(), self.abi.ptr().into()], false);
-        let f = self.module.add_function(&key, fty, None);
+        let f = self.module.add_function(&key, fty, Some(Linkage::Private));
         self.tracers.insert(key, Some(f));
 
         let saved = self.builder.get_insert_block();
@@ -529,7 +548,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             .ctx
             .void_type()
             .fn_type(&[self.abi.ptr().into()], false);
-        let f = self.module.add_function(&key, fty, None);
+        let f = self.module.add_function(&key, fty, Some(Linkage::Private));
         self.destructors.insert(key, f);
 
         // Collect each heap field's (type, byte offset, llvm type) before emitting,
@@ -763,7 +782,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             .ctx
             .void_type()
             .fn_type(&[self.abi.ptr().into()], false);
-        let f = self.module.add_function(&key, fty, None);
+        let f = self.module.add_function(&key, fty, Some(Linkage::Private));
         self.destructors.insert(key, f);
 
         // Collect managed captures (type, llvm type, offset) before emitting.
@@ -1620,7 +1639,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         }
         let ptrt = self.abi.ptr();
         let fty = ptrt.fn_type(&[ptrt.into()], false);
-        let f = self.module.add_function(&key, fty, None);
+        let f = self.module.add_function(&key, fty, Some(Linkage::Private));
         self.deep_copy_fns.insert(key, f);
 
         let saved_block = self.builder.get_insert_block();
@@ -1808,7 +1827,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             return *f;
         }
         let fty = self.abi.ptr().fn_type(&[self.abi.ptr().into()], false);
-        let f = self.module.add_function(&key, fty, None);
+        let f = self.module.add_function(&key, fty, Some(Linkage::Private));
         self.to_string_fns.insert(key, f);
 
         // Gather the shape up front so the `program` borrow ends before the
@@ -2011,6 +2030,206 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     }
 }
 
+impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
+    /// Declare each typed global, zero-initialized; init instances fill
+    /// them. A runtime add-on or lazy function module only DECLARES them (no
+    /// initializer): the linker then resolves the reference to the startup
+    /// (or support) module's storage, where the program's actual state lives.
+    fn declare_globals(&mut self, program: &MonoProgram) {
+        for (name, ty) in &program.globals {
+            let llty = self.abi.typed_basic(ty);
+            let g = self.module.add_global(llty, None, &mangle_global(name));
+            if !self.mir.in_runtime_module {
+                g.set_initializer(&llty.const_zero());
+            }
+            self.mir.globals.insert(name.clone(), g);
+        }
+    }
+
+    /// The module-local declaration of a monomorphized instance, or `None`
+    /// when no such instance exists. Eager and runtime modules pre-declare
+    /// every instance in `begin_program`, so this is a cache hit; a lazy
+    /// function module declares an instance the first time its one body
+    /// references it, from the shared per-program signature table.
+    fn instance_fn(&mut self, symbol: &str) -> Option<FunctionValue<'ctx>> {
+        let name = mangle_fn(symbol);
+        if let Some(f) = self.fns.map.get(&name) {
+            return Some(*f);
+        }
+        let fty = *self.mir.lazy_signatures.as_ref()?.get(&name)?;
+        let f = self.module.add_function(&name, fty, None);
+        self.fns.map.insert(name, f);
+        Some(f)
+    }
+
+    /// Prepare a warm lazy run as independent, unoptimized function modules.
+    /// ORC receives a callable stub for every monomorphized instance; its O2
+    /// transform and native code generator do no work for a module until that
+    /// stub is entered by executed control flow.
+    pub(crate) fn prepare_lazy_orc(
+        &mut self,
+        context: &OrcContext,
+        program: &MonoProgram,
+    ) -> Result<(), String> {
+        if self.mir.engine.is_some() || self.mir.orc.is_some() {
+            return Err("JIT backend was finalized twice".to_string());
+        }
+
+        // Per-program facts every function module shares, computed once: the
+        // LLVM signature of each instance (the single context makes the types
+        // reusable across modules) and whether the program uses `with`.
+        // Modules then declare only the instances their one body references.
+        let mut signatures = HashMap::with_capacity(program.functions.len());
+        for f in &program.functions {
+            let fty = if f.is_closure {
+                self.abi.typed_closure_fn_type(&f.type_args, &f.ret)
+            } else {
+                self.abi.typed_fn_type(&f.type_args, &f.ret)
+            };
+            signatures.insert(mangle_fn(&f.symbol), fty);
+        }
+        let signatures = std::rc::Rc::new(signatures);
+        let region_barriers = brass_engine::program_uses_with(program);
+
+        let mut pending = HashMap::with_capacity(program.functions.len());
+        let mut perf = brass_utils::PerfLog::start("back/codegen-fn");
+        for function in &program.functions {
+            let started = std::time::Instant::now();
+            let public = mangle_fn(&function.symbol);
+            let module = self.lazy_function_module(
+                program,
+                function,
+                &public,
+                signatures.clone(),
+                region_barriers,
+            )?;
+            perf.item(function.symbol.clone(), started.elapsed());
+            pending.insert(public, module);
+        }
+        perf.report();
+        self.mir.lazy_modules = pending;
+        self.mir.lazy_has_main = program.lookup("main").is_some();
+        self.mir.lazy_precompile = brass_engine::spawn_precompile(program)
+            .unwrap_or_default()
+            .iter()
+            .map(|symbol| mangle_fn(symbol))
+            .collect();
+
+        // This support module owns the program globals and the freeze entry.
+        // Function modules declare those globals without initializers.
+        self.begin_program(program);
+        self.emit_freeze_globals_fn();
+        self.module
+            .verify()
+            .map_err(|error| format!("LLVM support module verification failed:\n{error}"))?;
+        let support = std::mem::replace(&mut self.module, self.ctx.create_module("brass_done"));
+
+        // `OrcJit::new` takes context ownership. Store it in `MirState` before
+        // any later fallible operation so pending modules are always destroyed
+        // before their shared context on an early return.
+        self.mir.orc = Some(OrcJit::new(context)?);
+        let jit = self.mir.orc.as_mut().expect("ORC JIT stored");
+        let runtime_symbols = brass_runtime::symbols()
+            .into_iter()
+            .map(|(name, address)| (name.to_string(), address))
+            .chain(std::iter::once((
+                "pp_resolve".to_string(),
+                crate::dispatch::pp_resolve as *const () as usize,
+            )));
+        jit.define_absolute(runtime_symbols)?;
+        jit.add_eager_module(OrcModule::from_inkwell(support))?;
+        for function in &program.functions {
+            jit.register_lazy(&mangle_fn(&function.symbol))?;
+        }
+        Ok(())
+    }
+
+    /// Execute the ORC lazy program: init functions in order, the global freeze
+    /// entry, then `main`. Everything a spawned worker thread may reach is
+    /// materialized before execution because worker threads do not own the
+    /// Rust IR-module queue used by the first-call callback; the rest of the
+    /// program stays demand-driven.
+    pub(crate) fn execute_lazy_orc(&mut self) -> Result<(), String> {
+        let inits = self.mir.init_symbols.clone();
+        let frozen = self.mir.frozen_globals.clone();
+        let has_main = self.mir.lazy_has_main;
+        let precompile = std::mem::take(&mut self.mir.lazy_precompile);
+        let mut jit = self
+            .mir
+            .orc
+            .take()
+            .ok_or("execute called before lazy ORC preparation")?;
+        let modules = &mut self.mir.lazy_modules;
+        let mut materialize = |request: &crate::jit::orc::LazyFunction| {
+            modules
+                .remove(&request.symbol)
+                .ok_or_else(|| format!("lazy module for `{}` is unavailable", request.symbol))
+        };
+        let result = jit.with_materializer(&mut materialize, |jit| {
+            let call = |jit: &mut OrcJit, symbol: &str| -> Result<(), String> {
+                let address = jit.lookup(symbol)?;
+                // SAFETY: every entry invoked here has the generated `void()`
+                // signature, and the ORC session remains live through the call.
+                let function: unsafe extern "C" fn() = unsafe { std::mem::transmute(address) };
+                unsafe { function() };
+                Ok(())
+            };
+
+            for public in &precompile {
+                jit.lookup(&lazy_implementation_symbol(public))?;
+            }
+            for symbol in &inits {
+                call(jit, &mangle_fn(symbol))?;
+            }
+            if !frozen.is_empty() {
+                call(jit, FREEZE_GLOBALS_FN)?;
+            }
+            if has_main {
+                call(jit, &mangle_fn("main"))?;
+            }
+            jit.check_reported_errors()
+        });
+        self.mir.orc = Some(jit);
+        brass_runtime::conc::pp_join_all();
+        brass_runtime::gc::pp_gc_collect();
+        result
+    }
+
+    fn lazy_function_module(
+        &self,
+        program: &MonoProgram,
+        function: &MonoFunction,
+        public: &str,
+        signatures: std::rc::Rc<HashMap<String, FunctionType<'ctx>>>,
+        region_barriers: bool,
+    ) -> Result<OrcModule, String> {
+        let mut codegen = LlvmCodegen::new_backend(self.ctx, self.program);
+        // Globals belong to the support module; this one only references them.
+        codegen.mir.in_runtime_module = true;
+        codegen.mir.lazy_signatures = Some(signatures);
+        codegen.region_barriers = region_barriers;
+        codegen.declare_globals(program);
+        codegen.codegen_function(program, function);
+        let definition = codegen
+            .module
+            .get_function(public)
+            .ok_or_else(|| format!("generated function `{public}` is missing"))?;
+        definition
+            .as_global_value()
+            .set_name(&lazy_implementation_symbol(public));
+        codegen.mark_small_functions_alwaysinline();
+        codegen
+            .module
+            .verify()
+            .map_err(|error| format!("lazy function verification failed:\n{error}"))?;
+        let module = std::mem::replace(
+            &mut codegen.module,
+            self.ctx.create_module("brass_function_done"),
+        );
+        Ok(OrcModule::from_inkwell(module))
+    }
+}
+
 impl<'ctx, 'p> brass_engine::RuntimeJit for LlvmCodegen<'ctx, 'p> {
     /// Compile one monomorphized instance into the live execution engine and
     /// return its callable address (deferred monomorphization).
@@ -2183,18 +2402,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
             let func = self.module.add_function(&name, fty, None);
             self.fns.map.insert(name, func);
         }
-        // Declare each typed global, zero-initialized; init instances fill
-        // them. A runtime add-on module only DECLARES them (no initializer):
-        // MCJIT then resolves the reference to the startup module's storage,
-        // where the program's actual state lives.
-        for (name, ty) in &program.globals {
-            let llty = self.abi.typed_basic(ty);
-            let g = self.module.add_global(llty, None, &mangle_global(name));
-            if !self.mir.in_runtime_module {
-                g.set_initializer(&llty.const_zero());
-            }
-            self.mir.globals.insert(name.clone(), g);
-        }
+        self.declare_globals(program);
         self.mir.init_symbols = program.init_symbols.clone();
         self.mir.frozen_globals = immutable_heap_globals(program);
     }
@@ -2209,7 +2417,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
         self.mark_small_functions_alwaysinline();
         self.run_optimization_passes();
         // O2-equivalent backend codegen: `Default` is LLVM's `-O2`,
-        // not the previous `Aggressive` (~`-O3`).
+        // not `Aggressive` (~`-O3`).
         let engine = self
             .module
             .create_jit_execution_engine(OptimizationLevel::Default)
@@ -2266,7 +2474,9 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
     }
 
     fn begin_body(&mut self, func: &MonoFunction) {
-        let f = self.fns.map[&mangle_fn(&func.symbol)];
+        let f = self
+            .instance_fn(&func.symbol)
+            .expect("body of an undeclared instance");
         let body = func.body;
         self.cur_fn = Some(f);
 
@@ -3191,7 +3401,9 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
         args: &[BasicValueEnum<'ctx>],
         ret: &Type,
     ) -> BasicValueEnum<'ctx> {
-        let f = self.fns.map[&mangle_fn(symbol)];
+        let f = self
+            .instance_fn(symbol)
+            .unwrap_or_else(|| panic!("call to undeclared instance `{symbol}`"));
         let meta: Vec<inkwell::values::BasicMetadataValueEnum> =
             args.iter().map(|a| (*a).into()).collect();
         let cs = self.builder.build_call(f, &meta, "call").unwrap();
@@ -3871,7 +4083,9 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
             .unwrap_basic()
             .into_pointer_value();
         let sym = closure_symbol(id, &capture_types, params);
-        if let Some(func) = self.fns.map.get(&mangle_fn(&sym)) {
+        // An uninstantiated closure has no body to point at; the slot then
+        // stays null, exactly as when the eager path finds no declaration.
+        if let Some(func) = self.instance_fn(&sym) {
             let fp = func.as_global_value().as_pointer_value();
             let fpp = self.field_ptr(base, 16);
             self.builder.build_store(fpp, fp).unwrap();

@@ -16,5 +16,5 @@ pub mod ownership;
 pub use codegen::LlvmCodegen;
 pub use dispatch::prime_resolved;
 pub use dispatch::{RuntimeDispatcher, pp_resolve, with_dispatcher};
-pub use jit::{run, run_mono};
+pub use jit::{run, run_lazy, run_mono};
 pub use monomorph::{mangle_closure, mangle_fn, mangle_init, mangle_method};

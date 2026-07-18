@@ -221,6 +221,7 @@ dependencies = [
  "brass_mir",
  "brass_parser",
  "brass_runtime",
+ "brass_utils",
  "inkwell",
  "llvm-sys",
  "tracing",

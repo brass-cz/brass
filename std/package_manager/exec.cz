@@ -46,11 +46,12 @@ fun main() {
     const manifest = if let Ok { value } = read_file(
         current.join(PACKAGE_FILE_NAME),
     ) {
-        if let Ok { value } = Manifest.parse(value) {
-            value
-        } else {
-            error("failed to parse manifest file {PACKAGE_FILE_NAME}")!
-        }
+        // Propagate the parse failure itself -- its message names the actual
+        // problem (malformed TOML, a bad dependency name) -- with the file
+        // name attached as a trace frame rather than replacing it.
+        Manifest
+            .parse(value)
+            .context("failed to parse manifest file {PACKAGE_FILE_NAME}")!
     } else {
         if cmd == "lsp" {
             const code = run_czls("")!

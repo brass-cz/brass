@@ -47,10 +47,12 @@ fun Manifest.parse(s: string) -> Manifest! {
     // and reads the table key of each name. (`PackageInfo.from(..)` is a
     // different operation -- a structural conversion, which looks for those
     // fields on the *value*; a TOML table carries them as entries, not fields.)
+    // The package's own name is deliberately not validated here: it never
+    // becomes an import segment (a depender names this package with its own
+    // dependency key), it only locates the entry file, so a file-name-ish
+    // name like `my-app` is legal in an existing manifest. `new`/`init`
+    // still insist on an identifier for the packages they scaffold.
     const package: PackageInfo = toml.get("package")!.into()!
-    if !valid_package_name(package.name) {
-        return error("package name `{package.name}` is not a legal identifier")
-    }
 
     let dependencies: Dependencies = HashMap.new()
     if _has(toml.keys()!, "dependencies") {

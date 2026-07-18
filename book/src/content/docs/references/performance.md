@@ -5,13 +5,14 @@ description: "Measuring where compile time goes, and how the .czcache analysis c
 
 ## Where start-up time goes
 
-Every Brass run type-checks the whole program before executing anything (see
+Every piece of Brass code is type-checked before it executes -- lazily by
+default, whole-program under `check`/`--eager` (see
 [Execution model](/references/execution/)). On a library-heavy program that
 check dominates start-up: parsing and HIR lowering are single-digit
 milliseconds, MIR lowering and monomorphization a few more, while type
 inference takes hundreds of milliseconds, and a program using reflective
-(`-> infer!`) decoding runs the whole front end twice. The two tools below
-make that cost visible and avoid paying it repeatedly.
+(`-> infer!`) decoding runs the whole front end twice. The tools below make
+that cost visible and avoid paying it repeatedly.
 
 ## Timing logs
 
@@ -49,6 +50,7 @@ The phases:
 | `front/keyed-repass` | the second full front-end pass a reflective (`-> infer!`) program needs |
 | `back/lower-mir`, `back/monomorphize` | MIR lowering and monomorphization |
 | `back/codegen-fn`, `back/codegen`, `back/finalize` | per-function LLVM IR emission and the JIT engine build |
+| `back/orc-materialize` | first-call native compilation of one function on a warm run (below; per-item, TRACE) |
 | `front/cache-hit`, `front/cache-save` | the analysis cache (below) |
 
 Per-function items (`typeck/fn-bodies`, `typeck/method-body`,
@@ -206,3 +208,21 @@ carries no schema, the header is the only compatibility gate: a tag mismatch
 discards the file, and `FORMAT_VERSION` is bumped whenever the payload layout
 changes. No cross-version compatibility is attempted; a stale cache is simply
 rebuilt.
+
+## Compilation on warm runs
+
+A cache hit removes the check, not compilation, and the run compiles
+**lazily**: monomorphization starts from the module initializers and `main`
+(a function nothing reachable calls is not compiled at all), every reachable
+instance is emitted as unoptimized IR up front (the `back/codegen-fn` items),
+and a function is optimized and translated to native code only when execution
+first calls it (each such event logs a `back/orc-materialize` item). Code
+behind a branch the run never takes is never translated. A `spawn` is the
+exception: everything the spawned task could statically reach is translated
+before the spawn runs, because worker threads never compile.
+
+`--eager` trades that start-up laziness for the best steady state: the whole
+program is compiled as one unit, so calls are direct and small functions
+inline into their callers; a lazy run's per-function units instead call each
+other through a small indirection. See the
+[performance guide](/guides/performance/) for choosing between them.
