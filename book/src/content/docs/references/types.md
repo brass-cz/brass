@@ -109,14 +109,14 @@ flows into a non-nullable one; it must be narrowed first.
 
 ### Explicit conversions
 
-| Conversion                        | Result    | Notes                                                                            |
-| --------------------------------- | --------- | -------------------------------------------------------------------------------- |
-| `intN.from(x)`                    | `intN!`   | range-checked; `Err` when out of range                                           |
-| `intN.parse(s)`                   | `intN!`   | parses a string                                                                  |
-| `floatN.from(x)`                  | `floatN`  | **total**: always succeeds, precision loss is accepted because it was asked for  |
-| `floatN.parse(s)`                 | `floatN!` | parses a string                                                                  |
-| `string.from(x)`                  | `string`  | total; renders any value                                                         |
-| `T.from(v)` for a record type `T` | `T?`      | structural conversion: see [below](#structural-conversion)                       |
+| Conversion                        | Result    | Notes                                                                           |
+| --------------------------------- | --------- | ------------------------------------------------------------------------------- |
+| `intN.from(x)`                    | `intN!`   | range-checked; `Err` when out of range                                          |
+| `intN.parse(s)`                   | `intN!`   | parses a string                                                                 |
+| `floatN.from(x)`                  | `floatN`  | **total**: always succeeds, precision loss is accepted because it was asked for |
+| `floatN.parse(s)`                 | `floatN!` | parses a string                                                                 |
+| `string.from(x)`                  | `string`  | total; renders any value                                                        |
+| `T.from(v)` for a record type `T` | `T?`      | structural conversion: see [below](#structural-conversion)                      |
 
 `int32.from(3.9)` can fail (and truncates toward zero on success), so it
 returns a Result; `float64.from(big_int64)` cannot fail, so it returns a plain
@@ -129,15 +129,15 @@ aliases (`int32_from`, `int32_parse`, `float64_from`, `float64_parse`,
 How an argument is passed is part of the signature, and it is inferred when
 not annotated:
 
-| Annotation                | Passing                               | Callee mutation                                             |
-| ------------------------- | ------------------------------------- | ----------------------------------------------------------- |
-| _(none, body only reads)_ | shared reference                      | rejected by inference (would reclassify)                    |
-| _(none, body mutates)_    | **private deep copy** at callee entry | stays local, invisible to the caller                        |
-| `ref(T)`                  | immutable reference                   | rejected                                                    |
-| `ref(mut(T))`             | mutable reference                     | **writes through** to the caller                            |
-| `mut(T)`                  | mutable deep copy                     | stays local                                                 |
-| `infer`                   | read-only deep copy                   | rejected; mutating an `infer` parameter is a compile error  |
-| _(numeric type)_          | by value                              | n/a; numbers are copied                                     |
+| Annotation                | Passing                               | Callee mutation                                            |
+| ------------------------- | ------------------------------------- | ---------------------------------------------------------- |
+| _(none, body only reads)_ | shared reference                      | rejected by inference (would reclassify)                   |
+| _(none, body mutates)_    | **private deep copy** at callee entry | stays local, invisible to the caller                       |
+| `ref(T)`                  | immutable reference                   | rejected                                                   |
+| `ref(mut(T))`             | mutable reference                     | **writes through** to the caller                           |
+| `mut(T)`                  | mutable deep copy                     | stays local                                                |
+| `infer`                   | read-only deep copy                   | rejected; mutating an `infer` parameter is a compile error |
+| _(numeric type)_          | by value                              | n/a; numbers are copied                                    |
 
 Details:
 

@@ -17,6 +17,7 @@ This chapter describes the surface syntax exhaustively. Source files use the
    /* which may nest */
    still a comment */
 ```
+
 Block comments nest: each `/*` must be closed by its own `*/`. A newline
 inside a block comment does not separate statements; a newline that ends a
 line comment does. `//` and `#` are interchangeable; because `#` starts a
@@ -26,6 +27,7 @@ line comment, a file may begin with a shebang line
 ```brass norun
 #!/usr/bin/env brass
 ```
+
 ### Doc comments
 
 A block comment that opens with `/**` is a **documentation comment**. Written
@@ -50,6 +52,7 @@ type Point = {
 
 println(area(2.0))
 ```
+
 The text is the comment body with the `/**` and `*/` markers and each line's
 leading `*` decoration removed; it is treated as markdown. Attachment rules:
 
@@ -78,6 +81,7 @@ The reserved keywords are:
 type fun let const if else match for while in
 return break continue null true false self Self import
 ```
+
 Everything else is an ordinary identifier. In particular `ref`, `mut`,
 `infer`, `typeof`, `anonymous` are recognized contextually in type position;
 `print`, `println`, and `assert` are prelude functions. The compiler-owned
@@ -94,6 +98,7 @@ let b = 0xFF        // hex (0x / 0X)
 let c = 0b1010      // binary (0b / 0B)
 let d = 0o755       // octal (0o / 0O)
 ```
+
 There are no type suffixes: the type of a literal is decided by inference
 (see [Type system](/references/types/#literals)). A literal too large for `int64` is a
 lexing error.
@@ -113,6 +118,7 @@ Strings are double-quoted UTF-8. The recognized escapes are:
 ```
 \n  \t  \r  \0  \\  \"  \{  \}
 ```
+
 Any other escape is an error. `{expr}` inside a string is **interpolation**:
 the expression is evaluated and its text inserted. Literal braces are written
 `\{` and `\}` (there is no `{{` doubling). The interpolation scanner balances
@@ -123,6 +129,7 @@ may itself contain strings and braces:
 let items = ["a", "b"]
 println("first = {items[0]}, count = {items.len()}")
 ```
+
 There is no character type (a character is a one-character string) and no
 raw or multi-line string form (use `\n`).
 
@@ -146,6 +153,7 @@ let result = [3, 1, 4]
     .map((x) -> x * 10)
     .fold(0, (a, b) -> a + b)
 ```
+
 Commas are optional between type members and between match arms (newlines
 separate just as well), and trailing commas are accepted in every
 comma-separated list (arguments, parameters, array literals, field lists,
@@ -209,6 +217,7 @@ Notes:
       pattern => target = value,   // an assignment arm is allowed
   }
   ```
+
   Arms are separated by commas or newlines. There are no match guards.
 
 - **Closures** `(params) -> expr` or `(params) -> { block }`. Parameter
@@ -237,6 +246,7 @@ let x: int64 = 10         // with a type annotation
 let [a, b] = [10, 20]     // destructuring (array/tuple pattern)
 let p: Point              // uninitialized: `let` + annotation only
 ```
+
 `const` requires an initializer. An unannotated `let` requires an
 initializer. An annotated `let` may omit it; the binding must then be
 definitely assigned before use (see
@@ -250,6 +260,7 @@ for x in xs { ... }        // arrays and [lo..hi] ranges
 break
 continue
 ```
+
 The `for` head takes a single variable name (no destructuring). `break` and
 `continue` are bare; there are no labels.
 
@@ -285,6 +296,7 @@ fun name(param, other: Type, third: ref(mut(T))) -> ReturnType {
     ...
 }
 ```
+
 Both parameter and return annotations are optional. `fun T.m(params)` declares
 a method of type `T` (see [methods](/references/types/#methods)); the standard library
 also uses the receiver forms `fun string.m`, `fun int32.m` (any primitive type
@@ -300,6 +312,7 @@ type Name: IfaceA, IfaceB = { members } // with interface constraints
 type Child: Parent = | V1 { .. } | V2   // sum with a declared parent (subtyping)
 type Alias = Base { field: T, ... }     // refinement alias (see below)
 ```
+
 A member is either a **field** (`name` or `name: Type`, the annotation is
 optional), a **type slot** (`name: type`, a type parameter with no storage,
 see [Type slots](/references/types/#type-slots-and-refinements)), or a **method
@@ -324,6 +337,7 @@ import geometry.vec.Vec2                    // one name, same as .{ Vec2 }
 import geometry.vec                         // whole module: vec.dot(..), vec.Vec2
 import geometry.vec as g                   // module with custom qualifier: g.dot(..)
 ```
+
 `import path.{ Name, ... }` imports the listed names (`Name as Local` renames);
 `import path.Name` imports the one trailing name; a bare `import path` imports
 the module, whose exports are then used qualified by the path's last segment

@@ -101,7 +101,7 @@ b()!
 
 Two mechanisms make this work:
 
-- **The implicit location parameter.** A callable whose *last* parameter is
+- **The implicit location parameter.** A callable whose _last_ parameter is
   annotated with the prelude `Location` record may be called without it; the
   compiler fills the argument with the call site's position. `error` and
   `context` declare one (`loc: Location`), which is how they know where they
@@ -176,7 +176,7 @@ is `0` (likewise every numeric width), `bool.default()` is `false`,
 `string.default()` is `""`. An empty array is written as an annotated literal
 (`let xs: T[] = []`).
 
-An *uncalled* member access `x.m` keeps its compile-time
+An _uncalled_ member access `x.m` keeps its compile-time
 [member-presence meaning](/references/reflection/#member-presence-xm-without-a-call) rather than
 producing the method as a value. Every receiver supports the test (the
 primitive classes, records, and sums alike), and a declared method reads as
@@ -187,7 +187,7 @@ instantiates at scalars too.
 ## Declared sum subtyping
 
 A sum may declare another sum as its parent. It must cover **exactly** the
-parent's variant set, and each variant may only *widen* the parent's variant
+parent's variant set, and each variant may only _widen_ the parent's variant
 record (extra fields; annotated fields stay invariant):
 
 ```brass

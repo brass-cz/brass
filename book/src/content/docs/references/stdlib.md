@@ -29,12 +29,12 @@ Reserved builtin names that cannot be redefined: `len`, `spawn`, `with`,
 
 ## Builtins
 
-| Function                           | Signature                    | Notes                                                     |
-| ---------------------------------- | ---------------------------- | --------------------------------------------------------- |
-| `len(x)`                           | `(array or string) -> int64` | element count / byte length; also callable as `x.len()`   |
-| `error(x)`                         | `Err` wrapping an `Error`    | a prelude function; see [Errors](#errors-coreerror) |
-| `fields(x)`, `typeof(x)`           | compile-time                 | see [Reflection](/references/reflection/)                 |
-| `spawn(f)`, `with(c, f)`, `sync()` | concurrency                  | see [Concurrency](/references/concurrency/)               |
+| Function                           | Signature                    | Notes                                                   |
+| ---------------------------------- | ---------------------------- | ------------------------------------------------------- |
+| `len(x)`                           | `(array or string) -> int64` | element count / byte length; also callable as `x.len()` |
+| `error(x)`                         | `Err` wrapping an `Error`    | a prelude function; see [Errors](#errors-coreerror)     |
+| `fields(x)`, `typeof(x)`           | compile-time                 | see [Reflection](/references/reflection/)               |
+| `spawn(f)`, `with(c, f)`, `sync()` | concurrency                  | see [Concurrency](/references/concurrency/)             |
 
 Growable arrays (`T[]`) have these built-in methods (all rejected on
 fixed-length `T[n]`):
@@ -117,19 +117,19 @@ Part of the implicit prelude: `HashMap` needs no import. Keys may be of any
 type that renders to a stable string and compares with `==`; values may be of
 any type. Key and value types are inferred from `set` or `from_pairs`.
 
-| Method | Signature | Behavior |
-| --- | --- | --- |
-| `HashMap.new()` | `() -> HashMap` | empty map |
-| `HashMap.from_pairs(pairs)` | `([[K, V]]) -> HashMap` | build from `[key, value]` pairs |
-| `m.set(k, v)` | `(K, V) -> void` | insert or replace |
-| `m.get(k)` | `(K) -> V?` | `null` when absent |
-| `m.get_or(k, default)` | `(K, V) -> V` | stored value or fallback |
-| `m.contains_key(k)` | `(K) -> bool` | whether a key exists |
-| `m.delete(k)` | `(K) -> bool` | remove and report whether it existed |
-| `m.size()` / `m.is_empty()` | `() -> int64` / `() -> bool` | map size queries |
-| `m.keys()` / `m.values()` | `() -> K[]` / `() -> V[]` | unspecified slot order |
-| `m.pairs()` | `() -> [K, V][]` | same order as `keys()` |
-| `m.clear()` | `() -> void` | remove all pairs, retaining inferred types |
+| Method                      | Signature                    | Behavior                                   |
+| --------------------------- | ---------------------------- | ------------------------------------------ |
+| `HashMap.new()`             | `() -> HashMap`              | empty map                                  |
+| `HashMap.from_pairs(pairs)` | `([[K, V]]) -> HashMap`      | build from `[key, value]` pairs            |
+| `m.set(k, v)`               | `(K, V) -> void`             | insert or replace                          |
+| `m.get(k)`                  | `(K) -> V?`                  | `null` when absent                         |
+| `m.get_or(k, default)`      | `(K, V) -> V`                | stored value or fallback                   |
+| `m.contains_key(k)`         | `(K) -> bool`                | whether a key exists                       |
+| `m.delete(k)`               | `(K) -> bool`                | remove and report whether it existed       |
+| `m.size()` / `m.is_empty()` | `() -> int64` / `() -> bool` | map size queries                           |
+| `m.keys()` / `m.values()`   | `() -> K[]` / `() -> V[]`    | unspecified slot order                     |
+| `m.pairs()`                 | `() -> [K, V][]`             | same order as `keys()`                     |
+| `m.clear()`                 | `() -> void`                 | remove all pairs, retaining inferred types |
 
 ## `core.string`
 
@@ -183,6 +183,7 @@ generic message.
 ```brass norun
 import std.process.{ Command, Stdio }
 ```
+
 Spawn and control child processes. Its native implementation is included in
 the complete toolchain and the installed `std` package resolves automatically.
 It is unavailable in the browser playground. See
@@ -230,6 +231,7 @@ const child = Command.new("sh")
     .stdout(Stdio.Pipe)
     .spawn()!
 ```
+
 `wait` blocks for exit and nothing else, so a child writing more to a pipe
 than the OS buffers (about 64KiB on Linux) blocks on the full pipe while
 `wait` blocks on the child. Read the piped streams before waiting, or use
@@ -249,6 +251,7 @@ let result = child.output()!
 print(to_text(result.stdout)!)
 println("exit: {result.code}")
 ```
+
 Waiting is idempotent: a second `wait` returns the same code, and a piped
 stream stays readable afterwards, since the pipe still holds what the child
 wrote before it exited.
@@ -261,6 +264,7 @@ and the fs plugin executes natively under the interpreter too.
 ```brass norun
 import std.path.{ Path }
 ```
+
 Filesystem paths. Operating-system queries use the native plugin included in
 the complete toolchain; lexical operations such as `parse`, `join`, and
 `normalize` do not access the filesystem.
@@ -316,11 +320,13 @@ for entry in here.join("assets").entries()! {
     }
 }
 ```
+
 ## `std.fs`
 
 ```brass norun
 import std.fs.{ File, read_file, write_file, create_dir, remove_dir }
 ```
+
 File handles, byte I/O, and directories. Native file access is included in the
 complete toolchain and unavailable in the browser playground.
 
@@ -398,6 +404,7 @@ filesystem, so the examples here are not runnable in it.
 ```brass norun
 import std.env.{ args, var, vars, path_separator, current_dir }
 ```
+
 The process environment: command-line arguments, environment variables, and
 the working directory. These operating-system calls are unavailable in the
 browser playground.
@@ -416,6 +423,7 @@ program, verbatim, flags included, with no separator needed:
 ```sh
 brass main.cz --verbose input.txt
 ```
+
 gives `args() == ["main.cz", "--verbose", "input.txt"]`: the program file
 as written, then the arguments (index `0` is the program, as in C's `argv`).
 The same holds for `brass repl main.cz ...`. In an interactive REPL
@@ -426,6 +434,7 @@ session, or under an embedder that passes no arguments, `args()` is empty.
 ```brass norun
 import std.hash.{ sha256, hmac_sha256, hex, equal, Hasher }
 ```
+
 Message digests (MD5, SHA-1, SHA-2) and HMAC. A plugin under `std/`
 wrapping the RustCrypto implementations, since these algorithms are built
 from wrapping 32/64-bit arithmetic, which Brass does not have; a Brass
@@ -439,6 +448,7 @@ bytes with the prelude's `to_bytes`, and render the result with `hex`:
 println(hex(sha256(to_bytes("abc"))))
 // ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
 ```
+
 | Function                       | Signature                       | Digest size      |
 | ------------------------------ | ------------------------------- | ---------------- |
 | `md5(data)`                    | `(uint8[]) -> uint8[]`          | 16 bytes         |
@@ -461,6 +471,7 @@ h.update(chunk)!
 h.update(next)!
 println(hex(h.finalize()!))
 ```
+
 **Security.** `md5` and `sha1` are broken against collision attacks: use them
 only to interoperate with something that already speaks them (a published MD5
 checksum, a git object id), never to decide whether two inputs are "the same".
@@ -477,6 +488,7 @@ offer, so that a fast hash cannot be mistaken for one.
 ```brass norun
 import std.regex.{ Regex, escape }
 ```
+
 Regular expressions, on Rust's `regex` engine: a finite automaton, so matching
 is **linear** in the subject's length however the pattern is written: a regex
 over untrusted input cannot blow up the way a backtracking engine does. The
@@ -512,6 +524,7 @@ if let m = date.find("due 2026-07-13, ok") {
 }
 println(date.replace_all("2026-07-13", "$year/$2"))   // 2026/07
 ```
+
 ### API
 
 `Regex.new(pattern) -> Regex!` is where a bad pattern is reported; every method
@@ -545,6 +558,7 @@ costs far more than matching.
 ```brass norun
 import std.semver.{ Version, sort }
 ```
+
 [Semantic Versioning 2.0.0](https://semver.org): parse a version, render it
 back, and order two of them. Pure Brass on top of `std.regex` (it has no native
 half of its own), and it parses with the **official pattern from semver.org
@@ -558,6 +572,7 @@ println("{v.major}.{v.minor}.{v.patch}")        // 1.4.2
 println(v.prerelease)                           // rc.1  (null when absent)
 println(v.compare(Version.parse("1.4.2")!))     // -1: a pre-release is LOWER
 ```
+
 `Version` is `{ major, minor, patch: int64, prerelease, build: string? }`.
 The optional components are `null` when absent, which the grammar keeps
 distinct from empty.
@@ -586,6 +601,7 @@ compare `to_string()` if textual identity is what you want.
 ```brass norun
 import std.net.{ Tcp, TcpListener, Udp, TlsStream }
 ```
+
 TCP and UDP sockets plus TLS client connections. The native networking plugin
 is included in the complete toolchain. Networking does not run in the browser
 playground.
@@ -640,6 +656,7 @@ let server = listener.accept()!
 client.write(to_bytes("hello"))!
 println(to_text(server.read(64)!)!)   // hello
 ```
+
 Two practical notes for concurrent servers. A spawned closure should capture
 the **port** (a copied scalar), not the listener: a shared listener is
 auto-guarded by a cown lock that a blocking `accept` would then hold. And
@@ -667,6 +684,7 @@ conn.write(to_bytes("GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\
 println(to_text(conn.read(16)!)!)   // HTTP/1.1 200 OK
 conn.close()!
 ```
+
 Everything here runs on either back end: sockets are `fs`
 `File`s and the plugins execute natively under the interpreter too.
 
@@ -692,26 +710,26 @@ type URI = {
 }
 ```
 
-| Method | Signature | Behavior |
-| --- | --- | --- |
-| `URI.parse(text)` | `(string) -> URI!` | parse an absolute URI; a scheme is required |
-| `URI.parse_reference(text)` | `(string) -> URI!` | also accepts relative references |
-| `uri.to_string()` | `() -> string` | reassemble without decoding components |
-| `uri.authority_string()` | `() -> string?` | serialized authority, or `null` |
-| `uri.resolve(reference)` | `(string) -> URI!` | resolve a relative or absolute reference against an absolute base |
-| `uri.path_segments()` | `() -> string[]!` | split and percent-decode path segments |
-| `uri.query_pairs()` | `() -> QueryPair[]!` | decode the query as form-style key/value pairs |
+| Method                      | Signature            | Behavior                                                          |
+| --------------------------- | -------------------- | ----------------------------------------------------------------- |
+| `URI.parse(text)`           | `(string) -> URI!`   | parse an absolute URI; a scheme is required                       |
+| `URI.parse_reference(text)` | `(string) -> URI!`   | also accepts relative references                                  |
+| `uri.to_string()`           | `() -> string`       | reassemble without decoding components                            |
+| `uri.authority_string()`    | `() -> string?`      | serialized authority, or `null`                                   |
+| `uri.resolve(reference)`    | `(string) -> URI!`   | resolve a relative or absolute reference against an absolute base |
+| `uri.path_segments()`       | `() -> string[]!`    | split and percent-decode path segments                            |
+| `uri.query_pairs()`         | `() -> QueryPair[]!` | decode the query as form-style key/value pairs                    |
 
 The public supporting modules are:
 
-| Import | API |
-| --- | --- |
-| `std.url.authority.Authority` | `{ userinfo: string?, host: string, port: uint16? }`; `parse`, `is_ip_literal`, `to_string` |
-| `std.url.query.QueryPair` | `{ key: string, value: string }`; `parse_all(query)`, `format_all(pairs)` |
-| `std.url.percent` | `decode(text) -> string!`, `encode(text, extra) -> string`, `encode_component(text) -> string` |
-| `std.url.validate` | `CharClass`, `validate(text, class) -> string!`; low-level component validation |
-| `std.url.charset` | RFC character predicates such as `is_unreserved` and `is_path_char` |
-| `std.url.text` | character-array helpers `substr` and `index_of` used by URI parsers |
+| Import                        | API                                                                                            |
+| ----------------------------- | ---------------------------------------------------------------------------------------------- |
+| `std.url.authority.Authority` | `{ userinfo: string?, host: string, port: uint16? }`; `parse`, `is_ip_literal`, `to_string`    |
+| `std.url.query.QueryPair`     | `{ key: string, value: string }`; `parse_all(query)`, `format_all(pairs)`                      |
+| `std.url.percent`             | `decode(text) -> string!`, `encode(text, extra) -> string`, `encode_component(text) -> string` |
+| `std.url.validate`            | `CharClass`, `validate(text, class) -> string!`; low-level component validation                |
+| `std.url.charset`             | RFC character predicates such as `is_unreserved` and `is_path_char`                            |
+| `std.url.text`                | character-array helpers `substr` and `index_of` used by URI parsers                            |
 
 `QueryPair` parsing treats `&` as the pair separator, the first `=` as the
 key/value separator, and `+` as a space. Formatting emits percent-encoded
@@ -745,19 +763,19 @@ type HttpResponse = {
 }
 ```
 
-| Function / method | Signature | Behavior |
-| --- | --- | --- |
-| `fetch(url)` | `(string) -> HttpResponse!` | GET an HTTP(S) URL; follows at most `MAX_REDIRECTS` redirects |
-| `request(req)` | `(HttpRequest) -> HttpResponse!` | plain HTTP using the request's `Host` header |
-| `HttpClient.http(host, port)` | `(string, int32) -> HttpClient` | create a plain client |
-| `HttpClient.https(host, port)` | `(string, int32) -> HttpClient` | create a TLS client |
-| `client.fetch(path)` | `(string) -> HttpResponse!` | GET a path on that client |
-| `client.request(req)` | `(HttpRequest) -> HttpResponse!` | send a request on that client |
-| `HttpRequest.parse(raw)` | `(string) -> HttpRequest!` | parse a complete request string |
-| `request.serialize()` | `() -> uint8[]` | serialize the request line, headers, and body |
-| `HttpResponse.parse(raw)` | `(string) -> HttpResponse!` | parse a complete response string |
-| `response.serialize()` | `() -> uint8[]` | serialize the status line, headers, and body |
-| `response.body_text()` | `() -> string!` | decode the body as UTF-8 |
+| Function / method              | Signature                        | Behavior                                                      |
+| ------------------------------ | -------------------------------- | ------------------------------------------------------------- |
+| `fetch(url)`                   | `(string) -> HttpResponse!`      | GET an HTTP(S) URL; follows at most `MAX_REDIRECTS` redirects |
+| `request(req)`                 | `(HttpRequest) -> HttpResponse!` | plain HTTP using the request's `Host` header                  |
+| `HttpClient.http(host, port)`  | `(string, int32) -> HttpClient`  | create a plain client                                         |
+| `HttpClient.https(host, port)` | `(string, int32) -> HttpClient`  | create a TLS client                                           |
+| `client.fetch(path)`           | `(string) -> HttpResponse!`      | GET a path on that client                                     |
+| `client.request(req)`          | `(HttpRequest) -> HttpResponse!` | send a request on that client                                 |
+| `HttpRequest.parse(raw)`       | `(string) -> HttpRequest!`       | parse a complete request string                               |
+| `request.serialize()`          | `() -> uint8[]`                  | serialize the request line, headers, and body                 |
+| `HttpResponse.parse(raw)`      | `(string) -> HttpResponse!`      | parse a complete response string                              |
+| `response.serialize()`         | `() -> uint8[]`                  | serialize the status line, headers, and body                  |
+| `response.body_text()`         | `() -> string!`                  | decode the body as UTF-8                                      |
 
 The client reads a body using `Content-Length`, or until connection close when
 that header is absent. It does not decode chunked transfer coding. Serializing
@@ -770,6 +788,7 @@ Networking is unavailable in the browser playground.
 ```brass norun
 import std.data.json.{ JsonValue }
 ```
+
 A JSON value tree, parser, accessors, serializer, and a reflective decoder.
 The whole surface hangs off `JsonValue`, so the type is the only name to import.
 A pure-Brass module under the installed `std` package.
@@ -783,6 +802,7 @@ type JsonValue =
     | Array { value: JsonValue[] }
     | Object { values: _JsonObject }   // a string -> JsonValue HashMap
 ```
+
 An `Object` keeps its members in a `HashMap` (a refinement pinning the key
 to `string` and the value to `JsonValue`), so `get` is a hash lookup. One
 consequence: `stringify` renders object members in the map's slot order,
@@ -830,21 +850,21 @@ type TomlValue =
     | Table { values }            // string -> TomlValue HashMap
 ```
 
-| Function / method | Signature | Behavior |
-| --- | --- | --- |
-| `TomlValue.parse(text)` | `(string) -> TomlValue!` | parse a complete TOML document; the root is a table |
-| `value.stringify()` | `() -> string` | serialize as TOML; nested containers use inline form |
-| `value.as_string()` | `() -> string!` | extract a string |
-| `value.as_integer()` | `() -> int64!` | extract an integer |
-| `value.as_float()` | `() -> float64!` | extract a float |
-| `value.as_bool()` | `() -> bool!` | extract a boolean |
-| `value.as_datetime()` | `() -> string!` | extract the original date/time text |
-| `value.is_table()` | `() -> bool` | whether the value is a table |
-| `value.get(key)` | `(string) -> TomlValue!` | table entry or an error |
-| `value.at(index)` | `(int64) -> TomlValue!` | range-checked array element |
-| `value.as_array()` | `() -> TomlValue[]!` | array elements or an error |
-| `value.keys()` | `() -> string[]!` | table keys in unspecified map order |
-| `value.into()` | `() -> infer!` | decode a scalar or record into the call site's expected type |
+| Function / method       | Signature                | Behavior                                                     |
+| ----------------------- | ------------------------ | ------------------------------------------------------------ |
+| `TomlValue.parse(text)` | `(string) -> TomlValue!` | parse a complete TOML document; the root is a table          |
+| `value.stringify()`     | `() -> string`           | serialize as TOML; nested containers use inline form         |
+| `value.as_string()`     | `() -> string!`          | extract a string                                             |
+| `value.as_integer()`    | `() -> int64!`           | extract an integer                                           |
+| `value.as_float()`      | `() -> float64!`         | extract a float                                              |
+| `value.as_bool()`       | `() -> bool!`            | extract a boolean                                            |
+| `value.as_datetime()`   | `() -> string!`          | extract the original date/time text                          |
+| `value.is_table()`      | `() -> bool`             | whether the value is a table                                 |
+| `value.get(key)`        | `(string) -> TomlValue!` | table entry or an error                                      |
+| `value.at(index)`       | `(int64) -> TomlValue!`  | range-checked array element                                  |
+| `value.as_array()`      | `() -> TomlValue[]!`     | array elements or an error                                   |
+| `value.keys()`          | `() -> string[]!`        | table keys in unspecified map order                          |
+| `value.into()`          | `() -> infer!`           | decode a scalar or record into the call site's expected type |
 
 The parser supports comments, bare and quoted dotted keys, basic and literal
 strings, decimal and radix integers, floats, booleans, arrays, inline tables,

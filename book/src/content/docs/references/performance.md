@@ -21,15 +21,15 @@ BRASS_LOG_TYPE=perf brass check app.cz
 The debug filter prints phase totals and the slowest items. `BRASS_LOG_TYPE`
 enables trace-level per-item events and is substantially more verbose.
 
-| Phase | Work measured |
-| --- | --- |
-| `front/parse-stdlib`, `front/load-modules`, `front/lower-hir` | parsing, imports, and HIR lowering |
-| `typeck/*` | type inference and function, method, and initializer checks |
-| `front/keyed-repass` | the additional front-end pass required by reflective `-> infer!` calls |
-| `back/lower-mir`, `back/monomorphize` | MIR lowering and concrete function instances |
-| `back/codegen-fn`, `back/codegen`, `back/finalize` | native-code preparation and JIT finalization |
-| `back/orc-materialize` | first-use native compilation during a demand-driven run |
-| `front/cache-hit`, `front/cache-save` | analysis cache loading and saving |
+| Phase                                                         | Work measured                                                          |
+| ------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `front/parse-stdlib`, `front/load-modules`, `front/lower-hir` | parsing, imports, and HIR lowering                                     |
+| `typeck/*`                                                    | type inference and function, method, and initializer checks            |
+| `front/keyed-repass`                                          | the additional front-end pass required by reflective `-> infer!` calls |
+| `back/lower-mir`, `back/monomorphize`                         | MIR lowering and concrete function instances                           |
+| `back/codegen-fn`, `back/codegen`, `back/finalize`            | native-code preparation and JIT finalization                           |
+| `back/orc-materialize`                                        | first-use native compilation during a demand-driven run                |
+| `front/cache-hit`, `front/cache-save`                         | analysis cache loading and saving                                      |
 
 Function and method events include their names. Start with phase totals, then
 inspect per-item output only for the phase that dominates.
@@ -38,10 +38,10 @@ inspect per-item output only for the phase that dominates.
 
 Brass uses two analysis-cache locations:
 
-| Cache | Location | Purpose |
-| --- | --- | --- |
-| `.czcache` | beside the entry file | Reuse a complete check, or resume a partially completed normal run |
-| `.czctx` | the user's cache directory | Reuse checked dependencies when only the entry file changes |
+| Cache      | Location                   | Purpose                                                            |
+| ---------- | -------------------------- | ------------------------------------------------------------------ |
+| `.czcache` | beside the entry file      | Reuse a complete check, or resume a partially completed normal run |
+| `.czctx`   | the user's cache directory | Reuse checked dependencies when only the entry file changes        |
 
 `BRASS_CACHE=off` disables cache reads and writes. Cache operations are
 best-effort: an unavailable or read-only cache location does not prevent a

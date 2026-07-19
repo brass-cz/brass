@@ -31,6 +31,7 @@ dump(Point { x: 3, y: 4 })
 // x = 3
 // y = 4
 ```
+
 Because the loop is unrolled, each iteration is ordinary typed code: `p[field]`
 has the field's own type, so a type error in one iteration is reported against
 that field ("while expanding field `y` of `Point`"). A type that is not a
@@ -59,12 +60,14 @@ fun name(x) -> string { return typeof(x) }
 println(name(1))                               // int32
 println(name("s"))                             // string
 ```
+
 **As a type** (type position). `typeof(v)` denotes v's type, so a binding or
 return can be declared to have the same type as another value:
 
 ```
 let w: typeof(v) = ...          // w has v's type
 ```
+
 **As a static receiver.** `typeof(v)` is the type of v, so a static method or
 associated function of that type is reachable through a value:
 
@@ -72,6 +75,7 @@ associated function of that type is reachable through a value:
 const o = typeof(v).origin()    // calls the static `origin` of v's type
 const n = typeof(x).from(3.9)!  // the `from` of x's numeric type
 ```
+
 In every value context `typeof(v)` decays to the type's name string, exactly as
 a `fields()` descriptor decays to the field name outside `v[field]`. Only the
 operand's type is consulted, so a bare variable costs nothing at runtime; a
@@ -80,7 +84,7 @@ like any other argument.
 
 ## Member presence: `x.m` without a call
 
-An *uncalled* member access asks whether `x`'s type has a member `m`, and the
+An _uncalled_ member access asks whether `x`'s type has a member `m`, and the
 answer is fixed at compile time:
 
 - a **field** reads as the field's value, as always;
@@ -95,7 +99,7 @@ answer is fixed at compile time:
 Because a bare `null` is statically false and any other value statically true,
 an `if` over a member access is decided while checking. The arm that cannot run
 is neither type-checked nor emitted, so a single generic body may hold arms that
-only type for *some* of its instantiations:
+only type for _some_ of its instantiations:
 
 ```brass
 type Segments = { parts: string[] }
@@ -116,6 +120,7 @@ println(describe(Segments { parts: ["usr", "lib"] }))
 println(describe("a/b/c"))
 println(describe(["x", "y"]))
 ```
+
 `s.split(...)` would not type against `Segments`, and `s.parts` names no member
 of `string`, but each arm is reached only by the receiver it fits. This is how
 a library takes "a string, an array of strings, or a `Path`" through one
@@ -146,6 +151,7 @@ println(describe("a"))
 println(describe(3))
 println(describe(1.5))
 ```
+
 Calling the method (`v.is_string()`) returns `true`: it only exists on the
 matching type, so the call is only reachable there. Records and sums carry
 none of these members.
@@ -168,6 +174,7 @@ fun doubled(p: Point) -> Point {
     return ret                        // now fully initialized
 }
 ```
+
 Reading a field before it is assigned, or reading the whole binding before every
 field is, is a compile error. `fields(x)` and `typeof(x)` read only the type,
 so they are allowed on an uninitialized binding.
@@ -194,6 +201,7 @@ fun from_map(source: HashMap) -> Config! {
     return ret
 }
 ```
+
 The `if let ... else { return error(...) }` shape is understood by the
 definite-assignment checker: every non-erroring path through the loop body
 assigns the current field, so after the loop `ret` is fully initialized.
@@ -230,6 +238,7 @@ fun JsonValue.into(self) -> infer! {
 
 let user: User = obj.into()!                     // decodes a nested User tree
 ```
+
 The compiler generates one concrete method per target type actually requested
 (and, transitively, per field type a record decode needs), so there is no
 runtime type dispatch: a `Json.JNum` reaching a `User` target, or a missing
