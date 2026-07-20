@@ -25,6 +25,8 @@
 //! contributes principled let-polymorphism and structural reconciliation, kept
 //! permissive where it cannot be certain so it never rejects a valid program.
 
+use std::collections::BTreeMap;
+
 use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use brass_hir::{
@@ -871,7 +873,22 @@ impl<'p> Hm<'p> {
                             Some(ty) if ty.is_unknown() => {
                                 self.solver.fresh(InferenceVarKind::Source)
                             }
-                            Some(ty) => ty,
+                            // A field written over the declaration's type SLOTS
+                            // (`items: Self.item[]`) is per-instance the same way:
+                            // each access instantiates the slot variables fresh so
+                            // independent values are not coupled through the
+                            // declaration; the `infer` pass checks per value.
+                            Some(ty) => {
+                                let slot_vars: Vec<u32> = self
+                                    .type_def(&resolved)
+                                    .map(|info| info.slots.iter().map(|(_, v)| *v).collect())
+                                    .unwrap_or_default();
+                                let slot_map: BTreeMap<u32, Type> = slot_vars
+                                    .into_iter()
+                                    .map(|v| (v, self.solver.fresh(InferenceVarKind::Source)))
+                                    .collect();
+                                brass_hir::substitute_vars(&ty, &slot_map)
+                            }
                             // Accessing a field a structure does not have is not an
                             // error: the access is an inference failure -- typed as
                             // the always-null `never?`, so an `if` on it is
@@ -1044,6 +1061,21 @@ impl<'p> Hm<'p> {
             }
             Expr::TypeLit(name, fields, span) => {
                 let record = self.named_type(name);
+                // The declaration's type SLOTS are per-instance parameters:
+                // this literal's fields are constrained against its own
+                // instantiation of them (one variable per slot for the whole
+                // literal), never the declaration's shared slot variables --
+                // through those, the first literal's field values would pin
+                // every other literal's slots program-wide.
+                let slot_vars: Vec<u32> = record
+                    .as_ref()
+                    .and_then(|r| self.type_def(r))
+                    .map(|info| info.slots.iter().map(|(_, v)| *v).collect())
+                    .unwrap_or_default();
+                let slot_map: BTreeMap<u32, Type> = slot_vars
+                    .into_iter()
+                    .map(|v| (v, self.solver.fresh(InferenceVarKind::Source)))
+                    .collect();
                 for (fname, e) in fields {
                     let vt = self.infer_expr(e);
                     // An unannotated field accepts any value (its type is per-value,
@@ -1053,6 +1085,7 @@ impl<'p> Hm<'p> {
                         && let Some(fty) = self.record_field_type(rec, fname)
                         && !fty.is_unknown()
                     {
+                        let fty = brass_hir::substitute_vars(&fty, &slot_map);
                         self.flow_into(&vt, &fty, *span);
                     }
                 }

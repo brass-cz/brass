@@ -1492,6 +1492,33 @@ mod tests {
     }
 
     #[test]
+    fn slotted_record_instances_are_independent() {
+        // Two literals of a slotted record pin their slots independently: each
+        // literal (and each field access on it) takes its own instantiation of
+        // the declaration's slot variables. Unifying through the shared
+        // declaration variables made the first instance's element type reject
+        // every differently-typed instance in the program.
+        let e = errs(
+            "type Stack = {\n    type item\n    items: Self.item[]\n}\nfun main() {\n    let a = Stack { items: [1] }\n    let b = Stack { items: [\"x\"] }\n    a.items.push(2)\n    b.items.push(\"y\")\n}\n",
+        );
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn slotted_record_same_instance_mismatch_is_rejected() {
+        // Independence is per instance, not per use: a second store into ONE
+        // instance still checks against the type its first store pinned.
+        let e = errs(
+            "type Stack = {\n    type item\n    items: Self.item[]\n}\nfun main() {\n    let a = Stack { items: [1] }\n    a.items.push(\"y\")\n}\n",
+        );
+        assert!(
+            e.iter()
+                .any(|m| m.contains("cannot use `string` where `int32` is required")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
     fn interface_unknown_field_is_constrained_at_call_site() {
         let e = errs(
             "type Container = {\n    value\n}\ntype IntBox: Container = {\n    value: int32\n}\nfun get(c: Container) -> string {\n    return c.value\n}\nfun main() {\n    let box = IntBox { value: 1 }\n    let value = get(box)\n}\n",

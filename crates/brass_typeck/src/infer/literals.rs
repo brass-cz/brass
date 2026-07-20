@@ -3,6 +3,8 @@
 //! types, unit-variant names, and the per-variant/common field type of
 //! a sum scrutinee.
 
+use std::collections::BTreeMap;
+
 use super::*;
 
 impl<'a> Checker<'a> {
@@ -105,11 +107,22 @@ impl<'a> Checker<'a> {
         // The concrete type `Self` denotes in a field type, so a closure-typed
         // field declared `(self, T) -> U` is checked with `self` bound to the
         // type being constructed rather than the abstract `Self`.
-        let self_ty = self
-            .program
-            .types
-            .get(who.split('.').next().unwrap_or(who))
-            .map(|info| info.type_ref());
+        let base_info = self.program.types.get(who.split('.').next().unwrap_or(who));
+        let self_ty = base_info.map(|info| info.type_ref());
+        // The declaration's type SLOTS are per-instance parameters. Each literal
+        // instantiates them fresh -- one variable per slot for the WHOLE literal,
+        // so two fields written over one slot stay linked within the instance --
+        // rather than checking against the declaration's shared slot variables:
+        // through those, the first literal's field values would pin every other
+        // literal's slots program-wide (two `Stack { items: [...] }` of different
+        // element types in one scope must not conflict).
+        let slot_vars: Vec<u32> = base_info
+            .map(|info| info.slots.iter().map(|(_, v)| *v).collect())
+            .unwrap_or_default();
+        let slot_map: BTreeMap<u32, Type> = slot_vars
+            .into_iter()
+            .map(|v| (v, self.fresh_unknown()))
+            .collect();
         for field in declared {
             match fields.iter().find(|(name, _)| name == &field.name) {
                 Some((_, expr)) => {
@@ -118,6 +131,9 @@ impl<'a> Checker<'a> {
                             Some(s) => substitute_self(want, s),
                             None => want.clone(),
                         };
+                        // Slot variables occurring in the declared type take this
+                        // literal's own instantiation (see `slot_map` above).
+                        let want = brass_hir::substitute_vars(&want, &slot_map);
                         // A bare unannotated field's declared variable is SHARED
                         // by every use of the declaration -- method co-checking
                         // deliberately binds through it (the scheme links the
@@ -134,7 +150,31 @@ impl<'a> Checker<'a> {
                         } else {
                             want
                         };
-                        self.check_expr_against(expr, &want, scopes)
+                        // An array-literal value for a sequence-typed slot field
+                        // whose element THIS literal must pin (still open after
+                        // the per-literal instantiation): type it bottom-up (the
+                        // elements decide, as for an unannotated field) and
+                        // COMMIT the result to the instance's element variable.
+                        // The element-wise against-check only probes, and an
+                        // unpinned element would accept a conflicting later
+                        // store on the same instance. Safe to commit here and
+                        // only here: `want`'s open variables are this literal's
+                        // own instantiation, never a shared signature type.
+                        let resolved_want = self.resolve(&want);
+                        let open_seq_elem = matches!(expr, Expr::Array(..))
+                            && match &resolved_want {
+                                Type::Slice(e) | Type::Array(e, _) => self.resolve(e).is_unknown(),
+                                _ => false,
+                            };
+                        if open_seq_elem {
+                            let got = self.check_expr(expr, scopes);
+                            if self.solver.unify(&got, &want).is_err() {
+                                self.expect_expr_assignable(&got, &want, expr);
+                            }
+                            got
+                        } else {
+                            self.check_expr_against(expr, &want, scopes)
+                        }
                     } else {
                         self.check_expr(expr, scopes)
                     };

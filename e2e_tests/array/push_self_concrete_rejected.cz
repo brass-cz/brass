@@ -1,0 +1,10 @@
+// Pushing an array into itself when the element type is already pinned by the
+// call site's literal: rejected as an ordinary element mismatch (the array's
+// element is `int32`, the pushed value is `int32[]`), not an infinite type.
+fun grow(a: infer[]) {
+    a.push(a)
+}
+
+fun main() {
+    grow([1, 2, 3])
+}

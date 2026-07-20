@@ -1,0 +1,1 @@
+error: cannot use `int32[]` where `int32` is required

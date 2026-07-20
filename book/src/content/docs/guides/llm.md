@@ -83,9 +83,19 @@ println("{greeting}: {values}")
 fun distance(x: float64, y: float64) -> float64 {
     return sqrt(x * x + y * y)
 }
+
+fun double(x) {
+    return x + x
+}
+
+println(double(2))     // 4
+println(double(2.5))   // 5.0
 ```
 
 - Return types are inferred when omitted. `void` means no value.
+- An unannotated function is generic: each call site checks the body against
+  its own argument types, so `double` above serves `int32` and `float64`
+  alike.
 - An unannotated parameter that is only read is passed by shared reference.
   If its body mutates the parameter, the callee receives a private deep copy.
 - Use `ref(T)` for an explicit immutable reference and `ref(mut(T))` when the
@@ -116,6 +126,13 @@ fun Account.new(owner: string) -> Account {
 fun Account.deposit(self, amount: int64) {
     self.balance += amount
 }
+
+type Stack = {
+    type item          // a type slot: a named type parameter, no storage
+    items: Self.item[]
+}
+
+type Names = Stack { item: string }   // alias pinning the slot
 ```
 
 - Construct a record as `Type { field: value, ... }` and call methods as
@@ -132,8 +149,12 @@ fun Account.deposit(self, amount: int64) {
 - `{ field: value }` is an anonymous record. It can dispatch to exactly one
   in-scope nominal record whose fields and requested method fit.
 - `T.from(value) -> T?` performs structural conversion to record type `T`.
-- A refined alias such as `type Counts = HashMap { key: string, value: int64 }`
-  pins inferred type slots without creating a new nominal type.
+- `type name` inside a record declares a type slot: a type parameter other
+  fields reference as `Self.name`. A slot is not stored and never appears in
+  a construction literal; an open slot is fixed by the first value stored.
+- A refined alias such as `type Names = Stack { item: string }` or
+  `type Counts = HashMap { key: string, value: int64 }` pins type slots
+  without creating a new nominal type.
 
 ## Control flow and patterns
 

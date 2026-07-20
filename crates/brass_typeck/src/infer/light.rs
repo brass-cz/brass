@@ -594,7 +594,20 @@ impl<'a> Checker<'a> {
         for field in declared {
             if let Some((_, expr)) = fields.iter().find(|(name, _)| name == &field.name) {
                 let got = self.infer_expr_light(expr, env, props);
-                if field.resolved_ty.as_ref().is_some_and(Type::is_unknown) {
+                // A field whose declared type carries any inference variable --
+                // a bare dynamic field, or one written over the declaration's
+                // type SLOTS (`items: Self.item[]`) -- is per-instance: record
+                // the value's own type so a later use of this instance (a
+                // `push` this pass growth-tracks, a field read) resolves
+                // through the substitution rather than falling back to the
+                // declaration's SHARED variables. Pinning those couples every
+                // literal of the type program-wide, in the solver this pass
+                // shares with the full check.
+                let dynamic = field
+                    .resolved_ty
+                    .as_ref()
+                    .is_some_and(|t| !brass_hir::type_vars(t).is_empty());
+                if dynamic {
                     substitution.insert(field_substitution_key(variant, &field.name), got);
                 }
             }

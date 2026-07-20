@@ -72,6 +72,89 @@ let b = Student { name: "Edison", id: "AL17001" }
 println("{a.id} / {b.id}")   // 1001 / AL17001
 ```
 
+## Type slots
+
+An unannotated field takes whatever type its construction site provides, but
+it has no name that other fields can refer to. A record can instead name its
+type parameters as **type slots** — members declared with the `type` keyword —
+and express other fields over them with `Self.<slot>`. A slot has no runtime
+storage: it never appears in the layout or in a construction literal, it only
+names a type:
+
+```brass
+type Stack = {
+    type item
+    items: Self.item[]
+}
+
+fun Stack.new() {
+    return Self { items: [] }
+}
+
+fun Stack.add(self, v) {
+    self.items.push(v)
+}
+
+fun Stack.top(self) {
+    return self.items[len(self.items) - 1]
+}
+
+fun main() {
+    let s = Stack.new()
+    s.add(10)
+    s.add(20)
+    println(s.top())   // 20
+}
+```
+
+`Stack.new()` needs no sample value: `item` starts open, the first `add`
+fixes it to `int32`, and a later `s.add("oops")` is a compile error rather
+than a runtime surprise.
+
+A **refinement** `Base { slot: T, ... }` pins slots up front. Written as the
+right-hand side of a `type` declaration it names that concrete instance — an
+alias, not a new type:
+
+```brass
+type Stack = {
+    type item
+    items: Self.item[]
+}
+
+fun Stack.new() {
+    return Self { items: [] }
+}
+
+fun Stack.add(self, v) {
+    self.items.push(v)
+}
+
+type Names = Stack { item: string }
+
+fun greet(s: Names) {
+    for name in s.items {
+        println("hello, {name}")
+    }
+}
+
+fun main() {
+    let s: Names = Stack.new()
+    s.add("Ada")
+    s.add("Grace")
+    greet(s)
+}
+```
+
+Annotating the binding `let s: Names` pins `item` to `string` before anything
+is stored, and `greet` accepts any stack whose `item` is `string`: the alias
+unifies with a matching instance instead of demanding a distinct nominal
+type. The prelude's `HashMap` is built exactly this way — `key` and `value`
+slots, pinned by the first stored pair or by an alias such as
+`type Counts = HashMap { key: string, value: int64 }`.
+
+Slots, refinements, and their exact rules are in the
+[type system reference](/references/types/#type-slots-and-refinements).
+
 ## Sum types
 
 The same `type` keyword defines "OR" types (tagged unions). Variants are

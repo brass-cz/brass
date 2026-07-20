@@ -1,0 +1,42 @@
+// Two instantiations of a slotted record in one scope stay independent: a
+// record literal (and a witness-free constructor call) instantiates the
+// declaration's type slots fresh per literal, so pinning one instance's
+// `item` must not constrain the other's. Regression: the checker used to
+// unify every literal's fields through the declaration's shared slot
+// variables, so the first instance's element type leaked into all others.
+
+type Stack = {
+    type item
+    items: Self.item[]
+}
+
+fun Stack.new() {
+    return Self { items: [] }
+}
+
+fun Stack.add(self, v) {
+    self.items.push(v)
+}
+
+fun Stack.top(self) {
+    return self.items[len(self.items) - 1]
+}
+
+fun main() {
+    // Through the witness-free constructor and a mutating method.
+    let numbers = Stack.new()
+    numbers.add(10)
+    numbers.add(20)
+    let words = Stack.new()
+    words.add("brass")
+    println(numbers.top())
+    println(words.top())
+
+    // Through direct literals and direct field stores.
+    let a = Stack { items: [1] }
+    let b = Stack { items: ["x"] }
+    a.items.push(2)
+    b.items.push("y")
+    println(a.items[1])
+    println(b.items[1])
+}
