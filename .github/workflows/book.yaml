@@ -1,6 +1,9 @@
 name: book
 
 on:
+  release:
+    types:
+      - released
   push:
     tags:
       - v*
