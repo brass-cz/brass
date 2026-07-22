@@ -25,34 +25,12 @@ pub use value::Value;
 /// `print`/`println` output to `out`. Mirrors `brass_jit_llvm::run`'s contract:
 /// a program whose `main` reaches a construct outside the typed subset is rejected
 /// rather than partially executed.
-#[allow(clippy::too_many_arguments)] // mirrors the checker's channel outputs
 pub fn run(
     program: &Program,
-    expr_types: &fxhash::FxHashMap<brass_hir::Span, brass_hir::Type>,
-    view_args: &fxhash::FxHashSet<brass_hir::Span>,
-    sum_views: &fxhash::FxHashMap<brass_hir::Span, brass_hir::Type>,
-    call_locations: &fxhash::FxHashMap<brass_hir::Span, (String, u32, u32)>,
-    lift_errs: &fxhash::FxHashSet<brass_hir::Span>,
-    fields_loops: &fxhash::FxHashMap<brass_hir::Span, Vec<String>>,
-    type_names: &fxhash::FxHashMap<brass_hir::Span, String>,
-    typeof_types: &fxhash::FxHashMap<brass_hir::Span, brass_hir::Type>,
-    null_props: &fxhash::FxHashSet<brass_hir::Span>,
-    type_tests: &fxhash::FxHashMap<brass_hir::Span, brass_hir::Type>,
+    channels: &brass_mir::CheckerChannels<'_>,
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    let mir = brass_mir::lower_program_with_types(
-        program,
-        expr_types,
-        view_args,
-        sum_views,
-        call_locations,
-        lift_errs,
-        fields_loops,
-        type_names,
-        typeof_types,
-        null_props,
-        type_tests,
-    );
+    let mir = brass_mir::lower_program_with_types(program, channels);
     let mono = brass_engine::monomorphize(&mir, program)
         .map_err(|e| format!("typed lowering failed: {e}"))?;
     if program.functions.contains_key("main") && mono.lookup("main").is_none() {

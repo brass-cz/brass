@@ -22,6 +22,22 @@ type HttpResponse = {
     body: uint8[]
 }
 
+type _HttpHead = {
+    line: string
+    headers: Header[]
+}
+
+type _HttpMessage = {
+    head: _HttpHead
+    body: uint8[]
+}
+
+type _StatusLine = {
+    version: string
+    status: int32
+    reason: string
+}
+
 // --- internal helpers ---
 
 fun _split_once(s: string, delim: string) {
@@ -51,9 +67,8 @@ fun _find_header(headers: Header[], name: string) -> string? {
 }
 
 fun _require_header(headers: Header[], name: string) {
-    let lower = name.to_lower()
-    for h in headers {
-        if h.name.to_lower() == lower { return h.value }
+    if let value = _find_header(headers, name) {
+        return value
     }
     error("missing header: {name}")!
 }
@@ -69,67 +84,82 @@ fun _parse_header_lines(text: string) {
     return headers
 }
 
+fun _parse_head(text: string, kind: string) {
+    const lines = text.split("\r\n")
+    if len(lines) == 0 { error("empty {kind}")! }
+    const header_text = lines.slice(1, len(lines)).join("\r\n")
+    return _HttpHead {
+        line: lines[0],
+        headers: _parse_header_lines(header_text)!,
+    }
+}
+
+fun _parse_message(raw: string, kind: string) {
+    const [head, body_text] = _split_once(raw, "\r\n\r\n")!
+    return _HttpMessage {
+        head: _parse_head(head, kind)!,
+        body: to_bytes(body_text),
+    }
+}
+
+fun _parse_status_line(line: string) {
+    const parts = line.split(" ")
+    if len(parts) < 2 { error("invalid status line")! }
+    let reason = ""
+    if len(parts) >= 3 {
+        reason = parts.slice(2, len(parts)).join(" ")
+    }
+    return _StatusLine {
+        version: parts[0],
+        status: int32.parse(parts[1])!,
+        reason: reason,
+    }
+}
+
+fun _serialize_message(line: string, headers: Header[], body: uint8[]) -> uint8[] {
+    let text = "{line}\r\n"
+    for h in headers {
+        text = "{text}{h.name}: {h.value}\r\n"
+    }
+    text = "{text}\r\n"
+    let bytes = to_bytes(text)
+    for b in body { bytes.push(b) }
+    return bytes
+}
+
 // --- HttpRequest ---
 
 /** Parses a raw HTTP/1.x request string. */
 fun HttpRequest.parse(raw: string) {
-    let [head, body_text] = _split_once(raw, "\r\n\r\n")!
-    let lines = head.split("\r\n")
-    if len(lines) == 0 { error("empty request")! }
-
-    let parts = lines[0].split(" ")
+    const message = _parse_message(raw, "request")!
+    const parts = message.head.line.split(" ")
     if len(parts) < 3 { error("invalid request line")! }
-
-    let header_text = lines.slice(1, len(lines)).join("\r\n")
-    let headers = _parse_header_lines(header_text)!
-
     return Self {
         method: parts[0],
         path: parts[1],
         version: parts[2],
-        headers: headers,
-        body: to_bytes(body_text),
+        headers: message.head.headers,
+        body: message.body,
     }
 }
 
 /** Serializes this request into raw bytes for sending over TCP. */
 fun HttpRequest.serialize(self) -> uint8[] {
-    let text = "{self.method} {self.path} {self.version}\r\n"
-    for h in self.headers {
-        text = "{text}{h.name}: {h.value}\r\n"
-    }
-    text = "{text}\r\n"
-    let bytes = to_bytes(text)
-    for b in self.body { bytes.push(b) }
-    return bytes
+    return _serialize_message("{self.method} {self.path} {self.version}", self.headers, self.body)
 }
 
 // --- HttpResponse ---
 
 /** Parses a raw HTTP/1.x response string. */
 fun HttpResponse.parse(raw: string) {
-    let [head, body_text] = _split_once(raw, "\r\n\r\n")!
-    let lines = head.split("\r\n")
-    if len(lines) == 0 { error("empty response")! }
-
-    let parts = lines[0].split(" ")
-    if len(parts) < 2 { error("invalid status line")! }
-
-    let status = int32.parse(parts[1])!
-    let reason = ""
-    if len(parts) >= 3 {
-        reason = parts.slice(2, len(parts)).join(" ")
-    }
-
-    let header_text = lines.slice(1, len(lines)).join("\r\n")
-    let headers = _parse_header_lines(header_text)!
-
+    const message = _parse_message(raw, "response")!
+    const status = _parse_status_line(message.head.line)!
     return Self {
-        version: parts[0],
-        status: status,
-        reason: reason,
-        headers: headers,
-        body: to_bytes(body_text),
+        version: status.version,
+        status: status.status,
+        reason: status.reason,
+        headers: message.head.headers,
+        body: message.body,
     }
 }
 
@@ -146,14 +176,11 @@ fun HttpResponse.parse(raw: string) {
  * `parse` read the line back.
  */
 fun HttpResponse.serialize(self) -> uint8[] {
-    let text = "{self.version} {self.status} {self.reason}\r\n"
-    for h in self.headers {
-        text = "{text}{h.name}: {h.value}\r\n"
-    }
-    text = "{text}\r\n"
-    let bytes = to_bytes(text)
-    for b in self.body { bytes.push(b) }
-    return bytes
+    return _serialize_message(
+        "{self.version} {self.status} {self.reason}",
+        self.headers,
+        self.body,
+    )
 }
 
 /** Returns the response body decoded as a UTF-8 string. */
@@ -208,21 +235,9 @@ fun _read_response(conn, req: HttpRequest) {
 
     let header_bytes = data.slice(0, header_end)
     let header_text = to_text(header_bytes)!
-    let lines = header_text.split("\r\n")
-    if len(lines) == 0 { error("empty response")! }
-
-    let status_parts = lines[0].split(" ")
-    if len(status_parts) < 2 { error("invalid status line")! }
-
-    let version = status_parts[0]
-    let status = int32.parse(status_parts[1])!
-    let reason = ""
-    if len(status_parts) >= 3 {
-        reason = status_parts.slice(2, len(status_parts)).join(" ")
-    }
-
-    let remaining = lines.slice(1, len(lines)).join("\r\n")
-    let headers = _parse_header_lines(remaining)!
+    const head = _parse_head(header_text, "response")!
+    const status = _parse_status_line(head.line)!
+    const headers = head.headers
 
     let body_start = header_end + 4
     let content_length: int64 = -1
@@ -254,9 +269,9 @@ fun _read_response(conn, req: HttpRequest) {
     conn.close()
 
     return HttpResponse {
-        version: version,
-        status: status,
-        reason: reason,
+        version: status.version,
+        status: status.status,
+        reason: status.reason,
         headers: headers,
         body: data.slice(body_start, len(data)),
     }

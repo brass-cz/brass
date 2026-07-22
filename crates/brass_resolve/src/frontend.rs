@@ -10,7 +10,6 @@
 //! the language server converts everything to diagnostics and analyzes the
 //! recovered graph anyway.
 
-use fxhash::FxHashSet as HashSet;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -18,8 +17,8 @@ use brass_hir::LoadedModule;
 use brass_parser::Span;
 
 use crate::loader::{
-    SearchPaths, SourceMap, canonicalize_imports, inject_module_path, load_module, module_location,
-    parse_stdlib,
+    SearchPaths, SourceMap, canonicalize_imports, inject_module_path, load_modules,
+    module_location, parse_stdlib,
 };
 
 /// The parsed embedded core library, shared for the life of the process: it never
@@ -116,21 +115,15 @@ pub fn assemble(entry_path: &Path, entry_src: &str, root: &Path, search: &Search
         .collect();
 
     let mut load_errors = Vec::new();
-    let mut visited = HashSet::default();
-    let mut stack = HashSet::default();
-    for (target, span) in canonicalize_imports(&[], root, &mut entry_ast.imports, search) {
-        load_module(
-            &target,
-            root,
-            &mut sources,
-            &mut visited,
-            &mut stack,
-            &mut modules,
-            span,
-            &mut load_errors,
-            search,
-        );
-    }
+    let targets = canonicalize_imports(&[], root, &mut entry_ast.imports, search);
+    load_modules(
+        &targets,
+        root,
+        &mut sources,
+        &mut modules,
+        &mut load_errors,
+        search,
+    );
 
     // The entry joins the graph under the fixed module path `main`, LAST (the
     // context-prefix invariant documented on `Frontend::modules`): its file

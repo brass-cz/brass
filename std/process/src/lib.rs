@@ -14,12 +14,10 @@
 //! twice is not an error, and streams stay takeable afterwards, because a pipe
 //! still holds whatever the child wrote before it exited.
 
-use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use brass_plugin::{BrassLib, Bytes, Registry, brass_lib, decl, export};
+use brass_plugin::{BrassLib, Bytes, HandleError, HandleTable, Registry, brass_lib, decl, export};
 
 /// One spawned child. `status` caches the exit code once waited for, and
 /// `captured` holds the stdout/stderr buffers `process_wait_captured` drained.
@@ -33,9 +31,9 @@ struct Entry {
 
 /// Live spawned children by handle. Each entry has its own lock, so a blocking
 /// `wait` does not freeze unrelated process calls.
-fn table() -> &'static Mutex<HashMap<i64, Arc<Mutex<Entry>>>> {
-    static TABLE: OnceLock<Mutex<HashMap<i64, Arc<Mutex<Entry>>>>> = OnceLock::new();
-    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+fn table() -> &'static HandleTable<Arc<Mutex<Entry>>> {
+    static TABLE: OnceLock<HandleTable<Arc<Mutex<Entry>>>> = OnceLock::new();
+    TABLE.get_or_init(HandleTable::new)
 }
 
 fn poisoned() -> String {
@@ -45,12 +43,15 @@ fn poisoned() -> String {
 /// The entry for `handle`, with the table lock released: a caller may then
 /// block on the child without holding up the whole table.
 fn entry(handle: i64) -> Result<Arc<Mutex<Entry>>, String> {
-    table()
-        .lock()
-        .map_err(|_| poisoned())?
-        .get(&handle)
-        .cloned()
-        .ok_or_else(|| "no such child process".to_string())
+    table().get_cloned(handle).map_err(handle_error)
+}
+
+fn handle_error(error: HandleError) -> String {
+    match error {
+        HandleError::Poisoned => poisoned(),
+        HandleError::Exhausted => "the process table cannot allocate another handle".to_string(),
+        HandleError::Missing(_) => "no such child process".to_string(),
+    }
 }
 
 fn lock(entry: &Arc<Mutex<Entry>>) -> Result<MutexGuard<'_, Entry>, String> {
@@ -150,14 +151,10 @@ export! {
             command.env(&pair[0], &pair[1]);
         }
         let child = command.spawn().map_err(|e| e.to_string())?;
-        static NEXT: AtomicI64 = AtomicI64::new(1);
-        let handle = NEXT.fetch_add(1, Ordering::Relaxed);
         let entry = Entry { child: Some(child), ..Entry::default() };
         table()
-            .lock()
-            .map_err(|_| poisoned())?
-            .insert(handle, Arc::new(Mutex::new(entry)));
-        Ok(handle)
+            .insert(Arc::new(Mutex::new(entry)))
+            .map_err(handle_error)
     }
 
     /// End THIS process with exit code `code` (0 = success, by convention).

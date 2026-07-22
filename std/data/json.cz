@@ -234,6 +234,14 @@ fun _Cursor._peek(self) -> string {
     return ""
 }
 
+fun _Cursor._starts_with_here(self, value: string) -> bool {
+    const end = self.pos + len(value)
+    if end > len(self.text) {
+        return false
+    }
+    return _string_slice(self.text, self.pos, end) == value
+}
+
 fun _Cursor._skip_ws(self) {
     while self.pos < len(self.text) {
         const c = self._peek()
@@ -363,11 +371,10 @@ fun _Cursor._number(self) -> JsonValue! {
     const start = self.pos
     while self.pos < len(self.text) {
         const c = self._peek()
-        if _is_number_char(c) {
-            self.pos = self.pos + 1
-        } else {
-            return JsonValue.Number { value: float64.parse(_string_slice(self.text, start, self.pos))! }
+        if !_is_number_char(c) {
+            break
         }
+        self.pos = self.pos + 1
     }
     return JsonValue.Number { value: float64.parse(_string_slice(self.text, start, self.pos))! }
 }
@@ -379,11 +386,11 @@ fun _is_number_char(c: string) -> bool {
 }
 
 fun _Cursor._bool(self) -> JsonValue! {
-    if _string_slice(self.text, self.pos, _min(self.pos + 4, len(self.text))) == "true" {
+    if self._starts_with_here("true") {
         self.pos = self.pos + 4
         return JsonValue.Bool { value: true }
     }
-    if _string_slice(self.text, self.pos, _min(self.pos + 5, len(self.text))) == "false" {
+    if self._starts_with_here("false") {
         self.pos = self.pos + 5
         return JsonValue.Bool { value: false }
     }
@@ -391,16 +398,9 @@ fun _Cursor._bool(self) -> JsonValue! {
 }
 
 fun _Cursor._null(self) -> JsonValue! {
-    if _string_slice(self.text, self.pos, _min(self.pos + 4, len(self.text))) == "null" {
+    if self._starts_with_here("null") {
         self.pos = self.pos + 4
         return JsonValue.Null
     }
     return error("invalid literal at offset {self.pos}")
-}
-
-fun _min(a: int64, b: int64) -> int64 {
-    if a < b {
-        return a
-    }
-    return b
 }

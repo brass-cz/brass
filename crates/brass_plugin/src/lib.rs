@@ -52,12 +52,14 @@
 //! an editor analyzing it) resolves the import, so a plugin runs with the
 //! same trust as the program importing it.
 
+mod handle;
 pub mod raw;
 mod registry;
 mod value;
 
 use std::sync::OnceLock;
 
+pub use handle::{HandleError, HandleTable};
 pub use registry::{FunctionDecl, PluginFn, Registry};
 pub use value::{Bytes, FromValue, IntoOutcome, IntoValue, Value, ValueType, release_raw};
 

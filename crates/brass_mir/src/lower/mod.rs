@@ -165,34 +165,20 @@ pub(crate) struct ProgramCtx<'p> {
 }
 
 impl<'p> ProgramCtx<'p> {
-    #[allow(clippy::too_many_arguments)] // mirrors the checker's channel outputs
-    fn new(
-        program: &'p Program,
-        tables: &'p LowerTables,
-        expr_types: &'p HashMap<Span, Type>,
-        view_args: &'p fxhash::FxHashSet<Span>,
-        sum_views: &'p HashMap<Span, Type>,
-        call_locations: &'p HashMap<Span, (String, u32, u32)>,
-        lift_errs: &'p fxhash::FxHashSet<Span>,
-        fields_loops: &'p HashMap<Span, Vec<String>>,
-        type_names: &'p HashMap<Span, String>,
-        typeof_types: &'p HashMap<Span, Type>,
-        null_props: &'p fxhash::FxHashSet<Span>,
-        type_tests: &'p HashMap<Span, Type>,
-    ) -> Self {
+    fn new(program: &'p Program, tables: &'p LowerTables, channels: &CheckerChannels<'p>) -> Self {
         ProgramCtx {
             program,
             tables,
-            expr_types,
-            view_args,
-            sum_views,
-            call_locations,
-            lift_errs,
-            fields_loops,
-            type_names,
-            typeof_types,
-            null_props,
-            type_tests,
+            expr_types: channels.expr_types,
+            view_args: channels.view_args,
+            sum_views: channels.sum_views,
+            call_locations: channels.call_locations,
+            lift_errs: channels.lift_errs,
+            fields_loops: channels.fields_loops,
+            type_names: channels.type_names,
+            typeof_types: channels.typeof_types,
+            null_props: channels.null_props,
+            type_tests: channels.type_tests,
             closures: RefCell::new(Vec::new()),
             next_closure: Cell::new(0),
         }
@@ -786,20 +772,19 @@ pub fn lower_body(
     let no_null_props = fxhash::FxHashSet::default();
     let no_type_tests = HashMap::default();
     let tables = LowerTables::new(program);
-    let ctx = ProgramCtx::new(
-        program,
-        &tables,
-        &no_types,
-        &no_views,
-        &no_sum_views,
-        &no_call_locations,
-        &no_lift_errs,
-        &no_fields_loops,
-        &no_type_names,
-        &no_typeof_types,
-        &no_null_props,
-        &no_type_tests,
-    );
+    let channels = CheckerChannels {
+        expr_types: &no_types,
+        view_args: &no_views,
+        sum_views: &no_sum_views,
+        call_locations: &no_call_locations,
+        lift_errs: &no_lift_errs,
+        fields_loops: &no_fields_loops,
+        type_names: &no_type_names,
+        typeof_types: &no_typeof_types,
+        null_props: &no_null_props,
+        type_tests: &no_type_tests,
+    };
+    let ctx = ProgramCtx::new(program, &tables, &channels);
     let body = lower_one(
         &ctx,
         module.to_vec(),
@@ -844,23 +829,27 @@ fn lower_one(
 pub fn lower_program(program: &Program) -> MirProgram {
     lower_program_with_types(
         program,
-        &HashMap::default(),
-        &fxhash::FxHashSet::default(),
-        &HashMap::default(),
-        &HashMap::default(),
-        &fxhash::FxHashSet::default(),
-        &HashMap::default(),
-        &HashMap::default(),
-        &HashMap::default(),
-        &fxhash::FxHashSet::default(),
-        &HashMap::default(),
+        &CheckerChannels {
+            expr_types: &HashMap::default(),
+            view_args: &fxhash::FxHashSet::default(),
+            sum_views: &HashMap::default(),
+            call_locations: &HashMap::default(),
+            lift_errs: &fxhash::FxHashSet::default(),
+            fields_loops: &HashMap::default(),
+            type_names: &HashMap::default(),
+            typeof_types: &HashMap::default(),
+            null_props: &fxhash::FxHashSet::default(),
+            type_tests: &HashMap::default(),
+        },
     )
 }
 
-/// The checker's span-keyed channel outputs, borrowed as one bundle -- the
-/// same ten maps [`lower_program_with_types`] takes positionally, for the
-/// APIs that consume them repeatedly (the lazy pipeline re-lowers against a
-/// growing channel state).
+/// The checker's span-keyed outputs borrowed as one lowering input.
+///
+/// Keeping these related tables in one value prevents back ends from silently
+/// reordering or omitting a channel as the checker grows another output. The
+/// lazy pipeline can also re-borrow its changing channel state without
+/// rebuilding a positional argument list at every lowering boundary.
 pub struct CheckerChannels<'a> {
     pub expr_types: &'a HashMap<Span, Type>,
     pub view_args: &'a fxhash::FxHashSet<Span>,
@@ -943,7 +932,7 @@ impl SubsetLowering {
             return false;
         };
         let ctx = subset_ctx(program, tables, channels, self.next_closure);
-        lower_function_into(&ctx, &mut self.mir, info, channels.null_props);
+        lower_function_into(&ctx, &mut self.mir, info);
         self.next_closure = ctx.next_closure.get();
         let mut closures = ctx.closures.into_inner();
         closures.sort_by_key(|c| c.id.0);
@@ -961,32 +950,14 @@ fn subset_ctx<'p>(
     channels: &CheckerChannels<'p>,
     closure_base: u32,
 ) -> ProgramCtx<'p> {
-    let ctx = ProgramCtx::new(
-        program,
-        tables,
-        channels.expr_types,
-        channels.view_args,
-        channels.sum_views,
-        channels.call_locations,
-        channels.lift_errs,
-        channels.fields_loops,
-        channels.type_names,
-        channels.typeof_types,
-        channels.null_props,
-        channels.type_tests,
-    );
+    let ctx = ProgramCtx::new(program, tables, channels);
     ctx.next_closure.set(closure_base);
     ctx
 }
 
 /// Lower one free function into `out` (the per-function core of
 /// [`lower_program_with_types`]).
-fn lower_function_into(
-    ctx: &ProgramCtx,
-    out: &mut MirProgram,
-    info: &brass_hir::FunInfo,
-    null_props: &fxhash::FxHashSet<Span>,
-) {
+fn lower_function_into(ctx: &ProgramCtx, out: &mut MirProgram, info: &brass_hir::FunInfo) {
     // The entry `main` (the root module's bare `main` symbol) is the
     // program: a failed `expr!` there aborts with the error instead of
     // propagating (there is no caller to receive a Result), so `!` alone
@@ -1003,7 +974,7 @@ fn lower_function_into(
     let fallible = if entry_main && info.decl.ret.is_none() {
         crate::analysis::constructs_error_block(&info.decl.body)
     } else {
-        function_fallible(info.decl.ret.as_ref(), &info.decl.body, null_props)
+        function_fallible(info.decl.ret.as_ref(), &info.decl.body, ctx.null_props)
     };
     out.functions.push(MirFunction {
         name: info.decl.name.clone(),
@@ -1082,41 +1053,15 @@ fn lower_methods_into(ctx: &ProgramCtx, out: &mut MirProgram, program: &Program)
 /// real execution paths pass the checker's data; [`lower_program`] is the
 /// inputs-free form used by tests and by runtime re-lowering, where the back
 /// end re-derives types on its own and keeps full argument values.
-#[allow(clippy::too_many_arguments)] // mirrors the checker's channel outputs
-pub fn lower_program_with_types(
-    program: &Program,
-    expr_types: &HashMap<Span, Type>,
-    view_args: &fxhash::FxHashSet<Span>,
-    sum_views: &HashMap<Span, Type>,
-    call_locations: &HashMap<Span, (String, u32, u32)>,
-    lift_errs: &fxhash::FxHashSet<Span>,
-    fields_loops: &HashMap<Span, Vec<String>>,
-    type_names: &HashMap<Span, String>,
-    typeof_types: &HashMap<Span, Type>,
-    null_props: &fxhash::FxHashSet<Span>,
-    type_tests: &HashMap<Span, Type>,
-) -> MirProgram {
+pub fn lower_program_with_types(program: &Program, channels: &CheckerChannels<'_>) -> MirProgram {
     let tables = LowerTables::new(program);
-    let ctx = ProgramCtx::new(
-        program,
-        &tables,
-        expr_types,
-        view_args,
-        sum_views,
-        call_locations,
-        lift_errs,
-        fields_loops,
-        type_names,
-        typeof_types,
-        null_props,
-        type_tests,
-    );
+    let ctx = ProgramCtx::new(program, &tables, channels);
     let mut out = MirProgram::default();
 
     let mut fn_names: Vec<&String> = program.functions.keys().collect();
     fn_names.sort();
     for name in fn_names {
-        lower_function_into(&ctx, &mut out, &program.functions[name], null_props);
+        lower_function_into(&ctx, &mut out, &program.functions[name]);
     }
 
     lower_methods_into(&ctx, &mut out, program);

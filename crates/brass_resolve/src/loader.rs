@@ -659,74 +659,99 @@ pub fn canonicalize_imports(
     targets
 }
 
-/// Load the module at canonical `path` and, transitively, every module it
-/// imports, pushing each onto `out`. Problems are collected into `errors`
-/// rather than aborting, so one bad dependency does not hide the rest:
-/// graph-level problems (missing file, privacy, cycle) are attributed to
-/// `trigger_span` (the entry-file import that asked for this subgraph), while
-/// a dependency's own syntax errors keep their in-file spans. `core`/prelude
-/// paths never arrive here (they are filtered out as non-file modules during
-/// canonicalization).
+/// Load every canonical module in `targets` and its transitive imports into
+/// `out`. Problems are collected into `errors` rather than aborting, so one bad
+/// dependency does not hide the rest. Each target's span is retained for
+/// graph-level failures; syntax failures keep their own in-file spans.
 ///
-/// The file serving `path` is found by [`find_module_file`]: a declared
+/// The file serving a path is found by [`find_module_file`]: a declared
 /// package's directory when the first segment names one, otherwise the
 /// project `root` first and then each include path in order.
-#[allow(clippy::too_many_arguments)]
-pub fn load_module(
-    path: &[String],
+pub fn load_modules(
+    targets: &[(Vec<String>, Span)],
     root: &Path,
     sources: &mut SourceMap,
-    visited: &mut HashSet<String>,
-    stack: &mut HashSet<String>,
     out: &mut Vec<LoadedModule>,
-    trigger_span: Span,
     errors: &mut Vec<LoadError>,
     search: &SearchPaths,
 ) {
+    let mut context = LoadContext {
+        root,
+        sources,
+        visited: HashSet::default(),
+        stack: HashSet::default(),
+        out,
+        errors,
+        search,
+    };
+    for (path, trigger_span) in targets {
+        load_module(path, *trigger_span, &mut context);
+    }
+}
+
+struct LoadContext<'a> {
+    root: &'a Path,
+    sources: &'a mut SourceMap,
+    visited: HashSet<String>,
+    stack: HashSet<String>,
+    out: &'a mut Vec<LoadedModule>,
+    errors: &'a mut Vec<LoadError>,
+    search: &'a SearchPaths,
+}
+
+fn load_module(path: &[String], trigger_span: Span, context: &mut LoadContext<'_>) {
     let key = path.join(".");
     if crate::is_private_module(path) {
-        errors.push(LoadError {
+        context.errors.push(LoadError {
             message: format!("cannot import private module `{key}`"),
             span: trigger_span,
         });
         return;
     }
-    if visited.contains(&key) {
+    if context.visited.contains(&key) {
         return;
     }
-    if !stack.insert(key.clone()) {
-        errors.push(LoadError {
+    if !context.stack.insert(key.clone()) {
+        context.errors.push(LoadError {
             message: format!("circular import involving `{key}`"),
             span: trigger_span,
         });
         return;
     }
 
-    let (file, src) = match find_module_file(root, search, path) {
+    let (file, src) = match find_module_file(context.root, context.search, path) {
         // A native plugin library may serve the path instead of a `.cz` file
         // (`plugins/math.so` for `import plugins.math`), as a module
         // synthesized from the plugin's manifest.
         Some(ModuleFile::Plugin(lib)) => {
             match crate::plugin::synthesize_plugin_module(&lib) {
-                Ok(src) => load_synthesized(&lib, src, path, sources, out, trigger_span, errors),
-                Err(message) => errors.push(LoadError {
+                Ok(src) => load_synthesized(
+                    &lib,
+                    src,
+                    path,
+                    context.sources,
+                    context.out,
+                    trigger_span,
+                    context.errors,
+                ),
+                Err(message) => context.errors.push(LoadError {
                     message,
                     span: trigger_span,
                 }),
             }
-            stack.remove(&key);
-            visited.insert(key);
+            context.stack.remove(&key);
+            context.visited.insert(key);
             return;
         }
         Some(ModuleFile::Source(file)) => match std::fs::read_to_string(&file) {
             Ok(src) => (file, src),
             Err(e) => {
-                errors.push(LoadError {
+                context.errors.push(LoadError {
                     message: format!("cannot read module `{key}` (`{}`): {e}", file.display()),
                     span: trigger_span,
                 });
-                stack.remove(&key);
-                visited.insert(key);
+                context.stack.remove(&key);
+                context.visited.insert(key);
                 return;
             }
         },
@@ -735,63 +760,60 @@ pub fn load_module(
             // its file under the declared package's directory; anything else
             // expects the project-root location, with a note when include
             // paths were searched too.
-            let pkg_root = path.first().and_then(|s| search.packages.get(s.as_str()));
-            let mut expected = pkg_root.map(PathBuf::from).unwrap_or(root.to_path_buf());
+            let pkg_root = path
+                .first()
+                .and_then(|s| context.search.packages.get(s.as_str()));
+            let mut expected = pkg_root
+                .map(PathBuf::from)
+                .unwrap_or(context.root.to_path_buf());
             for seg in path {
                 expected.push(seg);
             }
             expected.set_extension("cz");
-            let searched = if pkg_root.is_some() || search.includes.is_empty() {
+            let searched = if pkg_root.is_some() || context.search.includes.is_empty() {
                 String::new()
             } else {
-                format!("; also searched {} include path(s)", search.includes.len())
+                format!(
+                    "; also searched {} include path(s)",
+                    context.search.includes.len()
+                )
             };
-            errors.push(LoadError {
+            context.errors.push(LoadError {
                 message: format!(
                     "cannot find module `{key}` (expected `{}`{searched})",
                     expected.display()
                 ),
                 span: trigger_span,
             });
-            stack.remove(&key);
-            visited.insert(key);
+            context.stack.remove(&key);
+            context.visited.insert(key);
             return;
         }
     };
     let label = file.display().to_string();
     let location = module_location(&file);
-    let base = sources.add(Some(file), label, src.clone());
+    let base = context.sources.add(Some(file), label, src.clone());
     let (ast, parse_errors) = brass_parser::parse_recovering(&src, base);
     if !parse_errors.is_empty() {
         for e in parse_errors {
-            errors.push(LoadError {
+            context.errors.push(LoadError {
                 message: format!("syntax error: {}", e.message),
                 span: e.span,
             });
         }
-        stack.remove(&key);
-        visited.insert(key);
+        context.stack.remove(&key);
+        context.visited.insert(key);
         return;
     }
     let mut ast = ast;
     inject_module_path(&mut ast, &location, Span::new(base, base));
     let dir = path[..path.len() - 1].to_vec();
-    for (target, _) in canonicalize_imports(&dir, root, &mut ast.imports, search) {
-        load_module(
-            &target,
-            root,
-            sources,
-            visited,
-            stack,
-            out,
-            trigger_span,
-            errors,
-            search,
-        );
+    for (target, _) in canonicalize_imports(&dir, context.root, &mut ast.imports, context.search) {
+        load_module(&target, trigger_span, context);
     }
-    stack.remove(&key);
-    visited.insert(key.clone());
-    out.push(LoadedModule {
+    context.stack.remove(&key);
+    context.visited.insert(key.clone());
+    context.out.push(LoadedModule {
         is_prelude: false,
         path: path.to_vec(),
         ast,

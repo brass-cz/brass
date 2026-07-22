@@ -20,19 +20,17 @@
 //! that wants them (`Match.start`/`end`). Offsets from this engine always fall
 //! on character boundaries.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
-use brass_plugin::{BrassLib, Registry, brass_lib, decl, export};
+use brass_plugin::{BrassLib, HandleError, HandleTable, Registry, brass_lib, decl, export};
 use regex::Regex;
 
 /// The compiled regexes, by handle. Cloned out (an `Arc`) before matching, so
 /// the global lock is held only for the lookup -- a long match on one regex
 /// never blocks another thread's lookup.
-fn table() -> &'static Mutex<HashMap<i64, Arc<Regex>>> {
-    static TABLE: OnceLock<Mutex<HashMap<i64, Arc<Regex>>>> = OnceLock::new();
-    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+fn table() -> &'static HandleTable<Arc<Regex>> {
+    static TABLE: OnceLock<HandleTable<Arc<Regex>>> = OnceLock::new();
+    TABLE.get_or_init(HandleTable::new)
 }
 
 /// The regex behind `handle`.
@@ -44,11 +42,16 @@ fn table() -> &'static Mutex<HashMap<i64, Arc<Regex>>> {
 /// match fallible on the Brass side for an error it cannot produce.
 fn regex(handle: i64) -> Arc<Regex> {
     table()
-        .lock()
-        .expect("the regex table is poisoned")
-        .get(&handle)
-        .cloned()
-        .unwrap_or_else(|| panic!("regex handle {handle} does not exist"))
+        .get_cloned(handle)
+        .unwrap_or_else(|error| panic!("{}", handle_error(error)))
+}
+
+fn handle_error(error: HandleError) -> String {
+    match error {
+        HandleError::Poisoned => "the regex table is poisoned".to_string(),
+        HandleError::Exhausted => "the regex table cannot allocate another handle".to_string(),
+        HandleError::Missing(handle) => format!("regex handle {handle} does not exist"),
+    }
 }
 
 /// The capture spans of `caps` as a flat `[start, end, start, end, ...]` run,
@@ -78,13 +81,9 @@ export! {
     /// the engine's limit).
     fn regex_compile(pattern: String) -> Result<i64, String> {
         let re = Regex::new(&pattern).map_err(|e| e.to_string())?;
-        static NEXT: AtomicI64 = AtomicI64::new(1);
-        let handle = NEXT.fetch_add(1, Ordering::Relaxed);
         table()
-            .lock()
-            .map_err(|_| "the regex table is poisoned".to_string())?
-            .insert(handle, Arc::new(re));
-        Ok(handle)
+            .insert(Arc::new(re))
+            .map_err(handle_error)
     }
 
     /// The name of each capture group in group order, empty for an unnamed one
@@ -189,10 +188,7 @@ mod tests {
 
     fn compile(pattern: &str) -> i64 {
         let re = Regex::new(pattern).expect("valid pattern");
-        static NEXT: AtomicI64 = AtomicI64::new(-1);
-        let handle = NEXT.fetch_sub(1, Ordering::Relaxed);
-        table().lock().unwrap().insert(handle, Arc::new(re));
-        handle
+        table().insert(Arc::new(re)).expect("insert regex")
     }
 
     /// A non-participating group is `(-1, -1)`, not an empty span at 0: the

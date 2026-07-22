@@ -16,35 +16,8 @@ use brass_runtime::symbols;
 /// typed, fully unboxed back end (no boxed `Value`). There is no Value fallback:
 /// a program whose `main` reaches a construct outside the typed subset is
 /// rejected rather than executed.
-#[allow(clippy::too_many_arguments)] // mirrors the checker's channel outputs
-pub fn run(
-    program: &Program,
-    expr_types: &fxhash::FxHashMap<brass_hir::Span, brass_hir::Type>,
-    view_args: &fxhash::FxHashSet<brass_hir::Span>,
-    sum_views: &fxhash::FxHashMap<brass_hir::Span, brass_hir::Type>,
-    call_locations: &fxhash::FxHashMap<brass_hir::Span, (String, u32, u32)>,
-    lift_errs: &fxhash::FxHashSet<brass_hir::Span>,
-    fields_loops: &fxhash::FxHashMap<brass_hir::Span, Vec<String>>,
-    type_names: &fxhash::FxHashMap<brass_hir::Span, String>,
-    typeof_types: &fxhash::FxHashMap<brass_hir::Span, brass_hir::Type>,
-    null_props: &fxhash::FxHashSet<brass_hir::Span>,
-    type_tests: &fxhash::FxHashMap<brass_hir::Span, brass_hir::Type>,
-) -> Result<(), String> {
-    let mir = lower_checked(
-        program,
-        &brass_mir::CheckerChannels {
-            expr_types,
-            view_args,
-            sum_views,
-            call_locations,
-            lift_errs,
-            fields_loops,
-            type_names,
-            typeof_types,
-            null_props,
-            type_tests,
-        },
-    );
+pub fn run(program: &Program, channels: &brass_mir::CheckerChannels<'_>) -> Result<(), String> {
+    let mir = lower_checked(program, channels);
     let t = std::time::Instant::now();
     let mono = brass_engine::monomorphize(&mir, program)
         .map_err(|e| format!("typed lowering failed: {e}"))?;
@@ -124,19 +97,7 @@ fn lower_checked(
     channels: &brass_mir::CheckerChannels,
 ) -> brass_mir::MirProgram {
     let t = std::time::Instant::now();
-    let mir = brass_mir::lower_program_with_types(
-        program,
-        channels.expr_types,
-        channels.view_args,
-        channels.sum_views,
-        channels.call_locations,
-        channels.lift_errs,
-        channels.fields_loops,
-        channels.type_names,
-        channels.typeof_types,
-        channels.null_props,
-        channels.type_tests,
-    );
+    let mir = brass_mir::lower_program_with_types(program, channels);
     tracing::debug!(
         target: "brass::perf",
         "back/lower-mir: total {:.3}ms",

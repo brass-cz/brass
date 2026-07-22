@@ -11,7 +11,7 @@ pub mod visibility;
 
 pub use loader::{
     LoadError, Located, MODULE_PATH_CONST, ModuleFile, STDLIB, SearchPaths, SourceMap,
-    canonicalize_imports, inject_module_path, is_prelude_path, load_module, module_source,
+    canonicalize_imports, inject_module_path, is_prelude_path, load_modules, module_source,
     parse_stdlib, prelude_module_names, prelude_source, qualified_core_path, reinject_module_path,
     reinject_plugin_path, resolve_module_file,
 };

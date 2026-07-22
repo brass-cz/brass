@@ -508,118 +508,36 @@ fn install_jit_panic_guard() {
 /// Run a checked program through the default runtime: the LLVM JIT, used when the
 /// JIT back end is available (the `jit` feature on a non-wasm target).
 #[cfg(jit_backend)]
-#[allow(clippy::too_many_arguments)] // mirrors the checker's channel outputs
 fn execute(
     program: &Program,
-    expr_types: &HashMap<Span, brass_hir::Type>,
-    view_args: &HashSet<Span>,
-    sum_views: &HashMap<Span, brass_hir::Type>,
-    call_locations: &HashMap<Span, (String, u32, u32)>,
-    lift_errs: &HashSet<Span>,
-    fields_loops: &HashMap<Span, Vec<String>>,
-    type_names: &HashMap<Span, String>,
-    typeof_types: &HashMap<Span, brass_hir::Type>,
-    null_props: &HashSet<Span>,
-    type_tests: &HashMap<Span, brass_hir::Type>,
+    channels: &brass_mir::CheckerChannels<'_>,
     lazy: bool,
 ) -> Result<(), String> {
     install_jit_panic_guard();
     if lazy {
-        return brass_jit_llvm::run_lazy(
-            program,
-            &brass_mir::CheckerChannels {
-                expr_types,
-                view_args,
-                sum_views,
-                call_locations,
-                lift_errs,
-                fields_loops,
-                type_names,
-                typeof_types,
-                null_props,
-                type_tests,
-            },
-        );
+        return brass_jit_llvm::run_lazy(program, channels);
     }
-    brass_jit_llvm::run(
-        program,
-        expr_types,
-        view_args,
-        sum_views,
-        call_locations,
-        lift_errs,
-        fields_loops,
-        type_names,
-        typeof_types,
-        null_props,
-        type_tests,
-    )
+    brass_jit_llvm::run(program, channels)
 }
 
 /// Run a checked program through the default runtime: the REPL interpreter, used
 /// when the JIT back end is unavailable (no `jit` feature, or a wasm target).
 #[cfg(not(jit_backend))]
-#[allow(clippy::too_many_arguments)] // mirrors the checker's channel outputs
 fn execute(
     program: &Program,
-    expr_types: &HashMap<Span, brass_hir::Type>,
-    view_args: &HashSet<Span>,
-    sum_views: &HashMap<Span, brass_hir::Type>,
-    call_locations: &HashMap<Span, (String, u32, u32)>,
-    lift_errs: &HashSet<Span>,
-    fields_loops: &HashMap<Span, Vec<String>>,
-    type_names: &HashMap<Span, String>,
-    typeof_types: &HashMap<Span, brass_hir::Type>,
-    null_props: &HashSet<Span>,
-    type_tests: &HashMap<Span, brass_hir::Type>,
+    channels: &brass_mir::CheckerChannels<'_>,
     _lazy: bool,
 ) -> Result<(), String> {
-    brass_repl::run(
-        program,
-        expr_types,
-        view_args,
-        sum_views,
-        call_locations,
-        lift_errs,
-        fields_loops,
-        type_names,
-        typeof_types,
-        null_props,
-        type_tests,
-        &mut io::stdout(),
-    )
+    brass_repl::run(program, channels, &mut io::stdout())
 }
 
 /// Run a checked program through the REPL interpreter (the `repl` subcommand),
 /// regardless of the `jit` feature.
-#[allow(clippy::too_many_arguments)] // mirrors the checker's channel outputs
 fn execute_repl(
     program: &Program,
-    expr_types: &HashMap<Span, brass_hir::Type>,
-    view_args: &HashSet<Span>,
-    sum_views: &HashMap<Span, brass_hir::Type>,
-    call_locations: &HashMap<Span, (String, u32, u32)>,
-    lift_errs: &HashSet<Span>,
-    fields_loops: &HashMap<Span, Vec<String>>,
-    type_names: &HashMap<Span, String>,
-    typeof_types: &HashMap<Span, brass_hir::Type>,
-    null_props: &HashSet<Span>,
-    type_tests: &HashMap<Span, brass_hir::Type>,
+    channels: &brass_mir::CheckerChannels<'_>,
 ) -> Result<(), String> {
-    brass_repl::run(
-        program,
-        expr_types,
-        view_args,
-        sum_views,
-        call_locations,
-        lift_errs,
-        fields_loops,
-        type_names,
-        typeof_types,
-        null_props,
-        type_tests,
-        &mut io::stdout(),
-    )
+    brass_repl::run(program, channels, &mut io::stdout())
 }
 
 /// A program that passed every front-end check, ready to run.
@@ -657,6 +575,25 @@ struct Checked {
     type_tests: HashMap<Span, brass_hir::Type>,
 }
 
+impl Checked {
+    /// Borrow the checker's complete MIR-lowering sidecar without rebuilding
+    /// its field list at each execution boundary.
+    fn channels(&self) -> brass_mir::CheckerChannels<'_> {
+        brass_mir::CheckerChannels {
+            expr_types: &self.expr_types,
+            view_args: &self.view_args,
+            sum_views: &self.sum_views,
+            call_locations: &self.call_locations,
+            lift_errs: &self.lift_errs,
+            fields_loops: &self.fields_loops,
+            type_names: &self.type_names,
+            typeof_types: &self.typeof_types,
+            null_props: &self.null_props,
+            type_tests: &self.type_tests,
+        }
+    }
+}
+
 /// Drive the front end on a source file, then act per `mode`. Front-end
 /// diagnostics are printed to stderr; an error returns a non-zero exit code.
 fn drive(mode: Mode, file: &str) -> Result<(), u8> {
@@ -691,38 +628,11 @@ fn drive(mode: Mode, file: &str) -> Result<(), u8> {
         // carries the answer, and anything on stdout is noise an editor or a script
         // has to filter out.
         Mode::Check => Ok(()),
-        Mode::Run { .. } => execute(
-            &checked.program,
-            &checked.expr_types,
-            &checked.view_args,
-            &checked.sum_views,
-            &checked.call_locations,
-            &checked.lift_errs,
-            &checked.fields_loops,
-            &checked.type_names,
-            &checked.typeof_types,
-            &checked.null_props,
-            &checked.type_tests,
-            lazy,
-        )
-        .map_err(|e| {
+        Mode::Run { .. } => execute(&checked.program, &checked.channels(), lazy).map_err(|e| {
             report_runtime_error(&e);
             1
         }),
-        Mode::Repl => execute_repl(
-            &checked.program,
-            &checked.expr_types,
-            &checked.view_args,
-            &checked.sum_views,
-            &checked.call_locations,
-            &checked.lift_errs,
-            &checked.fields_loops,
-            &checked.type_names,
-            &checked.typeof_types,
-            &checked.null_props,
-            &checked.type_tests,
-        )
-        .map_err(|e| {
+        Mode::Repl => execute_repl(&checked.program, &checked.channels()).map_err(|e| {
             report_runtime_error(&e);
             1
         }),
@@ -2539,21 +2449,7 @@ fn run_fresh_eager(label: &str, src: &str, root: &Path) -> Result<(), u8> {
         Ok(c) => c,
         Err(diags) => return Err(print_diags(diags)),
     };
-    execute(
-        &checked.program,
-        &checked.expr_types,
-        &checked.view_args,
-        &checked.sum_views,
-        &checked.call_locations,
-        &checked.lift_errs,
-        &checked.fields_loops,
-        &checked.type_names,
-        &checked.typeof_types,
-        &checked.null_props,
-        &checked.type_tests,
-        false,
-    )
-    .map_err(|e| {
+    execute(&checked.program, &checked.channels(), false).map_err(|e| {
         report_runtime_error(&e);
         1
     })
@@ -2659,21 +2555,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         Ok(c) => c,
         Err(diags) => return Err(print_diags(diags)),
     };
-    execute(
-        &checked.program,
-        &checked.expr_types,
-        &checked.view_args,
-        &checked.sum_views,
-        &checked.call_locations,
-        &checked.lift_errs,
-        &checked.fields_loops,
-        &checked.type_names,
-        &checked.typeof_types,
-        &checked.null_props,
-        &checked.type_tests,
-        false,
-    )
-    .map_err(|e| {
+    execute(&checked.program, &checked.channels(), false).map_err(|e| {
         report_runtime_error(&e);
         1
     })
@@ -3555,20 +3437,7 @@ fn run_capture(defs: &[String], body: &[String], root: &Path) -> Result<String, 
     let src = assemble(defs, body);
     let checked = analyze("<repl>", &src, root).map_err(|d| d.join("\n"))?;
     let mut buf: Vec<u8> = Vec::new();
-    brass_repl::run(
-        &checked.program,
-        &checked.expr_types,
-        &checked.view_args,
-        &checked.sum_views,
-        &checked.call_locations,
-        &checked.lift_errs,
-        &checked.fields_loops,
-        &checked.type_names,
-        &checked.typeof_types,
-        &checked.null_props,
-        &checked.type_tests,
-        &mut buf,
-    )?;
+    brass_repl::run(&checked.program, &checked.channels(), &mut buf)?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 

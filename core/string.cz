@@ -159,32 +159,26 @@ fun string[].join(self, sep: string) -> string {
 }
 
 /** A copy of `self` with ASCII letters upper-cased; other characters are unchanged. */
-// Implemented over the UTF-8 byte view. An ASCII case change preserves UTF-8
-// validity, so the byte->string conversion cannot fail; matching (rather than
-// `!`) keeps `to_upper` non-fallible, returning `string` not `string!`.
 fun string.to_upper(self) -> string {
-    let bytes = _string_bytes(self)
-    let result = []
-    for b in bytes {
-        if b >= 97 && b <= 122 {
-            result.push(b - 32)
-        } else {
-            result.push(b)
-        }
-    }
-    return match _string_from_bytes(result) {
-        Ok { value } => value,
-        Err { error } => self,
-    }
+    return _string_ascii_case(self, false)
 }
 
 /** A copy of `self` with ASCII letters lower-cased; other characters are unchanged. */
 fun string.to_lower(self) -> string {
+    return _string_ascii_case(self, true)
+}
+
+// Transforming only ASCII bytes preserves every non-ASCII UTF-8 sequence.
+// The byte-to-string conversion therefore cannot fail; matching keeps the
+// public helpers non-fallible without hiding an unchecked propagation.
+fun _string_ascii_case(self: string, lower: bool) -> string {
     let bytes = _string_bytes(self)
     let result = []
     for b in bytes {
-        if b >= 65 && b <= 90 {
+        if lower && b >= 65 && b <= 90 {
             result.push(b + 32)
+        } else if !lower && b >= 97 && b <= 122 {
+            result.push(b - 32)
         } else {
             result.push(b)
         }

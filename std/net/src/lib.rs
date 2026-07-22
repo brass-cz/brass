@@ -14,16 +14,14 @@
 //! default against the Mozilla root set (webpki-roots), with the server name
 //! taken from `host`; no knobs are exposed.
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::mem::ManuallyDrop;
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use brass_plugin::{BrassLib, Bytes, Registry, brass_lib, decl, export};
+use brass_plugin::{BrassLib, Bytes, HandleError, HandleTable, Registry, brass_lib, decl, export};
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -178,10 +176,9 @@ export! {
                 return Err(format!("TLS handshake failed: {e}"));
             }
         }
-        static NEXT: AtomicI64 = AtomicI64::new(1);
-        let handle = NEXT.fetch_add(1, Ordering::Relaxed);
-        table().lock().map_err(|_| poisoned())?.insert(handle, Arc::new(Mutex::new(stream)));
-        Ok(handle)
+        table()
+            .insert(Arc::new(Mutex::new(stream)))
+            .map_err(handle_error)
     }
 
     /// Up to `max` plaintext bytes from TLS connection `handle` (fewer on a
@@ -210,17 +207,12 @@ export! {
     /// Closing an already-closed handle is an error Result, mirroring
     /// double-close on a `File`.
     fn tls_close(handle: i64) -> Result<(), String> {
-        let removed = table().lock().map_err(|_| poisoned())?.remove(&handle);
-        match removed {
-            Some(c) => {
-                if let Ok(mut stream) = c.lock() {
-                    stream.conn.send_close_notify();
-                    let _ = stream.flush();
-                }
-                Ok(())
-            }
-            None => Err("TLS connection is closed".to_string()),
+        let connection = table().remove(handle).map_err(handle_error)?;
+        if let Ok(mut stream) = connection.lock() {
+            stream.conn.send_close_notify();
+            let _ = stream.flush();
         }
+        Ok(())
     }
 }
 
@@ -229,18 +221,23 @@ type Conn = StreamOwned<ClientConnection, TcpStream>;
 /// Live TLS connections by handle. Each connection sits behind its own lock
 /// so a blocking read on one never stalls another; the outer map lock is
 /// held only for lookup/insert/remove.
-fn table() -> &'static Mutex<HashMap<i64, Arc<Mutex<Conn>>>> {
-    static TABLE: OnceLock<Mutex<HashMap<i64, Arc<Mutex<Conn>>>>> = OnceLock::new();
-    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+fn table() -> &'static HandleTable<Arc<Mutex<Conn>>> {
+    static TABLE: OnceLock<HandleTable<Arc<Mutex<Conn>>>> = OnceLock::new();
+    TABLE.get_or_init(HandleTable::new)
 }
 
 fn conn(handle: i64) -> Result<Arc<Mutex<Conn>>, String> {
-    table()
-        .lock()
-        .map_err(|_| poisoned())?
-        .get(&handle)
-        .cloned()
-        .ok_or_else(|| "TLS connection is closed".to_string())
+    table().get_cloned(handle).map_err(handle_error)
+}
+
+fn handle_error(error: HandleError) -> String {
+    match error {
+        HandleError::Poisoned => poisoned(),
+        HandleError::Exhausted => {
+            "the TLS connection table cannot allocate another handle".to_string()
+        }
+        HandleError::Missing(_) => "TLS connection is closed".to_string(),
+    }
 }
 
 fn poisoned() -> String {

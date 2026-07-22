@@ -19,11 +19,9 @@
 //! sessions use. There the algorithm IS chosen by name (the handle is minted
 //! once, and the call is fallible anyway).
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
-use brass_plugin::{BrassLib, Bytes, Registry, brass_lib, decl, export};
+use brass_plugin::{BrassLib, Bytes, HandleError, HandleTable, Registry, brass_lib, decl, export};
 use digest::{Digest, DynDigest};
 use hmac::{Hmac, KeyInit, Mac};
 
@@ -125,18 +123,15 @@ export! {
     /// life of the process.
     fn hasher_new(alg: String) -> Result<i64, String> {
         let digest = new_digest(&alg)?;
-        static NEXT: AtomicI64 = AtomicI64::new(1);
-        let handle = NEXT.fetch_add(1, Ordering::Relaxed);
-        table().lock().map_err(|_| poisoned())?.insert(handle, digest);
-        Ok(handle)
+        table().insert(digest).map_err(handle_error)
     }
 
     /// Feed `data` to the hasher. Digests are streaming, so one array of N
     /// bytes and N arrays of one byte produce the same digest.
     fn hasher_update(handle: i64, data: Bytes) -> Result<(), String> {
-        let mut t = table().lock().map_err(|_| poisoned())?;
-        t.get_mut(&handle).ok_or_else(finalized)?.update(&data.0);
-        Ok(())
+        table()
+            .with_mut(handle, |digest| digest.update(&data.0))
+            .map_err(handle_error)
     }
 
     /// The digest of everything fed to the hasher so far, CONSUMING it: the
@@ -144,11 +139,7 @@ export! {
     /// not resumable after finalization, so keeping the handle alive would only
     /// offer a broken second call.)
     fn hasher_finalize(handle: i64) -> Result<Bytes, String> {
-        let digest = table()
-            .lock()
-            .map_err(|_| poisoned())?
-            .remove(&handle)
-            .ok_or_else(finalized)?;
+        let digest = table().remove(handle).map_err(handle_error)?;
         Ok(Bytes(digest.finalize().to_vec()))
     }
 }
@@ -156,18 +147,19 @@ export! {
 /// Live streaming hashers by handle. Each hasher is owned by exactly one
 /// Brass `Hasher` value, so the map lock is only ever held for one update --
 /// there is no per-hasher lock as the TLS session table needs.
-#[allow(clippy::type_complexity)]
-fn table() -> &'static Mutex<HashMap<i64, Box<dyn DynDigest + Send>>> {
-    static TABLE: OnceLock<Mutex<HashMap<i64, Box<dyn DynDigest + Send>>>> = OnceLock::new();
-    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+type HasherTable = HandleTable<Box<dyn DynDigest + Send>>;
+
+fn table() -> &'static HasherTable {
+    static TABLE: OnceLock<HasherTable> = OnceLock::new();
+    TABLE.get_or_init(HandleTable::new)
 }
 
-fn finalized() -> String {
-    "this hasher was already finalized".to_string()
-}
-
-fn poisoned() -> String {
-    "the hasher table is poisoned".to_string()
+fn handle_error(error: HandleError) -> String {
+    match error {
+        HandleError::Poisoned => "the hasher table is poisoned".to_string(),
+        HandleError::Exhausted => "the hasher table cannot allocate another handle".to_string(),
+        HandleError::Missing(_) => "this hasher was already finalized".to_string(),
+    }
 }
 
 struct HashLib;

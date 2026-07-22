@@ -46,16 +46,18 @@ fn three_shapes_collapse_to_one_display_instance() {
     // needed here) and monomorphize from the zero-parameter roots.
     let mir = brass_mir::lower_program_with_types(
         &program,
-        &fxhash::FxHashMap::default(),
-        &analysis.view_args,
-        &analysis.sum_views,
-        &fxhash::FxHashMap::default(),
-        &fxhash::FxHashSet::default(),
-        &analysis.fields_loops,
-        &analysis.type_names,
-        &analysis.typeof_types,
-        &analysis.null_props,
-        &analysis.type_tests,
+        &brass_mir::CheckerChannels {
+            expr_types: &fxhash::FxHashMap::default(),
+            view_args: &analysis.view_args,
+            sum_views: &analysis.sum_views,
+            call_locations: &fxhash::FxHashMap::default(),
+            lift_errs: &fxhash::FxHashSet::default(),
+            fields_loops: &analysis.fields_loops,
+            type_names: &analysis.type_names,
+            typeof_types: &analysis.typeof_types,
+            null_props: &analysis.null_props,
+            type_tests: &analysis.type_tests,
+        },
     );
     let mono = monomorphize(&mir, &program).expect("monomorphize");
     let display_instances: Vec<&str> = mono
