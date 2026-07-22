@@ -10,7 +10,9 @@
     with just-in-time compilation
   </p>
   <p>
-    <a href="https://brass-cz.org">Documentation &amp; Playground</a> |
+    <a href="https://brass-cz.org">Documentation</a> |
+    <a href="https://brass-cz.org/playground/">Playground</a> |
+    <a href="https://github.com/brass-cz/codespace">Codespaces</a> |
     <a href="https://brass.zulipchat.com/#narrow/channel/618307-announcement">Zulip community</a>
   </p>
 </div>
