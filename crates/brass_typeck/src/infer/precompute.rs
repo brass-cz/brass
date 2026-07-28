@@ -548,8 +548,11 @@ or drop the `!`"
             return (self.complete_open_error(&declared, err_ty), false);
         }
         let has_props = !props.errors.is_empty() || !props.nulls.is_empty();
-        let normal_ty = self.reconcile_return_types(&normal, true);
-        let err_ty = self.reconcile_error_payloads(&props.errors, true);
+        // Type-test arms disagree per instance by design; see
+        // `infer_function_return`.
+        let report = !block_has_type_test(body);
+        let normal_ty = self.reconcile_return_types(&normal, report);
+        let err_ty = self.reconcile_error_payloads(&props.errors, report);
         let base = self.result_from_payloads(normal_ty, err_ty);
         (wrap_null_propagated_return(base, &props.nulls), has_props)
     }
@@ -708,8 +711,13 @@ or drop the `!`"
         let mut normal = Vec::new();
         let mut props = LightProps::default();
         self.infer_returns_block(body, &mut env, &mut normal, &mut props);
-        let normal_ty = self.reconcile_return_types(&normal, true);
-        let err_ty = self.reconcile_error_payloads(&props.errors, true);
+        // A body with a type test dispatches per instance: its arms may return
+        // (and fail with) different types, one per instantiation, so the OPEN
+        // definitional walk -- which cannot select an arm -- must not report
+        // their disagreement. Each instance reconciles its own live path.
+        let report = !block_has_type_test(body);
+        let normal_ty = self.reconcile_return_types(&normal, report);
+        let err_ty = self.reconcile_error_payloads(&props.errors, report);
         let base = self.result_from_payloads(normal_ty, err_ty);
         wrap_null_propagated_return(base, &props.nulls)
     }
@@ -1016,4 +1024,21 @@ pub(super) fn wrap_null_propagated_return(base: Type, nulls: &[Span]) -> Type {
         Type::Void | Type::Nullable(_) => base,
         other => Type::Nullable(Box::new(other)),
     }
+}
+
+/// Whether `b` contains a type-test `if` condition anywhere. Such a body
+/// dispatches per instance, so the open definitional walk reconciles its
+/// returns leniently (see `infer_function_return`).
+fn block_has_type_test(b: &Block) -> bool {
+    struct Finder(bool);
+    impl crate::walk::ExprVisitor for Finder {
+        fn visit(&mut self, e: &Expr) {
+            if matches!(e, Expr::TypeTest(..)) {
+                self.0 = true;
+            }
+        }
+    }
+    let mut finder = Finder(false);
+    crate::walk::walk_block(b, &mut finder);
+    finder.0
 }

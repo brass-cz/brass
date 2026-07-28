@@ -925,22 +925,26 @@ impl<'a> Checker<'a> {
         if brass_hir::is_fully_known(&subject_ty) {
             self.record_type_test(test_span, &pattern);
             let matched = brass_typesys::type_test_accepts(self.program, &pattern, &subject_ty);
-            // The dead arm is walked with its errors discarded but its
-            // `return`s still collected, exactly like a presence-dispatch
-            // `if`: the back end's fallible ABI is per FUNCTION (an
-            // `error(...)` in any arm makes every instance return a
-            // `Result`), so the instance's reconciled return must see the
-            // pruned arm's returns or the checked type and the compiled ABI
-            // would disagree.
+            // The dead arm is walked (so nested instances still reach
+            // monomorphization) but contributes NOTHING to this instance:
+            // its errors are discarded and its `return`s are isolated. The
+            // back end mirrors this exactly -- a type-test-dead block joins
+            // no return and supplies no error site (`type_test_live_blocks`)
+            // -- so an `error(...)` on an unselected path does not make this
+            // instance's ABI a `Result`.
             let mut then_scopes = scopes.clone();
             let chosen = if matched {
                 let then_ty = self.check_branch(then, &mut then_scopes, false);
                 if let Some(e) = els {
+                    self.return_values.push(Vec::new());
                     self.check_branch_expr(e, scopes, true);
+                    self.return_values.pop();
                 }
                 then_ty
             } else {
+                self.return_values.push(Vec::new());
                 self.check_branch(then, &mut then_scopes, true);
+                self.return_values.pop();
                 match els {
                     Some(e) => self.check_branch_expr(e, scopes, false),
                     None => Type::Void,
@@ -950,7 +954,11 @@ impl<'a> Checker<'a> {
             // the rest of the enclosing block is unreachable for this
             // instance. The syntactic always-returns probe cannot see through
             // a statically-decided nested chain; the selected arm's type can.
+            // Statements a TYPE-TEST divergence kills also stop contributing
+            // returns (`check_block` isolates them): the fall-through after a
+            // selected always-returning arm is not this instance's code.
             self.static_divergence = matches!(self.resolve(&chosen), Type::Never);
+            self.static_divergence_prunes_returns = self.static_divergence;
             chosen
         } else {
             let snap = self.solver.snapshot();
@@ -1315,7 +1323,7 @@ impl<'a> Checker<'a> {
 /// with the `infer` wildcard. A hole nothing pinned means "matches anything",
 /// and a leftover solver id would differ between instantiations (and between
 /// the checker and MIR), so the recorded pattern must carry none.
-fn wildcard_open_vars(ty: &Type) -> Type {
+pub(super) fn wildcard_open_vars(ty: &Type) -> Type {
     use brass_hir::{NominalType, Substitution};
     match ty {
         Type::Unknown(_) => Type::Unknown(brass_hir::INFER_VAR),

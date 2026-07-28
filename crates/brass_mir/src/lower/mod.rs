@@ -963,13 +963,17 @@ fn lower_function_into(ctx: &ProgramCtx, out: &mut MirProgram, info: &brass_hir:
     // propagating (there is no caller to receive a Result), so `!` alone
     // does not make `main` fallible -- only an explicit `error(...)` does.
     let entry_main = info.symbol == "main";
-    let body = lower_one(
+    let mut body = lower_one(
         ctx,
         info.module.clone(),
         None,
         &info.decl.params,
         &info.decl.body,
         entry_main,
+    );
+    body.declared_fallible = matches!(
+        info.decl.ret,
+        Some(brass_parser::ast::TypeExpr::Fallible(..))
     );
     let fallible = if entry_main && info.decl.ret.is_none() {
         crate::analysis::constructs_error_block(&info.decl.body)
@@ -1095,7 +1099,7 @@ fn lower_method(
     body: &Block,
     self_type: Option<String>,
 ) -> MirMethod {
-    let mir_body = lower_one(
+    let mut mir_body = lower_one(
         ctx,
         info.module.clone(),
         self_type.clone(),
@@ -1103,6 +1107,7 @@ fn lower_method(
         body,
         false,
     );
+    mir_body.declared_fallible = matches!(ret, Some(brass_parser::ast::TypeExpr::Fallible(..)));
     MirMethod {
         type_name: info.name.clone(),
         type_symbol: info.symbol.clone(),

@@ -921,22 +921,6 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 type_args.len()
             ));
         }
-        // The provisional return type mutual recursion may type against: the
-        // authoritative annotation when there is one. A fallible callable's
-        // annotation (`T!`) leaves the error payload open, so it is guessed as
-        // the payload `error(...)`/a lifted `!` produces (the prelude `Error`
-        // wrapping a string); the guess is validated against the final
-        // inferred type when this frame completes.
-        let provisional = ret_ann.clone().or_else(|| {
-            if fallible {
-                let err = self.guessed_error_payload();
-                declared_ok.clone().map(|ok| result_type(ok, err))
-            } else {
-                None
-            }
-        });
-        self.in_progress.insert(sym.clone(), provisional);
-
         let mut local_types: Vec<Option<Type>> = vec![None; body.locals.len()];
         for (i, p) in body.params.iter().enumerate() {
             local_types[p.index()] = Some(type_args[i].clone());
@@ -954,6 +938,34 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 local_types[i] = Some(resolve_nominal(self.program, t));
             }
         }
+        // The blocks this instance actually owns, once its type tests fold
+        // against the seeded parameter types. A type-test-dead block is never
+        // typed or compiled here and contributes NO evidence: its returns do
+        // not join the instance's return type and its error sites do not make
+        // the instance fallible -- that code belongs to other instantiations.
+        let live = fold::type_test_live_blocks(self.program, body, &local_types);
+        // Fallibility is per instance: a declared `T!` annotation is always a
+        // Result (its body may only forward), while a body-inferred fallible
+        // callable is one only when a live block still carries an error
+        // source.
+        let fallible =
+            fallible && (body.declared_fallible || fold::live_fallible_site(body, &live));
+        // The provisional return type mutual recursion may type against: the
+        // authoritative annotation when there is one. A fallible callable's
+        // annotation (`T!`) leaves the error payload open, so it is guessed as
+        // the payload `error(...)`/a lifted `!` produces (the prelude `Error`
+        // wrapping a string); the guess is validated against the final
+        // inferred type when this frame completes.
+        let provisional = ret_ann.clone().or_else(|| {
+            if fallible {
+                let err = self.guessed_error_payload();
+                declared_ok.clone().map(|ok| result_type(ok, err))
+            } else {
+                None
+            }
+        });
+        self.in_progress.insert(sym.clone(), provisional);
+
         let mut ret = ret_ann;
         // A supported return annotation is authoritative; without one the return
         // type is inferred by joining the return operands below.
@@ -997,6 +1009,9 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             let mut changed = false;
             block_errors.iter_mut().for_each(|e| *e = None);
             for (i, block) in body.blocks.iter().enumerate() {
+                if !live[i] {
+                    continue;
+                }
                 for stmt in &block.stmts {
                     if let Err(e) = self.type_stmt(
                         stmt,

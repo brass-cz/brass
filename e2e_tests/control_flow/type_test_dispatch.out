@@ -1,4 +1,5 @@
 str 5
 ints 3
 bytes 2
+sum 3
 bool err

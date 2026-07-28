@@ -1500,6 +1500,13 @@ struct Checker<'a> {
     /// ARM of such an `if` -- the back end folds the branch to a direct jump and
     /// never emits the fall-through either.
     static_divergence: bool,
+    /// Set alongside `static_divergence` by a TYPE-TEST `if`: the unreachable
+    /// fall-through additionally contributes no `return`s to the instance's
+    /// reconciled return type (the back end joins no return from a
+    /// type-test-dead block, so collecting them here would disagree with the
+    /// compiled ABI). A presence-dispatch fold leaves this false and keeps
+    /// its historical behavior.
+    static_divergence_prunes_returns: bool,
     /// Resolved patterns of checked type tests (`if v: T`), keyed by the test's
     /// span: the annotation with each `infer` hole either pinned by the tested
     /// arm's own requirements or left a wildcard. MIR lowering embeds the
@@ -1598,6 +1605,7 @@ impl<'a> Checker<'a> {
             null_props: HashSet::default(),
             in_entry_main: false,
             static_divergence: false,
+            static_divergence_prunes_returns: false,
             type_tests: HashMap::default(),
             type_test_poisoned: HashSet::default(),
             type_test_holes: HashSet::default(),
@@ -1771,17 +1779,31 @@ impl<'a> Checker<'a> {
         scopes.push(HashMap::default());
         self.const_scopes.push(HashSet::default());
         let mut unreachable = false;
+        // Whether the divergence came from a TYPE TEST: the unreachable
+        // statements then also contribute no `return`s (their values are
+        // collected into a discarded scratch frame), mirroring the back
+        // end's type-test-dead blocks. A presence fold keeps collecting.
+        let mut prune_returns = false;
         for s in &b.stmts {
             let mark = self.errors.len();
             self.static_divergence = false;
-            self.check_stmt(s, scopes);
+            self.static_divergence_prunes_returns = false;
+            if unreachable && prune_returns {
+                self.return_values.push(Vec::new());
+                self.check_stmt(s, scopes);
+                self.return_values.pop();
+            } else {
+                self.check_stmt(s, scopes);
+            }
             if unreachable {
                 self.errors.truncate(mark);
             } else {
                 unreachable = self.static_divergence;
+                prune_returns = self.static_divergence_prunes_returns;
             }
         }
         self.static_divergence = false;
+        self.static_divergence_prunes_returns = false;
         self.const_scopes.pop();
         scopes.pop();
     }

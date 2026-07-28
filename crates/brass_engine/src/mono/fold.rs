@@ -83,19 +83,96 @@ pub fn cond_static_truthiness(
             _ => Some(true),
         };
     }
-    // A type test (`if v: T`) always folds: the subject's monomorphized type
-    // either satisfies the checker-resolved pattern or it does not -- through
-    // the same `brass_typesys::type_test_accepts` (exact/wildcard core plus
-    // structural subtyping) the checker selected the arm with, so the pruned
-    // arm is exactly the unchecked one.
+    // A type test (`if v: T`) folds once its subject's type is real: the
+    // monomorphized type either satisfies the checker-resolved pattern or it
+    // does not -- through the same `brass_typesys::type_test_accepts`
+    // (exact/wildcard core plus structural subtyping) the checker selected
+    // the arm with, so the pruned arm is exactly the unchecked one. A
+    // subject that never resolved (the `Never` stand-in of an untyped local
+    // mid-inference) decides nothing.
     if let Some((subj, pattern)) = type_test_of(body, cond) {
-        return Some(brass_typesys::type_test_accepts(
-            program,
-            pattern,
-            &operand_type_of(subj, local_types),
-        ));
+        return match operand_type_of(subj, local_types) {
+            Type::Never | Type::Unknown(_) => None,
+            ty => Some(brass_typesys::type_test_accepts(program, pattern, &ty)),
+        };
     }
     operand_type_of(cond, local_types).static_truthiness()
+}
+
+/// The blocks an instance reaches once its TYPE TESTS are folded against the
+/// seeded (parameter/annotation) types -- before the type fixpoint has run.
+/// Only a test whose subject is already fully known decides; every other
+/// condition conservatively keeps both successors. Monomorphization uses this
+/// to skip typing (and to deny return/fallibility evidence to) the arms other
+/// instantiations own: a statement on a type-test-dead path is never compiled
+/// for this instance, so nothing about it -- its returns, its `error(...)`
+/// sites -- may shape the instance's ABI.
+pub fn type_test_live_blocks(
+    program: &Program,
+    body: &MirBody,
+    seeded: &[Option<Type>],
+) -> Vec<bool> {
+    let mut reached = vec![false; body.blocks.len()];
+    let mut stack = vec![body.entry];
+    while let Some(id) = stack.pop() {
+        if std::mem::replace(&mut reached[id.index()], true) {
+            continue;
+        }
+        match &body.block(id).term {
+            Terminator::Goto(b) => stack.push(*b),
+            Terminator::CondBranch { cond, then, els } => {
+                let decided = type_test_of(body, cond).and_then(|(subj, pattern)| {
+                    let ty = match subj {
+                        Operand::Local(l) => seeded.get(l.index())?.clone()?,
+                        Operand::Const(_) => return None,
+                    };
+                    brass_hir::is_fully_known(&ty)
+                        .then(|| brass_typesys::type_test_accepts(program, pattern, &ty))
+                });
+                match decided {
+                    Some(true) => stack.push(*then),
+                    Some(false) => stack.push(*els),
+                    None => {
+                        stack.push(*then);
+                        stack.push(*els);
+                    }
+                }
+            }
+            Terminator::Return(_) | Terminator::Unreachable => {}
+        }
+    }
+    reached
+}
+
+/// Whether any live block carries a fallibility site, mirroring the AST rule
+/// the lowering's `function_fallible` applied to the whole body: a call to
+/// the reserved `error(...)` (which lowers as a call to the prelude `error`
+/// function, not an inline construction), an explicit `Result.Err`
+/// construction (the `!` lift rebuild included), or a `!`-propagation error
+/// return. The per-instance fallible ABI keys on this -- an error source on
+/// a type-test-dead path belongs to other instantiations.
+pub(super) fn live_fallible_site(body: &MirBody, live: &[bool]) -> bool {
+    for (i, block) in body.blocks.iter().enumerate() {
+        if !live[i] {
+            continue;
+        }
+        for stmt in &block.stmts {
+            let rv = match stmt {
+                MirStmt::Assign(_, rv) | MirStmt::Eval(rv) => rv,
+                _ => continue,
+            };
+            match rv {
+                Rvalue::Call(Callee::Free(sym), _) if sym == "error" => return true,
+                Rvalue::Variant { ty, variant, .. } if ty == "Result" && variant == "Err" => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+    super::scan::propagated_result_returns(body)
+        .iter()
+        .any(|(idx, _)| live[*idx])
 }
 
 /// If `cond` is the result of an `Rvalue::TypeTest` assignment (a type-test

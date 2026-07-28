@@ -633,6 +633,7 @@ mod tests {
             }],
             entry: BlockId(0),
             params: vec![LocalId(0), LocalId(1)],
+            declared_fallible: false,
         }
     }
 
@@ -706,6 +707,7 @@ mod tests {
             }],
             entry: BlockId(0),
             params: vec![],
+            declared_fallible: false,
         };
         let locals = infer_body(&body, &[], &[], None, false, &mut NullResolver).expect("ok");
         assert_eq!(locals[0], Type::Int(IntKind::I32));

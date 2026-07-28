@@ -67,6 +67,90 @@ impl<'a> Checker<'a> {
                 Stmt::Return(None, span) => normal.push((Type::Void, *span)),
                 Stmt::Break(_) | Stmt::Continue(_) => {}
             }
+            // A decided type-test chain whose selected arm always returns
+            // kills the fall-through for this instance; the remaining
+            // statements' returns belong to nothing this instance compiles.
+            if self.light_chain_diverges(stmt, env, props) {
+                break;
+            }
+        }
+    }
+
+    /// Decide a type-test `if` condition against the light environment:
+    /// `Some(matched)` when `cond` is a type test whose subject's type is
+    /// already fully known (a per-instance pass), `None` otherwise -- either
+    /// not a type test at all, or the definitional pass, where nothing is
+    /// selected and both arms stay walked. The pattern is the channel entry
+    /// the full check just recorded (holes pinned by the tested arm); a
+    /// missing entry falls back to the syntactic annotation with every hole a
+    /// wildcard.
+    fn light_type_test_decision(
+        &mut self,
+        cond: &Expr,
+        env: &HashMap<String, Type>,
+        props: &mut LightProps,
+    ) -> Option<bool> {
+        let Expr::TypeTest(subject, te, tspan) = cond else {
+            return None;
+        };
+        let subject_ty = self.infer_expr_light(subject, env, props);
+        let subject_ty = self.resolve(&subject_ty);
+        if !brass_hir::is_fully_known(&subject_ty) {
+            return None;
+        }
+        let pattern = match self.type_tests.get(tspan) {
+            Some(p) => p.clone(),
+            None => {
+                let resolved = self.resolve_type(te).ok()?;
+                let resolved = self.resolve(&resolved);
+                super::expr::wildcard_open_vars(&resolved)
+            }
+        };
+        Some(brass_typesys::type_test_accepts(
+            self.program,
+            &pattern,
+            &subject_ty,
+        ))
+    }
+
+    /// Whether `stmt` holds a type-test `if` chain whose selected arm always
+    /// returns for this instance: the light walk then stops collecting the
+    /// enclosing block's remaining statements, which the back end never
+    /// compiles for this instance (`check_block` isolates them the same way).
+    fn light_chain_diverges(
+        &mut self,
+        stmt: &Stmt,
+        env: &HashMap<String, Type>,
+        props: &mut LightProps,
+    ) -> bool {
+        let expr = match stmt {
+            Stmt::Expr(e) => e,
+            Stmt::Let {
+                value: Some(value), ..
+            } => value,
+            _ => return false,
+        };
+        self.light_if_chain_diverges(expr, env, props)
+    }
+
+    fn light_if_chain_diverges(
+        &mut self,
+        expr: &Expr,
+        env: &HashMap<String, Type>,
+        props: &mut LightProps,
+    ) -> bool {
+        let Expr::If(cond, then, els, _) = expr else {
+            return false;
+        };
+        match self.light_type_test_decision(cond, env, props) {
+            Some(true) => block_always_returns(then),
+            Some(false) => match els.as_deref() {
+                None => false,
+                Some(Expr::Block(b, _)) => block_always_returns(b),
+                Some(nested @ Expr::If(..)) => self.light_if_chain_diverges(nested, env, props),
+                Some(_) => false,
+            },
+            None => false,
         }
     }
 
@@ -79,6 +163,16 @@ impl<'a> Checker<'a> {
     ) {
         match expr {
             Expr::If(cond, then, els, _) => {
+                // A decided type test walks the selected arm only: the other
+                // arm's returns and error sites belong to other instances.
+                if let Some(matched) = self.light_type_test_decision(cond, env, props) {
+                    if matched {
+                        self.infer_returns_block(then, &mut env.clone(), normal, props);
+                    } else if let Some(els) = els {
+                        self.infer_returns_expr(els, &mut env.clone(), normal, props);
+                    }
+                    return;
+                }
                 self.infer_expr_light(cond, env, props);
                 self.infer_returns_block(then, &mut env.clone(), normal, props);
                 if let Some(els) = els {
@@ -260,7 +354,18 @@ impl<'a> Checker<'a> {
             Expr::VariantLit(name, variant, fields, _) => {
                 self.infer_variant_lit_light(name, variant, fields, env, props)
             }
-            Expr::If(_, then, els, _) => {
+            Expr::If(cond, then, els, _) => {
+                // A decided type test types as the selected arm alone; the
+                // unselected arm is other instances' code (no join, no props).
+                if let Some(matched) = self.light_type_test_decision(cond, env, props) {
+                    return if matched {
+                        self.infer_block_value_light(then, &mut env.clone(), props)
+                    } else {
+                        els.as_ref()
+                            .map(|e| self.infer_expr_light(e, env, props))
+                            .unwrap_or(Type::Void)
+                    };
+                }
                 let then_ty = self.infer_block_value_light(then, &mut env.clone(), props);
                 let else_ty = els
                     .as_ref()

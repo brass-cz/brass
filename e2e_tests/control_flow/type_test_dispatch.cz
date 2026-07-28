@@ -12,20 +12,12 @@ fun length(val) {
 }
 
 fun main() {
-    match length("hello") {
-        Ok { value } => println("str {value}")
-        Err { error } => println("str err")
-    }
-    match length([1, 2, 3]) {
-        Ok { value } => println("ints {value}")
-        Err { error } => println("ints err")
-    }
-    match length(to_bytes("ab")) {
-        Ok { value } => println("bytes {value}")
-        Err { error } => println("bytes err")
-    }
+    println("str {length("hello")}")
+    println("ints {length([1, 2, 3])}")
+    println("bytes {length(to_bytes("ab"))}")
+    println("sum {length("xy") + 1}")
     match length(true) {
-        Ok { value } => println("bool {value}")
+        Ok { value } => println("bool ok")
         Err { error } => println("bool err")
     }
 }

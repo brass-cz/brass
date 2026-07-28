@@ -151,6 +151,7 @@ impl BodyBuilder {
             blocks,
             entry,
             params,
+            declared_fallible: false,
         }
     }
 }

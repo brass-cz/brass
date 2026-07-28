@@ -74,6 +74,11 @@ pub struct MirBody {
     /// The locals bound to the callable's parameters, in declaration order.
     /// Codegen loads incoming arguments into these.
     pub params: Vec<LocalId>,
+    /// Whether the source return annotation was `T!`: the fallible ABI is
+    /// then declared, not inferred from the body's error sites, so the
+    /// per-instance fallibility fold must never narrow it away (a `-> infer!`
+    /// body may only FORWARD another callable's Result).
+    pub declared_fallible: bool,
 }
 
 impl MirBody {

@@ -1,0 +1,11 @@
+fun f(v) {
+    if v: string {
+        return 1
+    }
+    return 2.5
+}
+
+fun main() {
+    println(f("x"))
+    println(f(true))
+}
