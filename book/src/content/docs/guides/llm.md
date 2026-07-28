@@ -183,6 +183,9 @@ satisfaction, declared sum parents); it never converts (`int32` fails an
 `int64` test, `T` fails a `T?` test). `infer` in the tested type is a hole:
 pinned by what the arm itself requires, otherwise matching anything
 (`infer[]` = any array). Inside the arm the value keeps its own type.
+Unselected paths contribute nothing to an instance: each instance's return
+type comes from its live path alone, and an `error(...)` on a pruned path
+does not make that instance return a Result.
 
 ```brass norun
 fun length(val) {

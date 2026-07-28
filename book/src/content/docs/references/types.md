@@ -288,15 +288,21 @@ goes through the ordinary flow rules, views and rebuilds included.)
 - A hole nothing constrains matches any type: `infer` alone matches
   everything, `infer[]` matches any array.
 
-Two consequences of the per-instance decision:
+Consequences of the per-instance decision:
 
 - Inside a generic (unannotated) function, nothing is decided at the
   definition; each call site's instantiation selects and checks its own arm.
   An arm no instantiation selects is never fully checked, like any other
   statically dead code.
-- Fallibility stays a property of the whole function: an `error(...)` in any
-  arm -- selected or not -- makes every instance of the function return a
-  `Result`.
+- A path this instance never passes contributes NOTHING: neither the
+  unselected arms nor the statements a selected always-returning arm makes
+  unreachable. Their `return`s do not join the instance's return type -- one
+  arm may return `int32` and another `string`, each instance keeping its own
+  -- and an `error(...)` on such a path does not make the instance fallible.
+- Fallibility is therefore per instance too: only an instance whose live path
+  reaches an `error(...)`/`!` returns a `Result`. An instance whose live path
+  ONLY errors behaves like any function that only returns errors: its Ok
+  payload is uninhabited, and reading it concretely is rejected.
 
 ```
 fun length(val) {
@@ -313,9 +319,10 @@ fun length(val) {
 }
 ```
 
-`length("hi")` compiles the first arm only, `length(to_bytes("hi"))` the
-second, `length([1, 2, 3])` the third, and `length(true)` the `else` -- each
-instance prunes the rest.
+`length("hi")` compiles the first arm only and returns a bare `int64`;
+`length(to_bytes("hi"))` the second, `length([1, 2, 3])` the third -- both
+also bare. Only `length(true)` selects the `else` and returns a `Result`
+(always its `Err`).
 
 ## Interfaces
 

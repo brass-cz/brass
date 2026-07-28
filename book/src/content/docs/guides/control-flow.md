@@ -57,16 +57,12 @@ fun length(val) {
     return bytes.len()
 }
 
-match length("hello") {
-    Ok { value } => println("string: {value} bytes"),
-    Err { error } => println(error.display()),
-}
-match length([1, 2, 3]) {
-    Ok { value } => println("array: {value} elements"),
-    Err { error } => println(error.display()),
-}
+// Instances whose live path never reaches `error(...)` return a plain value...
+println(length("hello") + length([1, 2, 3]))   // 8
+
+// ...and only the instance that actually selects the `else` arm is fallible.
 match length(true) {
-    Ok { value } => println("{value}"),
+    Ok { value } => println("unreachable"),
     Err { error } => println("bool: unsupported"),
 }
 ```
@@ -75,6 +71,11 @@ A bare `infer` in the tested type is a hole filled by what the arm itself
 requires: `to_bytes` accepts a `string`, so the first arm selects exactly the
 string case. A hole nothing constrains matches any type -- `infer[]` reads as
 "any array".
+
+Unselected arms contribute nothing to an instance: the `error(...)` above
+makes only the `length(true)` instance return a `Result`, and each instance's
+return type comes from its own live path alone -- one arm may return an
+`int32` and another a `string`, each serving its own callers.
 
 The test also accepts [structural subtyping](/guides/types/#structural-subtyping):
 a record matches any tested type whose fields and methods it satisfies, so a
