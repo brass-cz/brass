@@ -1032,7 +1032,13 @@ impl<'a, 'p> FnLower<'a, 'p> {
                 let loc = self.location_operand(span);
                 ops.push(loc);
             }
-            return Rvalue::Call(Callee::Method(method.clone()), ops);
+            let method = self
+                .ctx
+                .keyed_dispatch
+                .get(&span)
+                .cloned()
+                .unwrap_or_else(|| method.clone());
+            return Rvalue::Call(Callee::Method(method), ops);
         }
         if let Expr::Ident(name, _) = callee {
             // A local holding a closure/function value is called indirectly.

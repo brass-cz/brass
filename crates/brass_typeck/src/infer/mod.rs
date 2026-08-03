@@ -699,6 +699,116 @@ pub fn analyze_with(program: &Program, seed: Option<&ContextTables>) -> Inferenc
     analyze_inner(program, seed, None).0
 }
 
+/// Check only append-only methods synthesized from keyed templates, reusing
+/// the completed first pass's cross-module tables. Generated methods may call
+/// one another, so all declarations must already be present in `program`.
+pub fn analyze_generated(
+    program: &Program,
+    seed: &ContextTables,
+    generated: &[brass_hir::GeneratedDecl],
+) -> Inference {
+    let rows = Rc::new(brass_typesys::RowInfo::analyze(program));
+    let mut checker = Checker::new(program, rows);
+    let (tables, next) = seed.remapped(next_unknown_after_program(program));
+    checker.apply_seed(tables, next);
+    checker.co_checking = true;
+
+    for generated in generated {
+        let Some(info) = program
+            .types
+            .values()
+            .find(|info| info.name == generated.receiver && info.module == generated.module)
+        else {
+            continue;
+        };
+        checker.current_module = info.module.clone();
+        match &info.kind {
+            TypeKind::Record { methods, .. } => {
+                let Some(method) = methods.get(&generated.decl.name) else {
+                    continue;
+                };
+                let Some(body) = method.decl.body.as_ref() else {
+                    continue;
+                };
+                let mut scopes = checker.signature_scopes(&method.signature.params);
+                checker.current_co_method =
+                    Some((info.name.clone(), method.signature.name.clone()));
+                checker.check_block_with_self(
+                    body,
+                    &mut scopes,
+                    method.signature.ret_ty.as_ref(),
+                    &info.name,
+                );
+                checker.current_co_method = None;
+                checker.errors.extend(crate::exhaustive::check_block(
+                    program,
+                    &checker.typed,
+                    body,
+                ));
+            }
+            TypeKind::Sum { variants } => {
+                for variant in variants {
+                    let Some(method) = variant.methods.get(&generated.decl.name) else {
+                        continue;
+                    };
+                    let Some(body) = method.decl.body.as_ref() else {
+                        continue;
+                    };
+                    let mut scopes = checker.signature_scopes(&method.signature.params);
+                    checker.check_block_with_self_variant(
+                        body,
+                        &mut scopes,
+                        method.signature.ret_ty.as_ref(),
+                        &info.name,
+                        &variant.name,
+                    );
+                    checker.errors.extend(crate::exhaustive::check_block(
+                        program,
+                        &checker.typed,
+                        body,
+                    ));
+                }
+            }
+        }
+    }
+    checker.co_checking = false;
+    checker.report_uninferable_error_types();
+    checker.finalize_typed();
+
+    let function_returns = checker
+        .function_returns
+        .iter()
+        .map(|(key, ty)| (key.clone(), checker.resolve(ty)))
+        .collect();
+    let method_returns = checker
+        .method_returns
+        .iter()
+        .map(|(key, ty)| (key.clone(), checker.resolve(ty)))
+        .collect();
+    let sum_views = checker
+        .sum_views
+        .iter()
+        .map(|(span, ty)| (*span, checker.resolve(ty)))
+        .collect();
+    Inference {
+        errors: checker.errors,
+        typed: checker.typed,
+        schemes: checker.schemes,
+        view_args: checker.view_args,
+        lift_errs: checker.lift_errs,
+        sum_views,
+        fields_loops: checker.fields_loops,
+        type_names: checker.type_names,
+        keyed_calls: checker.keyed_calls,
+        typeof_types: checker.typeof_types,
+        type_tests: checker.type_tests,
+        null_props: checker.null_props,
+        function_returns,
+        method_returns,
+        context_tables: seed.clone(),
+    }
+}
+
 /// [`analyze_with`] with optional streaming control (the lazy-check
 /// pipeline): with a [`StreamCtl`], bodies are checked in an execution-first
 /// order -- module initializers, then `main`, then the remaining functions,
@@ -1370,6 +1480,13 @@ fn flush_delta(
                 .instance_returns
                 .push((key.0.clone(), key.1.clone(), ret.clone()));
             state.instance_returns.insert(key.clone(), ret.clone());
+        }
+    }
+    for (span, (receiver, method, key)) in &checker.keyed_calls {
+        if state.keyed_calls.insert(*span) {
+            delta
+                .keyed_calls
+                .push((*span, receiver.clone(), method.clone(), key.clone()));
         }
     }
     // The errors reported in this window (raw report order; the final

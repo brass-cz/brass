@@ -6,7 +6,7 @@ use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::rc::Rc;
 
 use brass_parser::Span;
-use brass_parser::ast::{Member, TopLevel, TypeBody, TypeDecl};
+use brass_parser::ast::{Member, Method, TopLevel, TypeBody, TypeDecl};
 
 use crate::hir::*;
 use crate::types::{NominalInfo, Type};
@@ -243,6 +243,110 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
     resolve_program_annotations(&mut program, &alias_decls, &mut errors);
 
     (program, errors)
+}
+
+/// Append concrete reflective-method specializations to an already lowered
+/// program. Existing declarations and module metadata are left untouched; the
+/// generated signature inherits the template's resolved parameters and fixes
+/// only its keyed result.
+pub fn lower_generated_into(
+    program: &mut Program,
+    generated: &[GeneratedDecl],
+) -> Result<Vec<String>, Vec<LowerError>> {
+    let mut symbols = Vec::with_capacity(generated.len());
+    let mut errors = Vec::new();
+    for generated in generated {
+        let Some(type_symbol) = program
+            .types
+            .iter()
+            .find(|(_, info)| info.name == generated.receiver && info.module == generated.module)
+            .map(|(symbol, _)| symbol.clone())
+        else {
+            errors.push(LowerError {
+                message: format!(
+                    "unknown receiver type `{}` for generated method `{}`",
+                    generated.receiver, generated.decl.name
+                ),
+                span: generated.decl.span,
+            });
+            continue;
+        };
+        let method_decl = Method {
+            name: generated.decl.name.clone(),
+            params: generated.decl.params.clone(),
+            ret: generated.decl.ret.clone(),
+            body: Some(generated.decl.body.clone()),
+            span: generated.decl.span,
+            doc: generated.decl.doc.clone(),
+        };
+        let next_error = Type::Unknown(program.next_infer_var);
+        program.next_infer_var += 1;
+        let keyed_ret = Type::result(generated.key.clone(), next_error);
+        let info = program
+            .types
+            .get_mut(&type_symbol)
+            .expect("generated receiver was resolved above");
+        let make_method = |template: &MethodInfo| {
+            let mut signature = CallableSignature::from_method(&method_decl);
+            for (param, source) in signature.params.iter_mut().zip(&template.signature.params) {
+                param.resolved_ty = source.resolved_ty.clone();
+            }
+            signature.ret_ty = Some(keyed_ret.clone());
+            MethodInfo {
+                signature,
+                decl: Rc::new(method_decl.clone()),
+            }
+        };
+        let inserted = match &mut info.kind {
+            TypeKind::Record { methods, .. } => {
+                if methods.contains_key(&generated.decl.name) {
+                    false
+                } else if let Some(template) = methods.get(&generated.template).cloned() {
+                    methods.insert(generated.decl.name.clone(), make_method(&template));
+                    true
+                } else {
+                    false
+                }
+            }
+            TypeKind::Sum { variants } => {
+                let templates: Vec<Option<MethodInfo>> = variants
+                    .iter()
+                    .map(|variant| variant.methods.get(&generated.template).cloned())
+                    .collect();
+                if templates.iter().any(Option::is_none)
+                    || variants
+                        .iter()
+                        .any(|variant| variant.methods.contains_key(&generated.decl.name))
+                {
+                    false
+                } else {
+                    for (variant, template) in variants.iter_mut().zip(templates) {
+                        variant.methods.insert(
+                            generated.decl.name.clone(),
+                            make_method(&template.expect("checked above")),
+                        );
+                    }
+                    true
+                }
+            }
+        };
+        if inserted {
+            symbols.push(format!("{}.{}", generated.receiver, generated.decl.name));
+        } else {
+            errors.push(LowerError {
+                message: format!(
+                    "cannot append generated method `{}.{}` from template `{}`",
+                    generated.receiver, generated.decl.name, generated.template
+                ),
+                span: generated.decl.span,
+            });
+        }
+    }
+    if errors.is_empty() {
+        Ok(symbols)
+    } else {
+        Err(errors)
+    }
 }
 
 /// Attach each `fun T.m(...)` method implementation to its receiver type.

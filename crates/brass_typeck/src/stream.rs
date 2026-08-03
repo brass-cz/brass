@@ -84,6 +84,8 @@ pub struct ChannelDelta {
     /// lowering the body. Emitted only for a clean elaboration whose return
     /// resolved fully known; an annotated body already has a contract.
     pub instance_returns: Vec<(String, Vec<Type>, Type)>,
+    /// Reflective calls first observed in this window.
+    pub keyed_calls: Vec<(Span, String, String, Type)>,
 }
 
 impl ChannelDelta {
@@ -102,6 +104,7 @@ impl ChannelDelta {
             && self.type_tests.is_empty()
             && self.type_tests_removed.is_empty()
             && self.errors.is_empty()
+            && self.keyed_calls.is_empty()
     }
 }
 
@@ -125,17 +128,17 @@ pub enum CheckEvent {
     /// re-resolved against the final substitution) and the full, sorted,
     /// deduplicated error set -- the same set `Analysis::errors` carries.
     Finished(ChannelDelta, Vec<TypeError>),
+    /// Append-only specialization completed without restarting analysis.
+    KeyedReady(
+        Vec<brass_hir::GeneratedDecl>,
+        Vec<(Span, String)>,
+        ChannelDelta,
+    ),
     /// The consumer's stop request was honored at a body boundary: the
     /// snapshot is everything this run settled, for the caller to persist
     /// as a partial cache and resume from next time. Emitted only on a
     /// stopped run, just before the stream closes.
     Interrupted(StreamSnapshot),
-    /// The whole analysis is starting over on a rewritten program (the
-    /// reflective `-> infer!` specialization re-pass injects methods and
-    /// renames call sites, which moves spans). Emitted by the pipeline
-    /// driver, not the checker; a consumer drops everything accumulated so
-    /// far. A fresh event sequence follows.
-    Restarted,
 }
 
 /// A priority request: check function `symbol` next. `type_args` are the
@@ -219,6 +222,7 @@ pub(crate) struct FlushState {
     pub(crate) typeof_types: HashMap<Span, Type>,
     pub(crate) type_tests: HashMap<Span, Type>,
     pub(crate) instance_returns: HashMap<(String, Vec<Type>), Type>,
+    pub(crate) keyed_calls: fxhash::FxHashSet<Span>,
 }
 
 /// Everything a stopped streaming run had settled, in serializable form:
@@ -352,6 +356,7 @@ impl FlushState {
             // Contracts are deliberately not snapshotted. A resumed run
             // re-elaborates a demanded instance before deferring it again.
             instance_returns: HashMap::default(),
+            keyed_calls: fxhash::FxHashSet::default(),
         }
     }
 }
@@ -688,9 +693,7 @@ mod tests {
                     m.apply(d);
                     m.final_errors = Some(errors.clone());
                 }
-                // Single-pass analyses (no keyed specialization) never restart,
-                // and nothing stops the recorder's runs.
-                CheckEvent::Restarted => unreachable!("restart in a single-pass analysis"),
+                CheckEvent::KeyedReady(_, _, d) => m.apply(d),
                 CheckEvent::Interrupted(_) => unreachable!("stop in an unstopped analysis"),
             }
         }

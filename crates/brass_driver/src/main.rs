@@ -573,6 +573,8 @@ struct Checked {
     /// Resolved type-test patterns (`if v: T`), keyed by the test's span; MIR
     /// lowering embeds each into the test's rvalue.
     type_tests: HashMap<Span, brass_hir::Type>,
+    /// Reflective call sites routed to append-only generated methods.
+    keyed_dispatch: HashMap<Span, String>,
 }
 
 impl Checked {
@@ -590,6 +592,7 @@ impl Checked {
             typeof_types: &self.typeof_types,
             null_props: &self.null_props,
             type_tests: &self.type_tests,
+            keyed_dispatch: &self.keyed_dispatch,
         }
     }
 }
@@ -952,14 +955,15 @@ fn retain_diagnostic_free_context(
     Some(tables)
 }
 
-/// A finished front-end analysis in thread-transportable form: the final
-/// module graph (post-resolution, post-rewrite, post-keyed-specialization)
-/// plus the checker's span-keyed channels. HIR holds `Rc`, so a checked
+/// A finished front-end analysis in thread-transportable form: the unchanged
+/// module graph, append-only generated declarations, and checker channels.
+/// HIR holds `Rc`, so a checked
 /// `Program` cannot cross the checker-thread boundary; the receiver rebuilds
 /// it from the modules with [`assemble_checked`]. A cache hit reproduces the
 /// same shape from disk (`brass_cache::Payload` stores exactly these parts).
 struct AnalyzedProgram {
     modules: Vec<LoadedModule>,
+    generated: Vec<brass_hir::GeneratedDecl>,
     channels: brass_cache::Channels,
 }
 
@@ -969,8 +973,14 @@ struct AnalyzedProgram {
 /// error here means a stale cache or a driver bug, and the caller decides
 /// whether to fall back or report.
 fn assemble_checked(analyzed: AnalyzedProgram) -> Result<Checked, Vec<String>> {
-    let (program, lower_errors) = lower(&analyzed.modules);
+    let (mut program, lower_errors) = lower(&analyzed.modules);
     if !lower_errors.is_empty() {
+        return Err(lower_errors
+            .into_iter()
+            .map(|e| format!("error: {}", e.message))
+            .collect());
+    }
+    if let Err(lower_errors) = brass_hir::lower_generated_into(&mut program, &analyzed.generated) {
         return Err(lower_errors
             .into_iter()
             .map(|e| format!("error: {}", e.message))
@@ -989,6 +999,7 @@ fn assemble_checked(analyzed: AnalyzedProgram) -> Result<Checked, Vec<String>> {
         typeof_types: c.typeof_types.into_iter().collect(),
         null_props: c.null_props.into_iter().collect(),
         type_tests: c.type_tests.into_iter().collect(),
+        keyed_dispatch: c.keyed_dispatch.into_iter().collect(),
     })
 }
 
@@ -1010,6 +1021,7 @@ fn load_cached(main_label: &str, root: &Path) -> Option<Checked> {
     reanchor_module_paths(&mut payload.modules, &entry_path, root, &search);
     match assemble_checked(AnalyzedProgram {
         modules: payload.modules,
+        generated: payload.generated,
         channels: payload.channels,
     }) {
         Ok(checked) => {
@@ -1097,8 +1109,8 @@ impl brass_typeck::stream::Scheduler for ThreadScheduler {
 /// The main-thread accumulation of the checker thread's event stream: the
 /// same span-keyed maps [`Checked`] carries, built by replaying channel
 /// deltas as they arrive (removals first -- a delta never removes and
-/// re-adds one span). A `Restarted` event (the keyed-specialization re-pass
-/// rewrote the program, moving spans) drops everything accumulated.
+/// re-adds one span). Generated continuation deltas overwrite by span like
+/// ordinary body deltas.
 #[cfg(jit_backend)]
 #[derive(Default)]
 struct MergedChannels {
@@ -1115,6 +1127,7 @@ struct MergedChannels {
     typeof_types: HashMap<Span, brass_hir::Type>,
     null_props: HashSet<Span>,
     type_tests: HashMap<Span, brass_hir::Type>,
+    keyed_dispatch: HashMap<Span, String>,
 }
 
 #[cfg(jit_backend)]
@@ -1129,7 +1142,10 @@ impl MergedChannels {
             CheckEvent::ContextReady(d)
             | CheckEvent::BodyChecked(_, d)
             | CheckEvent::Finished(d, _) => self.apply_delta(d),
-            CheckEvent::Restarted => *self = Self::default(),
+            CheckEvent::KeyedReady(_, dispatch, d) => {
+                self.apply_delta(d);
+                self.keyed_dispatch.extend(dispatch);
+            }
             // The stop-snapshot is bookkeeping for the partial cache, not
             // channel data (everything in it was already applied as deltas).
             CheckEvent::Interrupted(_) => {}
@@ -1176,6 +1192,7 @@ impl MergedChannels {
                 .iter()
                 .map(|(s, t)| (*s, t.clone()))
                 .collect(),
+            keyed_dispatch: HashMap::default(),
         }
     }
 
@@ -1272,17 +1289,16 @@ enum FatalVerdict {
     Clean,
     /// Fatal diagnostics were printed: abort with this code.
     Fatal(u8),
-    /// The confirmation wait saw a keyed-specialization restart: the
-    /// diagnostics were the first pass's provisional artifacts, not a
-    /// verdict -- fall back to the whole-analysis path.
-    Restarted,
+    /// A runtime-demanded body discovered a keyed call that requires the
+    /// narrow eager fallback.
+    NeedsEager,
 }
 
 /// Judge the held diagnostics at a gate. A fatal candidate is CONFIRMED
 /// before it aborts anything: a keyed (`-> infer!`) program's first pass
-/// records provisional errors that its specialization re-pass may clear, so
-/// the gate waits for the checker's verdict (its terminal event, a restart,
-/// or hang-up) once -- and only once something looked fatal; clean programs
+/// records provisional errors that its continuation may clear, so the gate
+/// waits for the checker thread's final verdict once -- and only once
+/// something looked fatal; clean programs
 /// never wait here. Confirmed diagnostics print sorted and deduplicated,
 /// rendered like the eager pipeline.
 #[cfg(jit_backend)]
@@ -1294,16 +1310,14 @@ fn judge_fatal(
     if lazy.fatal(bodies).is_empty() {
         return FatalVerdict::Clean;
     }
-    // Wait for the checker's hang-up (or a restart), NOT its terminal
-    // event: a keyed program's first pass emits `Finished` before the
-    // specialization re-pass announces itself with `Restarted`. The wait is
-    // on the checker's own progress, so its queue must be running.
+    // Wait for the checker thread to finish publishing continuation results.
+    // The wait is on its own progress, so its queue must be running.
     lazy.resume_background();
-    while !lazy.closed && !lazy.restarted {
+    while !lazy.closed && !lazy.needs_eager {
         lazy.pump_blocking();
     }
-    if lazy.restarted {
-        return FatalVerdict::Restarted;
+    if lazy.needs_eager {
+        return FatalVerdict::NeedsEager;
     }
     let fatal = lazy.fatal(bodies);
     if fatal.is_empty() {
@@ -1345,9 +1359,9 @@ struct LazyState {
     /// of its own (a fatal confirmation, a transient-failure retry), which
     /// would otherwise wait forever on a held queue.
     paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// The keyed-specialization re-pass restarted the analysis: spans moved,
-    /// so everything merged is unusable and the run falls back likewise.
-    restarted: bool,
+    /// A keyed call first discovered by a runtime-demanded body requires the
+    /// narrow eager fallback until specialization can run per demand.
+    needs_eager: bool,
     /// The event channel closed (the checker finished and hung up).
     closed: bool,
     /// The stop-snapshot a stopped checker handed back, for the partial
@@ -1358,6 +1372,12 @@ struct LazyState {
     /// (a cross-body pinning: an init's array literal fixed by a function's
     /// `push`), so the lowering is rebuilt before its output is trusted.
     dirty: bool,
+    /// The entry gate remains closed between first keyed discovery and the
+    /// append-only continuation event.
+    awaiting_keyed: bool,
+    /// Set once the initial entry gate has completed.
+    entry_open: bool,
+    generated: Vec<brass_hir::GeneratedDecl>,
 }
 
 #[cfg(jit_backend)]
@@ -1387,7 +1407,14 @@ impl LazyState {
                 self.absorb_delta(d);
                 self.held.extend(errors.iter().cloned());
             }
-            CheckEvent::Restarted => self.restarted = true,
+            CheckEvent::KeyedReady(generated, _, d) => {
+                self.absorb_delta(d);
+                // The continuation event carries the complete final verdict;
+                // replace provisional keyed-statement errors from pass one.
+                self.held = d.errors.clone();
+                self.generated.extend(generated.iter().cloned());
+                self.awaiting_keyed = false;
+            }
             CheckEvent::Interrupted(snapshot) => self.snapshot = Some(snapshot.clone()),
         }
         self.merged.apply(event);
@@ -1397,6 +1424,16 @@ impl LazyState {
     /// content marks the current lowering stale.
     fn absorb_delta(&mut self, d: &brass_typeck::stream::ChannelDelta) {
         self.held.extend(d.errors.iter().cloned());
+        if !d.keyed_calls.is_empty() {
+            if self.entry_open {
+                // Per-demand specialization is future work; before execution
+                // this flag reaches finish_eagerly, while an already-running
+                // program fails without replaying prior side effects.
+                self.needs_eager = true;
+            } else {
+                self.awaiting_keyed = true;
+            }
+        }
         self.dirty |= !d.expr_types.is_empty()
             || !d.expr_types_removed.is_empty()
             || !d.view_args.is_empty()
@@ -1460,22 +1497,29 @@ impl LazyState {
 
     /// Block until the entry is settled: every module initializer and (when
     /// the program has one) `main`. False means the checker hung up (or
-    /// restarted) before settling them; held diagnostics are the caller's
+    /// requested the eager fallback) before settling them; held diagnostics are the caller's
     /// judgement to make.
     fn wait_gate(&mut self, inits: usize, has_main: bool) -> bool {
-        let settled =
-            |s: &Self| s.inits_checked >= inits && (!has_main || s.checked_fns.contains("main"));
-        while !self.restarted && !self.closed && !settled(self) {
+        let settled = |s: &Self| {
+            s.inits_checked >= inits
+                && (!has_main || s.checked_fns.contains("main"))
+                && !s.awaiting_keyed
+        };
+        while !self.needs_eager && !self.closed && !settled(self) {
+            if self.awaiting_keyed {
+                self.resume_background();
+            }
             self.pump_blocking();
         }
-        !self.restarted && settled(self)
+        !self.needs_eager && settled(self)
     }
 
     /// Ask the checker to settle `symbol` next -- the demanded function's
     /// path and the concrete argument types of the call that needs it --
     /// and block until it is. The body joins the NEEDED set: its held
     /// diagnostics become fatal, so callers judge [`LazyState::fatal`]
-    /// after every demand. False means the checker hung up or restarted.
+    /// after every demand. False means the checker hung up or requested the
+    /// eager fallback.
     fn demand(&mut self, symbol: &str, type_args: Vec<brass_hir::Type>) -> bool {
         self.needed.insert(symbol.to_string());
         if !self.checked_fns.contains(symbol) {
@@ -1483,11 +1527,11 @@ impl LazyState {
                 symbol: symbol.to_string(),
                 type_args,
             });
-            while !self.restarted && !self.closed && !self.checked_fns.contains(symbol) {
+            while !self.needs_eager && !self.closed && !self.checked_fns.contains(symbol) {
                 self.pump_blocking();
             }
         }
-        !self.restarted && self.checked_fns.contains(symbol)
+        !self.needs_eager && self.checked_fns.contains(symbol)
     }
 
     /// The merged channel state as the lowering bundle. Call locations are
@@ -1507,6 +1551,7 @@ impl LazyState {
             typeof_types: &self.merged.typeof_types,
             null_props: &self.merged.null_props,
             type_tests: &self.merged.type_tests,
+            keyed_dispatch: &self.merged.keyed_dispatch,
         }
     }
 }
@@ -1604,29 +1649,26 @@ fn drain_targets_for_spawn(
 /// callable address, or 0 after reporting -- the site then traps, keeping a
 /// resolver failure defined.
 ///
-/// Exit the process if the needed path holds a CONFIRMED fatal diagnostic
+/// Exit the process if the needed path holds a confirmed fatal diagnostic
 /// (see [`judge_fatal`]; reached from JIT code, which cannot unwind, hence
-/// `exit`). A keyed-specialization restart discovered mid-run cannot fall
-/// back -- the program is already executing on the first pass's spans -- so
-/// it exits with a pointer to the eager path instead.
+/// `exit`). A keyed call discovered after execution began cannot safely rerun
+/// prior side effects, so the narrow demand fallback asks for `--eager`.
 #[cfg(jit_backend)]
 fn exit_if_fatal(lazy: &mut LazyState, bodies: &BodySpans, sources: &brass_resolve::SourceMap) {
     if lazy.fatal(bodies).is_empty() {
         return;
     }
-    // Wait for the checker's hang-up (or a restart), NOT its terminal
-    // event: a keyed program's first pass emits `Finished` before the
-    // specialization re-pass announces itself with `Restarted`. The wait is
-    // on the checker's own progress, so its queue must be running.
+    // Wait for the checker thread's final verdict. The wait is on its own
+    // progress, so its queue must be running.
     lazy.resume_background();
-    while !lazy.closed && !lazy.restarted {
+    while !lazy.closed && !lazy.needs_eager {
         lazy.pump_blocking();
     }
     use std::io::Write;
-    if lazy.restarted {
+    if lazy.needs_eager {
         let _ = io::stdout().flush();
         eprintln!(
-            "error: reflective specialization restarted the analysis mid-run; rerun with --eager"
+            "error: a runtime-demanded body requires reflective specialization; rerun with --eager"
         );
         std::process::exit(1);
     }
@@ -1825,7 +1867,7 @@ fn resolve_deferred(
                 if !lazy.closed {
                     lazy.pump_blocking();
                     lazy.pump_pending();
-                    if !lazy.restarted {
+                    if !lazy.needs_eager {
                         continue;
                     }
                 }
@@ -1891,17 +1933,9 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         Ok(front) => front,
         Err(diags) => return Err(print_diags(diags)),
     };
-    // Lower on this side first: the module graph decides the route. A keyed
-    // (`-> infer!`) call anywhere in it restarts the analysis over a
-    // specialization-rewritten program, which a lazy run only ever survives
-    // by falling back to the eager verdict -- after paying for its own gate
-    // first. Route such a program to the eager pipeline before any thread
-    // starts (which also persists the full cache, so its repeat runs hit
-    // the fastest path). Lowering errors report through the same eager path.
-    let (program, lower_errors) = lower(&front.modules);
-    if lower_errors.is_empty() && brass_typeck::has_keyed_calls(&program) {
-        return run_fresh_eager(&label, &src, &root);
-    }
+    // Lower on this side first. Keyed methods no longer select the eager
+    // pipeline merely by being present in the module closure.
+    let (mut program, lower_errors) = lower(&front.modules);
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
     let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
     // A prior stopped run's PARTIAL cache: the checker resumes from it
@@ -1947,8 +1981,6 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         return finish_eagerly(&rt, checker, &stop, &paused, events_rx, &label, &src, &root);
     }
     let call_locations = call_site_locations(&front.modules, &front.sources, &search);
-    let bodies = BodySpans::new(&program);
-
     let mut lazy = LazyState {
         events: events_rx,
         requests: requests_tx,
@@ -1959,10 +1991,13 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         needed: HashSet::from_iter(["main".to_string()]),
         stop,
         paused,
-        restarted: false,
+        needs_eager: false,
         closed: false,
         snapshot: None,
         dirty: false,
+        awaiting_keyed: false,
+        entry_open: false,
+        generated: Vec::new(),
     };
     if let Some(snap) = &resume {
         // The snapshot's channel state stands in for the deltas the prior
@@ -1975,7 +2010,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
     let resumed = resume.is_some();
     let resume_entry: Option<&Path> = resumed.then_some(entry_path.as_path());
     let settled = lazy.wait_gate(program.inits.len(), program.functions.contains_key("main"));
-    if lazy.restarted {
+    if lazy.needs_eager {
         return finish_eagerly(
             &rt,
             checker,
@@ -1987,10 +2022,26 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
             &root,
         );
     }
+    if !lazy.generated.is_empty()
+        && brass_hir::lower_generated_into(&mut program, &lazy.generated).is_err()
+    {
+        return finish_eagerly(
+            &rt,
+            checker,
+            &lazy.stop,
+            &lazy.paused,
+            lazy.events,
+            &label,
+            &src,
+            &root,
+        );
+    }
+    lazy.entry_open = true;
+    let bodies = BodySpans::new(&program);
     match judge_fatal(&mut lazy, &bodies, &front.sources) {
         FatalVerdict::Clean => {}
         FatalVerdict::Fatal(code) => return Err(code),
-        FatalVerdict::Restarted => {
+        FatalVerdict::NeedsEager => {
             return finish_eagerly(
                 &rt,
                 checker,
@@ -2083,7 +2134,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                             lazy.resume_background();
                             lazy.pump_blocking();
                             lazy.pump_pending();
-                            if lazy.restarted {
+                            if lazy.needs_eager {
                                 return finish_eagerly(
                                     &rt,
                                     checker,
@@ -2098,7 +2149,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                             match judge_fatal(&mut lazy, &bodies, &front.sources) {
                                 FatalVerdict::Clean => {}
                                 FatalVerdict::Fatal(code) => return Err(code),
-                                FatalVerdict::Restarted => {
+                                FatalVerdict::NeedsEager => {
                                     return finish_eagerly(
                                         &rt,
                                         checker,
@@ -2119,7 +2170,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                         match judge_fatal(&mut lazy, &bodies, &front.sources) {
                             FatalVerdict::Clean => {}
                             FatalVerdict::Fatal(code) => return Err(code),
-                            FatalVerdict::Restarted => {
+                            FatalVerdict::NeedsEager => {
                                 return finish_eagerly(
                                     &rt,
                                     checker,
@@ -2173,7 +2224,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                             continue;
                         }
                         if !lazy.demand(&symbol, type_args) {
-                            if lazy.restarted {
+                            if lazy.needs_eager {
                                 return finish_eagerly(
                                     &rt,
                                     checker,
@@ -2188,7 +2239,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                             match judge_fatal(&mut lazy, &bodies, &front.sources) {
                                 FatalVerdict::Clean => {}
                                 FatalVerdict::Fatal(code) => return Err(code),
-                                FatalVerdict::Restarted => {
+                                FatalVerdict::NeedsEager => {
                                     return finish_eagerly(
                                         &rt,
                                         checker,
@@ -2210,7 +2261,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                         match judge_fatal(&mut lazy, &bodies, &front.sources) {
                             FatalVerdict::Clean => {}
                             FatalVerdict::Fatal(code) => return Err(code),
-                            FatalVerdict::Restarted => {
+                            FatalVerdict::NeedsEager => {
                                 return finish_eagerly(
                                     &rt,
                                     checker,
@@ -2269,7 +2320,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                         lazy.resume_background();
                         lazy.pump_blocking();
                         lazy.pump_pending();
-                        if lazy.restarted {
+                        if lazy.needs_eager {
                             return finish_eagerly(
                                 &rt,
                                 checker,
@@ -2284,7 +2335,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                         match judge_fatal(&mut lazy, &bodies, &front.sources) {
                             FatalVerdict::Clean => {}
                             FatalVerdict::Fatal(code) => return Err(code),
-                            FatalVerdict::Restarted => {
+                            FatalVerdict::NeedsEager => {
                                 return finish_eagerly(
                                     &rt,
                                     checker,
@@ -2305,7 +2356,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                     match judge_fatal(&mut lazy, &bodies, &front.sources) {
                         FatalVerdict::Clean => {}
                         FatalVerdict::Fatal(code) => return Err(code),
-                        FatalVerdict::Restarted => {
+                        FatalVerdict::NeedsEager => {
                             return finish_eagerly(
                                 &rt,
                                 checker,
@@ -2363,7 +2414,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
     // diagnostics elsewhere stay held -- lazy checking ignores code the run
     // never executes.
     lazy.pump_pending();
-    if lazy.restarted {
+    if lazy.needs_eager {
         drop(mono);
         return finish_eagerly(
             &rt,
@@ -2379,7 +2430,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
     match judge_fatal(&mut lazy, &bodies, &front.sources) {
         FatalVerdict::Clean => {}
         FatalVerdict::Fatal(code) => return Err(code),
-        FatalVerdict::Restarted => {
+        FatalVerdict::NeedsEager => {
             return finish_eagerly(
                 &rt,
                 checker,
@@ -2546,7 +2597,7 @@ fn save_partial_cache(
     bodies: &BodySpans,
     lazy: &mut LazyState,
 ) {
-    if !brass_cache::enabled() || lazy.restarted {
+    if !brass_cache::enabled() || lazy.needs_eager {
         return;
     }
     let Some(mut snapshot) = lazy.snapshot.take() else {
@@ -2615,9 +2666,8 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
 /// cache when possible.
 ///
 /// With a scheduler, the type check streams its progress through it (see
-/// `brass_typeck::stream`); a keyed-specialization re-pass emits `Restarted`
-/// first, because the rewritten program's spans invalidate everything
-/// streamed by the first pass.
+/// `brass_typeck::stream`). Keyed continuations append generated declarations
+/// and publish their dispatch/channel delta without invalidating prior events.
 fn analyze_fresh(
     main_label: &str,
     main_src: &str,
@@ -2728,7 +2778,7 @@ fn check_front(
     };
     let entry_path = PathBuf::from(main_label);
     let FrontEnd {
-        mut modules,
+        modules,
         sources,
         entry_base: base,
         warnings,
@@ -2808,141 +2858,50 @@ fn check_front(
         None => brass_typeck::analyze_with(&program, ctx_seed.as_ref()),
     };
     phase("front/typecheck", t);
-    // Reflective decoders: a `-> infer!` method call is keyed by the caller's
-    // expectation. Generate a concrete method per requested key, inject them,
-    // rewrite the calls to their specializations, and re-run the pipeline over
-    // the now fully-concrete program. Errors from the first pass are held until
-    // after specialization (a keyed call would otherwise report as an
-    // undeclared method); a genuine error re-surfaces in the second pass.
+    // Reflective decoders are appended directly to this HIR. The continuation
+    // checker reuses the completed first pass's tables and visits only the new
+    // method bodies; source ASTs and existing HIR items remain untouched.
     let mut program = program;
-    // No re-pass once the consumer stopped the session (its program already
-    // ran to completion): the specialization verdict would serve nobody --
-    // the driver never executes from this payload, the full-cache save is
-    // suppressed for a stopped run anyway, and the driver's exit would
-    // otherwise block on a whole eager re-analysis. The lazy run that DOES
-    // need the specializations sees `Restarted` before execution and falls
-    // back to the eager pipeline.
-    let repass_wanted = !sched.as_deref().is_some_and(|s| s.stopped());
-    if !analysis.keyed_calls.is_empty() && repass_wanted {
-        // The re-pass context is the pre-pass context PLUS the injected
-        // specializations -- a deterministic function of the context sources
-        // and the requested (receiver, method, key) set. Extending the context
-        // key with that set lets the re-pass reuse a seed exactly when the
-        // same decoders are requested again, which is every entry edit that
-        // does not change what gets decoded.
-        let mut spec_symbols: Vec<String> = analysis
-            .keyed_calls
-            .values()
-            .map(|(recv, method, key)| format!("{recv}.{method}:{}", brass_hir::type_key(key)))
-            .collect();
-        spec_symbols.sort();
-        spec_symbols.dedup();
-        let repass_key = ctx_key.map(|key| {
-            let mut keyed = key.to_vec();
-            for sym in &spec_symbols {
-                keyed.push(0);
-                keyed.extend_from_slice(sym.as_bytes());
-            }
-            brass_cache::content_hash(&keyed)
-        });
-        match specialize_keyed(&mut modules, &program, &analysis) {
-            Ok(injected) => {
-                // The specialization rewrote some modules in place, so their
-                // loaded sources no longer describe their ASTs. For the
-                // incremental sidecar, fold the specialization identity into
-                // the TOUCHED modules' hashes (injection targets plus every
-                // module containing a rewritten call site -- a keyed call's
-                // span lies in its module's source segment, and sources and
-                // modules are pushed in the same load order) and add a
-                // synthetic path entry, so the keyed context's sidecar is
-                // distinct from the plain one yet diffs the same way.
-                let mut touched = injected;
-                let attributable = modules
-                    .iter()
-                    .all(|module| module_source_base(module).is_some());
-                if attributable {
-                    for span in analysis.keyed_calls.keys() {
-                        if let Some(path) = module_path_at(&modules, &sources, span.lo) {
-                            touched.insert(path);
-                        }
+    let (generated, keyed_dispatch) =
+        if analysis.keyed_calls.is_empty() || sched.as_deref().is_some_and(|s| s.stopped()) {
+            (Vec::new(), HashMap::default())
+        } else {
+            let t = std::time::Instant::now();
+            match specialize_keyed(&mut program, &mut analysis, &sources) {
+                Ok((generated, keyed_dispatch)) => {
+                    phase("front/keyed-continuation", t);
+                    if let Some(s) = sched.as_deref_mut() {
+                        let mut delta = analysis_channel_delta(&analysis, &program);
+                        delta.errors.extend(errors.iter().map(|(message, span)| {
+                            brass_typeck::TypeError {
+                                message: message.clone(),
+                                span: *span,
+                            }
+                        }));
+                        s.emit(brass_typeck::stream::CheckEvent::KeyedReady(
+                            generated.clone(),
+                            keyed_dispatch
+                                .iter()
+                                .map(|(span, symbol)| (*span, symbol.clone()))
+                                .collect(),
+                            delta,
+                        ));
                     }
+                    (generated, keyed_dispatch)
                 }
-                let repass_hashes: Option<Vec<(String, [u8; 20])>> = ctx_module_hashes
-                    .as_ref()
-                    .filter(|_| attributable)
-                    .map(|hashes| {
-                        let mut spec_buf = Vec::new();
-                        for s in &spec_symbols {
-                            spec_buf.extend_from_slice(s.as_bytes());
-                            spec_buf.push(0);
-                        }
-                        let spec_hash = brass_cache::content_hash(&spec_buf);
-                        let touched_paths: HashSet<String> =
-                            touched.iter().map(|t| t.join(".")).collect();
-                        let mut v: Vec<(String, [u8; 20])> = hashes
-                            .iter()
-                            .map(|(p, h)| {
-                                if touched_paths.contains(p) {
-                                    let mut buf = h.to_vec();
-                                    buf.extend_from_slice(&spec_hash);
-                                    (p.clone(), brass_cache::content_hash(&buf))
-                                } else {
-                                    (p.clone(), *h)
-                                }
-                            })
-                            .collect();
-                        v.push(("(keyed-specializations)".to_string(), spec_hash));
-                        v
-                    });
-                // The plain context this run inferred moments ago doubles as
-                // the incremental prior: on a cache-cold run there is no
-                // keyed sidecar on disk, and without it the re-pass would
-                // re-infer the WHOLE context even though only the
-                // specialization-touched modules changed.
-                let plain_prior = match (ctx_seed, &ctx_module_hashes) {
-                    (Some(seed), Some(hashes)) => Some(brass_cache::ContextBundle {
-                        module_hashes: hashes.clone(),
-                        seed,
-                    }),
-                    _ => None,
-                };
-                let repass_seed = cached_context_seed(
-                    &repass_key,
-                    &modules[..modules.len() - 1],
-                    &sources,
-                    repass_hashes.as_deref(),
-                    plain_prior.as_ref(),
-                    "front/keyed-context-check",
-                );
-                let t = std::time::Instant::now();
-                let (program2, lower_errors2) = lower(&modules);
-                for e in lower_errors2 {
-                    errors.push((e.message, e.span));
+                Err(error) => {
+                    errors.push(error);
+                    (Vec::new(), HashMap::default())
                 }
-                program = program2;
-                // The injected specializations and rewritten call sites moved
-                // spans: a streaming consumer starts over on the re-pass.
-                // The re-pass itself is EAGER even under a streaming session
-                // -- the driver always falls back to the whole-analysis
-                // verdict on `Restarted` (execution cannot survive the span
-                // rewrite), so streaming it would serve nobody, and the
-                // eager result is complete enough to persist as the full
-                // cache the fallback then loads.
-                if let Some(s) = sched.as_deref_mut() {
-                    s.emit(brass_typeck::stream::CheckEvent::Restarted);
-                }
-                analysis = brass_typeck::analyze_with(&program, repass_seed.as_ref());
-                phase("front/keyed-repass", t);
             }
-            Err(e) => errors.push(e),
-        }
-    }
+        };
     for e in &analysis.errors {
         errors.push((e.message.clone(), e.span));
     }
     tracing::debug!(errors = errors.len(), "front-end analysis complete");
     if !errors.is_empty() {
-        errors.sort_by_key(|(_, s)| s.lo);
+        errors.sort_by(|a, b| (a.1.lo, &a.0).cmp(&(b.1.lo, &b.0)));
+        errors.dedup();
         return Err(render_errors(&errors, &sources));
     }
 
@@ -2959,6 +2918,7 @@ fn check_front(
         typeof_types: analysis.typeof_types.into_iter().collect(),
         null_props: analysis.null_props.into_iter().collect(),
         type_tests: analysis.type_tests.into_iter().collect(),
+        keyed_dispatch: keyed_dispatch.into_iter().collect(),
     };
     // A stopped (lazy-exit) analysis is INCOMPLETE: bodies past the stop
     // point were never checked, so caching it as a full verdict would replay
@@ -2980,6 +2940,7 @@ fn check_front(
                 packages: brass_cache::package_names(search),
                 plugins: stamps.plugins,
                 modules: cached_modules,
+                generated: generated.clone(),
                 warnings,
                 channels,
             };
@@ -2987,200 +2948,234 @@ fn check_front(
             phase("front/cache-save", t);
             return Ok(AnalyzedProgram {
                 modules,
+                generated,
                 channels: payload.channels,
             });
         }
     }
-    Ok(AnalyzedProgram { modules, channels })
+    Ok(AnalyzedProgram {
+        modules,
+        generated,
+        channels,
+    })
 }
 
-/// Generate concrete specializations of the reflective (`-> infer!`) methods
-/// the checker keyed, inject them into their defining modules' ASTs, and
-/// rewrite each keyed call site to its specialization. After this the program
-/// is fully concrete: the second checking/lowering pass sees ordinary methods.
-/// Returns the module paths the injection touched (generated methods and
-/// synthetic imports); call-site rewrites are the caller's to attribute (it
-/// owns the span-to-module mapping).
-fn specialize_keyed(
-    modules: &mut [LoadedModule],
-    program: &Program,
+/// Snapshot the completed analysis as one overwrite-safe streaming delta.
+/// Used only for the generated-body continuation, after the first pass has
+/// already flushed its own incremental windows.
+fn analysis_channel_delta(
     analysis: &brass_typeck::Analysis,
-) -> Result<HashSet<Vec<String>>, (String, Span)> {
-    // Deduplicate the requested (receiver, method, key) roots.
-    let mut roots: Vec<brass_typesys::KeyedNeed> = Vec::new();
-    let mut seen = fxhash::FxHashSet::default();
-    for (recv, method, key) in analysis.keyed_calls.values() {
-        let sym = format!("{recv}.{method}:{}", brass_hir::type_key(key));
-        if seen.insert(sym) {
-            roots.push(brass_typesys::KeyedNeed {
+    program: &Program,
+) -> brass_typeck::stream::ChannelDelta {
+    brass_typeck::stream::ChannelDelta {
+        expr_types: brass_typeck::stream::aggregate_result_types(&analysis.typed, program)
+            .into_iter()
+            .collect(),
+        view_args: analysis.view_args.iter().copied().collect(),
+        lift_errs: analysis.lift_errs.iter().copied().collect(),
+        null_props: analysis.null_props.iter().copied().collect(),
+        fields_loops: analysis
+            .fields_loops
+            .iter()
+            .map(|(span, fields)| (*span, fields.clone()))
+            .collect(),
+        sum_views: analysis
+            .sum_views
+            .iter()
+            .map(|(span, ty)| (*span, ty.clone()))
+            .collect(),
+        type_names: analysis
+            .type_names
+            .iter()
+            .map(|(span, name)| (*span, name.clone()))
+            .collect(),
+        typeof_types: analysis
+            .typeof_types
+            .iter()
+            .map(|(span, ty)| (*span, ty.clone()))
+            .collect(),
+        type_tests: analysis
+            .type_tests
+            .iter()
+            .map(|(span, ty)| (*span, ty.clone()))
+            .collect(),
+        errors: analysis.errors.clone(),
+        ..Default::default()
+    }
+}
+
+/// Append and check every keyed specialization requested by `analysis`.
+/// Nested requests discovered while checking generated bodies repeat the same
+/// append-only step; already generated `(receiver, method, key)` triples make
+/// the loop finite for recursive type graphs.
+type KeyedSpecializationResult = (Vec<brass_hir::GeneratedDecl>, HashMap<Span, String>);
+
+fn specialize_keyed(
+    program: &mut Program,
+    analysis: &mut brass_typeck::Analysis,
+    sources: &brass_resolve::SourceMap,
+) -> Result<KeyedSpecializationResult, (String, Span)> {
+    let seed = analysis.context_tables.clone();
+    let mut pending = analysis.keyed_calls.clone();
+    let keyed_spans: HashSet<Span> = pending.keys().copied().collect();
+    let keyed_statements = keyed_statement_spans(program, &keyed_spans);
+    let keyed_lines: HashSet<(String, usize)> = keyed_spans
+        .iter()
+        .filter_map(|span| {
+            let loc = sources.locate(span.lo)?;
+            let line = loc.src.as_bytes()[..loc.local]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count();
+            Some((loc.label.to_string(), line))
+        })
+        .collect();
+    // A keyed call is initially elaborated against the generic template, so
+    // constraints from a second key can leave a provisional error at that
+    // call span. The generated-body continuation is the verdict for those
+    // sites; discovery errors that prevented recording a key are unaffected.
+    analysis.errors.retain(|error| {
+        let keyed_line = sources.locate(error.span.lo).is_some_and(|loc| {
+            let line = loc.src.as_bytes()[..loc.local]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count();
+            keyed_lines.contains(&(loc.label.to_string(), line))
+        });
+        !keyed_line
+            && !keyed_spans.contains(&error.span)
+            && !keyed_statements
+                .iter()
+                .any(|span| span.lo <= error.span.lo && error.span.lo < span.hi)
+    });
+    let mut generated_all = Vec::new();
+    let mut generated_symbols = fxhash::FxHashSet::default();
+    let mut keyed_dispatch = HashMap::default();
+
+    for _ in 0..64 {
+        if pending.is_empty() {
+            return Ok((generated_all, keyed_dispatch));
+        }
+        for (span, (_, method, key)) in &pending {
+            keyed_dispatch.insert(*span, brass_typesys::mangled_name(method, key));
+        }
+        let mut roots: Vec<brass_typesys::KeyedNeed> = pending
+            .values()
+            .map(|(recv, method, key)| brass_typesys::KeyedNeed {
                 recv: recv.clone(),
                 method: method.clone(),
                 key: key.clone(),
-            });
+            })
+            .collect();
+        roots.sort_by(|a, b| {
+            (&a.recv, &a.method, brass_hir::type_key(&a.key)).cmp(&(
+                &b.recv,
+                &b.method,
+                brass_hir::type_key(&b.key),
+            ))
+        });
+        roots.dedup_by(|a, b| {
+            a.recv == b.recv
+                && a.method == b.method
+                && brass_hir::type_key(&a.key) == brass_hir::type_key(&b.key)
+        });
+        let generated = brass_typesys::specialize_all(program, &roots).map_err(|error| {
+            (
+                format!("reflective specialization failed: {error}"),
+                Span::new(0, 0),
+            )
+        })?;
+        let fresh: Vec<_> = generated
+            .into_iter()
+            .filter(|generated| {
+                generated_symbols.insert(format!(
+                    "{}.{}:{}",
+                    generated.receiver,
+                    generated.template,
+                    brass_hir::type_key(&generated.key)
+                ))
+            })
+            .collect();
+        if fresh.is_empty() {
+            return Err((
+                "reflective specialization failed: recursive specialization made no progress"
+                    .to_string(),
+                Span::new(0, 0),
+            ));
         }
-    }
-    // Deterministic order so the specializations (and the shared-solver
-    // re-elaboration that checks them) do not vary run to run.
-    roots.sort_by(|a, b| {
-        (&a.recv, &a.method, brass_hir::type_key(&a.key)).cmp(&(
-            &b.recv,
-            &b.method,
-            brass_hir::type_key(&b.key),
-        ))
-    });
-    let generated = brass_typesys::specialize_all(program, &roots).map_err(|e| {
-        (
-            format!("reflective specialization failed: {e}"),
-            Span::new(0, 0),
-        )
-    })?;
-    // Inject each generated method into the module that defines its receiver.
-    // A record key defined in another module (`User` in the caller, decoder in
-    // the json library) is not visible there, so also inject a synthetic import
-    // of the key type into the receiver's module. Collected per module first so
-    // one import covers every specialization that needs it.
-    use brass_hir::Type;
-    let mut synthetic_imports: HashMap<Vec<String>, Vec<(Vec<String>, String)>> =
-        HashMap::default();
-    for g in &generated {
-        if let Type::Record(n) | Type::Sum(n) = &g.key
-            && let Some(info) = program.type_by_id(n.id)
-            && info.module != g.module
-        {
-            let entry = synthetic_imports.entry(g.module.clone()).or_default();
-            let import = (info.module.clone(), n.name.clone());
-            if !entry.contains(&import) {
-                entry.push(import);
-            }
+        brass_hir::lower_generated_into(program, &fresh).map_err(|errors| {
+            let error = &errors[0];
+            (error.message.clone(), brass_hir::unshift_span(error.span))
+        })?;
+        let mut next_pending = HashMap::default();
+        for generated in &fresh {
+            let continuation =
+                brass_typeck::analyze_generated(program, &seed, std::slice::from_ref(generated));
+            next_pending.extend(continuation.keyed_calls.clone());
+            analysis.keyed_calls.extend(continuation.keyed_calls);
+            analysis
+                .typed
+                .expressions
+                .extend(continuation.typed.expressions);
+            analysis.view_args.extend(continuation.view_args);
+            analysis.sum_views.extend(continuation.sum_views);
+            analysis.lift_errs.extend(continuation.lift_errs);
+            analysis.fields_loops.extend(continuation.fields_loops);
+            analysis.type_names.extend(continuation.type_names);
+            analysis.typeof_types.extend(continuation.typeof_types);
+            analysis.type_tests.extend(continuation.type_tests);
+            analysis.null_props.extend(continuation.null_props);
+            analysis
+                .errors
+                .extend(continuation.errors.into_iter().map(|mut error| {
+                    error.span = brass_hir::unshift_span(error.span);
+                    error
+                }));
         }
+        pending = next_pending;
+        generated_all.extend(fresh);
     }
-    let mut touched: HashSet<Vec<String>> = HashSet::default();
-    for g in generated {
-        if let Some(m) = modules.iter_mut().find(|m| m.path == g.module) {
-            m.ast.items.push(TopLevel::Fun(g.decl));
-            touched.insert(g.module);
-        }
-    }
-    for (module_path, imports) in synthetic_imports {
-        touched.insert(module_path.clone());
-        if let Some(m) = modules.iter_mut().find(|m| m.path == module_path) {
-            for (from_module, name) in imports {
-                m.ast.imports.push(brass_parser::ast::ImportDecl {
-                    path: from_module,
-                    names: vec![brass_parser::ast::ImportedName::plain(
-                        name,
-                        Span::new(0, 0),
-                    )],
-                    bare: false,
-                    alias: None,
-                    explicit_alias: false,
-                    span: Span::new(0, 0),
-                });
-            }
-        }
-    }
-    // Rewrite the keyed call sites to their specializations.
-    let renames: fxhash::FxHashMap<Span, String> = analysis
-        .keyed_calls
-        .iter()
-        .map(|(span, (_, method, key))| (*span, brass_typesys::mangled_name(method, key)))
-        .collect();
-    for m in modules.iter_mut() {
-        for item in &mut m.ast.items {
-            if let TopLevel::Fun(f) = item {
-                rewrite_calls_block(&mut f.body, &renames);
-            } else if let TopLevel::Stmt(s) = item {
-                rewrite_calls_stmt(s, &renames);
-            }
-        }
-    }
-    Ok(touched)
+    Err((
+        "reflective specialization failed: specialization depth exceeded".to_string(),
+        Span::new(0, 0),
+    ))
 }
 
-/// Rewrite `recv.m(..)` calls whose span is in `renames` to `recv.<new>(..)`.
-fn rewrite_calls_block(
-    b: &mut brass_parser::ast::Block,
-    renames: &fxhash::FxHashMap<Span, String>,
-) {
-    for s in &mut b.stmts {
-        rewrite_calls_stmt(s, renames);
+/// Source statements containing a keyed call. First-pass inference errors on
+/// these statements are provisional because the template is shared across
+/// keys; static discovery errors do not record a keyed call and stay outside
+/// this set.
+fn keyed_statement_spans(program: &Program, keyed: &HashSet<Span>) -> Vec<Span> {
+    let mut owners = Vec::new();
+    let mut inspect = |stmt: &Stmt| {
+        let mut calls = Vec::new();
+        collect_call_spans_stmt(stmt, &mut calls);
+        if calls.iter().any(|span| keyed.contains(span)) {
+            owners.push(stmt.span());
+        }
+    };
+    for function in program.functions.values() {
+        function.decl.body.stmts.iter().for_each(&mut inspect);
     }
-}
-
-fn rewrite_calls_stmt(s: &mut Stmt, renames: &fxhash::FxHashMap<Span, String>) {
-    match s {
-        Stmt::Let { value: Some(v), .. } => rewrite_calls_expr(v, renames),
-        Stmt::Assign { target, value, .. } => {
-            rewrite_calls_expr(target, renames);
-            rewrite_calls_expr(value, renames);
-        }
-        Stmt::Expr(e) | Stmt::Return(Some(e), _) => rewrite_calls_expr(e, renames),
-        Stmt::While { cond, body, .. } => {
-            rewrite_calls_expr(cond, renames);
-            rewrite_calls_block(body, renames);
-        }
-        Stmt::For { iter, body, .. } => {
-            rewrite_calls_expr(iter, renames);
-            rewrite_calls_block(body, renames);
-        }
-        _ => {}
+    for init in &program.inits {
+        init.stmts.iter().for_each(&mut inspect);
     }
-}
-
-fn rewrite_calls_expr(e: &mut brass_parser::ast::Expr, renames: &fxhash::FxHashMap<Span, String>) {
-    use brass_parser::ast::{Expr, StrSeg};
-    match e {
-        Expr::Call(callee, args, span) => {
-            if let Some(new_name) = renames.get(span)
-                && let Expr::Field(_, m, _) = &mut **callee
-            {
-                *m = new_name.clone();
-            }
-            rewrite_calls_expr(callee, renames);
-            for a in args.iter_mut() {
-                rewrite_calls_expr(&mut a.expr, renames);
-            }
+    for info in program.types.values() {
+        match &info.kind {
+            brass_hir::TypeKind::Record { methods, .. } => methods
+                .values()
+                .filter_map(|method| method.decl.body.as_ref())
+                .flat_map(|body| &body.stmts)
+                .for_each(&mut inspect),
+            brass_hir::TypeKind::Sum { variants } => variants
+                .iter()
+                .flat_map(|variant| variant.methods.values())
+                .filter_map(|method| method.decl.body.as_ref())
+                .flat_map(|body| &body.stmts)
+                .for_each(&mut inspect),
         }
-        Expr::Field(b, _, _) | Expr::Unary(_, b, _) | Expr::ErrorProp(b, _) => {
-            rewrite_calls_expr(b, renames)
-        }
-        Expr::Binary(_, l, r, _) | Expr::Index(l, r, _) | Expr::Range(l, r, _) => {
-            rewrite_calls_expr(l, renames);
-            rewrite_calls_expr(r, renames);
-        }
-        Expr::Array(es, _) => es.iter_mut().for_each(|e| rewrite_calls_expr(e, renames)),
-        Expr::TypeLit(_, fs, _) | Expr::VariantLit(_, _, fs, _) => fs
-            .iter_mut()
-            .for_each(|(_, e)| rewrite_calls_expr(e, renames)),
-        Expr::Str(segs, _) => segs.iter_mut().for_each(|seg| {
-            if let StrSeg::Expr(e) = seg {
-                rewrite_calls_expr(e, renames);
-            }
-        }),
-        Expr::If(c, t, els, _) => {
-            rewrite_calls_expr(c, renames);
-            rewrite_calls_block(t, renames);
-            if let Some(e) = els {
-                rewrite_calls_expr(e, renames);
-            }
-        }
-        Expr::IfLet(_, scrut, t, els, _) => {
-            rewrite_calls_expr(scrut, renames);
-            rewrite_calls_block(t, renames);
-            if let Some(e) = els {
-                rewrite_calls_expr(e, renames);
-            }
-        }
-        Expr::Match(scrut, arms, _) => {
-            rewrite_calls_expr(scrut, renames);
-            for arm in arms.iter_mut() {
-                rewrite_calls_expr(&mut arm.body, renames);
-            }
-        }
-        Expr::Block(b, _) => rewrite_calls_block(b, renames),
-        Expr::Closure(_, b, _) => rewrite_calls_expr(b, renames),
-        _ => {}
     }
+    owners
 }
 
 /// Every call expression's span mapped to its source position (diagnostic

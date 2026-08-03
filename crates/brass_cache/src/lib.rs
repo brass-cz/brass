@@ -49,7 +49,7 @@ use brass_parser::Span;
 
 /// Bumped whenever the payload layout changes, so an old file is discarded by
 /// the header check instead of misread by postcard (which carries no schema).
-pub const FORMAT_VERSION: u16 = 5;
+pub const FORMAT_VERSION: u16 = 6;
 
 /// Leading magic, so a foreign file is rejected before any decoding.
 const MAGIC: &[u8; 8] = b"PPCACHE\0";
@@ -311,6 +311,7 @@ pub struct Channels {
     pub typeof_types: Vec<(Span, Type)>,
     pub null_props: Vec<Span>,
     pub type_tests: Vec<(Span, Type)>,
+    pub keyed_dispatch: Vec<(Span, String)>,
 }
 
 /// Everything a `.czcache` stores.
@@ -332,9 +333,13 @@ pub struct Payload {
     /// Native libraries keyed by logical import and contents, never by their
     /// build-machine path.
     pub plugins: Vec<PluginStamp>,
-    /// The final module graph: post-resolution, post-rewrite, post-keyed
-    /// specialization. Re-lowering these reproduces the checked program.
+    /// The resolved source module graph. Keyed specialization never rewrites
+    /// it, so cached modules remain an exact AST representation of the inputs.
     pub modules: Vec<LoadedModule>,
+    /// Append-only keyed declarations lowered after the unchanged modules.
+    /// Storing them keeps a cache hit to deterministic HIR lowering with no
+    /// type-checker or specializer work.
+    pub generated: Vec<brass_hir::GeneratedDecl>,
     /// Diagnostics the full pipeline prints for a CLEAN program (the spawn
     /// auto-acquire notes); replayed on a hit so warm runs warn identically.
     pub warnings: Vec<String>,

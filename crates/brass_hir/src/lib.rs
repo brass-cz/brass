@@ -15,11 +15,11 @@ pub use expand::{
     SPAN_SHIFT_UNIT, expand_fields_body, fields_loop_target, keyed_return, unshift_span,
 };
 pub use hir::{
-    CallableSignature, FieldInfo, FunInfo, LoadedModule, MethodInfo, ModuleInit, ParamInfo,
-    Program, QualifiedName, RESERVED_FUNCTION_NAMES, RESULT_TYPE_ID, SchemeMethod, TypeAlias,
-    TypeInfo, TypeKind, TypeScheme, VariantInfo, qualify, resolve_qualified,
+    CallableSignature, FieldInfo, FunInfo, GeneratedDecl, LoadedModule, MethodInfo, ModuleInit,
+    ParamInfo, Program, QualifiedName, RESERVED_FUNCTION_NAMES, RESULT_TYPE_ID, SchemeMethod,
+    TypeAlias, TypeInfo, TypeKind, TypeScheme, VariantInfo, qualify, resolve_qualified,
 };
-pub use lower::{LowerError, lower};
+pub use lower::{LowerError, lower, lower_generated_into};
 pub use mutation::{
     MutationInfo, annotated_type_passes_by_copy, mutates_root, mutates_value,
     param_infers_pass_mode, param_is_immutable_ref, param_is_infer, param_is_mut_ref,

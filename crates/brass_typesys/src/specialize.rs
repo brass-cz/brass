@@ -64,14 +64,8 @@ pub fn mangled_name(method: &str, key: &Type) -> String {
     format!("{method}__{}", brass_hir::type_key(key))
 }
 
-/// One generated specialization: the module its receiver lives in, the concrete
-/// method, and its key type (so the caller can make the key visible in that
-/// module -- a record key defined in another module needs a synthetic import).
-pub struct Generated {
-    pub module: Vec<String>,
-    pub decl: FunDecl,
-    pub key: Type,
-}
+/// One generated specialization, retained outside the parsed module graph.
+pub type Generated = brass_hir::GeneratedDecl;
 
 /// Generate every concrete method reachable from `roots` (transitively: a
 /// record key pulls in a specialization per field type), or an error naming a
@@ -103,6 +97,8 @@ pub fn specialize_all(program: &Program, roots: &[KeyedNeed]) -> Result<Vec<Gene
         decl.body = shift_spans(&decl.body, base);
         out.push(Generated {
             module,
+            receiver: need.recv.clone(),
+            template: need.method.clone(),
             decl,
             key: need.key.clone(),
         });

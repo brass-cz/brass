@@ -22,7 +22,6 @@ mod walk;
 // The constraint solver lives in `brass_solver` (shared with the JIT-time MIR
 // inference); re-export it so `crate::solver` / `crate::unify` keep resolving.
 pub use brass_solver::{solver, unify};
-pub use taint::has_keyed_calls;
 
 use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -156,6 +155,36 @@ pub fn analyze(program: &Program) -> Analysis {
 /// in the combined program, detaching every seeded table key.
 pub fn analyze_with(program: &Program, seed: Option<&ContextTables>) -> Analysis {
     analyze_impl(program, seed, None, None)
+}
+
+/// Continue a completed analysis by checking only append-only generated keyed
+/// methods. The caller merges the returned span channels into the first pass.
+pub fn analyze_generated(
+    program: &Program,
+    seed: &ContextTables,
+    generated: &[brass_hir::GeneratedDecl],
+) -> Analysis {
+    let infer = infer::analyze_generated(program, seed, generated);
+    let mut errors = infer.errors;
+    errors.sort_by(|a, b| (a.span.lo, &a.message).cmp(&(b.span.lo, &b.message)));
+    errors.dedup();
+    Analysis {
+        errors,
+        typed: infer.typed,
+        schemes: infer.schemes,
+        view_args: infer.view_args,
+        sum_views: infer.sum_views,
+        lift_errs: infer.lift_errs,
+        fields_loops: infer.fields_loops,
+        type_names: infer.type_names,
+        keyed_calls: infer.keyed_calls,
+        typeof_types: infer.typeof_types,
+        type_tests: infer.type_tests,
+        null_props: infer.null_props,
+        function_returns: infer.function_returns,
+        method_returns: infer.method_returns,
+        context_tables: infer.context_tables,
+    }
 }
 
 /// [`analyze_with`], streaming progress to `sched` (the lazy-check

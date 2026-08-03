@@ -71,38 +71,6 @@ fn keyed_method_names(program: &Program) -> HashSet<String> {
     keyed_names
 }
 
-/// Whether any body in the program CALLS a keyed (`-> infer!`) method, by
-/// name. The lazy driver routes such a program to the eager pipeline up
-/// front: keyed specialization restarts the analysis over a rewritten
-/// program, which a lazy run only ever survives by falling back to the
-/// eager verdict -- after paying for its own gate first.
-pub fn has_keyed_calls(program: &Program) -> bool {
-    let keyed_names = keyed_method_names(program);
-    if keyed_names.is_empty() {
-        return false;
-    }
-    struct Any<'k> {
-        keyed: &'k HashSet<String>,
-        found: bool,
-    }
-    impl ExprVisitor for Any<'_> {
-        fn visit(&mut self, e: &Expr) {
-            if let Expr::Call(callee, _, _) = e
-                && let Expr::Field(_, name, _) = &**callee
-                && self.keyed.contains(name)
-            {
-                self.found = true;
-            }
-        }
-    }
-    let mut v = Any {
-        keyed: &keyed_names,
-        found: false,
-    };
-    walk::walk_program_exprs(program, &mut v);
-    v.found
-}
-
 /// The set of free-function SYMBOLS that can reach a keyed method call,
 /// transitively through free-function and method calls. Empty when the
 /// program declares no keyed method at all (the common case, which then
@@ -144,6 +112,13 @@ pub(crate) fn keyed_reachable(program: &Program) -> HashSet<String> {
     for t in program.types.values() {
         let mut each = |methods: &HashMap<String, brass_hir::MethodInfo>| {
             for (name, m) in methods {
+                // A keyed template is never executed as written. Its own
+                // recursive keyed calls are rewritten inside each generated
+                // specialization, so they must not taint ordinary callers of
+                // an unrelated same-named method.
+                if brass_hir::keyed_return(m.decl.ret.as_ref()) {
+                    continue;
+                }
                 if let Some(body) = &m.decl.body {
                     let (direct, names) = scan(&keyed_names, body);
                     nodes.push(Node {

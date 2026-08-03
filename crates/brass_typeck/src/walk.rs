@@ -9,10 +9,6 @@ pub trait ExprVisitor {
     fn visit(&mut self, e: &Expr);
 }
 
-pub fn walk_program_exprs(program: &Program, v: &mut impl ExprVisitor) {
-    walk_program_exprs_in(program, crate::AnalysisModules::all(), v);
-}
-
 pub(crate) fn walk_program_exprs_in(
     program: &Program,
     modules: crate::AnalysisModules<'_>,

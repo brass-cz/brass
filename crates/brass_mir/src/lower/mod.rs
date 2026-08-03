@@ -160,6 +160,8 @@ pub(crate) struct ProgramCtx<'p> {
     /// without a checked program, or a body no instantiation ever decided)
     /// falls back to the syntactic annotation with every hole a wildcard.
     type_tests: &'p HashMap<Span, Type>,
+    /// Keyed call span -> concrete generated method name.
+    keyed_dispatch: &'p HashMap<Span, String>,
     closures: RefCell<Vec<MirClosure>>,
     next_closure: Cell<u32>,
 }
@@ -179,6 +181,7 @@ impl<'p> ProgramCtx<'p> {
             typeof_types: channels.typeof_types,
             null_props: channels.null_props,
             type_tests: channels.type_tests,
+            keyed_dispatch: channels.keyed_dispatch,
             closures: RefCell::new(Vec::new()),
             next_closure: Cell::new(0),
         }
@@ -783,6 +786,7 @@ pub fn lower_body(
         typeof_types: &no_typeof_types,
         null_props: &no_null_props,
         type_tests: &no_type_tests,
+        keyed_dispatch: &HashMap::default(),
     };
     let ctx = ProgramCtx::new(program, &tables, &channels);
     let body = lower_one(
@@ -840,6 +844,7 @@ pub fn lower_program(program: &Program) -> MirProgram {
             typeof_types: &HashMap::default(),
             null_props: &fxhash::FxHashSet::default(),
             type_tests: &HashMap::default(),
+            keyed_dispatch: &HashMap::default(),
         },
     )
 }
@@ -861,6 +866,7 @@ pub struct CheckerChannels<'a> {
     pub typeof_types: &'a HashMap<Span, Type>,
     pub null_props: &'a fxhash::FxHashSet<Span>,
     pub type_tests: &'a HashMap<Span, Type>,
+    pub keyed_dispatch: &'a HashMap<Span, String>,
 }
 
 /// A partially lowered MIR program for the lazy pipeline. Methods and module

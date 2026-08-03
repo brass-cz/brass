@@ -110,6 +110,20 @@ pub struct LoadedModule {
     pub is_prelude: bool,
 }
 
+/// A concrete method synthesized from a reflective `-> infer!` template.
+///
+/// Generated declarations are kept outside the parsed module graph so adding
+/// one never mutates source ASTs. The cache serializes this append-only payload
+/// and lowers it again after lowering the unchanged modules.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct GeneratedDecl {
+    pub module: Vec<String>,
+    pub receiver: String,
+    pub template: String,
+    pub decl: FunDecl,
+    pub key: Type,
+}
+
 #[derive(Clone, Debug)]
 pub struct FieldInfo {
     pub name: String,
