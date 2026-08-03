@@ -64,14 +64,16 @@ impl<'a> Checker<'a> {
             return fallback_ret;
         }
         let unannotated = declared_ret.is_none();
-        // A previous elaboration of this callee at the same fully-resolved
-        // argument types already recorded the body's channel entries and
-        // settled its return; reuse it (see `Checker::elaboration_memo`).
-        let memo_key = self.elaboration_memo_key("fn", symbol, arg_types);
+        // Co-checking records return links, and an active type-test probe commits
+        // bindings for its holes. Both require a real body walk.
+        let memo_enabled = !self.co_checking && self.type_test_holes.is_empty();
+        let memo_key = memo_enabled
+            .then(|| self.elaboration_memo_key("fn", symbol, arg_types))
+            .flatten();
         if let Some(memo_key) = &memo_key
-            && let Some(ret) = self.elaboration_memo.get(memo_key)
+            && let Some(entry) = self.elaboration_memo.get(memo_key).cloned()
         {
-            return ret.clone();
+            return self.replay_elaboration_memo_entry(&entry);
         }
         let errors_before = self.errors.len();
         let key = format!("fn:{symbol}");
@@ -87,6 +89,9 @@ impl<'a> Checker<'a> {
         if !self.elaboration_allowed(symbol, span) {
             self.instantiating.remove(&key);
             return fallback_ret;
+        }
+        if memo_key.is_some() {
+            self.begin_elaboration_journal();
         }
         tracing::debug!(
             symbol = %symbol,
@@ -122,16 +127,21 @@ impl<'a> Checker<'a> {
         };
         self.current_module = saved_module;
         self.instantiating.remove(&key);
-        if let Some(memo_key) = memo_key
-            && self.errors.len() == errors_before
-        {
+        if let Some(memo_key) = memo_key {
             let resolved = self.resolve(&ret);
-            if brass_hir::is_fully_known(&resolved) {
-                if unannotated {
-                    self.instance_returns
-                        .insert((symbol.to_string(), memo_key.1.clone()), resolved.clone());
-                }
-                self.elaboration_memo.insert(memo_key, resolved);
+            let memoizable =
+                self.errors.len() == errors_before && brass_hir::is_fully_known(&resolved);
+            if memoizable && unannotated {
+                self.record_instance_return(
+                    symbol.to_string(),
+                    memo_key.1.clone(),
+                    resolved.clone(),
+                );
+            }
+            let frame = self.finish_elaboration_journal();
+            if memoizable && frame.is_journalable() {
+                let entry = self.build_elaboration_memo_entry(&resolved, frame);
+                self.elaboration_memo.insert(memo_key, entry);
             }
         }
         ret
@@ -346,9 +356,9 @@ impl<'a> Checker<'a> {
             self.elaboration_memo_key("m", &callable, arg_types)
         });
         if let Some(memo_key) = &memo_key
-            && let Some(ret) = self.elaboration_memo.get(memo_key)
+            && let Some(entry) = self.elaboration_memo.get(memo_key).cloned()
         {
-            return ret.clone();
+            return self.replay_elaboration_memo_entry(&entry);
         }
         let errors_before = self.errors.len();
         // Keyed by the receiver TYPE, not by `owner` (the `Sum.Variant` qualifier
@@ -364,6 +374,9 @@ impl<'a> Checker<'a> {
         if !self.elaboration_allowed(&format!("{owner}.{method_name}"), span) {
             self.instantiating.remove(&key);
             return fallback_ret;
+        }
+        if memo_key.is_some() {
+            self.begin_elaboration_journal();
         }
         let saved = self.self_type.replace(self_type.to_string());
         let saved_variant = self.self_variant.clone();
@@ -391,12 +404,14 @@ impl<'a> Checker<'a> {
         self.self_variant = saved_variant;
         self.current_module = saved_module;
         self.instantiating.remove(&key);
-        if let Some(memo_key) = memo_key
-            && self.errors.len() == errors_before
-        {
+        if let Some(memo_key) = memo_key {
             let resolved = self.resolve(&ret);
-            if brass_hir::is_fully_known(&resolved) {
-                self.elaboration_memo.insert(memo_key, resolved);
+            let memoizable =
+                self.errors.len() == errors_before && brass_hir::is_fully_known(&resolved);
+            let frame = self.finish_elaboration_journal();
+            if memoizable && frame.is_journalable() {
+                let entry = self.build_elaboration_memo_entry(&resolved, frame);
+                self.elaboration_memo.insert(memo_key, entry);
             }
         }
         ret

@@ -280,7 +280,8 @@ impl<'a> Checker<'a> {
     /// no single correct shape -- left alone, the null-propagation lowering is
     /// forced onto the `Result` instance, which then returns (or renders) the
     /// whole `Result` where its Ok payload was meant.
-    fn record_prop_kind(&mut self, span: brass_parser::Span, kind: PropKind) {
+    pub(super) fn record_prop_kind(&mut self, span: brass_parser::Span, kind: PropKind) {
+        self.journal_elaboration(ElaborationJournalEntry::PropKind(span, kind));
         match self.prop_kinds.get(&span) {
             None => {
                 self.prop_kinds.insert(span, Some(kind));
@@ -309,6 +310,7 @@ impl<'a> Checker<'a> {
     /// lift (or drop the wrap of the one that must). Only called once the
     /// payload type is resolved, so the template elaboration stays silent.
     pub(super) fn record_lift_kind(&mut self, span: brass_parser::Span, lifted: bool) {
+        self.journal_elaboration(ElaborationJournalEntry::LiftKind(span, lifted));
         if self.lift_poisoned.contains(&span) {
             return;
         }
@@ -490,7 +492,7 @@ impl<'a> Checker<'a> {
                 if let Type::Nullable(inner_ty) = &resolved {
                     self.check_null_propagation_return_context(*span);
                     self.record_prop_kind(*span, PropKind::Null);
-                    self.null_props.insert(*span);
+                    self.record_null_prop(*span);
                     return (**inner_ty).clone();
                 }
                 match resolved.result_payloads() {
@@ -507,7 +509,7 @@ impl<'a> Checker<'a> {
                             let lifted = crate::lift_err_payload(self.program, err.clone()) != err;
                             self.record_lift_kind(*span, lifted);
                             if lifted {
-                                self.lift_errs.insert(*span);
+                                self.record_lift_err(*span);
                             }
                         }
                         ok
@@ -550,7 +552,7 @@ impl<'a> Checker<'a> {
                                     crate::lift_err_payload(self.program, err.clone()) != err;
                                 self.record_lift_kind(*span, lifted);
                                 if lifted {
-                                    self.lift_errs.insert(*span);
+                                    self.record_lift_err(*span);
                                 }
                             }
                             self.check_error_propagation_return_context(&coerced, *span);
@@ -974,7 +976,8 @@ impl<'a> Checker<'a> {
     /// Record a decided type test's pattern for MIR lowering, rejecting a
     /// shared generic body whose instantiations pin a hole differently (one
     /// lowering serves them all, so no single pattern would be right).
-    fn record_type_test(&mut self, span: brass_parser::Span, pattern: &Type) {
+    pub(super) fn record_type_test(&mut self, span: brass_parser::Span, pattern: &Type) {
+        self.journal_elaboration(ElaborationJournalEntry::TypeTest(span, pattern.clone()));
         if self.type_test_poisoned.contains(&span) {
             return;
         }

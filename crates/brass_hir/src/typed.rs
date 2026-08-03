@@ -11,7 +11,7 @@ use brass_parser::ast::{BinOp, Expr, UnaryOp};
 use crate::Type;
 
 /// Constness attached to a typed expression.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Constness {
     Mutable,
     Const,
@@ -46,7 +46,7 @@ pub enum Ownership {
 /// This intentionally stores only stable expression identity, not child nodes.
 /// It lets the typed sidecar move toward a fully typed HIR while the executable
 /// HIR still keeps parser AST nodes for code generation.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TypedExprKind {
     Int,
     Float,

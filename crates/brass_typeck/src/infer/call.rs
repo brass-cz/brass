@@ -260,19 +260,7 @@ impl<'a> Checker<'a> {
                     for a in cargs {
                         self.check_expr(&a.expr, scopes);
                     }
-                    if let Some(prev) = self.type_names.insert(*tspan, qualifier.clone())
-                        && prev != qualifier
-                    {
-                        self.errors.push(TypeError {
-                            message: format!(
-                                "`typeof(..)` resolves to `{prev}` in one instantiation of \
-                                 this generic function and `{qualifier}` in another; a static \
-                                 call through `typeof` must name the same type in every \
-                                 instantiation"
-                            ),
-                            span: *tspan,
-                        });
-                    }
+                    self.record_type_name(*tspan, qualifier.clone());
                 }
                 let ret = self.check_static_call(&qualifier, method, args, span, scopes);
                 // A REFINEMENT-alias qualifier carries pinned slot types
@@ -636,8 +624,7 @@ impl<'a> Checker<'a> {
             Type::Record(n) | Type::Sum(n) => n.name.clone(),
             other => other.type_name(),
         };
-        self.keyed_calls
-            .insert(span, (recv_name, method.to_string(), key.clone()));
+        self.record_keyed_call(span, recv_name, method.to_string(), key.clone());
         // The specialization's failures come from `error(..)`, whose payload
         // is the prelude `Error` wrapping the message string.
         let err = crate::lift_err_payload(self.program, Type::Str);
@@ -1166,7 +1153,7 @@ impl<'a> Checker<'a> {
                 .collect();
             let issues = brass_typesys::check_row(&row, &fields);
             if issues.is_empty() {
-                self.view_args.insert(arg.expr.span());
+                self.record_view_arg(arg.expr.span());
             } else {
                 ok = false;
                 for issue in issues {

@@ -34,12 +34,15 @@ mod call;
 mod expr;
 pub(crate) mod helpers;
 mod instantiate;
+mod journal;
 mod light;
 mod literals;
 mod lookup;
 mod patterns;
 mod precompute;
 mod resolve;
+
+use journal::{ElaborationJournalEntry, ElaborationJournalFrame, ElaborationMemoEntry};
 
 use assign::{common_nullable_type, integer_literal_fits};
 use builtins::primitive_static_return;
@@ -865,7 +868,7 @@ pub(crate) fn analyze_inner(
                 checker.errors.extend(errs);
                 perf.item(symbol.clone(), fn_started.elapsed());
                 if let (Some(args), Some(ret)) = (instance_args, instance_ret) {
-                    checker.instance_returns.insert((symbol.clone(), args), ret);
+                    checker.record_instance_return(symbol.clone(), args, ret);
                 }
                 let delta = flush_delta(&checker, &mut ctl.state, false);
                 ctl.sched.emit(stream::CheckEvent::BodyChecked(
@@ -1292,6 +1295,9 @@ struct Checker<'a> {
     program: &'a Program,
     errors: Vec<TypeError>,
     typed: TypedProgram,
+    /// Exact typed observations already present in `typed`, bucketed by their
+    /// fxhash so replay remains idempotent without a linear scan of the sidecar.
+    typed_seen: HashMap<u64, Vec<usize>>,
     const_scopes: Vec<HashSet<String>>,
     next_unknown: u32,
     self_type: Option<String>,
@@ -1417,12 +1423,18 @@ struct Checker<'a> {
     /// and return, so the first elaboration's answer is reused -- without this
     /// repeated subtrees of an unannotated call chain are re-checked once per call
     /// site, and sum dispatch multiplies each method call by its variant count.
+    /// Each entry also retains the semantic channel observations from that walk;
+    /// a hit replays them through the normal recording helpers so nested memo
+    /// windows and channel poison rules see the same writes as a real walk.
     /// Only clean (error-free) elaborations with fully-known keys and returns land
     /// here: an open input means the elaboration would constrain the caller's own
     /// variables, an open return must stay the shared table entry so later pinning
     /// reaches every reader, and an erroring body keeps reporting at every call
     /// site.
-    elaboration_memo: HashMap<(String, Vec<Type>), Type>,
+    elaboration_memo: HashMap<(String, Vec<Type>), ElaborationMemoEntry>,
+    /// Nested elaboration windows isolate their own observations while still
+    /// composing complete child subtrees into an enclosing memo entry.
+    elaboration_journals: Vec<ElaborationJournalFrame>,
     /// Fully-known returns from clean call-site elaborations of unannotated
     /// functions. Unlike the memo, these are part of the streaming contract:
     /// nested callees can remain runtime-deferred when their caller resolves.
@@ -1566,7 +1578,7 @@ struct Checker<'a> {
 
 /// What a checked `expr!` propagates on failure: the null of a nullable
 /// operand, or the `Err` of a `Result` operand. See `Checker::prop_kinds`.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum PropKind {
     Null,
     Err,
@@ -1578,6 +1590,7 @@ impl<'a> Checker<'a> {
             program,
             errors: Vec::new(),
             typed: TypedProgram::default(),
+            typed_seen: HashMap::default(),
             const_scopes: Vec::new(),
             next_unknown: next_unknown_after_program(program),
             self_type: None,
@@ -1615,6 +1628,7 @@ impl<'a> Checker<'a> {
             reported_result_shadow: HashSet::default(),
             lazy_profile: false,
             elaboration_memo: HashMap::default(),
+            elaboration_journals: Vec::new(),
             instance_returns: HashMap::default(),
             keyed_tainted: HashSet::default(),
             seeded_set: None,
@@ -1959,7 +1973,7 @@ impl<'a> Checker<'a> {
         let lifted = crate::lift_err_payload(self.program, g_err.clone());
         self.record_lift_kind(span, lifted != g_err);
         let flowed = if lifted != g_err {
-            self.lift_errs.insert(span);
+            self.record_lift_err(span);
             match got {
                 Type::Sum(n) => {
                     let mut n = n.clone();
@@ -2168,18 +2182,7 @@ impl<'a> Checker<'a> {
         // recorded nor a conflict.
         if contains_typeof(te) {
             let span = te.span();
-            let concrete = self.resolve(&resolved);
-            if is_concrete_type(&concrete) && !self.typeof_poisoned.contains(&span) {
-                match self.typeof_types.get(&span) {
-                    Some(prev) if peel_modes(prev) != peel_modes(&concrete) => {
-                        self.typeof_types.remove(&span);
-                        self.typeof_poisoned.insert(span);
-                    }
-                    _ => {
-                        self.typeof_types.insert(span, concrete);
-                    }
-                }
-            }
+            self.record_typeof_type(span, &resolved);
         }
         Ok(resolved)
     }
@@ -2316,18 +2319,9 @@ impl<'a> Checker<'a> {
         // Defensive: the channel is span-keyed and consumed by one shared MIR
         // lowering. A generic `fields(..)` operand is rejected before reaching
         // here today, but a disagreement must never be baked silently.
-        if let Some(prev) = self.fields_loops.get(&s.span())
-            && prev != &field_names
-        {
-            self.errors.push(TypeError {
-                message: "`fields(..)` expands different field sets across instantiations \
-                          of this generic function (annotate the operand to fix it)"
-                    .to_string(),
-                span: s.span(),
-            });
+        if !self.record_fields_loop(s.span(), field_names.clone()) {
             return;
         }
-        self.fields_loops.insert(s.span(), field_names.clone());
         for (i, field) in field_names.iter().enumerate() {
             let expanded = brass_hir::expand_fields_body(body, var, field, i);
             let err_start = self.errors.len();
@@ -2365,7 +2359,7 @@ impl<'a> Checker<'a> {
     /// re-resolves it against the final substitution like every other entry.
     fn record_binding(&mut self, name: &str, span: Span, ty: &Type) {
         let ty = self.resolve(ty);
-        self.typed.push_kind(
+        self.record_typed(
             brass_hir::TypedExprKind::Ident(name.to_string()),
             span,
             ty,
@@ -2380,7 +2374,12 @@ impl<'a> Checker<'a> {
         } else {
             ty
         };
-        self.typed.push_expr(expr, ty, constness);
+        self.record_typed(
+            brass_hir::TypedExprKind::from_expr(expr),
+            expr.span(),
+            ty,
+            constness,
+        );
     }
 
     /// Re-resolve every recorded expression type against the final substitution.

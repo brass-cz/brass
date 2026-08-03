@@ -220,8 +220,13 @@ impl<'a> Checker<'a> {
             }
         }
         let resolved = self.resolve(want);
-        self.note_sum_view(span, Some(&resolved));
-        self.sum_views.insert(span, resolved);
+        self.record_sum_view_type(span, resolved);
+    }
+
+    pub(super) fn record_sum_view_type(&mut self, span: brass_parser::Span, view: Type) {
+        self.journal_elaboration(ElaborationJournalEntry::SumView(span, view.clone()));
+        self.note_sum_view(span, Some(&view));
+        self.sum_views.insert(span, view);
     }
 
     /// Evidence that the sum flow at `span` needs NO rebuild in this
@@ -229,6 +234,7 @@ impl<'a> Checker<'a> {
     /// a generic body where another instantiation coerces at the same span is
     /// rejected instead of executing the baked rebuild on an uncoerced value.
     pub(super) fn record_sum_view_identity(&mut self, span: brass_parser::Span) {
+        self.journal_elaboration(ElaborationJournalEntry::SumViewIdentity(span));
         self.note_sum_view(span, None);
     }
 
