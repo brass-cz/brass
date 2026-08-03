@@ -20,7 +20,7 @@ use brass_hir::{FloatKind, IntKind, NominalType, Program, Type, TypeKind};
 use brass_mir::{BlockId, ClosureId, LocalId};
 use brass_parser::ast::*;
 
-use crate::jit::orc::{OrcContext, OrcJit, OrcModule, lazy_implementation_symbol};
+use crate::jit::orc::{OptTier, OrcContext, OrcJit, OrcModule, lazy_implementation_symbol};
 use crate::layout::Abi;
 use crate::monomorph::*;
 
@@ -2034,6 +2034,13 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     }
 }
 
+fn group_size_for(tier: OptTier) -> usize {
+    match tier {
+        OptTier::O0 => 16,
+        OptTier::O2 => 16,
+    }
+}
+
 impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     /// Declare each typed global, zero-initialized; init instances fill
     /// them. A runtime add-on or lazy function module only DECLARES them (no
@@ -2067,9 +2074,9 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     }
 
     /// Prepare a warm lazy run as independent, unoptimized function modules.
-    /// ORC receives a callable stub for every monomorphized instance; its O2
-    /// transform and native code generator do no work for a module until that
-    /// stub is entered by executed control flow.
+    /// ORC receives a callable stub for every monomorphized instance; its
+    /// tier-selected transform and native code generator do no work for a
+    /// module until that stub is entered by executed control flow.
     pub(crate) fn prepare_lazy_orc(
         &mut self,
         context: &OrcContext,
@@ -2099,7 +2106,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         // Small programs keep one module per function: materialization stays
         // observable at function granularity (a dead runtime branch is never
         // optimized or isel'd) and the per-module fixed cost is negligible at
-        // this size. Past the threshold that fixed cost (O2 pipeline setup,
+        // this size. Past the threshold that fixed cost (pipeline setup,
         // instruction selection, linking per module) dominates wide programs,
         // so functions are grouped in monomorphization order -- demand order
         // from the entry roots, so members of a group tend to call each
@@ -2108,9 +2115,9 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         // enters; only within an entered group does a dead branch now pay
         // compilation it previously deferred.
         const LAZY_GROUP_THRESHOLD: usize = 32;
-        const LAZY_GROUP_FUNCTIONS: usize = 16;
+        let tier = OptTier::from_env();
         let group_size = if program.functions.len() > LAZY_GROUP_THRESHOLD {
-            LAZY_GROUP_FUNCTIONS
+            group_size_for(tier)
         } else {
             1
         };

@@ -13,6 +13,7 @@ use std::ffi::{CStr, CString, c_void};
 use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
+use std::sync::OnceLock;
 
 use inkwell::module::Module;
 use inkwell::targets::{InitializationConfig, Target};
@@ -52,6 +53,28 @@ use llvm_sys::transforms::pass_builder::{
 };
 
 type Materializer<'a> = dyn FnMut(&LazyFunction) -> Result<OrcModule, String> + 'a;
+
+static OPT_TIER: OnceLock<OptTier> = OnceLock::new();
+
+/// The optimization tier shared by LLVM IR passes and native instruction
+/// selection. Cold compilation defaults to O0; `BRASS_OPT=2` opts into O2.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OptTier {
+    O0,
+    O2,
+}
+
+impl OptTier {
+    /// Returns the process-wide optimization tier selected by `BRASS_OPT`.
+    /// The environment is sampled once so every module in a run uses the same
+    /// pass pipeline, instruction-selection level, and lazy group sizing.
+    pub(crate) fn from_env() -> Self {
+        *OPT_TIER.get_or_init(|| match std::env::var("BRASS_OPT") {
+            Ok(value) if value == "2" => Self::O2,
+            _ => Self::O0,
+        })
+    }
+}
 
 /// Owns an LLVM context until it is transferred to ORC. This wrapper makes
 /// context ownership explicit across fallible JIT construction: ordinary Rust
@@ -315,13 +338,17 @@ extern "C" fn optimize_module(
     _context: *mut c_void,
     module: llvm_sys::prelude::LLVMModuleRef,
 ) -> LLVMErrorRef {
-    const PIPELINE: &[u8] = b"default<O2>\0";
+    let pipeline: &[u8] = match OptTier::from_env() {
+        OptTier::O0 => b"default<O0>\0",
+        OptTier::O2 => b"default<O2>\0",
+    };
     // SAFETY: `module` is locked by `LLVMOrcThreadSafeModuleWithModuleDo`.
-    // Target-independent O2 IR passes accept a null target machine; native
-    // code generation subsequently uses the O2 machine configured for LLJIT.
+    // Target-independent default pipelines accept a null target machine;
+    // native code generation subsequently uses the matching tier configured
+    // for LLJIT.
     unsafe {
         let options = LLVMCreatePassBuilderOptions();
-        let error = LLVMRunPasses(module, PIPELINE.as_ptr().cast(), ptr::null_mut(), options);
+        let error = LLVMRunPasses(module, pipeline.as_ptr().cast(), ptr::null_mut(), options);
         LLVMDisposePassBuilderOptions(options);
         error
     }
@@ -344,7 +371,7 @@ impl OrcJit {
         Target::initialize_native(&InitializationConfig::default())
             .map_err(|error| format!("failed to initialize native LLVM target: {error}"))?;
 
-        let jit = create_o2_jit()?;
+        let jit = create_jit(OptTier::from_env())?;
         // SAFETY: `jit` is live after successful construction and owns both
         // returned references.
         let (dylib, triple, data_layout, execution_session) = unsafe {
@@ -621,9 +648,10 @@ impl OrcJit {
     }
 }
 
-fn create_o2_jit() -> Result<LLVMOrcLLJITRef, String> {
-    // Construct LLJIT from an O2 target-machine template. This sets native
-    // instruction selection independently from the O2 IR transform above.
+/// Configures LLJIT's target machine for the selected optimization tier.
+/// PIC keeps generated objects relinkable across processes for a future native
+/// object cache while remaining suitable for in-process materialization.
+fn create_jit(tier: OptTier) -> Result<LLVMOrcLLJITRef, String> {
     unsafe {
         let triple = LLVMGetDefaultTargetTriple();
         let cpu = LLVMGetHostCPUName();
@@ -643,20 +671,24 @@ fn create_o2_jit() -> Result<LLVMOrcLLJITRef, String> {
             LLVMDisposeMessage(triple);
             return Err(error);
         }
+        let codegen_level = match tier {
+            OptTier::O0 => LLVMCodeGenOptLevel::LLVMCodeGenLevelNone,
+            OptTier::O2 => LLVMCodeGenOptLevel::LLVMCodeGenLevelDefault,
+        };
         let machine = LLVMCreateTargetMachine(
             target,
             triple,
             cpu,
             features,
-            LLVMCodeGenOptLevel::LLVMCodeGenLevelDefault,
-            LLVMRelocMode::LLVMRelocDefault,
+            codegen_level,
+            LLVMRelocMode::LLVMRelocPIC,
             LLVMCodeModel::LLVMCodeModelJITDefault,
         );
         LLVMDisposeMessage(features);
         LLVMDisposeMessage(cpu);
         LLVMDisposeMessage(triple);
         if machine.is_null() {
-            return Err("failed to create O2 LLVM target machine".to_string());
+            return Err("failed to create LLVM target machine".to_string());
         }
 
         // Each constructor consumes its input: the target builder disposes the
