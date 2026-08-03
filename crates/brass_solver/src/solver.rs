@@ -23,7 +23,7 @@ pub struct InferenceVarId(pub u32);
 /// Why an inference variable exists. The kind decides whether an unresolved
 /// variable is a legal deferred contract or a diagnostic at a required position
 /// for the inference pipeline.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum InferenceVarKind {
     /// A genuine source-level unknown (unannotated binding/parameter).
     Source,

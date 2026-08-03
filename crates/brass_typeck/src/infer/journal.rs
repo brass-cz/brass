@@ -1,11 +1,42 @@
 //! Replayable observations made while elaborating callable bodies.
 
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
 use brass_hir::{Constness, TypedExprKind};
 use fxhash::{FxHashMap, FxHasher};
 
 use super::*;
+
+/// One open input variable after first-occurrence canonicalization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct CanonVar {
+    pub(super) slot: u32,
+    pub(super) kind: InferenceVarKind,
+}
+
+/// A callable elaboration key independent of the checker's inference ids.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ElaborationMemoKey {
+    pub(super) callable: String,
+    pub(super) receiver: Option<Type>,
+    pub(super) args: Vec<Type>,
+    pub(super) scheme_inputs: Vec<Option<Type>>,
+    pub(super) canon_vars: Vec<CanonVar>,
+}
+
+/// The key plus the caller variables represented by its canonical slots.
+pub(super) struct ElaborationMemoContext {
+    pub(super) key: ElaborationMemoKey,
+    pub(super) inputs: Vec<(CanonVar, Type)>,
+}
+
+/// A non-input inference variable retained by a memoized result skeleton.
+#[derive(Clone)]
+pub(super) struct ElaborationFreshVar {
+    pub(super) placeholder: u32,
+    pub(super) kind: InferenceVarKind,
+}
 
 /// One semantic channel observation made while elaborating a callable body.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -35,11 +66,15 @@ pub(super) enum ElaborationJournalEntry {
 #[derive(Clone)]
 pub(super) struct ElaborationMemoEntry {
     pub(super) ret: Type,
+    pub(super) bindings: Vec<(CanonVar, Type)>,
+    pub(super) fresh: Vec<ElaborationFreshVar>,
+    pub(super) shapes: Vec<(Type, ShapeConstraint)>,
     journal: Vec<ElaborationJournalEntry>,
 }
 
 pub(super) struct ElaborationJournalFrame {
     journal: Vec<ElaborationJournalEntry>,
+    shapes: Vec<(Type, ShapeConstraint)>,
     journal_seen: Option<FxHashMap<u64, Vec<usize>>>,
     journalable: bool,
 }
@@ -48,6 +83,7 @@ impl Default for ElaborationJournalFrame {
     fn default() -> Self {
         Self {
             journal: Vec::new(),
+            shapes: Vec::new(),
             journal_seen: None,
             journalable: true,
         }
@@ -97,6 +133,7 @@ impl ElaborationJournalFrame {
         for entry in &child.journal {
             self.push(entry.clone());
         }
+        self.shapes.extend(child.shapes.iter().cloned());
         self.journalable &= child.journalable;
     }
 
@@ -105,16 +142,93 @@ impl ElaborationJournalFrame {
     }
 }
 
+struct MemoSkeleton {
+    vars: BTreeMap<u32, Type>,
+    next_placeholder: u32,
+    fresh: Vec<ElaborationFreshVar>,
+}
+
 fn fx_hash(value: &impl Hash) -> u64 {
     let mut hasher = FxHasher::default();
     value.hash(&mut hasher);
     hasher.finish()
 }
 
+fn substitute_shape_constraint(
+    constraint: &ShapeConstraint,
+    substitution: &BTreeMap<u32, Type>,
+) -> ShapeConstraint {
+    match constraint {
+        ShapeConstraint::Equals(ty) => {
+            ShapeConstraint::Equals(brass_hir::substitute_vars(ty, substitution))
+        }
+        other => other.clone(),
+    }
+}
+
+fn substitute_journal_entry(
+    entry: &ElaborationJournalEntry,
+    substitution: &BTreeMap<u32, Type>,
+) -> ElaborationJournalEntry {
+    match entry {
+        ElaborationJournalEntry::Typed {
+            kind,
+            span,
+            ty,
+            constness,
+        } => ElaborationJournalEntry::Typed {
+            kind: kind.clone(),
+            span: *span,
+            ty: brass_hir::substitute_vars(ty, substitution),
+            constness: *constness,
+        },
+        ElaborationJournalEntry::SumView(span, ty) => {
+            ElaborationJournalEntry::SumView(*span, brass_hir::substitute_vars(ty, substitution))
+        }
+        ElaborationJournalEntry::TypeOf(span, ty) => {
+            ElaborationJournalEntry::TypeOf(*span, brass_hir::substitute_vars(ty, substitution))
+        }
+        ElaborationJournalEntry::TypeTest(span, ty) => {
+            ElaborationJournalEntry::TypeTest(*span, brass_hir::substitute_vars(ty, substitution))
+        }
+        ElaborationJournalEntry::KeyedCall(span, receiver, method, key) => {
+            ElaborationJournalEntry::KeyedCall(
+                *span,
+                receiver.clone(),
+                method.clone(),
+                brass_hir::substitute_vars(key, substitution),
+            )
+        }
+        ElaborationJournalEntry::InstanceReturn(symbol, args, ret) => {
+            ElaborationJournalEntry::InstanceReturn(
+                symbol.clone(),
+                args.iter()
+                    .map(|arg| brass_hir::substitute_vars(arg, substitution))
+                    .collect(),
+                brass_hir::substitute_vars(ret, substitution),
+            )
+        }
+        other => other.clone(),
+    }
+}
+
 impl Checker<'_> {
+    fn fresh_memo_var(&mut self, kind: InferenceVarKind) -> Type {
+        let id = self.next_unknown;
+        self.next_unknown += 1;
+        self.solver.record_var(id, kind);
+        Type::Unknown(id)
+    }
+
     pub(super) fn journal_elaboration(&mut self, entry: ElaborationJournalEntry) {
         if let Some(frame) = self.elaboration_journals.last_mut() {
             frame.push(entry);
+        }
+    }
+
+    pub(super) fn journal_elaboration_shape(&mut self, ty: Type, constraint: ShapeConstraint) {
+        if let Some(frame) = self.elaboration_journals.last_mut() {
+            frame.shapes.push((ty, constraint));
         }
     }
 
@@ -140,31 +254,169 @@ impl Checker<'_> {
         &self,
         ret: &Type,
         frame: ElaborationJournalFrame,
+        context: &ElaborationMemoContext,
     ) -> ElaborationMemoEntry {
+        let mut skeleton = MemoSkeleton {
+            vars: context
+                .inputs
+                .iter()
+                .map(|(var, actual)| match actual {
+                    Type::Unknown(id) => (*id, Type::Unknown(var.slot)),
+                    _ => unreachable!("canonical memo inputs must be inference variables"),
+                })
+                .collect(),
+            next_placeholder: context.inputs.len() as u32,
+            fresh: Vec::new(),
+        };
+        let ret = self.memo_skeleton_type(ret, &mut skeleton);
+        let bindings = context
+            .inputs
+            .iter()
+            .map(|(var, actual)| (*var, self.memo_skeleton_type(actual, &mut skeleton)))
+            .collect();
+        let shapes = frame
+            .shapes
+            .into_iter()
+            .map(|(ty, constraint)| {
+                (
+                    self.apply_memo_skeleton_type(&ty, &skeleton),
+                    self.apply_memo_skeleton_shape(constraint, &skeleton),
+                )
+            })
+            .collect();
         let journal = frame
             .journal
             .into_iter()
-            .map(|entry| self.resolve_journal_entry(entry))
+            .map(|entry| self.apply_memo_skeleton_journal_entry(entry, &skeleton))
             .collect();
         ElaborationMemoEntry {
-            ret: self.resolve(ret),
+            ret,
+            bindings,
+            fresh: skeleton.fresh,
+            shapes,
             journal,
         }
     }
 
     /// Replay must traverse the same helper so poison semantics are those of a
     /// real elaboration.
-    pub(super) fn replay_elaboration_memo_entry(&mut self, entry: &ElaborationMemoEntry) -> Type {
+    pub(super) fn replay_elaboration_memo_entry(
+        &mut self,
+        entry: &ElaborationMemoEntry,
+        context: &ElaborationMemoContext,
+    ) -> Type {
+        if context.inputs.is_empty() && entry.fresh.is_empty() {
+            if let Some(frame) = self.elaboration_journals.last_mut() {
+                frame.prepare_for_replay();
+            }
+            for (ty, constraint) in &entry.shapes {
+                self.record_shape(ty, constraint.clone());
+            }
+            for observation in &entry.journal {
+                self.replay_elaboration_journal_entry(observation);
+            }
+            return entry.ret.clone();
+        }
+        let mut substitution: BTreeMap<u32, Type> = context
+            .inputs
+            .iter()
+            .map(|(var, actual)| (var.slot, actual.clone()))
+            .collect();
+        for fresh in &entry.fresh {
+            substitution.insert(fresh.placeholder, self.fresh_memo_var(fresh.kind));
+        }
+        for (var, binding) in &entry.bindings {
+            let actual = context
+                .inputs
+                .iter()
+                .find_map(|(candidate, actual)| (*candidate == *var).then_some(actual))
+                .expect("memo key and binding slots must agree");
+            let binding = brass_hir::substitute_vars(binding, &substitution);
+            debug_assert!(self.solver.unify(actual, &binding).is_ok());
+        }
+        for (ty, constraint) in &entry.shapes {
+            let ty = brass_hir::substitute_vars(ty, &substitution);
+            let constraint = substitute_shape_constraint(constraint, &substitution);
+            self.record_shape(&ty, constraint);
+        }
         if let Some(frame) = self.elaboration_journals.last_mut() {
             frame.prepare_for_replay();
         }
         for observation in &entry.journal {
-            self.replay_elaboration_journal_entry(observation);
+            if matches!(
+                observation,
+                ElaborationJournalEntry::Typed { .. }
+                    | ElaborationJournalEntry::SumView(..)
+                    | ElaborationJournalEntry::TypeOf(..)
+                    | ElaborationJournalEntry::TypeTest(..)
+                    | ElaborationJournalEntry::KeyedCall(..)
+                    | ElaborationJournalEntry::InstanceReturn(..)
+            ) {
+                let observation = substitute_journal_entry(observation, &substitution);
+                self.replay_elaboration_journal_entry(&observation);
+            } else {
+                self.replay_elaboration_journal_entry(observation);
+            }
         }
-        entry.ret.clone()
+        self.resolve(&brass_hir::substitute_vars(&entry.ret, &substitution))
     }
 
-    fn resolve_journal_entry(&self, entry: ElaborationJournalEntry) -> ElaborationJournalEntry {
+    fn memo_skeleton_type(&self, ty: &Type, skeleton: &mut MemoSkeleton) -> Type {
+        let resolved = self.resolve(ty);
+        let mut needs_substitution = false;
+        for id in brass_hir::type_vars(&resolved) {
+            // The shared `infer` sentinel in a decided type-test pattern is a
+            // wildcard, not a solver variable. It must remain byte-identical
+            // across replays or equal wildcard patterns would poison the span.
+            if id == brass_hir::INFER_VAR {
+                continue;
+            }
+            needs_substitution = true;
+            if skeleton.vars.contains_key(&id) {
+                continue;
+            }
+            let placeholder = skeleton.next_placeholder;
+            skeleton.next_placeholder += 1;
+            skeleton.vars.insert(id, Type::Unknown(placeholder));
+            skeleton.fresh.push(ElaborationFreshVar {
+                placeholder,
+                kind: self.solver.kind_of(id).unwrap_or(InferenceVarKind::Source),
+            });
+        }
+        if needs_substitution {
+            brass_hir::substitute_vars(&resolved, &skeleton.vars)
+        } else {
+            resolved
+        }
+    }
+
+    fn apply_memo_skeleton_type(&self, ty: &Type, skeleton: &MemoSkeleton) -> Type {
+        let resolved = self.resolve(ty);
+        if skeleton.vars.is_empty() {
+            resolved
+        } else {
+            brass_hir::substitute_vars(&resolved, &skeleton.vars)
+        }
+    }
+
+    fn apply_memo_skeleton_shape(
+        &self,
+        constraint: ShapeConstraint,
+        skeleton: &MemoSkeleton,
+    ) -> ShapeConstraint {
+        match constraint {
+            ShapeConstraint::Equals(ty) => {
+                ShapeConstraint::Equals(self.apply_memo_skeleton_type(&ty, skeleton))
+            }
+            other => other,
+        }
+    }
+
+    fn apply_memo_skeleton_journal_entry(
+        &self,
+        entry: ElaborationJournalEntry,
+        skeleton: &MemoSkeleton,
+    ) -> ElaborationJournalEntry {
         match entry {
             ElaborationJournalEntry::Typed {
                 kind,
@@ -174,26 +426,34 @@ impl Checker<'_> {
             } => ElaborationJournalEntry::Typed {
                 kind,
                 span,
-                ty: self.resolve(&ty),
+                ty: self.apply_memo_skeleton_type(&ty, skeleton),
                 constness,
             },
             ElaborationJournalEntry::SumView(span, ty) => {
-                ElaborationJournalEntry::SumView(span, self.resolve(&ty))
+                ElaborationJournalEntry::SumView(span, self.apply_memo_skeleton_type(&ty, skeleton))
             }
             ElaborationJournalEntry::TypeOf(span, ty) => {
-                ElaborationJournalEntry::TypeOf(span, self.resolve(&ty))
+                ElaborationJournalEntry::TypeOf(span, self.apply_memo_skeleton_type(&ty, skeleton))
             }
-            ElaborationJournalEntry::TypeTest(span, ty) => {
-                ElaborationJournalEntry::TypeTest(span, self.resolve(&ty))
-            }
+            ElaborationJournalEntry::TypeTest(span, ty) => ElaborationJournalEntry::TypeTest(
+                span,
+                self.apply_memo_skeleton_type(&ty, skeleton),
+            ),
             ElaborationJournalEntry::KeyedCall(span, receiver, method, key) => {
-                ElaborationJournalEntry::KeyedCall(span, receiver, method, self.resolve(&key))
+                ElaborationJournalEntry::KeyedCall(
+                    span,
+                    receiver,
+                    method,
+                    self.apply_memo_skeleton_type(&key, skeleton),
+                )
             }
             ElaborationJournalEntry::InstanceReturn(symbol, args, ret) => {
                 ElaborationJournalEntry::InstanceReturn(
                     symbol,
-                    args.into_iter().map(|arg| self.resolve(&arg)).collect(),
-                    self.resolve(&ret),
+                    args.into_iter()
+                        .map(|arg| self.apply_memo_skeleton_type(&arg, skeleton))
+                        .collect(),
+                    self.apply_memo_skeleton_type(&ret, skeleton),
                 )
             }
             other => other,
@@ -348,11 +608,16 @@ impl Checker<'_> {
     }
 
     pub(super) fn record_instance_return(&mut self, symbol: String, args: Vec<Type>, ret: Type) {
+        let args: Vec<_> = args.iter().map(|arg| self.resolve(arg)).collect();
+        let ret = self.resolve(&ret);
         self.journal_elaboration(ElaborationJournalEntry::InstanceReturn(
             symbol.clone(),
             args.clone(),
             ret.clone(),
         ));
+        if !args.iter().all(brass_hir::is_fully_known) || !brass_hir::is_fully_known(&ret) {
+            return;
+        }
         self.instance_returns.insert((symbol, args), ret);
     }
 }
@@ -360,6 +625,19 @@ impl Checker<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn concrete_context() -> ElaborationMemoContext {
+        ElaborationMemoContext {
+            key: ElaborationMemoKey {
+                callable: "test".to_string(),
+                receiver: None,
+                args: Vec::new(),
+                scheme_inputs: Vec::new(),
+                canon_vars: Vec::new(),
+            },
+            inputs: Vec::new(),
+        }
+    }
 
     #[test]
     fn nested_hit_journal_is_composed_into_its_parent() {
@@ -370,14 +648,15 @@ mod tests {
         checker.begin_elaboration_journal();
         checker.record_lift_err(child_span);
         let child_frame = checker.finish_elaboration_journal();
-        let child = checker.build_elaboration_memo_entry(&Type::Bool, child_frame);
+        let context = concrete_context();
+        let child = checker.build_elaboration_memo_entry(&Type::Bool, child_frame, &context);
 
         checker.begin_elaboration_journal();
         checker.record_null_prop(Span::new(0, 1));
-        checker.replay_elaboration_memo_entry(&child);
+        checker.replay_elaboration_memo_entry(&child, &context);
         checker.record_view_arg(Span::new(4, 5));
         let parent_frame = checker.finish_elaboration_journal();
-        let parent = checker.build_elaboration_memo_entry(&Type::Bool, parent_frame);
+        let parent = checker.build_elaboration_memo_entry(&Type::Bool, parent_frame, &context);
 
         // The skipped child's observation remains between the parent's writes,
         // matching the order of a real nested body walk.
@@ -406,12 +685,13 @@ mod tests {
             Constness::Unknown,
         );
         let frame = recorded.finish_elaboration_journal();
-        let memo = recorded.build_elaboration_memo_entry(&Type::Bool, frame);
+        let context = concrete_context();
+        let memo = recorded.build_elaboration_memo_entry(&Type::Bool, frame, &context);
 
         let mut replayed = Checker::new(&program);
         replayed.record_prop_kind(span, PropKind::Err);
-        replayed.replay_elaboration_memo_entry(&memo);
-        replayed.replay_elaboration_memo_entry(&memo);
+        replayed.replay_elaboration_memo_entry(&memo, &context);
+        replayed.replay_elaboration_memo_entry(&memo, &context);
 
         // A conflicting replay poisons through `record_prop_kind`, while the
         // second identical typed replay contributes no duplicate sidecar node.

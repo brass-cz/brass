@@ -379,6 +379,7 @@ impl<'a> Checker<'a> {
     /// is solved at a call site (see `crate::constraint`).
     pub(super) fn record_shape(&mut self, ty: &Type, constraint: ShapeConstraint) {
         if let Type::Unknown(id) = self.resolve_head(ty) {
+            self.journal_elaboration_shape(Type::Unknown(id), constraint.clone());
             self.shape_constraints
                 .entry(id)
                 .or_default()

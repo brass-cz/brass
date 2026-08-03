@@ -42,7 +42,10 @@ mod patterns;
 mod precompute;
 mod resolve;
 
-use journal::{ElaborationJournalEntry, ElaborationJournalFrame, ElaborationMemoEntry};
+use journal::{
+    CanonVar, ElaborationJournalEntry, ElaborationJournalFrame, ElaborationMemoContext,
+    ElaborationMemoEntry, ElaborationMemoKey,
+};
 
 use assign::{common_nullable_type, integer_literal_fits};
 use builtins::primitive_static_return;
@@ -1416,22 +1419,18 @@ struct Checker<'a> {
     /// only re-derives what the signature already states. The complete
     /// diagnostic verdict stays `check`'s (eager's) job, where this is off.
     lazy_profile: bool,
-    /// Memoized returns of call-site body re-elaborations, keyed by callable
-    /// identity and the fully-resolved argument types. A method's identity also
-    /// includes its resolved receiver instance and sum variant. The same body at
-    /// the same concrete inputs re-derives the same span-keyed channel entries
-    /// and return, so the first elaboration's answer is reused -- without this
-    /// repeated subtrees of an unannotated call chain are re-checked once per call
-    /// site, and sum dispatch multiplies each method call by its variant count.
-    /// Each entry also retains the semantic channel observations from that walk;
-    /// a hit replays them through the normal recording helpers so nested memo
-    /// windows and channel poison rules see the same writes as a real walk.
-    /// Only clean (error-free) elaborations with fully-known keys and returns land
-    /// here: an open input means the elaboration would constrain the caller's own
-    /// variables, an open return must stay the shared table entry so later pinning
-    /// reaches every reader, and an erroring body keeps reporting at every call
-    /// site.
-    elaboration_memo: HashMap<(String, Vec<Type>), ElaborationMemoEntry>,
+    /// Memoized call-site body elaborations. Open input variables are numbered by
+    /// first occurrence and tagged with their solver kind, preserving aliases
+    /// without making checker-local ids part of the key. A method key also covers
+    /// its receiver and receiver-derived scheme inputs.
+    ///
+    /// Each clean entry retains the return skeleton, constraints imposed on its
+    /// canonical inputs, non-input placeholders, deferred shape constraints, and
+    /// semantic channel observations. A hit freshens placeholders, applies input
+    /// bindings, registers shapes, and replays every channel through its normal
+    /// helper. This keeps nested windows and poison rules equivalent to a body
+    /// walk while collapsing repeated subtrees of inferred call chains.
+    elaboration_memo: HashMap<ElaborationMemoKey, Rc<ElaborationMemoEntry>>,
     /// Nested elaboration windows isolate their own observations while still
     /// composing complete child subtrees into an enclosing memo entry.
     elaboration_journals: Vec<ElaborationJournalFrame>,

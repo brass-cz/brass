@@ -3,6 +3,7 @@
 //! actual argument types, and re-inferring returns from the frame.
 
 use super::*;
+use std::sync::OnceLock;
 
 /// How deep the re-elaboration of callee bodies at call sites may nest. Each
 /// level is a distinct callable (a repeat is already caught as recursion), so a
@@ -15,6 +16,11 @@ const MAX_ELABORATION_DEPTH: usize = 64;
 /// under -- and low enough that a chain which expands instead of converging is
 /// reported rather than left to run forever.
 const ELABORATION_BUDGET: u64 = 2_000_000;
+
+fn memo_check_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("BRASS_MEMO_CHECK").is_ok_and(|value| value == "1"))
+}
 
 impl<'a> Checker<'a> {
     /// Whether another callee body may be re-elaborated: recursion is guarded per
@@ -64,19 +70,32 @@ impl<'a> Checker<'a> {
             return fallback_ret;
         }
         let unannotated = declared_ret.is_none();
+        let key = format!("fn:{symbol}");
         // Co-checking records return links, and an active type-test probe commits
-        // bindings for its holes. Both require a real body walk.
-        let memo_enabled = !self.co_checking && self.type_test_holes.is_empty();
+        // bindings for its holes. Recursive calls must read the shared fallback
+        // return instead of consulting or populating the body memo.
+        let memo_enabled = !self.co_checking
+            && self.type_test_holes.is_empty()
+            && !self.instantiating.contains(&key);
         let memo_key = memo_enabled
-            .then(|| self.elaboration_memo_key("fn", symbol, arg_types))
+            .then(|| self.elaboration_memo_key("fn", symbol, None, arg_types, &[]))
             .flatten();
+        let mut memo_validation = None;
         if let Some(memo_key) = &memo_key
-            && let Some(entry) = self.elaboration_memo.get(memo_key).cloned()
+            && let Some(entry) = self.elaboration_memo.get(&memo_key.key).cloned()
         {
-            return self.replay_elaboration_memo_entry(&entry);
+            tracing::debug!(callable = %memo_key.key.callable, "elaboration memo hit");
+            let replay_errors_before = self.errors.len();
+            let replayed = self.replay_elaboration_memo_entry(&entry, memo_key);
+            let replay_errors = self.errors.len() - replay_errors_before;
+            if !memo_check_enabled() {
+                return replayed;
+            }
+            memo_validation = Some((replayed, replay_errors));
+        } else if let Some(memo_key) = &memo_key {
+            tracing::debug!(callable = %memo_key.key.callable, "elaboration memo miss");
         }
         let errors_before = self.errors.len();
-        let key = format!("fn:{symbol}");
         if !self.instantiating.insert(key.clone()) {
             // Recursive call: re-checking the body again would not terminate, so
             // fall back to the declared/precomputed return type. Remember that it
@@ -127,49 +146,222 @@ impl<'a> Checker<'a> {
         };
         self.current_module = saved_module;
         self.instantiating.remove(&key);
+        if let Some((replayed, replay_errors)) = memo_validation {
+            debug_assert_eq!(
+                self.canonical_memo_check_return(&replayed),
+                self.canonical_memo_check_return(&ret)
+            );
+            debug_assert_eq!(replay_errors, self.errors.len() - errors_before);
+        }
         if let Some(memo_key) = memo_key {
             let resolved = self.resolve(&ret);
-            let memoizable =
-                self.errors.len() == errors_before && brass_hir::is_fully_known(&resolved);
+            let memoizable = self.errors.len() == errors_before;
             if memoizable && unannotated {
                 self.record_instance_return(
                     symbol.to_string(),
-                    memo_key.1.clone(),
+                    arg_types.iter().map(|arg| self.resolve(arg)).collect(),
                     resolved.clone(),
                 );
             }
             let frame = self.finish_elaboration_journal();
             if memoizable && frame.is_journalable() {
-                let entry = self.build_elaboration_memo_entry(&resolved, frame);
-                self.elaboration_memo.insert(memo_key, entry);
+                // Recursive return pinning changes the shared solver entry during
+                // this first walk. It is not a journal observation: later hits see
+                // the already-linked entry, just as repeated elaborations do.
+                let entry = self.build_elaboration_memo_entry(&resolved, frame, &memo_key);
+                self.elaboration_memo.insert(memo_key.key, Rc::new(entry));
             }
         }
         ret
     }
 
-    /// The memo key for re-elaborating a callable at these argument types, or
-    /// `None` when any argument is not fully resolved (elaborating at an open
-    /// argument constrains the caller's variables, which a memo hit must not
-    /// skip). The resolved argument types are kept structurally -- hashing
-    /// them directly is much cheaper than rendering them to a string, and the
-    /// structural comparison distinguishes two instantiations of one nominal
-    /// the way a full `Debug` rendering would (ids and substitutions
-    /// included).
+    /// Build a key whose open variables depend on first-occurrence structure,
+    /// not on the checker's allocation order. Receiver, arguments, and scheme
+    /// inputs share one slot namespace so aliases across them remain visible.
     fn elaboration_memo_key(
         &self,
         kind: &str,
         callable: &str,
+        receiver: Option<&Type>,
         arg_types: &[Type],
-    ) -> Option<(String, Vec<Type>)> {
-        let mut resolved_args = Vec::with_capacity(arg_types.len());
-        for arg in arg_types {
-            let resolved = self.resolve(arg);
-            if !brass_hir::is_fully_known(&resolved) {
-                return None;
-            }
-            resolved_args.push(resolved);
+        scheme_inputs: &[Option<Type>],
+    ) -> Option<ElaborationMemoContext> {
+        let resolved_receiver = receiver.map(|ty| self.resolve(ty));
+        let resolved_args: Vec<_> = arg_types.iter().map(|ty| self.resolve(ty)).collect();
+        let resolved_scheme_inputs: Vec<_> = scheme_inputs
+            .iter()
+            .map(|ty| ty.as_ref().map(|ty| self.resolve(ty)))
+            .collect();
+        if resolved_receiver
+            .iter()
+            .chain(resolved_args.iter())
+            .chain(resolved_scheme_inputs.iter().flatten())
+            .all(brass_hir::is_fully_known)
+        {
+            return Some(ElaborationMemoContext {
+                key: ElaborationMemoKey {
+                    callable: format!("{kind}:{callable}"),
+                    receiver: resolved_receiver,
+                    args: resolved_args,
+                    scheme_inputs: resolved_scheme_inputs,
+                    canon_vars: Vec::new(),
+                },
+                inputs: Vec::new(),
+            });
         }
-        Some((format!("{kind}:{callable}"), resolved_args))
+        let mut slots = HashMap::default();
+        let mut inputs = Vec::new();
+        let receiver = match resolved_receiver {
+            Some(ty) => Some(self.canonicalize_resolved_memo_type(ty, &mut slots, &mut inputs)?),
+            None => None,
+        };
+        let args = resolved_args
+            .into_iter()
+            .map(|ty| self.canonicalize_resolved_memo_type(ty, &mut slots, &mut inputs))
+            .collect::<Option<Vec<_>>>()?;
+        let scheme_inputs = resolved_scheme_inputs
+            .into_iter()
+            .map(|ty| match ty {
+                Some(ty) => self
+                    .canonicalize_resolved_memo_type(ty, &mut slots, &mut inputs)
+                    .map(Some),
+                None => Some(None),
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let canon_vars = inputs.iter().map(|(var, _)| *var).collect();
+        Some(ElaborationMemoContext {
+            key: ElaborationMemoKey {
+                callable: format!("{kind}:{callable}"),
+                receiver,
+                args,
+                scheme_inputs,
+                canon_vars,
+            },
+            inputs,
+        })
+    }
+
+    fn canonicalize_resolved_memo_type(
+        &self,
+        ty: Type,
+        slots: &mut HashMap<u32, CanonVar>,
+        inputs: &mut Vec<(CanonVar, Type)>,
+    ) -> Option<Type> {
+        match ty {
+            Type::Unknown(id) => {
+                if id == brass_hir::INFER_VAR {
+                    return None;
+                }
+                let kind = self.solver.kind_of(id).unwrap_or(InferenceVarKind::Source);
+                if matches!(
+                    kind,
+                    InferenceVarKind::ErrorOnlyOk | InferenceVarKind::Invalid
+                ) {
+                    return None;
+                }
+                let var = *slots.entry(id).or_insert_with(|| {
+                    let var = CanonVar {
+                        slot: inputs.len() as u32,
+                        kind,
+                    };
+                    inputs.push((var, Type::Unknown(id)));
+                    var
+                });
+                Some(Type::Unknown(var.slot))
+            }
+            Type::Array(inner, len) => Some(Type::Array(
+                Box::new(self.canonicalize_resolved_memo_type(*inner, slots, inputs)?),
+                len,
+            )),
+            Type::Slice(inner) => Some(Type::Slice(Box::new(
+                self.canonicalize_resolved_memo_type(*inner, slots, inputs)?,
+            ))),
+            Type::Tuple(elements) => Some(Type::Tuple(
+                elements
+                    .into_iter()
+                    .map(|ty| self.canonicalize_resolved_memo_type(ty, slots, inputs))
+                    .collect::<Option<Vec<_>>>()?,
+            )),
+            Type::Fun(params, ret) => Some(Type::Fun(
+                params
+                    .into_iter()
+                    .map(|ty| self.canonicalize_resolved_memo_type(ty, slots, inputs))
+                    .collect::<Option<Vec<_>>>()?,
+                Box::new(self.canonicalize_resolved_memo_type(*ret, slots, inputs)?),
+            )),
+            Type::Nullable(inner) => Some(Type::Nullable(Box::new(
+                self.canonicalize_resolved_memo_type(*inner, slots, inputs)?,
+            ))),
+            Type::ConstOf(inner) => Some(Type::ConstOf(Box::new(
+                self.canonicalize_resolved_memo_type(*inner, slots, inputs)?,
+            ))),
+            Type::Mut(inner) => Some(Type::Mut(Box::new(
+                self.canonicalize_resolved_memo_type(*inner, slots, inputs)?,
+            ))),
+            Type::Ref(inner) => Some(Type::Ref(Box::new(
+                self.canonicalize_resolved_memo_type(*inner, slots, inputs)?,
+            ))),
+            Type::Record(nominal) => self
+                .canonicalize_resolved_memo_nominal(nominal, slots, inputs)
+                .map(Type::Record),
+            Type::Sum(nominal) => self
+                .canonicalize_resolved_memo_nominal(nominal, slots, inputs)
+                .map(Type::Sum),
+            resolved => Some(resolved),
+        }
+    }
+
+    fn canonicalize_resolved_memo_nominal(
+        &self,
+        nominal: NominalType,
+        slots: &mut HashMap<u32, CanonVar>,
+        inputs: &mut Vec<(CanonVar, Type)>,
+    ) -> Option<NominalType> {
+        let mut substitution = Substitution::empty();
+        for (name, ty) in nominal.substitution.iter() {
+            substitution.insert(
+                name,
+                self.canonicalize_resolved_memo_type(ty.clone(), slots, inputs)?,
+            );
+        }
+        Some(NominalType::with_substitution(
+            nominal.id,
+            nominal.name,
+            substitution,
+        ))
+    }
+
+    fn canonical_memo_check_return(&self, ty: &Type) -> (Type, Vec<InferenceVarKind>) {
+        let resolved = self.resolve(ty);
+        let mut slots = HashMap::default();
+        let mut inputs = Vec::new();
+        if let Some(canonical) =
+            self.canonicalize_resolved_memo_type(resolved.clone(), &mut slots, &mut inputs)
+        {
+            return (
+                canonical,
+                inputs.into_iter().map(|(var, _)| var.kind).collect(),
+            );
+        }
+
+        // Error-classified variables are deliberately rejected from memo keys,
+        // but can be fresh outputs of an otherwise clean elaboration. Normalize
+        // them here so validation compares their structure rather than allocation
+        // ids while still comparing their solver kinds.
+        let vars: Vec<_> = brass_hir::type_vars(&resolved)
+            .into_iter()
+            .filter(|id| *id != brass_hir::INFER_VAR)
+            .collect();
+        let substitution = vars
+            .iter()
+            .enumerate()
+            .map(|(slot, id)| (*id, Type::Unknown(slot as u32)))
+            .collect();
+        let kinds = vars
+            .into_iter()
+            .map(|id| self.solver.kind_of(id).unwrap_or(InferenceVarKind::Source))
+            .collect();
+        (brass_hir::substitute_vars(&resolved, &substitution), kinds)
     }
 
     /// Choose an inferred-return body's return type: the full check's
@@ -325,42 +517,6 @@ impl<'a> Checker<'a> {
         if signature_params.len().saturating_sub(usize::from(has_self)) != arg_types.len() {
             return fallback_ret;
         }
-        // A co-check records return links and an active type-test probe commits
-        // bindings for its holes. Both require the body walk even when its value
-        // types match an earlier elaboration.
-        let memo_enabled = !self.co_checking && self.type_test_holes.is_empty();
-        let memo_key = memo_enabled.then(|| {
-            receiver_ty
-                .as_ref()
-                .map(|ty| self.resolve(ty))
-                // Static methods have no value receiver; their declaring nominal
-                // is the fixed receiver identity that supplies `Self`.
-                .or_else(|| self.program.types.get(self_type).map(TypeInfo::type_ref))
-        });
-        let memo_key = memo_key.flatten().and_then(|resolved_receiver| {
-            if !brass_hir::is_fully_known(&resolved_receiver) {
-                return None;
-            }
-            let variant = owner.split_once('.').map_or("", |(_, variant)| variant);
-            let callable = format!(
-                "{}:{}:{}",
-                brass_hir::type_key(&resolved_receiver),
-                variant,
-                method_name
-            );
-            // Receiver-scheme parameters are derived from the resolved receiver;
-            // an unpinned scheme parameter falls back to its argument type. The
-            // receiver and arguments therefore cover every frame binding. An
-            // ordinary method is not expectation-directed: expected returns only
-            // select reflective methods, whose template bodies do not reach here.
-            self.elaboration_memo_key("m", &callable, arg_types)
-        });
-        if let Some(memo_key) = &memo_key
-            && let Some(entry) = self.elaboration_memo.get(memo_key).cloned()
-        {
-            return self.replay_elaboration_memo_entry(&entry);
-        }
-        let errors_before = self.errors.len();
         // Keyed by the receiver TYPE, not by `owner` (the `Sum.Variant` qualifier
         // this call resolved through): a sum's method lives in every variant's
         // table, so one call resolves to one candidate per variant, all sharing
@@ -368,6 +524,50 @@ impl<'a> Checker<'a> {
         // a variant not yet on the stack, and the work grew factorially in the
         // variant count -- see `Checker::instantiating`.
         let key = format!("method:{self_type}.{method_name}");
+        // A co-check records return links and an active type-test probe commits
+        // bindings for its holes. Recursive calls must take the fallback path.
+        let memo_enabled = !self.co_checking
+            && self.type_test_holes.is_empty()
+            && !self.instantiating.contains(&key);
+        let memo_key = memo_enabled.then(|| {
+            receiver_ty
+                .clone()
+                // Static methods have no value receiver; their declaring nominal
+                // is the fixed receiver identity that supplies `Self`.
+                .or_else(|| self.program.types.get(self_type).map(TypeInfo::type_ref))
+        });
+        let memo_key = memo_key.flatten().and_then(|resolved_receiver| {
+            let variant = owner.split_once('.').map_or("", |(_, variant)| variant);
+            let callable = format!("{self_type}:{variant}:{method_name}");
+            // Receiver-scheme parameters are derived from the resolved receiver;
+            // an unpinned scheme parameter falls back to its argument type. The
+            // receiver and arguments therefore cover every frame binding. An
+            // ordinary method is not expectation-directed: expected returns only
+            // select reflective methods, whose template bodies do not reach here.
+            self.elaboration_memo_key(
+                "m",
+                &callable,
+                Some(&resolved_receiver),
+                arg_types,
+                scheme_params,
+            )
+        });
+        let mut memo_validation = None;
+        if let Some(memo_key) = &memo_key
+            && let Some(entry) = self.elaboration_memo.get(&memo_key.key).cloned()
+        {
+            tracing::debug!(callable = %memo_key.key.callable, "elaboration memo hit");
+            let replay_errors_before = self.errors.len();
+            let replayed = self.replay_elaboration_memo_entry(&entry, memo_key);
+            let replay_errors = self.errors.len() - replay_errors_before;
+            if !memo_check_enabled() {
+                return replayed;
+            }
+            memo_validation = Some((replayed, replay_errors));
+        } else if let Some(memo_key) = &memo_key {
+            tracing::debug!(callable = %memo_key.key.callable, "elaboration memo miss");
+        }
+        let errors_before = self.errors.len();
         if !self.instantiating.insert(key.clone()) {
             return fallback_ret;
         }
@@ -404,14 +604,20 @@ impl<'a> Checker<'a> {
         self.self_variant = saved_variant;
         self.current_module = saved_module;
         self.instantiating.remove(&key);
+        if let Some((replayed, replay_errors)) = memo_validation {
+            debug_assert_eq!(
+                self.canonical_memo_check_return(&replayed),
+                self.canonical_memo_check_return(&ret)
+            );
+            debug_assert_eq!(replay_errors, self.errors.len() - errors_before);
+        }
         if let Some(memo_key) = memo_key {
             let resolved = self.resolve(&ret);
-            let memoizable =
-                self.errors.len() == errors_before && brass_hir::is_fully_known(&resolved);
+            let memoizable = self.errors.len() == errors_before;
             let frame = self.finish_elaboration_journal();
             if memoizable && frame.is_journalable() {
-                let entry = self.build_elaboration_memo_entry(&resolved, frame);
-                self.elaboration_memo.insert(memo_key, entry);
+                let entry = self.build_elaboration_memo_entry(&resolved, frame, &memo_key);
+                self.elaboration_memo.insert(memo_key.key, Rc::new(entry));
             }
         }
         ret
