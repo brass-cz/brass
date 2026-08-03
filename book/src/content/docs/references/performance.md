@@ -36,12 +36,13 @@ inspect per-item output only for the phase that dominates.
 
 ## Cache overview
 
-Brass uses two analysis-cache locations:
+Brass uses two analysis-cache locations and one native-code cache:
 
 | Cache      | Location                   | Purpose                                                            |
 | ---------- | -------------------------- | ------------------------------------------------------------------ |
 | `.czcache` | beside the entry file      | Reuse a complete check, or resume a partially completed normal run |
 | `.czctx`   | the user's cache directory | Reuse checked dependencies when only the entry file changes        |
+| `.czobj`   | beside the entry file      | Reuse compiled native code for groups earlier runs materialized    |
 
 `BRASS_CACHE=off` disables cache reads and writes. Cache operations are
 best-effort: an unavailable or read-only cache location does not prevent a
@@ -104,8 +105,7 @@ execution-specific rewrites.
 
 ## Native compilation
 
-An analysis-cache hit removes checking work, not native compilation. During a
-normal native run:
+During a normal native run:
 
 - monomorphization begins at module initializers and `main`;
 - a reachable concrete function is optimized and translated on first use;
@@ -127,6 +127,21 @@ takes a few milliseconds where the optimized pipeline takes hundreds. Set
 `BRASS_OPT=2` to compile every group with the full optimizing pipeline
 instead -- the right trade for a long-running or compute-bound program whose
 first execution of each hot function matters more than its start-up.
+
+### Native object cache (`.czobj`)
+
+The machine code a run materializes is saved next to the entry as
+`<entry>.o0.czobj` (or `.o2.czobj` under `BRASS_OPT=2`) and bound to the
+exact analysis result that produced it: the file records the analysis
+payload's hash, the compile target's identity, and every group's symbol
+list. A later run whose analysis cache hits loads the matching groups as
+prebuilt objects -- no IR generation, optimization, or instruction
+selection -- and any mismatch simply recompiles that group. A `.o2.czobj`
+is preferred even in a default-tier session, since a prebuilt object skips
+the compiler entirely regardless of how it was optimized. Distributed
+toolchains ship these artifacts for the bundled tools, built with
+`BRASS_JIT_CPU=generic` so one packfile serves every host of the same
+architecture.
 
 `--eager` uses the same first-use native compilation. Its difference is when
 checking happens, not what native code is produced: the complete check (and

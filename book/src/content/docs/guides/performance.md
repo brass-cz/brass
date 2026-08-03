@@ -65,8 +65,11 @@ quality from its first call. See the
 
 Cache files are an implementation aid, not build artifacts you need to
 manage. They are ignored when sources, dependencies, plugins, or the compiler
-change. Set `BRASS_CACHE=off` when diagnosing cache behavior or comparing cold
-runs. See [Performance and caching](/references/performance/) for cache kinds,
+change. A repeated run reuses both the analysis and the native code compiled
+by earlier runs, so an unchanged program starts without checking or
+compiling anything. Set `BRASS_CACHE=off` when diagnosing cache behavior or
+comparing cold runs. See
+[Performance and caching](/references/performance/) for cache kinds,
 validation, and timing logs.
 
 ## Measuring
