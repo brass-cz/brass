@@ -173,12 +173,10 @@ impl<'a> Checker<'a> {
             closure_scope.insert(p.name.clone(), ty.clone());
             param_types.push(ty);
         }
-        let mut inferred_env = env_from_scopes(scopes);
-        inferred_env.extend(closure_scope.clone());
-        let mut light_props = LightProps::default();
-        self.infer_expr_light(body, &inferred_env, &mut light_props);
         let mut closure_scopes = scopes.clone();
-        closure_scopes.push(closure_scope);
+        closure_scopes.push(Scope::new(closure_scope));
+        let mut light_props = LightProps::default();
+        self.infer_expr_light(body, &closure_scopes, &mut light_props);
         self.const_scopes.push(HashSet::default());
         self.return_contexts
             .push(ReturnContext::Explicit(want_ret.clone()));
@@ -572,13 +570,11 @@ impl<'a> Checker<'a> {
             }
             Expr::Closure(params, body, _) => {
                 self.report_duplicate_params("closure", params);
-                let mut inferred_env = env_from_scopes(scopes);
                 let closure_scope = self.param_scope(params);
-                inferred_env.extend(closure_scope.clone());
-                let mut propagated = LightProps::default();
-                self.infer_expr_light(body, &inferred_env, &mut propagated);
                 let mut closure_scopes = scopes.clone();
-                closure_scopes.push(closure_scope);
+                closure_scopes.push(Scope::new(closure_scope));
+                let mut propagated = LightProps::default();
+                self.infer_expr_light(body, &closure_scopes, &mut propagated);
                 self.const_scopes.push(HashSet::default());
                 self.return_contexts.push(ReturnContext::Inferred);
                 self.return_values.push(Vec::new());
@@ -747,7 +743,7 @@ impl<'a> Checker<'a> {
                 let scrut_ty = self.check_expr(scrut, scopes);
                 self.check_pattern_against(&scrut_ty, pat);
                 let mut then_scopes = scopes.clone();
-                then_scopes.push(HashMap::default());
+                then_scopes.push(Scope::default());
                 self.const_scopes.push(HashSet::default());
                 // A plain binding on a nullable scrutinee is a presence test, so on
                 // the then-arm the value is proven non-null: bind it at the unwrapped
@@ -772,7 +768,7 @@ impl<'a> Checker<'a> {
                 for arm in arms {
                     self.check_pattern_against(&scrut_ty, &arm.pattern);
                     let mut arm_scopes = scopes.clone();
-                    arm_scopes.push(HashMap::default());
+                    arm_scopes.push(Scope::default());
                     self.const_scopes.push(HashSet::default());
                     self.bind_pattern(&arm.pattern, &scrut_ty, &mut arm_scopes);
                     let arm_ty = self.check_expr(&arm.body, &mut arm_scopes);
@@ -905,7 +901,7 @@ impl<'a> Checker<'a> {
         if let Expr::Ident(name, _) = subject {
             let mut frame: HashMap<String, Type> = HashMap::default();
             frame.insert(name.clone(), pattern.clone());
-            probe_scopes.push(frame);
+            probe_scopes.push(Scope::new(frame));
         }
         if !hole_ids.is_empty() {
             self.type_test_holes.extend(hole_ids.iter().copied());
@@ -1067,7 +1063,7 @@ impl<'a> Checker<'a> {
         let Some((ty, _)) = probe_returns.iter().find(|(_, s)| *s == span) else {
             return false;
         };
-        let ty = self.resolve(ty);
+        let ty = self.resolve_head(ty);
         // A returned `Result` flows whole rather than as the Ok payload; the
         // back end never folds on it.
         if ty.is_result_type() {
@@ -1098,7 +1094,7 @@ impl<'a> Checker<'a> {
     /// yields nothing. (The HM checker's `infer_block_value` has always done this
     /// for a trailing `return`; the two now agree.)
     fn check_block_expr(&mut self, b: &Block, scopes: &mut ScopeStack) -> Type {
-        scopes.push(HashMap::default());
+        scopes.push(Scope::default());
         self.const_scopes.push(HashSet::default());
         let mut last = Type::Void;
         let mut diverges = false;

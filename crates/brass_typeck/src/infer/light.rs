@@ -8,7 +8,7 @@ impl<'a> Checker<'a> {
     pub(super) fn infer_returns_block(
         &mut self,
         block: &Block,
-        env: &mut HashMap<String, Type>,
+        env: &mut ScopeStack,
         normal: &mut Vec<(Type, Span)>,
         props: &mut LightProps,
     ) {
@@ -87,7 +87,7 @@ impl<'a> Checker<'a> {
     fn light_type_test_decision(
         &mut self,
         cond: &Expr,
-        env: &HashMap<String, Type>,
+        env: &ScopeStack,
         props: &mut LightProps,
     ) -> Option<bool> {
         let Expr::TypeTest(subject, te, tspan) = cond else {
@@ -120,7 +120,7 @@ impl<'a> Checker<'a> {
     fn light_chain_diverges(
         &mut self,
         stmt: &Stmt,
-        env: &HashMap<String, Type>,
+        env: &ScopeStack,
         props: &mut LightProps,
     ) -> bool {
         let expr = match stmt {
@@ -136,7 +136,7 @@ impl<'a> Checker<'a> {
     fn light_if_chain_diverges(
         &mut self,
         expr: &Expr,
-        env: &HashMap<String, Type>,
+        env: &ScopeStack,
         props: &mut LightProps,
     ) -> bool {
         let Expr::If(cond, then, els, _) = expr else {
@@ -157,7 +157,7 @@ impl<'a> Checker<'a> {
     fn infer_returns_expr(
         &mut self,
         expr: &Expr,
-        env: &mut HashMap<String, Type>,
+        env: &mut ScopeStack,
         normal: &mut Vec<(Type, Span)>,
         props: &mut LightProps,
     ) {
@@ -207,12 +207,7 @@ impl<'a> Checker<'a> {
     /// up, so the light return-inference pass sees the grown element type. It
     /// only ever binds the local's own element variable, not the function's
     /// parameter variables.
-    fn track_collection_growth(
-        &mut self,
-        expr: &Expr,
-        env: &HashMap<String, Type>,
-        props: &mut LightProps,
-    ) {
+    fn track_collection_growth(&mut self, expr: &Expr, env: &ScopeStack, props: &mut LightProps) {
         if let Expr::Call(callee, args, _) = expr
             && let Expr::Field(recv, method, _) = callee.as_ref()
             && matches!(method.as_str(), "push" | "insert")
@@ -229,7 +224,7 @@ impl<'a> Checker<'a> {
     pub(super) fn infer_expr_light(
         &mut self,
         expr: &Expr,
-        env: &HashMap<String, Type>,
+        env: &ScopeStack,
         props: &mut LightProps,
     ) -> Type {
         match expr {
@@ -238,13 +233,11 @@ impl<'a> Checker<'a> {
             Expr::Bool(..) => Type::Bool,
             Expr::Null(_) => Type::null(),
             Expr::Str(..) => Type::Str,
-            Expr::Ident(name, _) => env
-                .get(name)
-                .cloned()
+            Expr::Ident(name, _) => self
+                .lookup(env, name)
                 .unwrap_or_else(|| self.fresh_unknown()),
-            Expr::SelfExpr(_) => env
-                .get("self")
-                .cloned()
+            Expr::SelfExpr(_) => self
+                .lookup(env, "self")
                 .unwrap_or_else(|| self.fresh_unknown()),
             Expr::Unary(_, inner, _) => self.infer_expr_light(inner, env, props),
             // A type test is a compile-time bool; the light pass never folds
@@ -284,22 +277,24 @@ impl<'a> Checker<'a> {
             }
             Expr::Closure(params, body, _) => {
                 let mut inner = env.clone();
+                inner.push(Scope::default());
                 for param in params {
                     let ty = param
                         .ty
                         .as_ref()
                         .and_then(|t| self.resolve_type(t).ok())
                         .unwrap_or_else(|| self.fresh_unknown());
-                    inner.insert(param.name.clone(), ty);
+                    inner
+                        .last_mut()
+                        .expect("closure scope frame")
+                        .insert(param.name.clone(), ty);
                 }
                 let ret = self.infer_expr_light(body, &inner, props);
                 Type::Fun(
                     params
                         .iter()
                         .map(|p| {
-                            inner
-                                .get(&p.name)
-                                .cloned()
+                            self.lookup(&inner, &p.name)
                                 .unwrap_or_else(|| self.fresh_unknown())
                         })
                         .collect(),
@@ -399,7 +394,7 @@ impl<'a> Checker<'a> {
         &mut self,
         callee: &Expr,
         args: &[Arg],
-        env: &HashMap<String, Type>,
+        env: &ScopeStack,
         props: &mut LightProps,
     ) -> Type {
         if let Expr::Ident(name, _) = callee {
@@ -452,7 +447,7 @@ impl<'a> Checker<'a> {
         }
         if let Expr::Field(base, method, _) = callee {
             if let Expr::Ident(tname, _) = &**base
-                && env.get(tname).is_none()
+                && self.lookup(env, tname).is_none()
             {
                 let ret = self.primitive_static_type(tname, method);
                 if ret.is_some() {
@@ -596,10 +591,10 @@ impl<'a> Checker<'a> {
         &mut self,
         base: &Expr,
         name: &str,
-        env: &HashMap<String, Type>,
+        env: &ScopeStack,
         props: &mut LightProps,
     ) -> Type {
-        let shadowed = matches!(base, Expr::Ident(n, _) if env.contains_key(n));
+        let shadowed = matches!(base, Expr::Ident(n, _) if self.lookup(env, n).is_some());
         if let Some(ty) = self.unit_variant_type(base, name, shadowed) {
             return ty;
         }
@@ -633,7 +628,7 @@ impl<'a> Checker<'a> {
         &mut self,
         name: &str,
         fields: &[(String, Expr)],
-        env: &HashMap<String, Type>,
+        env: &ScopeStack,
         props: &mut LightProps,
     ) -> Type {
         if name.is_empty() {
@@ -668,7 +663,7 @@ impl<'a> Checker<'a> {
         type_name: &str,
         variant: &str,
         fields: &[(String, Expr)],
-        env: &HashMap<String, Type>,
+        env: &ScopeStack,
         props: &mut LightProps,
     ) -> Type {
         let tn = self.resolve_self_name(type_name);
@@ -695,7 +690,7 @@ impl<'a> Checker<'a> {
         variant: Option<&str>,
         declared: &[brass_hir::FieldInfo],
         fields: &[(String, Expr)],
-        env: &HashMap<String, Type>,
+        env: &ScopeStack,
         props: &mut LightProps,
     ) -> Substitution {
         let mut substitution = Substitution::empty();
@@ -726,7 +721,7 @@ impl<'a> Checker<'a> {
     fn infer_block_value_light(
         &mut self,
         block: &Block,
-        env: &mut HashMap<String, Type>,
+        env: &mut ScopeStack,
         props: &mut LightProps,
     ) -> Type {
         let mut last = Type::Void;
@@ -790,15 +785,12 @@ impl<'a> Checker<'a> {
         Some(common)
     }
 
-    pub(super) fn bind_pattern_light(
-        &mut self,
-        pat: &Pattern,
-        ty: &Type,
-        env: &mut HashMap<String, Type>,
-    ) {
+    pub(super) fn bind_pattern_light(&mut self, pat: &Pattern, ty: &Type, env: &mut ScopeStack) {
         match pat {
             Pattern::Binding(name, _) if !self.is_unit_variant_name(name) => {
-                env.insert(name.clone(), ty.clone());
+                env.last_mut()
+                    .expect("light scope frame")
+                    .insert(name.clone(), ty.clone());
             }
             Pattern::Record(variant, fields, _) => {
                 let field_types = self.pattern_field_types(ty, variant);
@@ -810,7 +802,9 @@ impl<'a> Checker<'a> {
                     if let Some(subpat) = &field.pat {
                         self.bind_pattern_light(subpat, &fty, env);
                     } else {
-                        env.insert(field.name.clone(), fty);
+                        env.last_mut()
+                            .expect("light scope frame")
+                            .insert(field.name.clone(), fty);
                     }
                 }
             }

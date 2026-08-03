@@ -9,6 +9,7 @@
 //! explicit types.
 
 use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
 use brass_hir::{
@@ -45,16 +46,50 @@ use builtins::primitive_static_return;
 use helpers::{
     Pipe, apply_method_substitution, apply_nominal_substitution, assign_binop,
     block_always_returns, block_rebinds, closure_write_targets_block, collect_closure_writes_stmt,
-    const_index, contains_typeof, env_from_scopes, expr_always_returns, expr_may_branch,
-    field_substitution_key, int_fits_kind, is_concrete_primitive, is_concrete_type,
-    is_maybe_indexable, is_null_comparison, is_result_return_type, is_runtime_builtin_value,
-    is_self_expr, literal_pattern_matches, literal_pattern_type, method_param_substitution_key,
-    method_return_substitution_key, next_unknown_after_program, numeric_literal_repr,
-    param_expected_type, param_is_location, peel_ref_mut, peel_value_wrappers, required_arg_count,
-    same_nominal_instance, stmt_may_branch, substitute_self,
+    const_index, contains_typeof, expr_always_returns, expr_may_branch, field_substitution_key,
+    int_fits_kind, is_concrete_primitive, is_concrete_type, is_maybe_indexable, is_null_comparison,
+    is_result_return_type, is_runtime_builtin_value, is_self_expr, literal_pattern_matches,
+    literal_pattern_type, method_param_substitution_key, method_return_substitution_key,
+    next_unknown_after_program, numeric_literal_repr, param_expected_type, param_is_location,
+    peel_ref_mut, peel_value_wrappers, required_arg_count, same_nominal_instance, stmt_may_branch,
+    substitute_self,
 };
 
-type ScopeStack = Vec<HashMap<String, Type>>;
+#[derive(Clone, Default)]
+struct Scope(Rc<HashMap<String, Type>>);
+
+impl Scope {
+    fn new(values: HashMap<String, Type>) -> Self {
+        Self(Rc::new(values))
+    }
+
+    fn shared(values: Rc<HashMap<String, Type>>) -> Self {
+        Self(values)
+    }
+
+    fn into_map(self) -> HashMap<String, Type> {
+        match Rc::try_unwrap(self.0) {
+            Ok(values) => values,
+            Err(values) => values.as_ref().clone(),
+        }
+    }
+}
+
+impl Deref for Scope {
+    type Target = HashMap<String, Type>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Scope {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Rc::make_mut(&mut self.0)
+    }
+}
+
+type ScopeStack = Vec<Scope>;
 
 struct MethodCall<'a> {
     owner: &'a str,
@@ -83,7 +118,7 @@ struct ResolvedMethod {
     qualifier: String,
     self_type: String,
     signature: CallableSignature,
-    method: Method,
+    method: Rc<Method>,
 }
 
 /// Propagation signals the light pass collects while walking a body: the
@@ -1059,8 +1094,7 @@ fn check_function_body_at(
 ) -> Option<Type> {
     tracing::debug!(function = %f.signature.name, "inferring function body at demanded types");
     checker.current_module = f.module.clone();
-    let frame = checker.signature_call_frame(&f.signature.params, arg_types, &[], None);
-    let mut scopes = vec![frame];
+    let mut scopes = checker.signature_call_frame(&f.signature.params, arg_types, &[], None);
     checker.in_entry_main = symbol == "main";
     let errors_before = checker.errors.len();
     let full = checker.check_block_root(&f.decl.body, &mut scopes, f.signature.ret_ty.as_ref());
@@ -1082,7 +1116,8 @@ fn check_init_body(checker: &mut Checker, init: &ModuleInit) {
     // The globals of OTHER modules this one can see. Its own are left out so
     // they still accumulate as its statements are checked -- a later global is
     // not visible to an earlier initializer.
-    let mut scopes = vec![checker.globals_visible_from(&init.path)];
+    let global_scope = checker.global_scope();
+    let mut scopes = vec![Scope::shared(global_scope)];
     if let Some(own) = checker.global_defs.get(&init.path) {
         for name in own.keys() {
             scopes[0].remove(name);
@@ -1278,7 +1313,7 @@ struct Checker<'a> {
     /// end read the wrong slot at it.
     global_defs: HashMap<Vec<String>, HashMap<String, Type>>,
     /// Memoized `globals_visible_from`, keyed by the referencing module.
-    global_scopes: HashMap<Vec<String>, HashMap<String, Type>>,
+    global_scopes: HashMap<Vec<String>, Rc<HashMap<String, Type>>>,
     function_returns: HashMap<String, Type>,
     /// (method qualifier, method name) -> return type.
     /// Record qualifiers are the type name; variant qualifiers are `Type.Variant`.
@@ -1776,7 +1811,7 @@ impl<'a> Checker<'a> {
     /// only a condition whose truthiness the type alone decides (a present member
     /// vs an absent one) can make a fall-through dead.
     fn check_block(&mut self, b: &Block, scopes: &mut ScopeStack) {
-        scopes.push(HashMap::default());
+        scopes.push(Scope::default());
         self.const_scopes.push(HashSet::default());
         let mut unreachable = false;
         // Whether the divergence came from a TYPE TEST: the unreachable
@@ -2088,7 +2123,7 @@ impl<'a> Checker<'a> {
                     });
                     self.fresh_unknown()
                 });
-                scopes.push(HashMap::default());
+                scopes.push(Scope::default());
                 self.const_scopes.push(HashSet::default());
                 // Check the loop variable's pattern against the element type, so a
                 // destructuring of the wrong arity is a diagnostic here rather than
@@ -2431,5 +2466,11 @@ impl<'a> Checker<'a> {
     /// returned structurally unchanged.
     fn resolve(&self, ty: &Type) -> Type {
         self.solver.resolve(ty)
+    }
+
+    /// Follow the outer inference-variable chain without resolving components.
+    /// This is for control flow that only inspects the head constructor.
+    fn resolve_head(&self, ty: &Type) -> Type {
+        self.solver.resolve_head(ty)
     }
 }

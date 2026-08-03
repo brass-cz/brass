@@ -98,7 +98,7 @@ impl<'a> Checker<'a> {
         let saved_module = std::mem::replace(&mut self.current_module, module.to_vec());
         // A free function has no receiver instance, so no scheme parameters.
         let frame = self.signature_call_frame(params, arg_types, &[], None);
-        let mut scopes = vec![frame.clone()];
+        let mut scopes = frame.clone();
         let full_ret = self.check_block_root(body, &mut scopes, declared_ret.as_ref());
         let ret = match declared_ret {
             Some(ret) => ret,
@@ -172,7 +172,7 @@ impl<'a> Checker<'a> {
         &mut self,
         full_ret: Option<Type>,
         body: &Block,
-        frame: HashMap<String, Type>,
+        frame: ScopeStack,
     ) -> Type {
         let mut env = frame;
         let mut normal = Vec::new();
@@ -241,11 +241,7 @@ impl<'a> Checker<'a> {
         recv_ty: &Type,
         method: &str,
     ) -> Vec<Option<Type>> {
-        let mut t = self.resolve(recv_ty);
-        while let Type::Ref(i) | Type::Mut(i) | Type::ConstOf(i) | Type::Nullable(i) = t {
-            t = *i;
-        }
-        let Type::Record(nominal) = t else {
+        let Some(nominal) = self.scheme_receiver_record(recv_ty) else {
             return Vec::new();
         };
         let Some(info) = self.program.type_by_id(nominal.id) else {
@@ -257,37 +253,48 @@ impl<'a> Checker<'a> {
         let Some(scheme_method) = scheme.methods.get(method) else {
             return Vec::new();
         };
-        let map = scheme_instance_map(scheme, &nominal);
+        let map = scheme_instance_map(scheme, &nominal, |ty| self.resolve(ty));
         scheme_method
             .params
             .iter()
             .filter(|(name, _)| name != "self")
             .map(|(_, ty)| {
-                let inst = apply_scheme_param_map(ty, &map);
+                let inst = self.resolve(&apply_scheme_param_map(ty, &map));
                 self.solver.free_vars(&inst).is_empty().then_some(inst)
             })
             .collect()
     }
 
     pub(super) fn scheme_method_return(&self, recv_ty: &Type, method: &str) -> Option<Type> {
-        let mut t = self.resolve(recv_ty);
-        while let Type::Ref(i) | Type::Mut(i) | Type::ConstOf(i) | Type::Nullable(i) = t {
-            t = *i;
-        }
-        let Type::Record(nominal) = t else {
-            return None;
-        };
+        let nominal = self.scheme_receiver_record(recv_ty)?;
         let info = self.program.type_by_id(nominal.id)?;
         let scheme = self.schemes.get(&info.name)?;
         let scheme_method = scheme.methods.get(method)?;
-        let map = scheme_instance_map(scheme, &nominal);
+        let map = scheme_instance_map(scheme, &nominal, |ty| self.resolve(ty));
         // Instantiating a `?`-wrapped scheme return with a nullable value type
         // nests the nullable; collapse it (there is one `null`).
         let ret = brass_hir::collapse_nullable(&apply_scheme_param_map(&scheme_method.ret, &map));
+        let ret = self.resolve(&ret);
         // Only adopt the instantiated return when it is fully resolved; an open
         // variable means the instance did not constrain it, so the re-elaborated
         // return (which can still defer) is the safer choice.
         self.solver.free_vars(&ret).is_empty().then_some(ret)
+    }
+
+    /// Peel receiver modes while resolving only the constructor exposed at
+    /// each layer; scheme matching reads the record instance that remains.
+    fn scheme_receiver_record(&self, recv_ty: &Type) -> Option<NominalType> {
+        let mut ty = self.resolve_head(recv_ty);
+        loop {
+            match ty {
+                Type::Ref(inner)
+                | Type::Mut(inner)
+                | Type::ConstOf(inner)
+                | Type::Nullable(inner) => ty = self.resolve_head(&inner),
+                Type::Record(nominal) => return Some(nominal),
+                _ => return None,
+            }
+        }
     }
 
     pub(super) fn instantiate_method_call(&mut self, call: MethodCall<'_>) -> Type {
@@ -334,7 +341,7 @@ impl<'a> Checker<'a> {
         let frame =
             self.signature_call_frame(signature_params, arg_types, scheme_params, receiver_ty);
         let full_ret = if let Some(body) = &method.body {
-            let mut scopes = vec![frame.clone()];
+            let mut scopes = frame.clone();
             self.check_block_root(body, &mut scopes, declared_ret.as_ref())
         } else {
             None
@@ -357,11 +364,11 @@ impl<'a> Checker<'a> {
         arg_types: &[Type],
         scheme_params: &[Option<Type>],
         receiver_ty: Option<Type>,
-    ) -> HashMap<String, Type> {
+    ) -> ScopeStack {
         // Re-checking a callee body sees the globals visible from ITS module
         // (`current_module` is the callee's here); signature parameters layer on
         // top so they shadow same-named globals.
-        let mut frame = self.global_scope();
+        let mut frame = HashMap::default();
         let mut arg_idx = 0;
         for param in params {
             // A method called with the receiver passed separately (`receiver_ty`)
@@ -399,7 +406,7 @@ impl<'a> Checker<'a> {
             };
             frame.insert(param.name.clone(), ty);
         }
-        frame
+        vec![Scope::shared(self.global_scope()), Scope::new(frame)]
     }
 
     pub(super) fn instantiate_annotated_type(&self, annotated: &Type, actual: &Type) -> Type {
@@ -594,11 +601,15 @@ impl<'a> Checker<'a> {
 /// the scheme's field types against the receiver's resolved field substitution
 /// (`entries : _Entry<K, V>[]` vs `entries : _Entry<string, string>[]` gives `K
 /// -> string`, `V -> string`). Used to instantiate a method's scheme at a call.
-pub(super) fn scheme_instance_map(scheme: &TypeScheme, recv: &NominalType) -> HashMap<u32, Type> {
+pub(super) fn scheme_instance_map(
+    scheme: &TypeScheme,
+    recv: &NominalType,
+    resolve: impl Fn(&Type) -> Type,
+) -> HashMap<u32, Type> {
     let mut map = HashMap::default();
     for (fname, fty) in &scheme.fields {
         if let Some(actual) = recv.substitution.get(fname) {
-            match_scheme_param(fty, actual, &scheme.params, &mut map);
+            match_scheme_param(fty, &resolve(actual), &scheme.params, &mut map);
         }
     }
     map

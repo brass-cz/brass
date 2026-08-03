@@ -136,7 +136,7 @@ impl<'a> Checker<'a> {
     /// picking an arbitrary "owning" sum from the type table and comparing its
     /// name would accept or reject depending on hash order.
     fn scrutinee_accepts_variant(&mut self, scrutinee: &Type, variant: &str) -> bool {
-        let resolved = self.resolve(scrutinee);
+        let resolved = self.resolve_head(scrutinee);
         if resolved.is_result_type() {
             return matches!(variant, "Ok" | "Err");
         }

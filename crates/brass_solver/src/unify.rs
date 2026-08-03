@@ -61,6 +61,19 @@ impl Subst {
         }
     }
 
+    /// Follow only a top-level inference-variable chain to its representative.
+    /// Nested components stay untouched for callers that only inspect the outer
+    /// constructor and do not need a fully materialized type.
+    pub fn resolve_head(&self, t: &Type) -> Type {
+        match t {
+            Type::Unknown(id) => match self.table.get(id) {
+                Some(bound) => self.resolve_head(bound),
+                None => t.clone(),
+            },
+            _ => t.clone(),
+        }
+    }
+
     /// Resolve a type and recurse into its components so that nested inference
     /// variables are substituted too. Used when instantiating a polymorphic
     /// closure call: the argument types are unified into the parameter
@@ -313,6 +326,21 @@ mod tests {
             s.resolve_deep(&Type::Slice(Box::new(nullable(outer)))),
             Type::Slice(Box::new(nullable(Type::Str)))
         );
+    }
+
+    /// Head resolution follows a solved outer variable but deliberately keeps
+    /// variables inside the resolved constructor for allocation-free probing.
+    #[test]
+    fn head_resolution_leaves_nested_variables_unresolved() {
+        let mut s = Subst::new();
+        let inner = Type::Unknown(0);
+        s.unify(&inner, &Type::Str).unwrap();
+        let slice = Type::Slice(Box::new(inner.clone()));
+        let outer = Type::Unknown(1);
+        s.unify(&outer, &slice).unwrap();
+
+        assert_eq!(s.resolve_head(&outer), slice);
+        assert_eq!(s.resolve_deep(&outer), Type::Slice(Box::new(Type::Str)));
     }
 
     /// Collapsing is confined to nested nullables: a single `?` over a concrete

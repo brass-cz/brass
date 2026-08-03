@@ -171,6 +171,12 @@ impl Solver {
         self.subst.resolve_deep(t)
     }
 
+    /// Resolve only the outer inference-variable chain, leaving components and
+    /// nominal substitutions structurally unchanged.
+    pub fn resolve_head(&self, t: &Type) -> Type {
+        self.subst.resolve_head(t)
+    }
+
     /// Commit a unification into the persistent solution.
     pub fn unify(&mut self, a: &Type, b: &Type) -> Result<(), String> {
         self.subst.unify(a, b)

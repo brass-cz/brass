@@ -373,16 +373,6 @@ pub(super) fn required_arg_count(params: &[ParamInfo]) -> usize {
     params.len() - optional
 }
 
-pub(super) fn env_from_scopes(scopes: &ScopeStack) -> HashMap<String, Type> {
-    let mut env = HashMap::default();
-    for scope in scopes {
-        for (name, ty) in scope {
-            env.insert(name.clone(), ty.clone());
-        }
-    }
-    env
-}
-
 pub(super) fn is_maybe_indexable(ty: &Type) -> bool {
     matches!(
         ty,

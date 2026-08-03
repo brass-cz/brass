@@ -212,8 +212,18 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
         }
     }
 
+    let types_by_id = types
+        .iter()
+        .map(|(symbol, info)| (info.id, symbol.clone()))
+        .collect();
+    let type_names = types
+        .iter()
+        .flat_map(|(symbol, info)| [symbol.clone(), info.name.clone()])
+        .collect();
     let mut program = Program {
         types,
+        types_by_id,
+        type_names,
         functions,
         inits,
         prelude_modules: modules

@@ -188,8 +188,11 @@ impl<'a> Checker<'a> {
         let mut env = self.signature_param_env(params);
         // The variables standing for the parameters in THIS light run: an
         // open Err that is one of them is the function's own generic error.
-        let param_vars: std::collections::BTreeSet<u32> =
-            env.values().flat_map(brass_hir::type_vars).collect();
+        let param_vars: std::collections::BTreeSet<u32> = env
+            .iter()
+            .flat_map(|scope| scope.values())
+            .flat_map(brass_hir::type_vars)
+            .collect();
         let mut normal = Vec::new();
         let mut props = LightProps::default();
         self.infer_returns_block(body, &mut env, &mut normal, &mut props);
@@ -523,10 +526,15 @@ or drop the `!`"
         // An instance method's `self` is the enclosing nominal type. Variant
         // methods use the sum type because HIR has no separate variant type.
         if signature_params.first().is_some_and(|p| p.name == "self") {
-            env.insert("self".to_string(), self.type_by_name(self_type));
+            env.last_mut()
+                .expect("signature scope frame")
+                .insert("self".to_string(), self.type_by_name(self_type));
         }
-        let param_vars: std::collections::BTreeSet<u32> =
-            env.values().flat_map(brass_hir::type_vars).collect();
+        let param_vars: std::collections::BTreeSet<u32> = env
+            .iter()
+            .flat_map(|scope| scope.values())
+            .flat_map(brass_hir::type_vars)
+            .collect();
         let mut normal = Vec::new();
         let mut props = LightProps::default();
         self.infer_returns_block(body, &mut env, &mut normal, &mut props);
@@ -916,8 +924,8 @@ or drop the `!`"
             if self.seeded_module(&init.path) {
                 continue;
             }
-            let mut env = self.globals_visible_from(&init.path);
-            let mut own: HashMap<String, Type> = HashMap::default();
+            let mut env = vec![Scope::new(self.globals_visible_from(&init.path))];
+            let mut own = vec![Scope::default()];
             for stmt in &init.stmts {
                 let Stmt::Let { pat, ty, value, .. } = stmt else {
                     continue;
@@ -943,7 +951,10 @@ or drop the `!`"
                 self.bind_pattern_light(pat, &binding_ty, &mut env);
                 self.bind_pattern_light(pat, &binding_ty, &mut own);
             }
-            self.global_defs.insert(init.path.clone(), own);
+            self.global_defs.insert(
+                init.path.clone(),
+                own.pop().expect("global scope frame").into_map(),
+            );
             self.global_scopes.clear();
         }
     }
@@ -986,13 +997,13 @@ or drop the `!`"
     }
 
     /// [`Self::globals_visible_from`] for the module being checked, memoized.
-    pub(super) fn global_scope(&mut self) -> HashMap<String, Type> {
+    pub(super) fn global_scope(&mut self) -> Rc<HashMap<String, Type>> {
         let module = self.current_module.clone();
         if let Some(scope) = self.global_scopes.get(&module) {
-            return scope.clone();
+            return Rc::clone(scope);
         }
-        let scope = self.globals_visible_from(&module);
-        self.global_scopes.insert(module, scope.clone());
+        let scope = Rc::new(self.globals_visible_from(&module));
+        self.global_scopes.insert(module, Rc::clone(&scope));
         scope
     }
 
@@ -1000,15 +1011,16 @@ or drop the `!`"
     /// visible from its module at the bottom, signature parameters on top so
     /// parameters shadow same-named globals.
     pub(super) fn signature_scopes(&mut self, params: &[ParamInfo]) -> ScopeStack {
-        vec![self.global_scope(), self.signature_param_scope(params)]
+        vec![
+            Scope::shared(self.global_scope()),
+            Scope::new(self.signature_param_scope(params)),
+        ]
     }
 
-    /// A single-scope environment for return inference that layers signature
-    /// parameters over the globals, mirroring `signature_scopes` shadowing.
-    fn signature_param_env(&mut self, params: &[ParamInfo]) -> HashMap<String, Type> {
-        let mut env = self.global_scope();
-        env.extend(self.signature_param_scope(params));
-        env
+    /// The layered environment used for return inference, with shared globals
+    /// below signature parameters so parameter bindings preserve shadowing.
+    fn signature_param_env(&mut self, params: &[ParamInfo]) -> ScopeStack {
+        self.signature_scopes(params)
     }
 }
 

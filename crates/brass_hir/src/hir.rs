@@ -3,7 +3,7 @@
 //! runtime. Records and sum types keep their members (as AST nodes, lowered
 //! on demand by codegen); this is the "typed HIR" the back end consumes.
 
-use fxhash::FxHashMap as HashMap;
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::rc::Rc;
 
 use brass_parser::Span;
@@ -291,6 +291,8 @@ pub struct ModuleInit {
 /// The collected, id-assigned program.
 pub struct Program {
     pub types: HashMap<String, TypeInfo>,
+    pub(crate) types_by_id: HashMap<i32, String>,
+    pub(crate) type_names: HashSet<String>,
     /// One past the highest `Type::Unknown` id lowering minted into the
     /// resolved signature and field types above. Every solver that types
     /// against this program MUST seed its fresh-variable counter here
@@ -364,8 +366,30 @@ pub struct TypeAlias {
 }
 
 impl Program {
+    /// Construct a program with no declarations or module metadata.
+    pub fn empty() -> Self {
+        Self {
+            types: HashMap::default(),
+            types_by_id: HashMap::default(),
+            type_names: HashSet::default(),
+            next_infer_var: 0,
+            functions: HashMap::default(),
+            inits: Vec::new(),
+            prelude_modules: HashSet::default(),
+            module_imports: HashMap::default(),
+            import_origins: HashMap::default(),
+            import_renames: HashMap::default(),
+            module_aliases: HashMap::default(),
+            symbol_aliases: HashMap::default(),
+            primitive_methods: HashMap::default(),
+            type_aliases: HashMap::default(),
+        }
+    }
+
     pub fn type_by_id(&self, id: i32) -> Option<&TypeInfo> {
-        self.types.values().find(|t| t.id == id)
+        self.types_by_id
+            .get(&id)
+            .and_then(|symbol| self.types.get(symbol))
     }
 
     /// The compile-time presence of an uncalled member `x.m`: `Some(true)` when
@@ -459,11 +483,7 @@ impl Program {
     }
 
     pub fn has_type_named(&self, name: &str) -> bool {
-        self.types.contains_key(name)
-            || self
-                .types
-                .keys()
-                .any(|k| k.starts_with(name) && k[name.len()..].starts_with('@'))
+        self.type_names.contains(name)
     }
 
     /// Resolve a bare type name to its definition as seen from `module`: its

@@ -292,7 +292,7 @@ impl<'a> Checker<'a> {
                 return ret;
             }
             let recv_ty = self.check_expr(base, scopes);
-            if let Type::Nullable(_) = self.resolve(&recv_ty) {
+            if let Type::Nullable(_) = self.resolve_head(&recv_ty) {
                 self.report_nullable_use(base.span());
             }
             if let Some(ret) = self.builtin_method_type(&recv_ty, method, args, scopes, span) {
@@ -302,21 +302,20 @@ impl<'a> Checker<'a> {
             // expectation: its result type is fixed per call site, and the
             // driver generates a concrete specialization per key (this call is
             // rewritten to it). The template body is not elaborated here.
-            if let Some(methods) = self.methods_for_type(&recv_ty, method)
-                && methods
+            if let Some(methods) = self.methods_for_type(&recv_ty, method) {
+                if methods
                     .first()
                     .is_some_and(|m| brass_hir::keyed_return(m.method.ret.as_ref()))
-            {
-                return self.check_keyed_method_call(
-                    &recv_ty,
-                    method,
-                    args,
-                    span,
-                    call_expected.as_ref(),
-                    scopes,
-                );
-            }
-            if let Some(methods) = self.methods_for_type(&recv_ty, method) {
+                {
+                    return self.check_keyed_method_call(
+                        &recv_ty,
+                        method,
+                        args,
+                        span,
+                        call_expected.as_ref(),
+                        scopes,
+                    );
+                }
                 return self
                     .check_methods_call(methods, &recv_ty, method, args, span, None, scopes);
             }
@@ -894,7 +893,7 @@ impl<'a> Checker<'a> {
         span: brass_parser::Span,
         scopes: &mut ScopeStack,
     ) -> Type {
-        match self.resolve(&callee_ty) {
+        match self.resolve_head(&callee_ty) {
             Type::Fun(params, ret) => {
                 self.check_arg_count("<closure>", params.len(), args.len(), span);
                 // Instantiate the (possibly polymorphic) callable for this call
@@ -918,7 +917,7 @@ impl<'a> Checker<'a> {
                         // carrying its own inference variables stays local-only:
                         // pinning through it would defeat let-polymorphism.
                         if self.solver.free_vars(param).is_empty()
-                            && matches!(self.resolve(&got), Type::Unknown(_))
+                            && matches!(self.resolve_head(&got), Type::Unknown(_))
                         {
                             let _ = self.solver.unify(&got, param);
                         }
@@ -931,7 +930,7 @@ impl<'a> Checker<'a> {
                         self.check_expr(&arg.expr, scopes);
                     }
                 }
-                subst.resolve_deep(&ret)
+                self.resolve(&subst.resolve_deep(&ret))
             }
             // Calling a value of still-unknown type constrains it to a function:
             // unify it with `(arg types...) -> fresh_ret`. This is the application

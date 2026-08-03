@@ -25,7 +25,7 @@ impl<'a> Checker<'a> {
                     qualifier: info.symbol.clone(),
                     self_type: info.symbol.clone(),
                     signature: m.signature.clone(),
-                    method: m.decl.as_ref().clone(),
+                    method: Rc::clone(&m.decl),
                 };
                 Some(vec![apply_method_substitution(
                     resolved,
@@ -49,7 +49,7 @@ impl<'a> Checker<'a> {
                             qualifier: format!("{}.{}", info.symbol, variant.name),
                             self_type: info.symbol.clone(),
                             signature: method.signature.clone(),
-                            method: method.decl.as_ref().clone(),
+                            method: Rc::clone(&method.decl),
                         })
                     })
                     .collect::<Option<Vec<_>>>()?;
@@ -80,7 +80,7 @@ impl<'a> Checker<'a> {
                     qualifier: format!("{}.{variant}", info.name),
                     self_type: symbol.clone(),
                     signature: v_method.signature.clone(),
-                    method: v_method.decl.as_ref().clone(),
+                    method: Rc::clone(&v_method.decl),
                 });
             }
         }
@@ -103,7 +103,7 @@ impl<'a> Checker<'a> {
                     qualifier: info.name.clone(),
                     self_type: symbol,
                     signature: method.signature.clone(),
-                    method: method.decl.as_ref().clone(),
+                    method: Rc::clone(&method.decl),
                 })
             }
             // A method declared on a SUM (`fun TomlValue.parse`) is lowered into
@@ -123,7 +123,7 @@ impl<'a> Checker<'a> {
                     qualifier: format!("{}.{}", info.name, variant.name),
                     self_type: symbol,
                     signature: m.signature.clone(),
-                    method: m.decl.as_ref().clone(),
+                    method: Rc::clone(&m.decl),
                 })
             }
         }
@@ -378,7 +378,7 @@ impl<'a> Checker<'a> {
     /// an unknown-typed parameter; the constraint is verified when the variable
     /// is solved at a call site (see `crate::constraint`).
     pub(super) fn record_shape(&mut self, ty: &Type, constraint: ShapeConstraint) {
-        if let Type::Unknown(id) = self.resolve(ty) {
+        if let Type::Unknown(id) = self.resolve_head(ty) {
             self.shape_constraints
                 .entry(id)
                 .or_default()
@@ -432,16 +432,16 @@ impl<'a> Checker<'a> {
         got: &Type,
         span: brass_parser::Span,
     ) {
-        let Type::Unknown(id) = self.resolve(var) else {
+        let Type::Unknown(id) = self.resolve_head(var) else {
             return;
         };
-        let got = self.resolve(got);
-        if matches!(got, Type::Unknown(_)) {
+        if matches!(self.resolve_head(got), Type::Unknown(_)) {
             return;
         }
         let Some(constraints) = self.shape_constraints.get(&id).cloned() else {
             return;
         };
+        let got = self.resolve(got);
         for constraint in constraints {
             match constraint {
                 ShapeConstraint::Equals(expected) => {
@@ -488,7 +488,31 @@ impl<'a> Checker<'a> {
     /// is genuinely absent on a concrete receiver is rejected.
     fn concrete_type_has_method(&self, ty: &Type, method: &str) -> bool {
         let resolved = self.resolve(ty);
-        if self.methods_for_type(&resolved, method).is_some() {
+        let has_declared_method = match brass_hir::peel_modes(&resolved) {
+            Type::Record(name) => self
+                .program
+                .type_by_id(name.id)
+                .and_then(|info| match &info.kind {
+                    TypeKind::Record { methods, .. } => Some(methods.contains_key(method)),
+                    TypeKind::Sum { .. } => None,
+                })
+                .unwrap_or(false),
+            Type::Sum(name) => self
+                .program
+                .type_by_id(name.id)
+                .and_then(|info| match &info.kind {
+                    TypeKind::Sum { variants } => Some(
+                        !variants.is_empty()
+                            && variants
+                                .iter()
+                                .all(|variant| variant.methods.contains_key(method)),
+                    ),
+                    TypeKind::Record { .. } => None,
+                })
+                .unwrap_or(false),
+            _ => false,
+        };
+        if has_declared_method {
             return true;
         }
         // UFCS: `recv.m(..)` falls back to a visible free function `m(recv, ..)`.
