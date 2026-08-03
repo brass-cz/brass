@@ -121,6 +121,13 @@ while a group no executed path enters is still never compiled. A dead branch
 that shares a group with executed code may therefore be compiled; it still
 never runs.
 
+First-use compilation runs at the lowest optimization level: the default run
+is tuned for start-up latency, and translating a group without the optimizer
+takes a few milliseconds where the optimized pipeline takes hundreds. Set
+`BRASS_OPT=2` to compile every group with the full optimizing pipeline
+instead -- the right trade for a long-running or compute-bound program whose
+first execution of each hot function matters more than its start-up.
+
 `--eager` uses the same first-use native compilation. Its difference is when
 checking happens, not what native code is produced: the complete check (and
 IR preparation for every checked instance) finishes before execution begins.

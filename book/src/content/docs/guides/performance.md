@@ -52,6 +52,15 @@ large applications that use only a small part of their code in one run. For a
 fast repeated run, `brass check` once and let the full analysis cache carry
 the later runs; see [Caches](#caches).
 
+## When to use `BRASS_OPT=2`
+
+The default run translates functions at the lowest optimization level to keep
+start-up short. A long-running or compute-bound program can set `BRASS_OPT=2`
+to compile with the full optimizing pipeline instead: start-up slows by the
+optimizer's cost per compiled group, and every function runs at full native
+quality from its first call. See the
+[native compilation reference](/references/performance/#native-compilation).
+
 ## Caches
 
 Cache files are an implementation aid, not build artifacts you need to
