@@ -46,13 +46,18 @@ struct ConstChecker<'a> {
 }
 
 pub fn check(program: &Program) -> Vec<TypeError> {
+    check_in(program, crate::AnalysisModules::all())
+}
+
+pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -> Vec<TypeError> {
     let mut checker = ConstChecker {
         program,
+        // Entry diagnostics still need mutation facts for seeded callees.
         mutation: MutationInfo::analyze(program),
         current_module: Vec::new(),
         errors: Vec::new(),
     };
-    checker.check_program();
+    checker.check_program(modules);
     checker.errors
 }
 
@@ -96,11 +101,14 @@ fn is_shared_heap(ty: &Type) -> bool {
 }
 
 impl ConstChecker<'_> {
-    fn check_program(&mut self) {
+    fn check_program(&mut self, modules: crate::AnalysisModules<'_>) {
         // Top-level consts are in scope for every body in the file, so function
         // and method bodies start from the module's global const bindings.
         let globals = self.global_consts();
         for f in self.program.functions.values() {
+            if !modules.checks(&f.module) {
+                continue;
+            }
             // Parameters are mutable handles within their own body (mutating one is
             // the very thing that makes the parameter mutable to callers), and they
             // shadow any like-named global const. A `ref(T)` parameter is an
@@ -111,6 +119,9 @@ impl ConstChecker<'_> {
             self.check_block(&f.decl.body, &mut vec![globals.clone(), params]);
         }
         for t in self.program.types.values() {
+            if !modules.checks(&t.module) {
+                continue;
+            }
             let methods: Vec<&brass_hir::MethodInfo> = match &t.kind {
                 TypeKind::Record { methods, .. } => methods.values().collect(),
                 TypeKind::Sum { variants } => {
@@ -135,6 +146,9 @@ impl ConstChecker<'_> {
         // Top-level init statements build their scope up in order, so a global
         // is only visible to later top-level statements, not earlier ones.
         for init in &self.program.inits {
+            if !modules.checks(&init.path) {
+                continue;
+            }
             self.current_module = init.path.clone();
             let mut scopes = vec![HashMap::default()];
             for stmt in &init.stmts {

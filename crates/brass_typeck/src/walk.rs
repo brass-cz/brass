@@ -10,10 +10,24 @@ pub trait ExprVisitor {
 }
 
 pub fn walk_program_exprs(program: &Program, v: &mut impl ExprVisitor) {
+    walk_program_exprs_in(program, crate::AnalysisModules::all(), v);
+}
+
+pub(crate) fn walk_program_exprs_in(
+    program: &Program,
+    modules: crate::AnalysisModules<'_>,
+    v: &mut impl ExprVisitor,
+) {
     for f in program.functions.values() {
+        if !modules.checks(&f.module) {
+            continue;
+        }
         walk_block(&f.decl.body, v);
     }
     for t in program.types.values() {
+        if !modules.checks(&t.module) {
+            continue;
+        }
         match &t.kind {
             TypeKind::Record { methods, .. } => {
                 for m in methods.values() {
@@ -34,6 +48,9 @@ pub fn walk_program_exprs(program: &Program, v: &mut impl ExprVisitor) {
         }
     }
     for init in &program.inits {
+        if !modules.checks(&init.path) {
+            continue;
+        }
         for s in &init.stmts {
             walk_stmt(s, v);
         }

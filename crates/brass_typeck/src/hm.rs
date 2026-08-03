@@ -43,16 +43,25 @@ use crate::solver::{InferenceVarKind, Scheme, Solver};
 /// Type-check `program` with Algorithm W, returning the inferred type errors.
 /// Intended to run before monomorphization so concrete types are settled first.
 pub fn check(program: &Program) -> Vec<TypeError> {
+    check_in(program, crate::AnalysisModules::all())
+}
+
+pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -> Vec<TypeError> {
     let mut hm = Hm::new(program);
     hm.build_globals();
     // Deterministic order: all callables share one solver, so a var that leaks
     // across bodies would otherwise make diagnostics depend on HashMap order.
-    let mut symbols: Vec<String> = program.functions.keys().cloned().collect();
+    let mut symbols: Vec<String> = program
+        .functions
+        .iter()
+        .filter(|(_, info)| modules.checks(&info.module))
+        .map(|(symbol, _)| symbol.clone())
+        .collect();
     symbols.sort();
     for symbol in symbols {
         hm.check_function(&symbol);
     }
-    hm.check_methods();
+    hm.check_methods(modules);
     hm.errors
 }
 
@@ -228,9 +237,12 @@ impl<'p> Hm<'p> {
     /// open (a variant's own fields are not on the sum, so typing `self` as the
     /// sum would wrongly reject `self.variantField`); its parameters and return
     /// are still checked.
-    fn check_methods(&mut self) {
+    fn check_methods(&mut self, modules: crate::AnalysisModules<'_>) {
         let mut jobs: Vec<(Option<Type>, Vec<String>, MethodInfo)> = Vec::new();
         for info in self.program.types.values() {
+            if !modules.checks(&info.module) {
+                continue;
+            }
             match &info.kind {
                 TypeKind::Record { methods, .. } => {
                     for m in methods.values() {

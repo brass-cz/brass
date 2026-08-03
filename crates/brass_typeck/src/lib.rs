@@ -96,6 +96,25 @@ pub fn check(program: &Program) -> Vec<TypeError> {
 
 pub use infer::ContextTables;
 
+#[derive(Clone, Copy)]
+pub(crate) struct AnalysisModules<'a> {
+    seed: Option<&'a ContextTables>,
+}
+
+impl<'a> AnalysisModules<'a> {
+    fn new(seed: Option<&'a ContextTables>) -> Self {
+        Self { seed }
+    }
+
+    fn all() -> Self {
+        Self { seed: None }
+    }
+
+    pub(crate) fn checks(self, module: &[String]) -> bool {
+        !self.seed.is_some_and(|seed| seed.covers_module(module))
+    }
+}
+
 /// Extract the reusable context seed of `program` -- which must be a
 /// CONTEXT-ONLY program (every module except the entry). `None` when the
 /// context has any diagnostic: only a clean context's tables may stand in for
@@ -173,20 +192,21 @@ fn analyze_impl(
                 .any(|t| matches!(t.module.as_slice(), [m] if m == "main") && t.name == name)
         };
     let seed = seed.filter(|s| !s.bare_names.iter().any(|name| entry_declares(name)));
+    let modules = AnalysisModules::new(seed);
     let mut errors = Vec::new();
-    errors.extend(resolve_annotations(program));
-    errors.extend(check_constructions(program));
-    errors.extend(interface::check(program));
-    errors.extend(flow::check(program));
-    errors.extend(definite::check(program));
-    errors.extend(globals::check(program));
-    errors.extend(check_reserved_names(program));
-    errors.extend(check_result_shadows(program));
-    errors.extend(constck::check(program));
+    errors.extend(resolve_annotations(program, modules));
+    errors.extend(check_constructions(program, modules));
+    errors.extend(interface::check_in(program, modules));
+    errors.extend(flow::check_in(program, modules));
+    errors.extend(definite::check_in(program, modules));
+    errors.extend(globals::check_in(program, modules));
+    errors.extend(check_reserved_names(program, modules));
+    errors.extend(check_result_shadows(program, modules));
+    errors.extend(constck::check_in(program, modules));
     // Hindley-Milner inference runs as the principled type-checking pass before
     // monomorphization: it infers principal types for the
     // functional core and rejects unification conflicts the ad-hoc pass may miss.
-    errors.extend(hm::check(program));
+    errors.extend(hm::check_in(program, modules));
     tracing::debug!(after_hm = errors.len(), "errors after Hindley-Milner pass");
     // A streaming consumer that intends to execute learns the static
     // verdict before any body event: an error here is fatal to execution.
@@ -206,7 +226,7 @@ fn analyze_impl(
     // Exhaustiveness depends on the scrutinee's inferred nominal id. Running it
     // after inference prevents a same-named variant in another sum from being
     // mistaken for the match's owner.
-    errors.extend(exhaustive::check(program, &infer.typed));
+    errors.extend(exhaustive::check_in(program, &infer.typed, modules));
     errors.extend(infer.errors);
     // Message is the secondary key so identical diagnostics from re-checked
     // bodies (per-instance re-elaboration, expanded fields-loop copies) land
@@ -281,12 +301,13 @@ pub(crate) fn lift_err_payload(program: &Program, resolved: brass_hir::Type) -> 
 /// it must carry the sugar's shape; checked at the declaration (not at use)
 /// so the mistake is reported once, where it was made. An ALIAS named
 /// `Result` cannot carry the sugar's identity at all.
-fn check_result_shadows(program: &Program) -> Vec<TypeError> {
+fn check_result_shadows(program: &Program, modules: AnalysisModules<'_>) -> Vec<TypeError> {
     let mut errors = Vec::new();
     for info in program.types.values() {
         if info.name != brass_hir::RESULT_TYPE_NAME
             || program.prelude_modules.contains(&info.module)
             || info.module.is_empty()
+            || !modules.checks(&info.module)
         {
             continue;
         }
@@ -305,7 +326,7 @@ fn check_result_shadows(program: &Program) -> Vec<TypeError> {
         }
     }
     for alias in program.type_aliases.values() {
-        if program.prelude_modules.contains(&alias.module) {
+        if program.prelude_modules.contains(&alias.module) || !modules.checks(&alias.module) {
             continue;
         }
         // The alias table is keyed by (possibly qualified) symbol; detect a
@@ -330,14 +351,14 @@ fn check_result_shadows(program: &Program) -> Vec<TypeError> {
     errors
 }
 
-fn check_reserved_names(program: &Program) -> Vec<TypeError> {
+fn check_reserved_names(program: &Program, modules: AnalysisModules<'_>) -> Vec<TypeError> {
     let mut errors = Vec::new();
     for name in brass_hir::RESERVED_FUNCTION_NAMES {
         if let Some(info) = program.functions.get(*name) {
             // The prelude itself provides some of these (`error` is an
             // ordinary core/error.cz function); only a user
             // redefinition is rejected.
-            if program.prelude_modules.contains(&info.module) {
+            if program.prelude_modules.contains(&info.module) || !modules.checks(&info.module) {
                 continue;
             }
             errors.push(TypeError {
@@ -351,7 +372,7 @@ fn check_reserved_names(program: &Program) -> Vec<TypeError> {
 
 /// Verify record/variant literals name a known type and variant. Without this,
 /// an unknown constructor silently produces a void value at runtime.
-fn check_constructions(program: &Program) -> Vec<TypeError> {
+fn check_constructions(program: &Program, modules: AnalysisModules<'_>) -> Vec<TypeError> {
     struct V<'a> {
         program: &'a Program,
         /// Local names some module's import renames (`import m.{ X as Y }`
@@ -410,7 +431,7 @@ fn check_constructions(program: &Program) -> Vec<TypeError> {
             .collect(),
         errors: Vec::new(),
     };
-    walk::walk_program_exprs(program, &mut v);
+    walk::walk_program_exprs_in(program, modules, &mut v);
     v.errors
 }
 
@@ -418,7 +439,7 @@ fn check_constructions(program: &Program) -> Vec<TypeError> {
 /// it appears in. Nominal names are keyed by the
 /// type's unique symbol, and each annotation is resolved from its declaring
 /// module (own/unique, this module's qualified definition, or an imported one).
-fn resolve_annotations(program: &Program) -> Vec<TypeError> {
+fn resolve_annotations(program: &Program, modules: AnalysisModules<'_>) -> Vec<TypeError> {
     let kinds: HashMap<String, NominalInfo> = program
         .types
         .iter()
@@ -514,6 +535,9 @@ fn resolve_annotations(program: &Program) -> Vec<TypeError> {
             out.extend(local.into_iter().map(|te| (module.to_vec(), te)));
         };
     for info in program.types.values() {
+        if !modules.checks(&info.module) {
+            continue;
+        }
         let mut local = Vec::new();
         match &info.kind {
             TypeKind::Record { fields, methods } => {
@@ -542,6 +566,9 @@ fn resolve_annotations(program: &Program) -> Vec<TypeError> {
         push_decl(&info.module, local, &mut tes);
     }
     for f in program.functions.values() {
+        if !modules.checks(&f.module) {
+            continue;
+        }
         let mut local = Vec::new();
         for p in &f.signature.params {
             if let Some(t) = &p.ty {
@@ -555,6 +582,9 @@ fn resolve_annotations(program: &Program) -> Vec<TypeError> {
         push_decl(&f.module, local, &mut tes);
     }
     for init in &program.inits {
+        if !modules.checks(&init.path) {
+            continue;
+        }
         let mut local = Vec::new();
         for stmt in &init.stmts {
             collect_stmt(stmt, &mut local);
@@ -831,6 +861,23 @@ mod tests {
 
         assert!(!seed.retain_modules(&current, &keep));
         assert_eq!(seed.covered, None);
+    }
+
+    #[test]
+    fn partial_context_seed_cannot_regain_dropped_modules() {
+        // A partial seed may be passed through another incremental selection;
+        // retaining a wider set cannot recreate tables that were never kept.
+        let program = module_program(&[
+            (&["a"], "fun a() { return 1 }\n"),
+            (&["b"], "fun b() { return 2 }\n"),
+        ]);
+        let mut seed = context_seed(&program).expect("clean context");
+        let only_a = HashSet::from_iter([vec!["a".to_string()]]);
+        assert!(seed.retain_modules(&program, &only_a));
+        let all = HashSet::from_iter([vec!["a".to_string()], vec!["b".to_string()]]);
+
+        assert!(seed.retain_modules(&program, &all));
+        assert_eq!(seed.covered, Some(only_a));
     }
 
     #[test]

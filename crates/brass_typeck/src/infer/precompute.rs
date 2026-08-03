@@ -465,22 +465,48 @@ or drop the `!`"
             })
             .collect();
         entries.sort();
-        for (qualifier, self_type, method, module) in entries {
-            // A seeded context type's returns are already in the table.
-            if self.seeded_module(&module) {
-                continue;
+        loop {
+            let mut changed = false;
+            for (qualifier, self_type, method, module) in &entries {
+                // A seeded context type's returns are already in the table.
+                if self.seeded_module(module) {
+                    continue;
+                }
+                let key = (qualifier.clone(), method.clone());
+                let previous = self
+                    .method_returns
+                    .get(&key)
+                    .map(|ty| self.canonical_return_shape(ty));
+                // As in `function_return_entry`: the light pass resolves names
+                // against the current module, which here is the TYPE's.
+                let saved = std::mem::replace(&mut self.current_module, module.clone());
+                let (ty, has_props) = self.infer_method_return(qualifier, self_type, method);
+                self.current_module = saved;
+                if has_props {
+                    self.method_return_props.insert(key.clone());
+                }
+                let current = self.canonical_return_shape(&ty);
+                if previous.as_ref() != Some(&current) {
+                    self.method_returns.insert(key, ty);
+                    changed = true;
+                }
             }
-            // As in `function_return_entry`: the light pass resolves names against
-            // the current module, which here is the TYPE's.
-            let saved = std::mem::replace(&mut self.current_module, module);
-            let (ty, has_props) = self.infer_method_return(&qualifier, &self_type, &method);
-            self.current_module = saved;
-            if has_props {
-                self.method_return_props
-                    .insert((qualifier.clone(), method.clone()));
+            if !changed {
+                break;
             }
-            self.method_returns.insert((qualifier, method), ty);
         }
+    }
+
+    /// Resolve a table return and renumber its remaining variables so fresh
+    /// allocation ids do not look like a semantic change between fixpoint rounds.
+    fn canonical_return_shape(&self, ty: &Type) -> Type {
+        let resolved = self.resolve(ty);
+        let substitution = brass_hir::type_vars(&resolved)
+            .into_iter()
+            .enumerate()
+            .map(|(slot, id)| (id, Type::Unknown(slot as u32)))
+            .collect();
+        brass_hir::substitute_vars(&resolved, &substitution)
     }
 
     /// The light-pass return type of a method, plus whether its body carries

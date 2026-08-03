@@ -17,11 +17,21 @@ use crate::exhaustive::{pattern_irrefutable, pattern_names_sum_variant};
 /// Report every function/method whose explicit non-`void` return type can be
 /// bypassed by falling through the end of the body.
 pub fn check(program: &Program) -> Vec<TypeError> {
+    check_in(program, crate::AnalysisModules::all())
+}
+
+pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -> Vec<TypeError> {
     let mut errors = Vec::new();
     for f in program.functions.values() {
+        if !modules.checks(&f.module) {
+            continue;
+        }
         check_callable(program, &f.signature, Some(&f.decl.body), &mut errors);
     }
     for info in program.types.values() {
+        if !modules.checks(&info.module) {
+            continue;
+        }
         match &info.kind {
             TypeKind::Record { methods, .. } => {
                 for m in methods.values() {
@@ -44,6 +54,9 @@ pub fn check(program: &Program) -> Vec<TypeError> {
         }
     }
     for init in &program.inits {
+        if !modules.checks(&init.path) {
+            continue;
+        }
         check_loop_control(&init.stmts, false, &mut errors);
     }
     errors

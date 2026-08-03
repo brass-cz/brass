@@ -9,15 +9,23 @@ use brass_parser::Span;
 use brass_parser::ast::*;
 
 use crate::TypeError;
-use crate::walk::{ExprVisitor, walk_program_exprs};
+use crate::walk::{ExprVisitor, walk_program_exprs_in};
 
 pub fn check(program: &Program, typed: &TypedProgram) -> Vec<TypeError> {
+    check_in(program, typed, crate::AnalysisModules::all())
+}
+
+pub(crate) fn check_in(
+    program: &Program,
+    typed: &TypedProgram,
+    modules: crate::AnalysisModules<'_>,
+) -> Vec<TypeError> {
     let mut v = ExhaustiveVisitor {
         program,
         typed,
         errors: Vec::new(),
     };
-    walk_program_exprs(program, &mut v);
+    walk_program_exprs_in(program, modules, &mut v);
     v.errors
 }
 

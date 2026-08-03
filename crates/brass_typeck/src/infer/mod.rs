@@ -232,6 +232,13 @@ impl ContextProgramIdentity {
 }
 
 impl ContextTables {
+    pub(crate) fn covers_module(&self, module: &[String]) -> bool {
+        match &self.covered {
+            Some(covered) => covered.contains(module),
+            None => !matches!(module, [name] if name == "main"),
+        }
+    }
+
     /// The tables with every inference variable renumbered densely from `base`,
     /// and the first id past them. One mapping is applied across all tables, so
     /// a variable shared between entries (a scheme parameter appearing in a
@@ -342,6 +349,13 @@ impl ContextTables {
         if self.program_identity != ContextProgramIdentity::of(program) {
             return false;
         }
+        // Retention can only narrow an existing partial seed. In particular, a
+        // cache sidecar produced while one module was broken must not claim that
+        // module merely because a later source-hash comparison calls it clean.
+        let keep: HashSet<Vec<String>> = match &self.covered {
+            Some(covered) => keep.intersection(covered).cloned().collect(),
+            None => keep.clone(),
+        };
         let fn_kept = |sym: &String| {
             program
                 .functions
@@ -360,7 +374,7 @@ impl ContextTables {
         self.co_method_returns.retain(|(ty, _), _| ty_kept(ty));
         self.method_return_props.retain(|(ty, _)| ty_kept(ty));
         self.global_defs.retain(|module, _| keep.contains(module));
-        self.covered = Some(keep.clone());
+        self.covered = Some(keep);
         true
     }
 }
@@ -431,16 +445,77 @@ impl Checker<'_> {
     /// Load remapped context tables into this checker and confine the per-item
     /// passes to the entry module. The caller has already renumbered the
     /// tables' variables past this checker's counter.
-    fn apply_seed(&mut self, seed: ContextTables, next_var: u32) {
-        self.schemes = seed.schemes;
-        self.function_returns = seed.function_returns;
-        self.method_returns = seed.method_returns;
-        self.method_return_props = seed.method_return_props;
-        self.co_method_returns = seed.co_method_returns;
-        self.global_defs = seed.global_defs;
-        self.seeded_set = seed.covered;
+    fn apply_seed(&mut self, seed: ContextTables, next_var: u32) -> AppliedSeedMetadata {
+        let ContextTables {
+            schemes,
+            function_returns,
+            method_returns,
+            method_return_props,
+            co_method_returns,
+            global_defs,
+            next_var: table_next_var,
+            bare_names,
+            covered,
+            program_identity,
+        } = seed;
+        let scheme_keys = schemes.keys().cloned().collect();
+        let function_return_keys = function_returns.keys().cloned().collect();
+        let method_return_keys = method_returns.keys().cloned().collect();
+        let method_return_prop_keys = method_return_props.clone();
+        let co_method_return_keys = co_method_returns.keys().cloned().collect();
+        let global_def_keys = global_defs.keys().cloned().collect();
+        self.schemes = schemes;
+        self.function_returns = function_returns;
+        self.method_returns = method_returns;
+        self.method_return_props = method_return_props;
+        self.co_method_returns = co_method_returns;
+        self.global_defs = global_defs;
+        self.seeded_set = covered;
         self.next_unknown = self.next_unknown.max(next_var);
         self.entry_only = true;
+        AppliedSeedMetadata {
+            next_var: table_next_var,
+            bare_names,
+            program_identity,
+            scheme_keys,
+            function_return_keys,
+            method_return_keys,
+            method_return_prop_keys,
+            co_method_return_keys,
+            global_def_keys,
+        }
+    }
+
+    /// Recover the applied seed after a preliminary checker has read it. Any
+    /// entries inferred for uncovered modules are removed before the tables are
+    /// transferred to the real checker.
+    fn take_applied_seed(&mut self, metadata: AppliedSeedMetadata) -> ContextTables {
+        let covered = self.seeded_set.take();
+        self.schemes
+            .retain(|name, _| metadata.scheme_keys.contains(name));
+        self.function_returns
+            .retain(|symbol, _| metadata.function_return_keys.contains(symbol));
+        self.method_returns
+            .retain(|key, _| metadata.method_return_keys.contains(key));
+        self.method_return_props
+            .retain(|key| metadata.method_return_prop_keys.contains(key));
+        self.co_method_returns
+            .retain(|key, _| metadata.co_method_return_keys.contains(key));
+        self.global_defs
+            .retain(|module, _| metadata.global_def_keys.contains(module));
+
+        ContextTables {
+            schemes: std::mem::take(&mut self.schemes),
+            function_returns: std::mem::take(&mut self.function_returns),
+            method_returns: std::mem::take(&mut self.method_returns),
+            method_return_props: std::mem::take(&mut self.method_return_props),
+            co_method_returns: std::mem::take(&mut self.co_method_returns),
+            global_defs: std::mem::take(&mut self.global_defs),
+            next_var: metadata.next_var,
+            bare_names: metadata.bare_names,
+            covered,
+            program_identity: metadata.program_identity,
+        }
     }
 
     /// Whether `module` was covered by the applied seed: anything but the
@@ -456,6 +531,18 @@ impl Checker<'_> {
             None => !matches!(module, [m] if m == "main"),
         }
     }
+}
+
+struct AppliedSeedMetadata {
+    next_var: u32,
+    bare_names: HashSet<String>,
+    program_identity: ContextProgramIdentity,
+    scheme_keys: HashSet<String>,
+    function_return_keys: HashSet<String>,
+    method_return_keys: HashSet<(String, String)>,
+    method_return_prop_keys: HashSet<(String, String)>,
+    co_method_return_keys: HashSet<(String, String)>,
+    global_def_keys: HashSet<Vec<String>>,
 }
 
 /// Whether the scheme pre-pass can skip co-checking `info`'s method bodies:
@@ -582,23 +669,22 @@ fn check_method_bodies(checker: &mut Checker, program: &Program, schemes_only: b
 ///
 /// The preliminary run's diagnostics and solver are discarded; only the schemes
 /// are kept, and the real pass rebuilds them once its own method bodies are done.
-/// It therefore does only the work a scheme needs: the declaration validation is
-/// pure diagnostics, and the second `precompute_method_returns` exists to converge
-/// cross-type *return* chains, which generalization does not read -- both are the
-/// real pass's job.
+/// It therefore does only the work a scheme needs: declaration validation is
+/// pure diagnostics, while method-return precomputation converges internally.
 fn seed_schemes(
     program: &Program,
-    seed: Option<&(ContextTables, u32)>,
-) -> HashMap<String, TypeScheme> {
-    let mut pre = Checker::new(program);
-    if let Some((tables, next)) = seed {
-        pre.apply_seed(tables.clone(), *next);
-    }
+    seed: Option<(ContextTables, u32)>,
+    rows: Rc<brass_typesys::RowInfo>,
+) -> (HashMap<String, TypeScheme>, Option<(ContextTables, u32)>) {
+    let mut pre = Checker::new(program, rows);
+    let applied = seed.map(|(tables, next)| (pre.apply_seed(tables, next), next));
     pre.precompute_global_bindings();
     pre.precompute_function_returns();
     pre.precompute_method_returns();
     check_method_bodies(&mut pre, program, true);
-    pre.build_schemes()
+    let schemes = pre.build_schemes();
+    let seed = applied.map(|(metadata, next)| (pre.take_applied_seed(metadata), next));
+    (schemes, seed)
 }
 
 pub fn analyze(program: &Program) -> Inference {
@@ -632,26 +718,26 @@ pub(crate) fn analyze_inner(
     // One remapping serves both checkers below, so the preliminary scheme pass
     // and the real pass agree on every seeded variable id.
     let remapped = seed.map(|s| s.remapped(next_unknown_after_program(program)));
+    let rows = Rc::new(brass_typesys::RowInfo::analyze(program));
     let t = std::time::Instant::now();
-    let seeded = seed_schemes(program, remapped.as_ref());
+    let (seeded, remapped) = seed_schemes(program, remapped, Rc::clone(&rows));
     phase("typeck/seed-schemes", t);
-    let mut checker = Checker::new(program);
+    let mut checker = Checker::new(program, rows);
     checker.lazy_profile = ctl.is_some();
     if checker.lazy_profile {
         checker.keyed_tainted = crate::taint::keyed_reachable(program);
     }
-    if let Some((tables, next)) = &remapped {
-        checker.apply_seed(tables.clone(), *next);
+    if let Some((tables, next)) = remapped {
+        checker.apply_seed(tables, next);
     }
     checker.schemes = seeded;
     let t = std::time::Instant::now();
     checker.validate_param_declarations();
     checker.precompute_global_bindings();
     checker.precompute_function_returns();
-    // The method pass runs twice: a method's inferred return may depend on
-    // another type's method (`Tcp.close` propagating `File.close`), and the
-    // second pass sees every first-pass entry, so cross-type chains converge.
-    checker.precompute_method_returns();
+    // A method's inferred return may depend on another type's method
+    // (`Tcp.close` propagating `File.close`), so this pass closes the table to a
+    // fixpoint.
     checker.precompute_method_returns();
     // The free functions were inferred before any method return existed (the
     // method pass needs theirs, so it cannot go first), which leaves a function
@@ -661,7 +747,6 @@ pub(crate) fn analyze_inner(
     // method reading a function that only just resolved (`QueryPair.parse_all`
     // propagating `_decode_form`, which propagates `percent.decode`) sees it.
     checker.refresh_function_returns();
-    checker.precompute_method_returns();
     checker.precompute_method_returns();
     phase("typeck/precompute", t);
     // Check each type's method bodies, then generalize each record type into a
@@ -1490,7 +1575,7 @@ struct Checker<'a> {
     /// function and method, derived once per program. An anonymous structural
     /// argument to a row-covered parameter is checked against the row at the
     /// argument's own span (the value is where the mismatch lives).
-    rows: brass_typesys::RowInfo,
+    rows: Rc<brass_typesys::RowInfo>,
     /// Spans of anonymous structural arguments that passed their callee row
     /// check for a view-ELIGIBLE parameter: exactly the call sites where MIR
     /// lowering may convert the argument into the parameter's view.
@@ -1584,7 +1669,7 @@ enum PropKind {
 }
 
 impl<'a> Checker<'a> {
-    fn new(program: &'a Program) -> Self {
+    fn new(program: &'a Program, rows: Rc<brass_typesys::RowInfo>) -> Self {
         Self {
             program,
             errors: Vec::new(),
@@ -1645,7 +1730,7 @@ impl<'a> Checker<'a> {
             lift_poisoned: HashSet::default(),
             narrowed_bindings: Vec::new(),
             closure_write_targets: HashSet::default(),
-            rows: brass_typesys::RowInfo::analyze(program),
+            rows,
             view_args: HashSet::default(),
             lift_errs: HashSet::default(),
             sum_views: HashMap::default(),

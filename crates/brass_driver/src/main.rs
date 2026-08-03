@@ -691,11 +691,12 @@ fn reanchor_module_paths(
 
 /// The context seed for `ctx` (every module except the entry): from the
 /// shared on-disk store under `key` when caching is enabled, else built by a
-/// context-only run and stored back. `None` when the context itself has
-/// diagnostics -- the unseeded full run then reports them as before.
+/// context-only run and stored back. A context with diagnostics retains only
+/// modules outside the diagnostic modules' importer closure.
 fn cached_context_seed(
     key: &Option<[u8; 20]>,
     ctx: &[LoadedModule],
+    sources: &brass_resolve::SourceMap,
     module_hashes: Option<&[(String, [u8; 20])]>,
     prior: Option<&brass_cache::ContextBundle>,
     phase_name: &'static str,
@@ -709,50 +710,56 @@ fn cached_context_seed(
     }
     let t = std::time::Instant::now();
     let (ctx_program, ctx_errors) = lower(ctx);
-    let seed = if ctx_errors.is_empty() {
-        // An exact-key miss usually means an EDIT somewhere in the context.
-        // The incremental sidecar of the previous build of this same context
-        // (same module-path list) tells which modules changed: everything
-        // else's tables are retained as a partial seed and only the changed
-        // modules -- plus their transitive importers, which may observe the
-        // change -- re-infer. When no sidecar is on disk, an in-memory
-        // `prior` bundle the caller just built serves the same way: the
-        // keyed re-pass hands in the plain context it inferred moments ago,
-        // so even a cache-cold run only re-infers the specialized modules.
-        let incremental = module_hashes.and_then(|hashes| {
-            let disk = if brass_cache::enabled() {
-                brass_cache::load_context_bundle(&context_identity(CACHE_FLAVOR, hashes))
-            } else {
-                None
-            };
-            let bundle = disk.as_ref().or(prior)?;
-            let keep = clean_context_modules(ctx, hashes, &bundle.module_hashes);
-            if keep.is_empty() {
-                return None;
-            }
+    // An exact-key miss usually means an EDIT somewhere in the context. The
+    // incremental sidecar of the previous build of this same context retains
+    // unchanged modules and their dependency closure as a partial input seed.
+    let incremental = module_hashes.and_then(|hashes| {
+        let disk = if brass_cache::enabled() {
+            brass_cache::load_context_bundle(&context_identity(CACHE_FLAVOR, hashes))
+        } else {
+            None
+        };
+        let bundle = disk.as_ref().or(prior)?;
+        let keep = clean_context_modules(ctx, hashes, &bundle.module_hashes);
+        if keep.is_empty() {
+            return None;
+        }
+        tracing::debug!(
+            target: "brass::perf",
+            kept = keep.len(),
+            total = ctx.len(),
+            "incremental context rebuild"
+        );
+        let mut partial = bundle.seed.clone();
+        if !partial.retain_modules(&ctx_program, &keep) {
             tracing::debug!(
                 target: "brass::perf",
-                kept = keep.len(),
-                total = ctx.len(),
-                "incremental context rebuild"
+                "incremental context rebuild rejected changed HIR identity"
             );
-            let mut partial = bundle.seed.clone();
-            if !partial.retain_modules(&ctx_program, &keep) {
-                tracing::debug!(
-                    target: "brass::perf",
-                    "incremental context rebuild rejected changed HIR identity"
-                );
-                return None;
-            }
-            brass_typeck::context_seed_with(&ctx_program, Some(&partial))
-        });
-        match incremental {
-            Some(seed) => Some(seed),
-            None => brass_typeck::context_seed(&ctx_program),
+            return None;
         }
-    } else {
-        None
-    };
+        Some(partial)
+    });
+    let analysis = brass_typeck::analyze_with(&ctx_program, incremental.as_ref());
+    for error in analysis.errors.iter().take(5) {
+        tracing::debug!(
+            target: "brass::perf",
+            "context diagnostic: {} @ {:?}",
+            error.message,
+            error.span
+        );
+    }
+    let diagnostic_spans = ctx_errors
+        .iter()
+        .map(|error| error.span)
+        .chain(analysis.errors.iter().map(|error| error.span));
+    let seed = retain_diagnostic_free_context(
+        ctx,
+        sources,
+        &ctx_program,
+        analysis.context_tables,
+        diagnostic_spans,
+    );
     brass_utils::perf_phase(phase_name, t.elapsed());
     if let (Some(key), Some(seed), true) = (key, &seed, brass_cache::enabled()) {
         brass_cache::save_context(key, seed);
@@ -845,11 +852,21 @@ fn clean_context_modules(
     prior: &[(String, [u8; 20])],
 ) -> HashSet<Vec<String>> {
     let prior_map: HashMap<&str, &[u8; 20]> = prior.iter().map(|(p, h)| (p.as_str(), h)).collect();
-    let mut dirty: HashSet<String> = now
+    let dirty: HashSet<String> = now
         .iter()
         .filter(|(p, h)| prior_map.get(p.as_str()) != Some(&h))
         .map(|(p, _)| p.clone())
         .collect();
+    context_modules_outside_dirty_closure(ctx, dirty)
+}
+
+/// Modules outside `dirty` and every transitive importer of a dirty module.
+/// A dirty implicit-prelude module affects every module without an explicit
+/// import edge, so none can be retained in that case.
+fn context_modules_outside_dirty_closure(
+    ctx: &[LoadedModule],
+    mut dirty: HashSet<String>,
+) -> HashSet<Vec<String>> {
     if dirty.is_empty() {
         // Identical context under a missed exact key (e.g. the entry list
         // changed): everything is reusable.
@@ -903,6 +920,36 @@ fn clean_context_modules(
         .filter(|m| !dirty.contains(&m.path.join(".")))
         .map(|m| m.path.clone())
         .collect()
+}
+
+/// Keep tables only for modules with no attributed diagnostic and no import
+/// path to one. If any diagnostic cannot be attributed to a source module, no
+/// partial seed is safe to advertise.
+fn retain_diagnostic_free_context(
+    ctx: &[LoadedModule],
+    sources: &brass_resolve::SourceMap,
+    program: &brass_hir::Program,
+    mut tables: brass_typeck::ContextTables,
+    diagnostics: impl IntoIterator<Item = Span>,
+) -> Option<brass_typeck::ContextTables> {
+    let mut dirty = HashSet::default();
+    for span in diagnostics {
+        dirty.insert(module_path_at(ctx, sources, span.lo)?.join("."));
+    }
+    if dirty.is_empty() {
+        return Some(tables);
+    }
+    let keep = context_modules_outside_dirty_closure(ctx, dirty);
+    if keep.is_empty() || !tables.retain_modules(program, &keep) {
+        return None;
+    }
+    tracing::debug!(
+        target: "brass::perf",
+        kept = keep.len(),
+        total = ctx.len(),
+        "retaining diagnostic-free context modules"
+    );
+    Some(tables)
 }
 
 /// A finished front-end analysis in thread-transportable form: the final
@@ -2716,6 +2763,7 @@ fn check_front(
     let ctx_seed = cached_context_seed(
         &ctx_key,
         &modules[..ctx_end],
+        &sources,
         ctx_module_hashes.as_deref(),
         None,
         "front/context-check",
@@ -2861,6 +2909,7 @@ fn check_front(
                 let repass_seed = cached_context_seed(
                     &repass_key,
                     &modules[..modules.len() - 1],
+                    &sources,
                     repass_hashes.as_deref(),
                     plain_prior.as_ref(),
                     "front/keyed-context-check",
@@ -3526,7 +3575,10 @@ fn brace_balanced(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{context_identity, context_module_hashes, module_path_at, program_file_index};
+    use super::{
+        context_identity, context_module_hashes, module_path_at, program_file_index,
+        retain_diagnostic_free_context,
+    };
     use brass_hir::LoadedModule;
     use brass_parser::Span;
     use brass_parser::ast::Module;
@@ -3599,6 +3651,33 @@ mod tests {
         assert_ne!(
             context_identity("jit", &modules),
             context_identity("repl", &modules)
+        );
+    }
+
+    #[test]
+    fn context_diagnostic_retains_other_modules() {
+        // A diagnostic attributed to one source drops that module while keeping
+        // an independent module's tables available as a partial seed.
+        let mut sources = brass_resolve::SourceMap::default();
+        let a = sources.add(None, "a".to_string(), "source a".to_string());
+        let b = sources.add(None, "b".to_string(), "source b".to_string());
+        let modules = vec![loaded("a", a), loaded("b", b)];
+        let (program, errors) = brass_hir::lower(&modules);
+        assert!(errors.is_empty());
+        let tables = brass_typeck::context_seed(&program).expect("clean context");
+
+        let seed = retain_diagnostic_free_context(
+            &modules,
+            &sources,
+            &program,
+            tables,
+            [Span::new(b + 1, b + 1)],
+        )
+        .expect("one clean module remains");
+
+        assert_eq!(
+            seed.covered,
+            Some(fxhash::FxHashSet::from_iter([vec!["a".to_string()]]))
         );
     }
 }

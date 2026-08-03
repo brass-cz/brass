@@ -9,8 +9,15 @@ use brass_hir::{FieldInfo, MethodInfo, Program, TypeKind};
 use crate::TypeError;
 
 pub fn check(program: &Program) -> Vec<TypeError> {
+    check_in(program, crate::AnalysisModules::all())
+}
+
+pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -> Vec<TypeError> {
     let mut errors = Vec::new();
     for info in program.types.values() {
+        if !modules.checks(&info.module) {
+            continue;
+        }
         // Two interfaces a type implements may declare the same field name with
         // incompatible types. Each parent is otherwise checked independently
         // against the implementer, so this conflict between the parents

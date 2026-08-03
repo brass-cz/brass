@@ -19,8 +19,15 @@ use brass_parser::ast::*;
 use crate::TypeError;
 
 pub fn check(program: &Program) -> Vec<TypeError> {
+    check_in(program, crate::AnalysisModules::all())
+}
+
+pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -> Vec<TypeError> {
     let mut errors = Vec::new();
     for module in &program.inits {
+        if !modules.checks(&module.path) {
+            continue;
+        }
         check_module(&module.stmts, &mut errors);
     }
     errors

@@ -642,7 +642,8 @@ mod tests {
     #[test]
     fn nested_hit_journal_is_composed_into_its_parent() {
         let program = Program::empty();
-        let mut checker = Checker::new(&program);
+        let mut checker =
+            Checker::new(&program, Rc::new(brass_typesys::RowInfo::analyze(&program)));
         let child_span = Span::new(2, 3);
 
         checker.begin_elaboration_journal();
@@ -673,7 +674,8 @@ mod tests {
     #[test]
     fn replay_uses_conflict_helpers_and_keeps_typed_entries_idempotent() {
         let program = Program::empty();
-        let mut recorded = Checker::new(&program);
+        let rows = Rc::new(brass_typesys::RowInfo::analyze(&program));
+        let mut recorded = Checker::new(&program, Rc::clone(&rows));
         let span = Span::new(0, 1);
 
         recorded.begin_elaboration_journal();
@@ -688,7 +690,7 @@ mod tests {
         let context = concrete_context();
         let memo = recorded.build_elaboration_memo_entry(&Type::Bool, frame, &context);
 
-        let mut replayed = Checker::new(&program);
+        let mut replayed = Checker::new(&program, rows);
         replayed.record_prop_kind(span, PropKind::Err);
         replayed.replay_elaboration_memo_entry(&memo, &context);
         replayed.replay_elaboration_memo_entry(&memo, &context);

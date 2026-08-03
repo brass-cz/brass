@@ -22,11 +22,21 @@ use crate::TypeError;
 /// Report every use of an uninitialized `let` binding that is not definitely
 /// assigned at that point.
 pub fn check(program: &Program) -> Vec<TypeError> {
+    check_in(program, crate::AnalysisModules::all())
+}
+
+pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -> Vec<TypeError> {
     let mut errors = Vec::new();
     for f in program.functions.values() {
+        if !modules.checks(&f.module) {
+            continue;
+        }
         check_body(program, None, &f.decl.body, &mut errors);
     }
     for info in program.types.values() {
+        if !modules.checks(&info.module) {
+            continue;
+        }
         match &info.kind {
             TypeKind::Record { methods, .. } => {
                 for m in methods.values() {
