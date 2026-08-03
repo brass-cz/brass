@@ -442,6 +442,15 @@ pub enum MonoStop {
     Fail(String),
 }
 
+/// A callable frame that failed only because its transitive MIR subset was
+/// incomplete. Replaying the demands preserves each root's watermark rules;
+/// the frame itself cannot produce a different result until the caller adds
+/// bodies and starts a new monomorphization pass.
+struct MissingFailure {
+    error: String,
+    demands: Vec<(String, Vec<Type>, bool)>,
+}
+
 /// [`monomorphize`] with the LAZY pipeline's roots: the module initializers
 /// and the entry `main` only, instead of every zero-parameter function. The
 /// reachable graph is identical for code execution can reach -- execution
@@ -673,6 +682,13 @@ struct Monomorphizer<'m, 'p> {
     /// branches or recovered probes, and dead code needs no body. A
     /// `RefCell` because the probes only hold `&self`.
     missing_demands: std::cell::RefCell<Vec<(String, Vec<Type>, bool)>>,
+    /// Pass-local memo of callable frames that observed a missing body. Mono's
+    /// fixpoint can revisit the same failed method many times, but the MIR set
+    /// cannot change during one pass, so only the demand replay is needed.
+    missing_failures: HashMap<String, MissingFailure>,
+    /// Counts every missing-body observation, including a deduplicated one,
+    /// so an enclosing frame can tell that its failure was demand-driven.
+    missing_observations: std::cell::Cell<u64>,
     /// Checker-reported instance returns for UNANNOTATED functions, keyed by
     /// `(base symbol, argument types)`: the runtime-deferral contract that
     /// lets a call to such a function compile as a runtime-resolved site
@@ -715,6 +731,8 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             defer: None,
             closure_depth: 0,
             missing_demands: std::cell::RefCell::new(Vec::new()),
+            missing_failures: HashMap::default(),
+            missing_observations: std::cell::Cell::new(0),
             instance_returns: HashMap::default(),
         }
     }
@@ -799,6 +817,8 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
     /// lowered body (a closure site, a non-deferrable shape) outweighs any
     /// number of deferral-candidate sites for the same instance.
     fn note_missing(&self, base: &str, arg_types: &[Type], needs_body: bool) {
+        self.missing_observations
+            .set(self.missing_observations.get() + 1);
         let mut demands = self.missing_demands.borrow_mut();
         if let Some(d) = demands
             .iter_mut()
@@ -871,6 +891,16 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         is_closure: bool,
         fallible: bool,
     ) -> Result<String, String> {
+        if let Some(failure) = self.missing_failures.get(&sym) {
+            let error = failure.error.clone();
+            let demands = failure.demands.clone();
+            for (base, type_args, needs_body) in demands {
+                self.note_missing(&base, &type_args, needs_body);
+            }
+            return Err(error);
+        }
+        let missing_before = self.missing_observations.get();
+        let demands_before = self.missing_demands.borrow().len();
         let watermark = self.instance_log.len();
         let cleanup_sym = sym.clone();
         let res = self.type_and_store_inner(
@@ -892,6 +922,18 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             }
             self.in_progress.remove(&cleanup_sym);
             self.assumed_rets.remove(&cleanup_sym);
+        }
+        if self.missing_observations.get() != missing_before
+            && let Err(error) = &res
+        {
+            let demands = self.missing_demands.borrow()[demands_before..].to_vec();
+            self.missing_failures.insert(
+                cleanup_sym,
+                MissingFailure {
+                    error: error.clone(),
+                    demands,
+                },
+            );
         }
         res
     }
@@ -2345,7 +2387,15 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             && !self.by_fn.contains_key(base)
             && self.program.functions.contains_key(base)
         {
-            let needs_body = !self.unannotated_deferral_candidate(base, &arg_types);
+            let candidate = self.unannotated_deferral_candidate(base, &arg_types);
+            // A candidate is body-free only while its checker contract is
+            // still outstanding. If that contract is already present,
+            // `deferrable` rejected its concrete return shape above, so only
+            // supplying the MIR body can change the next pass.
+            let contract_present = self
+                .instance_returns
+                .contains_key(&(base.to_string(), arg_types.clone()));
+            let needs_body = !candidate || contract_present;
             self.note_missing(base, &arg_types, needs_body);
             return Err(format!("missing body `{base}` (demanded)"));
         }
@@ -2806,7 +2856,10 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_instances, instance_symbol, monomorphize};
+    use super::{
+        HashMap, MonoStop, check_instances, instance_symbol, monomorphize,
+        monomorphize_entry_with_returns,
+    };
     use brass_hir::{RESULT_TYPE_ID, Type};
 
     /// The JIT-time constraint check passes on a valid program: each
@@ -2852,6 +2905,49 @@ mod tests {
         assert!(
             jit_errors.is_empty(),
             "valid fallible program: {jit_errors:?}"
+        );
+    }
+
+    /// Once an unannotated return contract has arrived but cannot describe a
+    /// deferred ABI, retrying without the body cannot change the result. The
+    /// demand must therefore be upgraded from a contract candidate to a real
+    /// MIR-body requirement.
+    #[test]
+    fn rejected_deferred_contract_demands_the_body() {
+        let src = "fun value(x) {\n  return x\n}\n\
+                   fun main() {\n  println(value(1))\n}\n";
+        let ast = brass_parser::parse(src).expect("parse");
+        let (program, errs) = brass_hir::lower(&[brass_hir::LoadedModule {
+            is_prelude: false,
+            path: vec!["main".into()],
+            ast,
+        }]);
+        assert!(errs.is_empty(), "lower: {errs:?}");
+        let mut mir = brass_mir::lower_program(&program);
+        mir.functions.retain(|function| function.symbol == "main");
+
+        let mut missing =
+            match monomorphize_entry_with_returns(&mir, &program, true, HashMap::default()) {
+                Err(MonoStop::MissingBodies(missing)) => missing,
+                Err(other) => panic!("expected missing bodies, got {other:?}"),
+                Ok(_) => panic!("value body should be absent"),
+            };
+        let (symbol, args, needs_body) = missing.pop().expect("one missing value instance");
+        assert_eq!(symbol, "value");
+        assert!(!needs_body, "the first demand may request a contract");
+
+        let mut returns = HashMap::default();
+        returns.insert((symbol, args), Type::Unknown(0));
+        let missing = match monomorphize_entry_with_returns(&mir, &program, true, returns) {
+            Err(MonoStop::MissingBodies(missing)) => missing,
+            Err(other) => panic!("expected missing bodies, got {other:?}"),
+            Ok(_) => panic!("unknown return should not defer"),
+        };
+        assert!(
+            missing
+                .iter()
+                .any(|(symbol, _, needs_body)| symbol == "value" && *needs_body),
+            "a rejected contract must require the body: {missing:?}"
         );
     }
 

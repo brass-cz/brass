@@ -809,14 +809,42 @@ pub fn analyze_generated(
     }
 }
 
+/// Publish settlement immediately for every demanded symbol, but defer the
+/// cumulative table scan until the last queued member of that demand batch.
+/// The driver waits for the whole set, so no retry can observe the empty
+/// intermediate deltas.
+fn emit_function_checked(
+    checker: &Checker,
+    ctl: &mut StreamCtl,
+    queue: &std::collections::VecDeque<(String, Option<u64>)>,
+    batch: Option<u64>,
+    symbol: String,
+) {
+    let batch_continues = batch.is_some_and(|batch| {
+        queue
+            .iter()
+            .any(|(_, queued_batch)| *queued_batch == Some(batch))
+    });
+    let delta = if batch_continues {
+        stream::ChannelDelta::default()
+    } else {
+        flush_delta(checker, &mut ctl.state, false)
+    };
+    ctl.sched.emit(stream::CheckEvent::BodyChecked(
+        stream::BodyId::Function(symbol),
+        delta,
+    ));
+}
+
 /// [`analyze_with`] with optional streaming control (the lazy-check
 /// pipeline): with a [`StreamCtl`], bodies are checked in an execution-first
 /// order -- module initializers, then `main`, then the remaining functions,
 /// reprioritized between bodies by the scheduler's requests -- and a channel
-/// delta is emitted after each body. Without one, the body order is the
-/// eager pipeline's. The second return value is the terminal delta (flushed
-/// after the finalize re-resolution), for the caller to emit once the
-/// remaining whole-program passes are done.
+/// event is emitted after each body; a priority batch carries its cumulative
+/// delta on the final event. Without one, the body order is the eager
+/// pipeline's. The second return value is the terminal delta (flushed after
+/// the finalize re-resolution), for the caller to emit once the remaining
+/// whole-program passes are done.
 pub(crate) fn analyze_inner(
     program: &Program,
     seed: Option<&ContextTables>,
@@ -964,14 +992,14 @@ pub(crate) fn analyze_inner(
             // its entries stream in through the re-elaboration a caller's
             // own check performs. Without the event, a consumer waiting on
             // a context function would wait forever.
-            let mut queue: std::collections::VecDeque<String> = {
+            let mut queue: std::collections::VecDeque<(String, Option<u64>)> = {
                 let mut symbols: Vec<String> = program.functions.keys().cloned().collect();
                 symbols.sort();
                 if let Some(pos) = symbols.iter().position(|s| s == "main") {
                     let main = symbols.remove(pos);
                     symbols.insert(0, main);
                 }
-                symbols.into()
+                symbols.into_iter().map(|symbol| (symbol, None)).collect()
             };
             let mut done: HashSet<String> = HashSet::default();
             // The concrete argument types each priority request carried: the
@@ -992,9 +1020,21 @@ pub(crate) fn analyze_inner(
                 if ctl.sched.stopped() {
                     break;
                 }
+                // While the consumer is settling its entry, hold the
+                // background queue and park until its next request. Waking the
+                // scheduler also releases this wait when execution begins.
+                let parked = ctl.sched.paused()
+                    && queue
+                        .front()
+                        .is_some_and(|(symbol, _)| !priority.contains(symbol));
+                let requests = if parked {
+                    ctl.sched.wait_for_requests()
+                } else {
+                    ctl.sched.drain_requests()
+                };
                 // Priority requests land at the front in request order; a
                 // request for an unknown or already-checked symbol is spent.
-                for request in ctl.sched.drain_requests().into_iter().rev() {
+                for request in requests.into_iter().rev() {
                     let fresh = !done.contains(&request.symbol)
                         && program.functions.contains_key(&request.symbol);
                     // A request naming a snapshot-settled body means the
@@ -1007,18 +1047,20 @@ pub(crate) fn analyze_inner(
                     if fresh || revived {
                         demanded_at.insert(request.symbol.clone(), request.type_args);
                         priority.insert(request.symbol.clone());
-                        queue.push_front(request.symbol);
+                        queue.push_front((request.symbol, Some(request.batch)));
                     }
                 }
-                // While the consumer is settling its entry, hold the
-                // background queue and wait for its next request (see
-                // `Scheduler::paused`); the wait is a poll because requests
-                // arrive on the consumer's own cadence.
-                if ctl.sched.paused() && queue.front().is_some_and(|s| !priority.contains(s)) {
-                    std::thread::sleep(std::time::Duration::from_micros(300));
+                // A wake may leave the queue paused when it accompanied only
+                // stale requests. Park again instead of starting background
+                // work before the entry gate opens.
+                if ctl.sched.paused()
+                    && queue
+                        .front()
+                        .is_some_and(|(symbol, _)| !priority.contains(symbol))
+                {
                     continue;
                 }
-                let Some(symbol) = queue.pop_front() else {
+                let Some((symbol, batch)) = queue.pop_front() else {
                     break;
                 };
                 if !done.insert(symbol.clone()) {
@@ -1048,10 +1090,7 @@ pub(crate) fn analyze_inner(
                     // on a context function would otherwise wait forever.
                     // A resume-snapshot body is settled the same way: its
                     // delivered state was seeded from the prior run.
-                    ctl.sched.emit(stream::CheckEvent::BodyChecked(
-                        stream::BodyId::Function(symbol),
-                        stream::ChannelDelta::default(),
-                    ));
+                    emit_function_checked(&checker, ctl, &queue, batch, symbol);
                     continue;
                 }
                 let fn_started = std::time::Instant::now();
@@ -1068,11 +1107,7 @@ pub(crate) fn analyze_inner(
                 if let (Some(args), Some(ret)) = (instance_args, instance_ret) {
                     checker.record_instance_return(symbol.clone(), args, ret);
                 }
-                let delta = flush_delta(&checker, &mut ctl.state, false);
-                ctl.sched.emit(stream::CheckEvent::BodyChecked(
-                    stream::BodyId::Function(symbol),
-                    delta,
-                ));
+                emit_function_checked(&checker, ctl, &queue, batch, symbol);
             }
             perf.report();
             checker.in_entry_main = false;

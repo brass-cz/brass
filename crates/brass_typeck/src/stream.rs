@@ -152,6 +152,10 @@ pub enum CheckEvent {
 pub struct BodyRequest {
     pub symbol: String,
     pub type_args: Vec<Type>,
+    /// Driver-assigned demand set. The checker publishes one cumulative
+    /// channel delta after the set's final body instead of rescanning its
+    /// tables after every member.
+    pub batch: u64,
 }
 
 /// The consumer half of a streaming analysis: receives progress events and
@@ -161,6 +165,13 @@ pub struct BodyRequest {
 /// already-checked symbols are ignored.
 pub trait Scheduler {
     fn drain_requests(&mut self) -> Vec<BodyRequest>;
+    /// Park until at least one priority request arrives or the consumer wakes
+    /// the background queue, then return every request currently available.
+    /// Threaded schedulers override this with a blocking channel receive;
+    /// in-process schedulers can keep the non-blocking default.
+    fn wait_for_requests(&mut self) -> Vec<BodyRequest> {
+        self.drain_requests()
+    }
     fn emit(&mut self, event: CheckEvent);
     /// Whether the consumer asked the analysis to stop (the lazy driver's
     /// exit). Polled at body boundaries: the streaming run breaks out of its
@@ -611,6 +622,7 @@ mod tests {
                 .map(|symbol| BodyRequest {
                     symbol,
                     type_args: Vec::new(),
+                    batch: 0,
                 })
                 .collect()
         }

@@ -2433,6 +2433,37 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     }
 }
 
+impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
+    /// Finalize the mutable deferred-monomorphization engine at the cold tier.
+    /// Runtime demand adds further modules to this same engine, so its startup
+    /// module uses the O0 tier that ORC applies to first-use materialization.
+    pub fn finalize_deferred(&mut self) -> Result<(), String> {
+        self.finalize_module(OptimizationLevel::None, false)
+    }
+
+    fn finalize_module(
+        &mut self,
+        optimization: OptimizationLevel,
+        optimize_ir: bool,
+    ) -> Result<(), String> {
+        self.emit_freeze_globals_fn();
+        self.module
+            .verify()
+            .map_err(|e| format!("LLVM module verification failed:\n{}", e.to_string()))?;
+        if optimize_ir {
+            self.mark_small_functions_alwaysinline();
+            self.run_optimization_passes();
+        }
+        let engine = self
+            .module
+            .create_jit_execution_engine(optimization)
+            .map_err(|e| format!("failed to create JIT engine: {e}"))?;
+        crate::jit::engine::map_runtime_symbols(&engine, &self.module);
+        self.mir.engine = Some(engine);
+        Ok(())
+    }
+}
+
 impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
     type Value = BasicValueEnum<'ctx>;
 
@@ -2460,25 +2491,9 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
     }
 
     fn finalize(&mut self) -> Result<(), String> {
-        // Generate the auto-freeze entry over the module's immutable heap globals, called between init and `main` in `execute`.
-        self.emit_freeze_globals_fn();
-        self.module
-            .verify()
-            .map_err(|e| format!("LLVM module verification failed:\n{}", e.to_string()))?;
-        // Mark small functions `alwaysinline` and run the optimizer.
-        self.mark_small_functions_alwaysinline();
-        self.run_optimization_passes();
         // O2-equivalent backend codegen: `Default` is LLVM's `-O2`,
         // not `Aggressive` (~`-O3`).
-        let engine = self
-            .module
-            .create_jit_execution_engine(OptimizationLevel::Default)
-            .map_err(|e| format!("failed to create JIT engine: {e}"))?;
-        // Map any runtime primitives the module references (none for the pure
-        // scalar subset, but keeps the path correct as it grows).
-        crate::jit::engine::map_runtime_symbols(&engine, &self.module);
-        self.mir.engine = Some(engine);
-        Ok(())
+        self.finalize_module(OptimizationLevel::Default, true)
     }
 
     fn execute(&mut self) -> Result<(), String> {

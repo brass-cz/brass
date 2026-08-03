@@ -946,6 +946,45 @@ impl SubsetLowering {
         self.lowered.insert(symbol.to_string());
         true
     }
+
+    /// Re-lower an already-added free function against revised checker
+    /// channels without rebuilding methods, initializers, or other functions.
+    /// Old closure entries stay unreachable; replacement closures receive new
+    /// ids from the shared counter and are appended to the program.
+    pub fn refresh_function(
+        &mut self,
+        program: &Program,
+        tables: &LowerTables,
+        symbol: &str,
+        channels: &CheckerChannels,
+    ) -> bool {
+        if !self.lowered.contains(symbol) {
+            return false;
+        }
+        let Some(info) = program.functions.get(symbol) else {
+            return false;
+        };
+        let Some(index) = self
+            .mir
+            .functions
+            .iter()
+            .position(|function| function.symbol == symbol)
+        else {
+            return false;
+        };
+        let ctx = subset_ctx(program, tables, channels, self.next_closure);
+        let mut replacement = MirProgram::default();
+        lower_function_into(&ctx, &mut replacement, info);
+        self.next_closure = ctx.next_closure.get();
+        let mut closures = ctx.closures.into_inner();
+        closures.sort_by_key(|closure| closure.id.0);
+        self.mir.closures.extend(closures);
+        self.mir.functions[index] = replacement
+            .functions
+            .pop()
+            .expect("one requested function was lowered");
+        true
+    }
 }
 
 /// A lowering context over the bundled channels, with the closure-id counter

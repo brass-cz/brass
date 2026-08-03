@@ -1055,11 +1055,41 @@ fn analyze(main_label: &str, main_src: &str, root: &Path) -> Result<Checked, Vec
 
 /// The checker-thread half of the streaming wiring: progress events flow out
 /// over an unbounded channel (the checker never blocks on a slow consumer),
-/// priority requests flow in and are drained non-blockingly between bodies.
+/// priority requests flow in and are drained between bodies.
+#[cfg(jit_backend)]
+struct CheckerPause {
+    paused: std::sync::atomic::AtomicBool,
+    requests: tokio::sync::mpsc::UnboundedSender<Option<Vec<brass_typeck::stream::BodyRequest>>>,
+}
+
+#[cfg(jit_backend)]
+impl CheckerPause {
+    fn request(&self, requests: Vec<brass_typeck::stream::BodyRequest>) {
+        if !requests.is_empty() {
+            let _ = self.requests.send(Some(requests));
+        }
+    }
+
+    /// Release a checker parked on the request channel. `None` is a control
+    /// wake and never enters the type checker's priority queue.
+    fn resume(&self) {
+        if self
+            .paused
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            let _ = self.requests.send(None);
+        }
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[cfg(jit_backend)]
 struct ThreadScheduler {
     events: tokio::sync::mpsc::UnboundedSender<brass_typeck::stream::CheckEvent>,
-    requests: tokio::sync::mpsc::UnboundedReceiver<brass_typeck::stream::BodyRequest>,
+    requests: tokio::sync::mpsc::UnboundedReceiver<Option<Vec<brass_typeck::stream::BodyRequest>>>,
     /// Set by the driver when the program ends: the checker stops at the
     /// next body boundary instead of finishing code nothing will run.
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1071,7 +1101,8 @@ struct ThreadScheduler {
     /// the checker serves only requested bodies, so no demand ever waits for
     /// a definitional pass the queue happened to start first. Cleared when
     /// execution begins.
-    paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    paused: std::sync::Arc<CheckerPause>,
+    requests_closed: bool,
 }
 
 #[cfg(jit_backend)]
@@ -1079,8 +1110,18 @@ impl brass_typeck::stream::Scheduler for ThreadScheduler {
     fn drain_requests(&mut self) -> Vec<brass_typeck::stream::BodyRequest> {
         let mut out = Vec::new();
         while let Ok(request) = self.requests.try_recv() {
-            out.push(request);
+            out.extend(request.into_iter().flatten());
         }
+        out
+    }
+
+    fn wait_for_requests(&mut self) -> Vec<brass_typeck::stream::BodyRequest> {
+        let mut out = Vec::new();
+        match self.requests.blocking_recv() {
+            Some(request) => out.extend(request.into_iter().flatten()),
+            None => self.requests_closed = true,
+        }
+        out.extend(self.drain_requests());
         out
     }
 
@@ -1102,7 +1143,7 @@ impl brass_typeck::stream::Scheduler for ThreadScheduler {
     }
 
     fn paused(&self) -> bool {
-        self.paused.load(std::sync::atomic::Ordering::Relaxed)
+        !self.requests_closed && self.paused.is_paused()
     }
 }
 
@@ -1337,7 +1378,6 @@ fn judge_fatal(
 #[cfg(jit_backend)]
 struct LazyState {
     events: tokio::sync::mpsc::UnboundedReceiver<brass_typeck::stream::CheckEvent>,
-    requests: tokio::sync::mpsc::UnboundedSender<brass_typeck::stream::BodyRequest>,
     merged: MergedChannels,
     checked_fns: HashSet<String>,
     inits_checked: usize,
@@ -1358,7 +1398,7 @@ struct LazyState {
     /// begins -- and before any wait that needs the checker to make progress
     /// of its own (a fatal confirmation, a transient-failure retry), which
     /// would otherwise wait forever on a held queue.
-    paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    paused: std::sync::Arc<CheckerPause>,
     /// A keyed call first discovered by a runtime-demanded body requires the
     /// narrow eager fallback until specialization can run per demand.
     needs_eager: bool,
@@ -1367,17 +1407,50 @@ struct LazyState {
     /// The stop-snapshot a stopped checker handed back, for the partial
     /// cache (everything it settled; resumes the next run).
     snapshot: Option<brass_typeck::stream::StreamSnapshot>,
-    /// A delta carried channel content since the last MIR (re)build. Bodies
+    /// A delta carried channel content since the last MIR revision. Bodies
     /// lowered before it may be missing entries the checker settled later
     /// (a cross-body pinning: an init's array literal fixed by a function's
-    /// `push`), so the lowering is rebuilt before its output is trusted.
+    /// `push`), so stale owners are refreshed before output is trusted.
     dirty: bool,
+    /// Free-function declaration ranges used to invalidate only lowered MIR
+    /// bodies whose span-keyed channel inputs changed.
+    function_ranges: Vec<(String, usize, usize)>,
+    dirty_functions: HashSet<String>,
+    /// A channel change outside every free function belongs to a method or
+    /// initializer and still requires rebuilding the subset base.
+    dirty_non_functions: bool,
     /// The entry gate remains closed between first keyed discovery and the
     /// append-only continuation event.
     awaiting_keyed: bool,
     /// Set once the initial entry gate has completed.
     entry_open: bool,
     generated: Vec<brass_hir::GeneratedDecl>,
+    next_demand_batch: u64,
+}
+
+#[cfg(jit_backend)]
+struct DemandBatchResult {
+    complete: bool,
+    new_requests: usize,
+    newly_settled: usize,
+}
+
+#[cfg(jit_backend)]
+const DEMAND_LOOP_STALLED: &str = "internal error: lazy demand loop made no progress";
+
+/// Enforce the demand-loop progress invariant: every retry must discover a
+/// new demand, observe a requested body settle, or add a missing MIR body.
+#[cfg(jit_backend)]
+fn demand_loop_progress(
+    new_demands: usize,
+    newly_settled: usize,
+    supplied_bodies: usize,
+) -> Result<(), &'static str> {
+    if new_demands + newly_settled + supplied_bodies == 0 {
+        Err(DEMAND_LOOP_STALLED)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(jit_backend)]
@@ -1385,8 +1458,7 @@ impl LazyState {
     /// Release the checker's background queue (idempotent). Called when
     /// execution begins, and before any wait on the checker's own progress.
     fn resume_background(&self) {
-        self.paused
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.paused.resume();
     }
 
     fn take(&mut self, event: brass_typeck::stream::CheckEvent) {
@@ -1446,6 +1518,60 @@ impl LazyState {
             || !d.typeof_types_removed.is_empty()
             || !d.type_tests.is_empty()
             || !d.type_tests_removed.is_empty();
+        let mut mark = |span: Span| {
+            if let Some((symbol, _, _)) = self
+                .function_ranges
+                .iter()
+                .find(|(_, lo, hi)| *lo <= span.lo && span.lo < *hi)
+            {
+                self.dirty_functions.insert(symbol.clone());
+            } else {
+                self.dirty_non_functions = true;
+            }
+        };
+        d.expr_types.iter().for_each(|(span, _)| mark(*span));
+        d.expr_types_removed.iter().for_each(|span| mark(*span));
+        d.view_args.iter().for_each(|span| mark(*span));
+        d.lift_errs.iter().for_each(|span| mark(*span));
+        d.null_props.iter().for_each(|span| mark(*span));
+        d.fields_loops.iter().for_each(|(span, _)| mark(*span));
+        d.sum_views.iter().for_each(|(span, _)| mark(*span));
+        d.type_names.iter().for_each(|(span, _)| mark(*span));
+        d.typeof_types.iter().for_each(|(span, _)| mark(*span));
+        d.typeof_types_removed.iter().for_each(|span| mark(*span));
+        d.type_tests.iter().for_each(|(span, _)| mark(*span));
+        d.type_tests_removed.iter().for_each(|span| mark(*span));
+    }
+
+    /// Refresh only stale free-function MIR. `false` asks the caller to rebuild
+    /// the base because a method or initializer channel changed.
+    fn refresh_lowering(
+        &mut self,
+        lowering: &mut brass_mir::SubsetLowering,
+        program: &Program,
+        tables: &brass_mir::LowerTables,
+        call_locations: &HashMap<Span, (String, u32, u32)>,
+    ) -> bool {
+        if self.dirty_non_functions {
+            return false;
+        }
+        let dirty = std::mem::take(&mut self.dirty_functions);
+        let channels = self.channels(call_locations);
+        let refreshed = dirty
+            .iter()
+            .filter(|symbol| lowering.refresh_function(program, tables, symbol, &channels))
+            .count();
+        tracing::debug!(
+            target: "brass::perf",
+            count = refreshed,
+            "lazy: lowering refresh"
+        );
+        self.dirty = false;
+        true
+    }
+
+    fn mark_lowered(&mut self, symbol: &str) {
+        self.dirty_functions.remove(symbol);
     }
 
     fn pump_blocking(&mut self) {
@@ -1514,24 +1640,60 @@ impl LazyState {
         !self.needs_eager && settled(self)
     }
 
-    /// Ask the checker to settle `symbol` next -- the demanded function's
-    /// path and the concrete argument types of the call that needs it --
-    /// and block until it is. The body joins the NEEDED set: its held
-    /// diagnostics become fatal, so callers judge [`LazyState::fatal`]
-    /// after every demand. False means the checker hung up or requested the
-    /// eager fallback.
-    fn demand(&mut self, symbol: &str, type_args: Vec<brass_hir::Type>) -> bool {
-        self.needed.insert(symbol.to_string());
-        if !self.checked_fns.contains(symbol) {
-            let _ = self.requests.send(brass_typeck::stream::BodyRequest {
-                symbol: symbol.to_string(),
-                type_args,
-            });
-            while !self.needs_eager && !self.closed && !self.checked_fns.contains(symbol) {
-                self.pump_blocking();
+    /// Send a complete mono demand batch before blocking, then wait until the
+    /// checker has settled every symbol. Each body joins the NEEDED set, so
+    /// callers judge [`LazyState::fatal`] once after the batch completes.
+    fn demand_all(&mut self, demands: &[(String, Vec<brass_hir::Type>)]) -> DemandBatchResult {
+        let started = std::time::Instant::now();
+        let mut pending = HashSet::default();
+        let mut requests = Vec::new();
+        let batch = self.next_demand_batch;
+        self.next_demand_batch += 1;
+        for (symbol, type_args) in demands {
+            self.needed.insert(symbol.clone());
+            if !self.checked_fns.contains(symbol) && pending.insert(symbol.clone()) {
+                requests.push(brass_typeck::stream::BodyRequest {
+                    symbol: symbol.clone(),
+                    type_args: type_args.clone(),
+                    batch,
+                });
             }
         }
-        !self.needs_eager && self.checked_fns.contains(symbol)
+        let new_requests = requests.len();
+        self.paused.request(requests);
+        while !self.needs_eager
+            && !self.closed
+            && pending
+                .iter()
+                .any(|symbol| !self.checked_fns.contains(symbol))
+        {
+            self.pump_blocking();
+        }
+        let complete = !self.needs_eager
+            && pending
+                .iter()
+                .all(|symbol| self.checked_fns.contains(symbol));
+        let newly_settled = pending
+            .iter()
+            .filter(|symbol| self.checked_fns.contains(*symbol))
+            .count();
+        tracing::debug!(
+            target: "brass::perf",
+            count = pending.len(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "lazy: demand batch settled"
+        );
+        DemandBatchResult {
+            complete,
+            new_requests,
+            newly_settled,
+        }
+    }
+
+    /// Settle one runtime-discovered body through the same request protocol
+    /// used by start-up batches.
+    fn demand(&mut self, symbol: &str, type_args: Vec<brass_hir::Type>) -> bool {
+        self.demand_all(&[(symbol.to_string(), type_args)]).complete
     }
 
     /// The merged channel state as the lowering bundle. Call locations are
@@ -1570,7 +1732,7 @@ fn finish_eagerly(
     rt: &tokio::runtime::Runtime,
     checker: tokio::task::JoinHandle<Result<AnalyzedProgram, Vec<String>>>,
     stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    paused: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    paused: &std::sync::Arc<CheckerPause>,
     mut events: tokio::sync::mpsc::UnboundedReceiver<brass_typeck::stream::CheckEvent>,
     label: &str,
     src: &str,
@@ -1579,7 +1741,7 @@ fn finish_eagerly(
     // Reclaim the thread: stop it at the next boundary (releasing the held
     // background queue so it can reach one), drain its events, and join.
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    paused.store(false, std::sync::atomic::Ordering::Relaxed);
+    paused.resume();
     while events.blocking_recv().is_some() {}
     let _ = rt
         .block_on(checker)
@@ -1825,12 +1987,17 @@ fn resolve_deferred(
                 return addr;
             }
             Err(brass_engine::MonoStop::MissingBodies(demands)) => {
-                let mut progressed = false;
+                let mut new_demands = 0;
+                let mut newly_settled = 0;
+                let mut supplied_bodies = 0;
                 for (miss, type_args, needs_body) in demands {
                     if lowering.is_lowered(&miss) || !program.functions.contains_key(&miss) {
                         continue;
                     }
-                    if !lazy.demand(&miss, type_args.clone()) {
+                    let result = lazy.demand_all(&[(miss.clone(), type_args.clone())]);
+                    new_demands += result.new_requests;
+                    newly_settled += result.newly_settled;
+                    if !result.complete {
                         return fatal_exit(
                             lazy,
                             &format!("error: the check of `{miss}` did not complete"),
@@ -1846,17 +2013,16 @@ fn resolve_deferred(
                         // The checker supplied the missing unannotated return
                         // contract. Retry with it instead of lowering the body;
                         // the call remains deferred until execution reaches it.
-                        progressed = true;
                         continue;
                     }
                     let channels = lazy.channels(call_locations);
-                    lowering.add_function(program, tables, &miss, &channels);
-                    progressed = true;
+                    supplied_bodies +=
+                        usize::from(lowering.add_function(program, tables, &miss, &channels));
                 }
-                // A batch that supplied nothing new would come straight
-                // back: a pipeline bug, not a user error -- fail readably.
-                if !progressed {
-                    eprintln!("error: lazy compilation cannot supply the demanded bodies");
+                if let Err(error) =
+                    demand_loop_progress(new_demands, newly_settled, supplied_bodies)
+                {
+                    eprintln!("error: {error}");
                     return 0;
                 }
             }
@@ -1953,7 +2119,10 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
     // driver's demands, so no demand ever waits behind a definitional pass
     // the background queue happened to start first (an unannotated body's
     // open-frame pass can be arbitrarily slow; see `Scheduler::paused`).
-    let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let paused = std::sync::Arc::new(CheckerPause {
+        paused: std::sync::atomic::AtomicBool::new(true),
+        requests: requests_tx,
+    });
     let checker = rt.spawn_blocking({
         let (label, front) = (label.clone(), front.clone());
         let stop = stop.clone();
@@ -1967,6 +2136,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                 stop,
                 interrupted: std::cell::Cell::new(false),
                 paused,
+                requests_closed: false,
             };
             check_front(&label, front, &search, Some(&mut sched), resume)
         }
@@ -1981,9 +2151,13 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         return finish_eagerly(&rt, checker, &stop, &paused, events_rx, &label, &src, &root);
     }
     let call_locations = call_site_locations(&front.modules, &front.sources, &search);
+    let function_ranges = program
+        .functions
+        .iter()
+        .map(|(symbol, function)| (symbol.clone(), function.decl.span.lo, function.decl.span.hi))
+        .collect();
     let mut lazy = LazyState {
         events: events_rx,
-        requests: requests_tx,
         merged: MergedChannels::default(),
         checked_fns: HashSet::default(),
         inits_checked: 0,
@@ -1995,9 +2169,13 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         closed: false,
         snapshot: None,
         dirty: false,
+        function_ranges,
+        dirty_functions: HashSet::default(),
+        dirty_non_functions: false,
         awaiting_keyed: false,
         entry_open: false,
         generated: Vec::new(),
+        next_demand_batch: 0,
     };
     if let Some(snap) = &resume {
         // The snapshot's channel state stands in for the deltas the prior
@@ -2080,21 +2258,29 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
     // Demand-driven compilation: methods and inits lower up front, function
     // bodies as monomorphization discovers it needs them. A delta arriving
     // after a body was lowered can carry entries for that body's spans (a
-    // cross-body pinning settles an earlier body's literal), so the whole
-    // lowering is rebuilt whenever the channel state moved -- per-body
-    // lowering is cheap next to checking and codegen.
+    // cross-body pinning settles an earlier body's literal), so those owners
+    // are refreshed before the mono result is trusted.
     let mut demanded: Vec<String> = Vec::new();
     // The HIR-derived lowering tables are channel-independent: computed once,
     // shared across every rebuild.
+    let tables_started = std::time::Instant::now();
     let tables = brass_mir::LowerTables::new(&program);
+    tracing::debug!(
+        target: "brass::perf",
+        elapsed_ms = tables_started.elapsed().as_secs_f64() * 1000.0,
+        "lazy: lowering tables"
+    );
     let mut lowering = 'rebuild: loop {
         lazy.dirty = false;
+        lazy.dirty_functions.clear();
+        lazy.dirty_non_functions = false;
         tracing::debug!(
             target: "brass::perf",
             demanded = demanded.len(),
             closed = lazy.closed,
             "lazy: lowering rebuild"
         );
+        let lowering_started = std::time::Instant::now();
         let mut built = {
             let channels = lazy.channels(&call_locations);
             let mut built = brass_mir::SubsetLowering::new(&program, &tables, &channels);
@@ -2103,19 +2289,29 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
             }
             built
         };
+        tracing::debug!(
+            target: "brass::perf",
+            elapsed_ms = lowering_started.elapsed().as_secs_f64() * 1000.0,
+            "lazy: lowering rebuild complete"
+        );
         // The demand loop: monomorphize, and supply each missing body as it
         // is reported, INCREMENTALLY -- new bodies are appended against the
-        // channel state of their arrival, and only a mono pass over a fully
-        // rebuilt (all-deltas-folded) lowering with no pending revisions is
-        // trusted. Rebuilding once per missing body would re-lower every
-        // method for each round.
+        // channel state of their arrival, and only a mono pass over an
+        // all-deltas-folded lowering with no pending revisions is trusted.
         loop {
-            match brass_engine::monomorphize_entry_with_returns(
+            let mono_started = std::time::Instant::now();
+            let mono_result = brass_engine::monomorphize_entry_with_returns(
                 &built.mir,
                 &program,
                 true,
                 lazy.merged.instance_returns.clone(),
-            ) {
+            );
+            tracing::debug!(
+                target: "brass::perf",
+                elapsed_ms = mono_started.elapsed().as_secs_f64() * 1000.0,
+                "lazy: monomorphization pass"
+            );
+            match mono_result {
                 Ok(mono) => {
                     // A `main` that fell outside the typed subset can be
                     // TRANSIENT under lazy checking -- most prominently a
@@ -2165,6 +2361,10 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                             continue 'rebuild;
                         }
                         if lazy.dirty {
+                            if lazy.refresh_lowering(&mut built, &program, &tables, &call_locations)
+                            {
+                                continue;
+                            }
                             continue 'rebuild;
                         }
                         match judge_fatal(&mut lazy, &bodies, &front.sources) {
@@ -2193,15 +2393,19 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                             return run_fresh_eager(&label, &src, &root);
                         }
                     } else if lazy.dirty {
-                        // Success over a stale (incrementally extended)
-                        // lowering: fold every delta in and prove it again.
+                        if lazy.refresh_lowering(&mut built, &program, &tables, &call_locations) {
+                            continue;
+                        }
+                        // A method or initializer changed: rebuild the subset
+                        // base before trusting the successful mono pass.
                         continue 'rebuild;
                     }
                     break 'rebuild built;
                 }
                 Err(brass_engine::MonoStop::MissingBodies(demands)) => {
                     tracing::debug!(target: "brass::perf", count = demands.len(), "lazy: missing bodies");
-                    let mut progressed = false;
+                    let mut supplied_bodies = 0;
+                    let mut fresh: Vec<(String, Vec<brass_hir::Type>, bool)> = Vec::new();
                     for (symbol, type_args, needs_body) in demands {
                         if !program.functions.contains_key(&symbol) {
                             continue;
@@ -2219,45 +2423,43 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                                 continue;
                             }
                             let channels = lazy.channels(&call_locations);
-                            built.add_function(&program, &tables, &symbol, &channels);
-                            progressed = true;
+                            if built.add_function(&program, &tables, &symbol, &channels) {
+                                lazy.mark_lowered(&symbol);
+                                supplied_bodies += 1;
+                            }
                             continue;
                         }
-                        if !lazy.demand(&symbol, type_args) {
-                            if lazy.needs_eager {
-                                return finish_eagerly(
-                                    &rt,
-                                    checker,
-                                    &lazy.stop,
-                                    &lazy.paused,
-                                    lazy.events,
-                                    &label,
-                                    &src,
-                                    &root,
-                                );
-                            }
-                            match judge_fatal(&mut lazy, &bodies, &front.sources) {
-                                FatalVerdict::Clean => {}
-                                FatalVerdict::Fatal(code) => return Err(code),
-                                FatalVerdict::NeedsEager => {
-                                    return finish_eagerly(
-                                        &rt,
-                                        checker,
-                                        &lazy.stop,
-                                        &lazy.paused,
-                                        lazy.events,
-                                        &label,
-                                        &src,
-                                        &root,
-                                    );
-                                }
-                            }
-                            eprintln!("error: lazy compilation cannot supply `{symbol}`");
-                            return Err(1);
+                        if let Some((_, _, existing_needs_body)) = fresh
+                            .iter_mut()
+                            .find(|(existing, _, _)| existing == &symbol)
+                        {
+                            *existing_needs_body |= needs_body;
+                        } else {
+                            fresh.push((symbol, type_args, needs_body));
                         }
-                        // The demanded body joined the needed set: its held
-                        // diagnostics, if any, are now fatal -- before its
-                        // code could ever run.
+                    }
+                    let batch: Vec<_> = fresh
+                        .iter()
+                        .map(|(symbol, type_args, _)| (symbol.clone(), type_args.clone()))
+                        .collect();
+                    let mut newly_settled = 0;
+                    let result = (!batch.is_empty()).then(|| lazy.demand_all(&batch));
+                    if let Some(result) = &result {
+                        newly_settled = result.newly_settled;
+                    }
+                    if result.as_ref().is_some_and(|result| !result.complete) {
+                        if lazy.needs_eager {
+                            return finish_eagerly(
+                                &rt,
+                                checker,
+                                &lazy.stop,
+                                &lazy.paused,
+                                lazy.events,
+                                &label,
+                                &src,
+                                &root,
+                            );
+                        }
                         match judge_fatal(&mut lazy, &bodies, &front.sources) {
                             FatalVerdict::Clean => {}
                             FatalVerdict::Fatal(code) => return Err(code),
@@ -2274,6 +2476,37 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                                 );
                             }
                         }
+                        let symbols = batch
+                            .iter()
+                            .map(|(symbol, _)| symbol.as_str())
+                            .collect::<Vec<_>>()
+                            .join("`, `");
+                        eprintln!("error: lazy compilation cannot supply `{symbols}`");
+                        return Err(1);
+                    }
+                    if !batch.is_empty() {
+                        // Every requested body is now settled. Judge their
+                        // held diagnostics together before lowering any code.
+                        match judge_fatal(&mut lazy, &bodies, &front.sources) {
+                            FatalVerdict::Clean => {}
+                            FatalVerdict::Fatal(code) => return Err(code),
+                            FatalVerdict::NeedsEager => {
+                                return finish_eagerly(
+                                    &rt,
+                                    checker,
+                                    &lazy.stop,
+                                    &lazy.paused,
+                                    lazy.events,
+                                    &label,
+                                    &src,
+                                    &root,
+                                );
+                            }
+                        }
+                    }
+                    let append_started = std::time::Instant::now();
+                    let append_count = fresh.len();
+                    for (symbol, _, needs_body) in fresh {
                         // A deferral candidate's first demand only CHECKS the
                         // body: the checker's instance-return contract (just
                         // merged from its delta) lets the next mono pass
@@ -2284,23 +2517,27 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                         // the body through the branch above.
                         if needs_body {
                             let channels = lazy.channels(&call_locations);
-                            built.add_function(&program, &tables, &symbol, &channels);
+                            if built.add_function(&program, &tables, &symbol, &channels) {
+                                lazy.mark_lowered(&symbol);
+                                supplied_bodies += 1;
+                            }
                         }
                         demanded.push(symbol);
-                        progressed = true;
                     }
-                    if !progressed {
-                        // No demand in the batch could be satisfied: not
-                        // functions of the program, or supplied already yet
-                        // reported missing again. A pipeline bug, not a user
-                        // error -- fail readably.
-                        if resumed {
-                            // Reclaimability: the paused checker thread must exit before `rt`
-                            // drops (it joins blocking tasks), and this path abandons it.
-                            lazy.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                            return run_fresh_eager(&label, &src, &root);
-                        }
-                        eprintln!("error: lazy compilation cannot supply the demanded bodies");
+                    tracing::debug!(
+                        target: "brass::perf",
+                        count = append_count,
+                        elapsed_ms = append_started.elapsed().as_secs_f64() * 1000.0,
+                        "lazy: lowering append"
+                    );
+                    if let Err(error) =
+                        demand_loop_progress(append_count, newly_settled, supplied_bodies)
+                    {
+                        eprintln!("error: {error}");
+                        // The checker may be parked waiting for another demand;
+                        // wake it so the runtime can join the stopped task.
+                        lazy.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        lazy.resume_background();
                         return Err(1);
                     }
                 }
@@ -2351,6 +2588,9 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                         continue 'rebuild;
                     }
                     if lazy.dirty {
+                        if lazy.refresh_lowering(&mut built, &program, &tables, &call_locations) {
+                            continue;
+                        }
                         continue 'rebuild;
                     }
                     match judge_fatal(&mut lazy, &bodies, &front.sources) {
@@ -2458,10 +2698,16 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         return Err(1);
     }
     use brass_engine::Codegen as _;
+    let codegen_started = std::time::Instant::now();
     let context = inkwell::context::Context::create();
     let mut backend = brass_jit_llvm::LlvmCodegen::new_backend(&context, &program);
     backend.begin_program(&mono);
     backend.codegen_program(&mono);
+    tracing::debug!(
+        target: "brass::perf",
+        elapsed_ms = codegen_started.elapsed().as_secs_f64() * 1000.0,
+        "lazy: codegen startup"
+    );
     let mut targets: HashMap<String, brass_engine::DeferredSig> = mono.deferred.clone();
     // The startup run typed every init, so its global table is complete;
     // runtime single-instance monos read module globals through it.
@@ -2469,7 +2715,15 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
     let startup_spawns = brass_engine::batch_spawns(&mono);
     // Free the lowering for the resolver's on-demand additions.
     drop(mono);
-    let result = match backend.finalize() {
+    let finalize_started = std::time::Instant::now();
+    let finalized = backend.finalize_deferred();
+    tracing::debug!(
+        target: "brass::perf",
+        elapsed_ms = finalize_started.elapsed().as_secs_f64() * 1000.0,
+        "lazy: finalize startup"
+    );
+    let execution_started = std::time::Instant::now();
+    let result = match finalized {
         Ok(()) => {
             // The startup set spawns: compile and prime every recorded
             // target BEFORE anything runs, so worker threads -- which can
@@ -2516,13 +2770,24 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         }
         Err(e) => Err(e),
     };
+    tracing::debug!(
+        target: "brass::perf",
+        elapsed_ms = execution_started.elapsed().as_secs_f64() * 1000.0,
+        "lazy: execute"
+    );
     // The program finished (or failed at runtime); the checker may still be
     // working through code this run never executed, and lazy checking
     // ignores whatever it would find there -- the complete verdict is
     // `brass check`'s job. Stop it at the next body boundary, persist what
     // it settled as the partial cache (the next run resumes from it), and
     // reclaim the thread; held diagnostics are discarded by policy.
+    let stop_started = std::time::Instant::now();
     stop_checker(&rt, checker, &mut lazy);
+    tracing::debug!(
+        target: "brass::perf",
+        elapsed_ms = stop_started.elapsed().as_secs_f64() * 1000.0,
+        "lazy: stop checker"
+    );
     save_partial_cache(&entry_path, &front.sources, &search, &bodies, &mut lazy);
     match result {
         Ok(()) => Ok(()),
@@ -3570,6 +3835,8 @@ fn brace_balanced(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(jit_backend)]
+    use super::demand_loop_progress;
     use super::{
         context_identity, context_module_hashes, module_path_at, program_file_index,
         retain_diagnostic_free_context,
@@ -3598,6 +3865,15 @@ mod tests {
             program_file_index(&argv(&["--eager", "check", "main.cz"])),
             None
         );
+    }
+
+    #[cfg(jit_backend)]
+    #[test]
+    fn demand_loop_rejects_a_retry_without_state_change() {
+        // This is the synthetic stuck round: mono returned a missing body, but
+        // the driver neither queued, settled, nor lowered anything before retry.
+        let error = demand_loop_progress(0, 0, 0).expect_err("stuck retry must abort");
+        assert!(error.contains("demand loop made no progress"));
     }
 
     #[test]
