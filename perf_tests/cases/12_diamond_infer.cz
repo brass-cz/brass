@@ -1,0 +1,125 @@
+// Diamond-shaped call graph over unannotated parameters: every body calls
+// the next function TWICE, so the number of call paths doubles per level.
+// The checker re-elaborates a callee body at every call site whenever an
+// argument is still an open inference variable, and during each function's
+// own definitional pass its parameter IS open -- so without an open-arg
+// elaboration memo this program costs O(2^depth) body walks while the
+// program itself is 19 three-line functions. Return annotations are
+// present on purpose: they pin the value flow, proving the blowup comes
+// from the call-site re-elaboration model alone, not from return
+// inference. Runtime work is trivial; this case exists for the check/front
+// columns.
+
+fun g0(x) -> string {
+    let a = g1(x)
+    let b = g1(x)
+    return a + b
+}
+
+fun g1(x) -> string {
+    let a = g2(x)
+    let b = g2(x)
+    return a + b
+}
+
+fun g2(x) -> string {
+    let a = g3(x)
+    let b = g3(x)
+    return a + b
+}
+
+fun g3(x) -> string {
+    let a = g4(x)
+    let b = g4(x)
+    return a + b
+}
+
+fun g4(x) -> string {
+    let a = g5(x)
+    let b = g5(x)
+    return a + b
+}
+
+fun g5(x) -> string {
+    let a = g6(x)
+    let b = g6(x)
+    return a + b
+}
+
+fun g6(x) -> string {
+    let a = g7(x)
+    let b = g7(x)
+    return a + b
+}
+
+fun g7(x) -> string {
+    let a = g8(x)
+    let b = g8(x)
+    return a + b
+}
+
+fun g8(x) -> string {
+    let a = g9(x)
+    let b = g9(x)
+    return a + b
+}
+
+fun g9(x) -> string {
+    let a = g10(x)
+    let b = g10(x)
+    return a + b
+}
+
+fun g10(x) -> string {
+    let a = g11(x)
+    let b = g11(x)
+    return a + b
+}
+
+fun g11(x) -> string {
+    let a = g12(x)
+    let b = g12(x)
+    return a + b
+}
+
+fun g12(x) -> string {
+    let a = g13(x)
+    let b = g13(x)
+    return a + b
+}
+
+fun g13(x) -> string {
+    let a = g14(x)
+    let b = g14(x)
+    return a + b
+}
+
+fun g14(x) -> string {
+    let a = g15(x)
+    let b = g15(x)
+    return a + b
+}
+
+fun g15(x) -> string {
+    let a = g16(x)
+    let b = g16(x)
+    return a + b
+}
+
+fun g16(x) -> string {
+    let a = g17(x)
+    let b = g17(x)
+    return a + b
+}
+
+fun g17(x) -> string {
+    return x
+}
+
+fun main() {
+    println("begin")
+    // The result is 2^17 copies of "a"; print only its length so the case's
+    // output stays one short, comparable line.
+    println(len(g0("a")))
+    println("end")
+}

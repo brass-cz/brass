@@ -1,0 +1,130 @@
+// Sum-method dispatch cost: a 7-variant sum whose methods are shared by all
+// variants (the TomlValue shape from std.data.toml). Lowering duplicates a
+// shared method body once per variant, so every `v.m(...)` call site
+// resolves 7 candidates -- and the checker elaborates each candidate's full
+// body per call site before the receiver scheme answers. With ~10 methods
+// and the call sites below, the per-analysis body-check count is
+// call-sites x variants x body size rather than one per method. Runtime
+// work is trivial; this case exists for the check/front columns.
+
+type Value =
+    | Str { value: string }
+    | Int { value: int64 }
+    | Flt { value: float64 }
+    | Bit { value: bool }
+    | Txt { value: string }
+    | Seq { value: int64[] }
+    | Cnt { value: int64 }
+
+fun Value.kind(self) -> string {
+    return match self {
+        Str { value } => "str",
+        Int { value } => "int",
+        Flt { value } => "flt",
+        Bit { value } => "bit",
+        Txt { value } => "txt",
+        Seq { value } => "seq",
+        Cnt { value } => "cnt",
+    }
+}
+
+fun Value.weight(self) -> int64 {
+    return match self {
+        Int { value } => value,
+        Cnt { value } => value,
+        Seq { value } => {
+            let n: int64 = 0
+            for v in value {
+                n += v
+            }
+            n
+        },
+        _ => {
+            // A bare `0` defaults to int32 and the eager checker rejects the
+            // int64/int32 branch join, so the fallback pins its width.
+            const zero: int64 = 0
+            zero
+        },
+    }
+}
+
+fun Value.is_text(self) -> bool {
+    return match self {
+        Str { value } => true,
+        Txt { value } => true,
+        _ => false,
+    }
+}
+
+fun Value.describe(self) -> string {
+    return "{self.kind()}:{self.weight()}"
+}
+
+fun Value.heavier(self, than: int64) -> bool {
+    return self.weight() > than
+}
+
+fun Value.text_or(self, dflt: string) -> string {
+    return match self {
+        Str { value } => value,
+        Txt { value } => value,
+        _ => dflt,
+    }
+}
+
+fun Value.score(self, bias: int64) -> int64 {
+    if self.is_text() {
+        return bias
+    }
+    return self.weight() + bias
+}
+
+fun Value.label(self, prefix: string) -> string {
+    return prefix + self.describe()
+}
+
+fun Value.pick(self, other: Value) -> Value {
+    if self.heavier(other.weight()) {
+        return self
+    }
+    return other
+}
+
+fun Value.summary(self) -> string {
+    return self.label("v=") + " " + self.text_or("-")
+}
+
+fun main() {
+    println("begin")
+    const vs = [
+        Value.Str { value: "a" },
+        Value.Int { value: 3 },
+        Value.Flt { value: 1.5 },
+        Value.Bit { value: true },
+        Value.Txt { value: "t" },
+        Value.Seq { value: [1, 2, 3] },
+        Value.Cnt { value: 9 },
+    ]
+    let acc: int64 = 0
+    let text = ""
+    for v in vs {
+        acc += v.score(1)
+        acc += v.weight()
+        text = v.label("x=")
+        if v.is_text() {
+            acc += 1
+        }
+        if v.heavier(2) {
+            acc += 2
+        }
+        text = v.summary()
+        text = v.text_or(text)
+        text = v.describe()
+        acc += v.pick(Value.Int { value: 4 }).weight()
+        acc += v.score(0)
+        text = v.kind()
+    }
+    println("acc = {acc}")
+    println("last = {text}")
+    println("end")
+}

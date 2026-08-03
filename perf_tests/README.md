@@ -39,9 +39,16 @@ groups:
 - compile-dominated: `02_wide_cold_unused`, `03_wide_all_called`,
   `06_infer_chain`, `07_mono_heavy`, `09_big_main` (cold-start cost, breadth
   of checking/compiling, inference deferral)
+- checker-dominated: `12_diamond_infer` (open-argument call-site
+  re-elaboration blowup), `13_sum_candidates` (per-call-site sum-method
+  candidate elaboration)
 - runtime-dominated: `01_hot_loop`, `04_call_heavy`, `05_cross_module`,
   `08_recursion`, `11_closures_hot` (code quality, call/stub indirection)
 - concurrency: `10_spawn_tasks` (spawn-reachable precompile)
+
+`check_bench.sh` times `brass check` alone (cold) over the checker-dominated
+cases plus the real czpm closure, isolating the front end from back-end
+changes.
 
 Files marked `GENERATED` are produced by `gen_cases.py`; edit the size
 constants there and rerun it to re-scale the corpus (the generated files are
