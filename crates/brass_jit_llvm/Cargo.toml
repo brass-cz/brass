@@ -15,7 +15,10 @@ brass_mir.workspace = true
 brass_engine.workspace = true
 brass_runtime.workspace = true
 brass_utils.workspace = true
+brass_cache.workspace = true
 inkwell.workspace = true
+serde.workspace = true
+postcard = { version = "1", features = ["use-std"] }
 # Not referenced in code: pins the `prefer-static` feature on the llvm-sys
 # build that inkwell links against.
 llvm-sys.workspace = true

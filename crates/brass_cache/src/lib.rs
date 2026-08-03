@@ -376,7 +376,7 @@ pub fn cache_path(entry: &Path) -> PathBuf {
 /// megabytes; a local rebuild always moves it. A nightly build whose own mtime
 /// cannot be determined gets NO tag at all -- caching is skipped rather than
 /// letting two such builds silently share one.
-fn cache_tag(flavor: &str) -> Option<String> {
+pub fn cache_tag(flavor: &str) -> Option<String> {
     let tag = format!("{}/{}/{flavor}", compiler_tag(), FORMAT_VERSION);
     if brass_metadata::build_channel() != BuildChannel::Nightly {
         return Some(tag);
@@ -400,7 +400,7 @@ pub fn enabled() -> bool {
 /// tag, and the body's SHA-1 -- postcard is positional varint data with no
 /// checksum of its own, so a corrupted body could otherwise decode into a
 /// shape-valid payload whose stamps still validate.
-fn encode_file(tag: &str, body: &[u8]) -> Vec<u8> {
+pub fn encode_file(tag: &str, body: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(MAGIC.len() + 1 + tag.len() + 20 + body.len());
     bytes.extend_from_slice(MAGIC);
     bytes.push(tag.len() as u8);
@@ -413,7 +413,7 @@ fn encode_file(tag: &str, body: &[u8]) -> Vec<u8> {
 /// The body of a cache file whose magic, tag, and body checksum all match;
 /// `None` rejects foreign, stale-versioned, or corrupted files before any
 /// payload decoding.
-fn decode_file<'a>(bytes: &'a [u8], tag: &str) -> Option<&'a [u8]> {
+pub fn decode_file<'a>(bytes: &'a [u8], tag: &str) -> Option<&'a [u8]> {
     let rest = bytes.strip_prefix(MAGIC.as_slice())?;
     let n = *rest.first()? as usize;
     if std::str::from_utf8(rest.get(1..1 + n)?).ok()? != tag {
@@ -427,8 +427,8 @@ fn decode_file<'a>(bytes: &'a [u8], tag: &str) -> Option<&'a [u8]> {
 /// Write `bytes` to `path` through a uniquely-named temporary file and a
 /// rename, best-effort: the cache is an accelerator, never a requirement, and
 /// two concurrent writers publish whole files instead of interleaving into one
-/// shared temp name.
-fn write_atomic(path: &Path, bytes: &[u8]) {
+/// shared temp name. Returns whether the complete file was published.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
     static NEXT_TMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(
@@ -438,7 +438,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) {
     ));
     let tmp = PathBuf::from(tmp);
     if std::fs::write(&tmp, bytes).is_err() {
-        return;
+        return false;
     }
     // Windows does not replace an existing destination with `rename`. A brief
     // missing-file window is safe for this best-effort cache: readers fall back
@@ -449,7 +449,20 @@ fn write_atomic(path: &Path, bytes: &[u8]) {
     }
     if std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
+        false
+    } else {
+        true
     }
+}
+
+/// A validated analysis-cache payload together with the SHA-1 of its serialized
+/// postcard body. Native artifacts bind to this identity so they cannot outlive
+/// the exact analysis that produced their MIR and monomorphized groups.
+pub struct LoadedPayload {
+    /// The decoded and source-validated analysis.
+    pub payload: Payload,
+    /// SHA-1 of the serialized postcard body inside the validated frame.
+    pub analysis_hash: [u8; 20],
 }
 
 /// The current sorted `BRASS_PACKAGES` name set, the payload's `packages`
@@ -466,7 +479,11 @@ pub fn package_names(search: &brass_resolve::SearchPaths) -> Vec<String> {
 /// end `flavor`, the entry file is not the recorded one, the declared package
 /// names changed, or any recorded source reference now resolves to different
 /// contents.
-pub fn load(entry: &Path, flavor: &str, search: &brass_resolve::SearchPaths) -> Option<Payload> {
+pub fn load(
+    entry: &Path,
+    flavor: &str,
+    search: &brass_resolve::SearchPaths,
+) -> Option<LoadedPayload> {
     let roots = StampRoots::new(entry, search);
     let path = cache_path(entry);
     let bytes = std::fs::read(&path).ok()?;
@@ -501,7 +518,10 @@ pub fn load(entry: &Path, flavor: &str, search: &brass_resolve::SearchPaths) -> 
             .find(|module| module.path == plugin.module)?;
         brass_resolve::reinject_plugin_path(&mut module.ast, &library.display().to_string());
     }
-    Some(payload)
+    Some(LoadedPayload {
+        payload,
+        analysis_hash: sha1(body),
+    })
 }
 
 /// A PARTIAL analysis cache: what a stopped lazy run had settled when its
@@ -558,15 +578,18 @@ pub fn save_partial(entry: &Path, flavor: &str, payload: &PartialPayload) {
     let (Ok(body), Some(tag)) = (postcard::to_stdvec(payload), cache_tag(flavor)) else {
         return;
     };
-    write_atomic(&cache_path(entry), &encode_file(&tag, &body));
+    let _ = write_atomic(&cache_path(entry), &encode_file(&tag, &body));
 }
 
 /// Write the cache for `entry`, best-effort (see [`write_atomic`]).
-pub fn save(entry: &Path, flavor: &str, payload: &Payload) {
+/// Returns the serialized payload identity only when the complete framed file
+/// was published successfully.
+pub fn save(entry: &Path, flavor: &str, payload: &Payload) -> Option<[u8; 20]> {
     let (Ok(body), Some(tag)) = (postcard::to_stdvec(payload), cache_tag(flavor)) else {
-        return;
+        return None;
     };
-    write_atomic(&cache_path(entry), &encode_file(&tag, &body));
+    let analysis_hash = sha1(&body);
+    write_atomic(&cache_path(entry), &encode_file(&tag, &body)).then_some(analysis_hash)
 }
 
 // ===== the context seed cache (`.czctx`) =====
@@ -604,7 +627,7 @@ pub fn content_hash(bytes: &[u8]) -> [u8; 20] {
 /// Where the shared context seeds live: one directory per user, because a
 /// context (the standard library plus a set of dependencies) is shared by
 /// every program that imports it, unlike the per-entry `.czcache`.
-fn context_dir() -> Option<PathBuf> {
+pub fn context_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
@@ -638,7 +661,7 @@ pub fn save_context(key: &[u8; 20], seed: &brass_typeck::ContextTables) {
     let (Ok(body), Some(tag)) = (postcard::to_stdvec(seed), cache_tag("ctx")) else {
         return;
     };
-    write_atomic(&path, &encode_file(&tag, &body));
+    let _ = write_atomic(&path, &encode_file(&tag, &body));
 }
 
 /// The incremental-rebuild sidecar of a context seed: the seed together with
@@ -679,7 +702,7 @@ pub fn save_context_bundle(id: &[u8; 20], bundle: &ContextBundle) {
     let (Ok(body), Some(tag)) = (postcard::to_stdvec(bundle), cache_tag("ctxb")) else {
         return;
     };
-    write_atomic(&path, &encode_file(&tag, &body));
+    let _ = write_atomic(&path, &encode_file(&tag, &body));
 }
 
 #[cfg(test)]

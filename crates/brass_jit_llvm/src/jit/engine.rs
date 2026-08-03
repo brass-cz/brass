@@ -41,11 +41,30 @@ pub fn run(program: &Program, channels: &brass_mir::CheckerChannels<'_>) -> Resu
 /// The single-module MCJIT sequence survives only inside the cold
 /// deferred-monomorphization path, which the ORC session cannot host yet.
 pub fn run_mono(program: &Program, mono: &brass_engine::MonoProgram) -> Result<(), String> {
+    run_mono_with_cache(program, mono, None)
+}
+
+fn run_mono_with_cache(
+    program: &Program,
+    mono: &brass_engine::MonoProgram,
+    cache: Option<crate::jit::objcache::ObjectCacheSession>,
+) -> Result<(), String> {
     require_main(program, mono)?;
     let context = crate::jit::orc::OrcContext::new();
     let mut backend = crate::LlvmCodegen::new_backend(context.context(), program);
-    backend.prepare_lazy_orc(&context, mono)?;
-    backend.execute_lazy_orc()
+    backend.prepare_lazy_orc(
+        &context,
+        mono,
+        cache.as_ref().and_then(|cache| cache.objects()),
+    )?;
+    if let Some(cache) = cache.as_ref() {
+        backend.install_object_cache_writer(cache);
+    }
+    let result = backend.execute_lazy_orc();
+    if let Some(cache) = cache {
+        cache.save(backend.take_captured_objects());
+    }
+    result
 }
 
 /// Compile and run an already-checked program through the lazy JIT.
@@ -55,6 +74,25 @@ pub fn run_mono(program: &Program, mono: &brass_engine::MonoProgram) -> Result<(
 /// zero-argument functions are left out. The ordinary eager path retains its
 /// all-roots validation behavior.
 pub fn run_lazy(program: &Program, channels: &brass_mir::CheckerChannels) -> Result<(), String> {
+    run_lazy_with_cache(program, channels, None)
+}
+
+/// [`run_lazy`] with a full-analysis-bound native object-cache session. Cached
+/// groups bypass LLVM IR generation, optimization, and instruction selection;
+/// objects emitted for misses are merged back into the pack after execution.
+pub fn run_lazy_cached(
+    program: &Program,
+    channels: &brass_mir::CheckerChannels,
+    cache: crate::jit::objcache::ObjectCacheSession,
+) -> Result<(), String> {
+    run_lazy_with_cache(program, channels, Some(cache))
+}
+
+fn run_lazy_with_cache(
+    program: &Program,
+    channels: &brass_mir::CheckerChannels,
+    cache: Option<crate::jit::objcache::ObjectCacheSession>,
+) -> Result<(), String> {
     let mir = lower_checked(program, channels);
     let t = std::time::Instant::now();
     let mono =
@@ -85,11 +123,7 @@ pub fn run_lazy(program: &Program, channels: &brass_mir::CheckerChannels) -> Res
         "back/monomorphize: total {:.3}ms",
         t.elapsed().as_secs_f64() * 1000.0
     );
-    require_main(program, &mono)?;
-    let context = crate::jit::orc::OrcContext::new();
-    let mut backend = crate::LlvmCodegen::new_backend(context.context(), program);
-    backend.prepare_lazy_orc(&context, &mono)?;
-    backend.execute_lazy_orc()
+    run_mono_with_cache(program, &mono, cache)
 }
 
 fn lower_checked(

@@ -57,6 +57,7 @@ fn three_shapes_collapse_to_one_display_instance() {
             typeof_types: &analysis.typeof_types,
             null_props: &analysis.null_props,
             type_tests: &analysis.type_tests,
+            keyed_dispatch: &fxhash::FxHashMap::default(),
         },
     );
     let mono = monomorphize(&mir, &program).expect("monomorphize");

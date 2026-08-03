@@ -512,9 +512,13 @@ fn execute(
     program: &Program,
     channels: &brass_mir::CheckerChannels<'_>,
     lazy: bool,
+    object_cache: Option<brass_jit_llvm::jit::objcache::ObjectCacheSession>,
 ) -> Result<(), String> {
     install_jit_panic_guard();
     if lazy {
+        if let Some(cache) = object_cache {
+            return brass_jit_llvm::run_lazy_cached(program, channels, cache);
+        }
         return brass_jit_llvm::run_lazy(program, channels);
     }
     brass_jit_llvm::run(program, channels)
@@ -527,6 +531,7 @@ fn execute(
     program: &Program,
     channels: &brass_mir::CheckerChannels<'_>,
     _lazy: bool,
+    _object_cache: Option<()>,
 ) -> Result<(), String> {
     brass_repl::run(program, channels, &mut io::stdout())
 }
@@ -543,6 +548,9 @@ fn execute_repl(
 /// A program that passed every front-end check, ready to run.
 struct Checked {
     program: Program,
+    /// Serialized full-analysis identity. Present only on a validated disk
+    /// cache hit, where native objects can be soundly bound to this program.
+    analysis_hash: Option<[u8; 20]>,
     /// Checker-resolved instance types of aggregate-producing expressions, keyed
     /// by span; the back-end seeding channel (see
     /// `brass_typeck::stream::aggregate_result_types`).
@@ -631,10 +639,21 @@ fn drive(mode: Mode, file: &str) -> Result<(), u8> {
         // carries the answer, and anything on stdout is noise an editor or a script
         // has to filter out.
         Mode::Check => Ok(()),
-        Mode::Run { .. } => execute(&checked.program, &checked.channels(), lazy).map_err(|e| {
-            report_runtime_error(&e);
-            1
-        }),
+        Mode::Run { .. } => {
+            #[cfg(jit_backend)]
+            let object_cache = checked.analysis_hash.map(|analysis_hash| {
+                brass_jit_llvm::jit::objcache::ObjectCacheSession::load(
+                    main_path.clone(),
+                    analysis_hash,
+                )
+            });
+            #[cfg(not(jit_backend))]
+            let object_cache = None;
+            execute(&checked.program, &checked.channels(), lazy, object_cache).map_err(|e| {
+                report_runtime_error(&e);
+                1
+            })
+        }
         Mode::Repl => execute_repl(&checked.program, &checked.channels()).map_err(|e| {
             report_runtime_error(&e);
             1
@@ -989,6 +1008,7 @@ fn assemble_checked(analyzed: AnalyzedProgram) -> Result<Checked, Vec<String>> {
     let c = analyzed.channels;
     Ok(Checked {
         program,
+        analysis_hash: None,
         expr_types: c.expr_types.into_iter().collect(),
         view_args: c.view_args.into_iter().collect(),
         sum_views: c.sum_views.into_iter().collect(),
@@ -1016,7 +1036,9 @@ fn load_cached(main_label: &str, root: &Path) -> Option<Checked> {
     if !brass_cache::enabled() {
         return None;
     }
-    let mut payload = brass_cache::load(&entry_path, CACHE_FLAVOR, &search)?;
+    let loaded = brass_cache::load(&entry_path, CACHE_FLAVOR, &search)?;
+    let analysis_hash = loaded.analysis_hash;
+    let mut payload = loaded.payload;
     let t = std::time::Instant::now();
     reanchor_module_paths(&mut payload.modules, &entry_path, root, &search);
     match assemble_checked(AnalyzedProgram {
@@ -1024,7 +1046,8 @@ fn load_cached(main_label: &str, root: &Path) -> Option<Checked> {
         generated: payload.generated,
         channels: payload.channels,
     }) {
-        Ok(checked) => {
+        Ok(mut checked) => {
+            checked.analysis_hash = Some(analysis_hash);
             // The full pipeline's clean-program warnings replay so warm runs
             // are not silently quieter than cold ones.
             for w in &payload.warnings {
@@ -2099,6 +2122,15 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         Ok(front) => front,
         Err(diags) => return Err(print_diags(diags)),
     };
+    // Once the shared context is warm, let the second streaming run finish its
+    // entry analysis before machine code starts. That completion publishes a
+    // full `.czcache`; the same run can then bind ORC captures to its identity.
+    // The first cold run remains demand-driven while it builds the context.
+    let prime_native_cache = brass_cache::enabled()
+        && front_context_key(&front)
+            .as_ref()
+            .is_some_and(|key| brass_cache::load_context(key).is_some());
+    tracing::debug!(target: "brass::perf", prime_native_cache, "lazy: native cache prime");
     // Lower on this side first. Keyed methods no longer select the eager
     // pipeline merely by being present in the module closure.
     let (mut program, lower_errors) = lower(&front.modules);
@@ -2392,13 +2424,50 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                             lazy.stop.store(true, std::sync::atomic::Ordering::Relaxed);
                             return run_fresh_eager(&label, &src, &root);
                         }
-                    } else if lazy.dirty {
-                        if lazy.refresh_lowering(&mut built, &program, &tables, &call_locations) {
-                            continue;
+                    } else {
+                        if prime_native_cache && !lazy.closed {
+                            lazy.resume_background();
+                            while !lazy.closed && !lazy.needs_eager {
+                                lazy.pump_blocking();
+                            }
+                            if lazy.needs_eager {
+                                return finish_eagerly(
+                                    &rt,
+                                    checker,
+                                    &lazy.stop,
+                                    &lazy.paused,
+                                    lazy.events,
+                                    &label,
+                                    &src,
+                                    &root,
+                                );
+                            }
+                            match judge_fatal(&mut lazy, &bodies, &front.sources) {
+                                FatalVerdict::Clean => {}
+                                FatalVerdict::Fatal(code) => return Err(code),
+                                FatalVerdict::NeedsEager => {
+                                    return finish_eagerly(
+                                        &rt,
+                                        checker,
+                                        &lazy.stop,
+                                        &lazy.paused,
+                                        lazy.events,
+                                        &label,
+                                        &src,
+                                        &root,
+                                    );
+                                }
+                            }
                         }
-                        // A method or initializer changed: rebuild the subset
-                        // base before trusting the successful mono pass.
-                        continue 'rebuild;
+                        if lazy.dirty {
+                            if lazy.refresh_lowering(&mut built, &program, &tables, &call_locations)
+                            {
+                                continue;
+                            }
+                            // A method or initializer changed: rebuild the subset
+                            // base before trusting the successful mono pass.
+                            continue 'rebuild;
+                        }
                     }
                     break 'rebuild built;
                 }
@@ -2683,6 +2752,36 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
             );
         }
     }
+    // A warm-context streaming run may have completed and published the full
+    // analysis while settling the entry above. Switch that same run to the
+    // cache-bound ORC path, so its emitted objects carry the just-published
+    // identity. This is also important for programs that call a non-returning
+    // native `exit`: the ORC transform publishes each group before entering it.
+    if prime_native_cache
+        && let Some(loaded) = brass_cache::load(&entry_path, CACHE_FLAVOR, &search)
+    {
+        let analysis_hash = loaded.analysis_hash;
+        let mut payload = loaded.payload;
+        reanchor_module_paths(&mut payload.modules, &entry_path, &root, &search);
+        if let Ok(checked) = assemble_checked(AnalyzedProgram {
+            modules: payload.modules,
+            generated: payload.generated,
+            channels: payload.channels,
+        }) {
+            install_jit_panic_guard();
+            let cache = brass_jit_llvm::jit::objcache::ObjectCacheSession::load(
+                entry_path.clone(),
+                analysis_hash,
+            );
+            let result =
+                brass_jit_llvm::run_lazy_cached(&checked.program, &checked.channels(), cache);
+            stop_checker(&rt, checker, &mut lazy);
+            return result.map_err(|error| {
+                report_runtime_error(&error);
+                1
+            });
+        }
+    }
     install_jit_panic_guard();
     // The deferred runtime: reject an untypeable `main` exactly as `run_mono`
     // would, compile the startup set, then run with the resolver installed --
@@ -2812,7 +2911,7 @@ fn run_fresh_eager(label: &str, src: &str, root: &Path) -> Result<(), u8> {
         Ok(c) => c,
         Err(diags) => return Err(print_diags(diags)),
     };
-    execute(&checked.program, &checked.channels(), false).map_err(|e| {
+    execute(&checked.program, &checked.channels(), false, None).map_err(|e| {
         report_runtime_error(&e);
         1
     })
@@ -2918,7 +3017,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         Ok(c) => c,
         Err(diags) => return Err(print_diags(diags)),
     };
-    execute(&checked.program, &checked.channels(), false).map_err(|e| {
+    execute(&checked.program, &checked.channels(), false, None).map_err(|e| {
         report_runtime_error(&e);
         1
     })
@@ -2963,6 +3062,24 @@ struct FrontEnd {
     /// here -- they abort the analysis together with lowering and type
     /// errors, keeping the eager report order.
     errors: Vec<(String, Span)>,
+}
+
+/// The shared context identity derived from an assembled front end. Kept in one
+/// helper so the streaming driver can recognize a warm context and the checker
+/// thread probes exactly the same key.
+fn front_context_key(front: &FrontEnd) -> Option<[u8; 20]> {
+    let context_end = front.modules.len().checked_sub(1)?;
+    brass_cache::context_key(
+        CACHE_FLAVOR,
+        front.modules[..context_end]
+            .iter()
+            .map(|module| module.path.join(".")),
+        front
+            .sources
+            .entries()
+            .filter(|(base, _)| *base != front.entry_base)
+            .map(|(_, source)| brass_cache::content_hash(source.as_bytes())),
+    )
 }
 
 /// Parse, resolve the module graph, and run the AST rewrites (qualified-use
@@ -3042,10 +3159,11 @@ fn check_front(
         brass_utils::perf_phase(name, at.elapsed());
     };
     let entry_path = PathBuf::from(main_label);
+    let ctx_key = front_context_key(&front);
     let FrontEnd {
         modules,
         sources,
-        entry_base: base,
+        entry_base: _,
         warnings,
         errors: front_errors,
     } = front;
@@ -3056,14 +3174,6 @@ fn check_front(
     // context. The front rewrites are deterministic functions of these
     // sources, so pre-rewrite content identifies the post-rewrite context.
     let ctx_end = modules.len() - 1;
-    let ctx_key = brass_cache::context_key(
-        CACHE_FLAVOR,
-        modules[..ctx_end].iter().map(|m| m.path.join(".")),
-        sources
-            .entries()
-            .filter(|(b, _)| *b != base)
-            .map(|(_, src)| brass_cache::content_hash(src.as_bytes())),
-    );
 
     // Per-module (dotted path, source hash) pairs for the incremental context
     // rebuild. Each module is matched to its source through the injected span
@@ -3209,7 +3319,7 @@ fn check_front(
                 warnings,
                 channels,
             };
-            brass_cache::save(&entry_path, CACHE_FLAVOR, &payload);
+            let _ = brass_cache::save(&entry_path, CACHE_FLAVOR, &payload);
             phase("front/cache-save", t);
             return Ok(AnalyzedProgram {
                 modules,

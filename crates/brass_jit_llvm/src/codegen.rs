@@ -20,6 +20,7 @@ use brass_hir::{FloatKind, IntKind, NominalType, Program, Type, TypeKind};
 use brass_mir::{BlockId, ClosureId, LocalId};
 use brass_parser::ast::*;
 
+use crate::jit::objcache::{CapturedObject, ObjectCacheSession, ValidatedObjects};
 use crate::jit::orc::{OptTier, OrcContext, OrcJit, OrcModule, lazy_implementation_symbol};
 use crate::layout::Abi;
 use crate::monomorph::*;
@@ -117,6 +118,9 @@ struct MirState<'ctx> {
     /// Which group module defines each public symbol: entering any member's
     /// stub materializes its whole group (see `OrcJit::register_lazy_group`).
     lazy_groups: HashMap<String, String>,
+    /// Exact ordered public symbols for every lazy group, used to bind captured
+    /// objects to the group shape persisted in the native packfile.
+    lazy_group_symbols: HashMap<String, Vec<String>>,
     /// The warm lazy-run ORC session. Cold deferred-monomorphization runs keep
     /// using MCJIT until their mutable lowering service is migrated as well.
     orc: Option<OrcJit>,
@@ -2081,6 +2085,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         &mut self,
         context: &OrcContext,
         program: &MonoProgram,
+        cached_objects: Option<&ValidatedObjects>,
     ) -> Result<(), String> {
         if self.mir.engine.is_some() || self.mir.orc.is_some() {
             return Err("JIT backend was finalized twice".to_string());
@@ -2125,24 +2130,36 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             HashMap::with_capacity_and_hasher(program.functions.len(), Default::default());
         let mut groups =
             HashMap::with_capacity_and_hasher(program.functions.len(), Default::default());
+        let mut group_symbols =
+            HashMap::with_capacity_and_hasher(program.functions.len(), Default::default());
+        let mut registrations = Vec::new();
         let mut perf = brass_utils::PerfLog::start("back/codegen-fn");
         for chunk in program.functions.chunks(group_size) {
             let key = mangle_fn(&chunk[0].symbol);
-            let module = self.lazy_group_module(
-                program,
-                chunk,
-                signatures.clone(),
-                region_barriers,
-                &mut perf,
-            )?;
-            for function in chunk {
-                groups.insert(mangle_fn(&function.symbol), key.clone());
+            let publics: Vec<String> = chunk.iter().map(|f| mangle_fn(&f.symbol)).collect();
+            let object = cached_objects
+                .and_then(|objects| objects.matching_object(&key, &publics))
+                .map(<[u8]>::to_vec);
+            if object.is_none() {
+                let module = self.lazy_group_module(
+                    program,
+                    chunk,
+                    signatures.clone(),
+                    region_barriers,
+                    &mut perf,
+                )?;
+                for public in &publics {
+                    groups.insert(public.clone(), key.clone());
+                }
+                pending.insert(key.clone(), module);
             }
-            pending.insert(key, module);
+            group_symbols.insert(key, publics.clone());
+            registrations.push((publics, object));
         }
         perf.report();
         self.mir.lazy_modules = pending;
         self.mir.lazy_groups = groups;
+        self.mir.lazy_group_symbols = group_symbols;
         self.mir.lazy_has_main = program.lookup("main").is_some();
         self.mir.lazy_precompile = brass_engine::spawn_precompile(program)
             .unwrap_or_default()
@@ -2173,11 +2190,58 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             )));
         jit.define_absolute(runtime_symbols)?;
         jit.add_eager_module(OrcModule::from_inkwell(support))?;
-        for chunk in program.functions.chunks(group_size) {
-            let publics: Vec<String> = chunk.iter().map(|f| mangle_fn(&f.symbol)).collect();
-            jit.register_lazy_group(&publics)?;
+        // `add_eager_module` registers its materialization unit but does not
+        // compile it immediately. Force the support object through the object
+        // transform while no lazy-group marker is active; otherwise its first
+        // global reference can materialize reentrantly during a group emission
+        // and be mistaken for that group's cached object.
+        jit.lookup(FREEZE_GLOBALS_FN)?;
+        for (publics, object) in registrations {
+            if let Some(object) = object {
+                jit.add_object(&object)?;
+                jit.register_object_group(&publics)?;
+            } else {
+                jit.register_lazy_group(&publics)?;
+            }
         }
         Ok(())
+    }
+
+    /// Drain native objects emitted for groups materialized during this run and
+    /// attach the exact public-symbol sequence needed for future validation.
+    pub(crate) fn take_captured_objects(&mut self) -> Vec<CapturedObject> {
+        let Some(jit) = self.mir.orc.as_mut() else {
+            return Vec::new();
+        };
+        jit.take_captured_objects()
+            .into_iter()
+            .filter_map(|(group_key, object)| {
+                let symbols = self.mir.lazy_group_symbols.get(&group_key)?.clone();
+                Some(CapturedObject {
+                    group_key,
+                    symbols,
+                    object,
+                })
+            })
+            .collect()
+    }
+
+    /// Attach an incremental pack writer before machine code can run. Native
+    /// functions may terminate the process without unwinding back through the
+    /// driver, so the ORC transform publishes each captured group immediately.
+    pub(crate) fn install_object_cache_writer(&mut self, cache: &ObjectCacheSession) {
+        let symbols = self
+            .mir
+            .lazy_group_symbols
+            .iter()
+            .map(|(key, symbols)| (key.clone(), symbols.clone()))
+            .collect();
+        let Some(writer) = cache.writer(symbols) else {
+            return;
+        };
+        if let Some(jit) = self.mir.orc.as_mut() {
+            jit.install_object_cache_writer(writer);
+        }
     }
 
     /// Execute the ORC lazy program: init functions in order, the global freeze

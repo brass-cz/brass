@@ -8,7 +8,7 @@
 //! owning [`OrcModule`] values and ordinary Rust callbacks.
 
 use fxhash::FxHashMap as HashMap;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, CString, c_void};
 use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -17,13 +17,17 @@ use std::sync::OnceLock;
 
 use inkwell::module::Module;
 use inkwell::targets::{InitializationConfig, Target};
-use llvm_sys::core::{LLVMDisposeMessage, LLVMDisposeModule, LLVMSetDataLayout};
+use llvm_sys::core::{
+    LLVMCreateMemoryBufferWithMemoryRangeCopy, LLVMDisposeMessage, LLVMDisposeModule,
+    LLVMGetBufferSize, LLVMGetBufferStart, LLVMSetDataLayout,
+};
 use llvm_sys::error::{LLVMDisposeErrorMessage, LLVMErrorRef, LLVMGetErrorMessage};
 use llvm_sys::orc2::lljit::{
-    LLVMOrcCreateLLJIT, LLVMOrcCreateLLJITBuilder, LLVMOrcDisposeLLJIT,
+    LLVMOrcCreateLLJIT, LLVMOrcCreateLLJITBuilder, LLVMOrcDisposeLLJIT, LLVMOrcLLJITAddObjectFile,
     LLVMOrcLLJITBuilderSetJITTargetMachineBuilder, LLVMOrcLLJITGetDataLayoutStr,
     LLVMOrcLLJITGetExecutionSession, LLVMOrcLLJITGetIRTransformLayer, LLVMOrcLLJITGetMainJITDylib,
-    LLVMOrcLLJITGetTripleString, LLVMOrcLLJITLookup, LLVMOrcLLJITMangleAndIntern, LLVMOrcLLJITRef,
+    LLVMOrcLLJITGetObjTransformLayer, LLVMOrcLLJITGetTripleString, LLVMOrcLLJITLookup,
+    LLVMOrcLLJITMangleAndIntern, LLVMOrcLLJITRef,
 };
 use llvm_sys::orc2::{
     LLVMJITEvaluatedSymbol, LLVMJITSymbolFlags, LLVMJITSymbolGenericFlags, LLVMOrcAbsoluteSymbols,
@@ -41,8 +45,8 @@ use llvm_sys::orc2::{
     LLVMOrcMaterializationResponsibilityFailMaterialization,
     LLVMOrcMaterializationResponsibilityGetRequestedSymbols,
     LLVMOrcMaterializationResponsibilityRef, LLVMOrcMaterializationUnitRef,
-    LLVMOrcSymbolStringPoolEntryStr, LLVMOrcThreadSafeContextRef,
-    LLVMOrcThreadSafeModuleWithModuleDo,
+    LLVMOrcObjectTransformLayerSetTransform, LLVMOrcSymbolStringPoolEntryStr,
+    LLVMOrcThreadSafeContextRef, LLVMOrcThreadSafeModuleWithModuleDo,
 };
 use llvm_sys::target_machine::{
     LLVMCodeGenOptLevel, LLVMCodeModel, LLVMCreateTargetMachine, LLVMGetDefaultTargetTriple,
@@ -51,6 +55,8 @@ use llvm_sys::target_machine::{
 use llvm_sys::transforms::pass_builder::{
     LLVMCreatePassBuilderOptions, LLVMDisposePassBuilderOptions, LLVMRunPasses,
 };
+
+use super::objcache::ObjectCacheWriter;
 
 type Materializer<'a> = dyn FnMut(&LazyFunction) -> Result<OrcModule, String> + 'a;
 
@@ -121,6 +127,7 @@ impl Drop for OrcContext {
 pub(crate) struct LazyFunction {
     pub(crate) symbol: String,
     pub(crate) implementation: String,
+    group_key: String,
 }
 
 pub(crate) fn lazy_implementation_symbol(symbol: &str) -> String {
@@ -163,7 +170,15 @@ struct MaterializerState {
     data_layout: CString,
     requests: HashMap<String, LazyFunction>,
     callback: *mut (),
+    capture: Box<RefCell<CaptureState>>,
     errors: Vec<String>,
+}
+
+#[derive(Default)]
+struct CaptureState {
+    current_group: Option<String>,
+    captured: Vec<(String, Vec<u8>)>,
+    writer: Option<ObjectCacheWriter>,
 }
 
 /// Session errors mirrored for [`materialization_failed`], which is entered
@@ -253,7 +268,7 @@ impl MaterializerState {
                     symbol = %request.symbol,
                     "back/orc-materialize"
                 );
-                callback(&request)
+                callback(&request).map(|module| (request.group_key.clone(), module))
             })
         };
         // SAFETY: ownership of the requested-symbol array belongs to this
@@ -261,14 +276,21 @@ impl MaterializerState {
         unsafe { LLVMOrcDisposeSymbols(symbols) };
 
         match result {
-            Ok(module) => {
+            Ok((group_key, module)) => {
                 let module = self.transfer_to_thread_safe_module(module);
                 // SAFETY: ORC takes ownership of both the responsibility and
                 // module when the transform layer is asked to emit them.
+                {
+                    let mut capture = self.capture.borrow_mut();
+                    debug_assert!(capture.current_group.is_none());
+                    capture.current_group = Some(group_key.clone());
+                }
                 unsafe {
                     let layer = LLVMOrcLLJITGetIRTransformLayer(self.jit);
                     LLVMOrcIRTransformLayerEmit(layer, responsibility, module);
                 }
+                let emitted_group = self.capture.borrow_mut().current_group.take();
+                debug_assert_eq!(emitted_group.as_deref(), Some(group_key.as_str()));
             }
             Err(error) => {
                 self.push_error(error);
@@ -354,6 +376,41 @@ extern "C" fn optimize_module(
     }
 }
 
+extern "C" fn capture_object(
+    context: *mut c_void,
+    object: *mut llvm_sys::prelude::LLVMMemoryBufferRef,
+) -> LLVMErrorRef {
+    // ORC invokes object transforms synchronously in this session. The support
+    // module and cached objects arrive with no current group marker and are
+    // deliberately ignored; only IR emitted by `materialize` is copied.
+    let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+        let capture = &*(context as *const RefCell<CaptureState>);
+        let Some(group_key) = capture.borrow().current_group.clone() else {
+            return;
+        };
+        if object.is_null() || (*object).is_null() {
+            return;
+        }
+        let size = LLVMGetBufferSize(*object);
+        let start = LLVMGetBufferStart(*object).cast::<u8>();
+        let bytes = if size == 0 {
+            Vec::new()
+        } else {
+            if start.is_null() {
+                return;
+            }
+            std::slice::from_raw_parts(start, size).to_vec()
+        };
+        let mut capture = capture.borrow_mut();
+        if let Some(writer) = capture.writer.as_mut() {
+            writer.record(&group_key, &bytes);
+        }
+        capture.captured.push((group_key, bytes));
+    }));
+    debug_assert!(result.is_ok(), "ORC object capture panicked");
+    ptr::null_mut()
+}
+
 /// A single-threaded ORC session supporting per-function lazy materialization.
 ///
 /// The supplied [`OrcContext`] is transferred to ORC. The JIT releases it after
@@ -425,6 +482,7 @@ impl OrcJit {
             data_layout,
             requests: HashMap::default(),
             callback: ptr::null_mut(),
+            capture: Box::new(RefCell::new(CaptureState::default())),
             errors: Vec::new(),
         });
         // SAFETY: `state` is boxed and remains at this address until after the
@@ -439,6 +497,11 @@ impl OrcJit {
                 LLVMOrcLLJITGetIRTransformLayer(jit),
                 optimize_transform,
                 ptr::null_mut(),
+            );
+            LLVMOrcObjectTransformLayerSetTransform(
+                LLVMOrcLLJITGetObjTransformLayer(jit),
+                capture_object,
+                state.capture.as_ref() as *const RefCell<CaptureState> as *mut c_void,
             );
         }
 
@@ -466,6 +529,27 @@ impl OrcJit {
             // SAFETY: `result` is an owned LLVM error.
             Err(unsafe { take_error(result) })
         }
+    }
+
+    /// Add a copied relocatable object to LLJIT. The C API consumes the memory
+    /// buffer on every return path, including errors, so this method never
+    /// disposes it after calling `LLVMOrcLLJITAddObjectFile`.
+    pub(crate) fn add_object(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let name = c"brass-cache-object";
+        // SAFETY: LLVM copies `bytes` and the identifier into a newly owned
+        // MemoryBuffer. LLJIT then takes ownership regardless of its result.
+        let buffer = unsafe {
+            LLVMCreateMemoryBufferWithMemoryRangeCopy(
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                name.as_ptr(),
+            )
+        };
+        if buffer.is_null() {
+            return Err("failed to copy cached LLVM object".to_string());
+        }
+        // SAFETY: the live LLJIT and dylib own the buffer after this call.
+        unsafe { check_error(LLVMOrcLLJITAddObjectFile(self.jit, self.dylib, buffer)) }
     }
 
     pub(crate) fn define_absolute(
@@ -503,6 +587,7 @@ impl OrcJit {
         Ok(LazyFunction {
             symbol: symbol.to_string(),
             implementation: lazy_implementation_symbol(symbol),
+            group_key: symbol.to_string(),
         })
     }
 
@@ -523,6 +608,7 @@ impl OrcJit {
             let request = LazyFunction {
                 symbol: symbol.clone(),
                 implementation: lazy_implementation_symbol(symbol),
+                group_key: symbols[0].clone(),
             };
             let impl_name = c_string(&request.implementation)?;
             // SAFETY: this retained entry is consumed by the custom unit below.
@@ -558,6 +644,16 @@ impl OrcJit {
         };
         self.define(implementation_unit)?;
 
+        self.register_object_group(symbols)
+    }
+
+    /// Register only the lazy-reexport aliases for a group already defined by
+    /// an object-file materialization unit. Unlike `register_lazy_group`, this
+    /// does not install a Rust custom materializer or add request bookkeeping.
+    pub(crate) fn register_object_group(&mut self, symbols: &[String]) -> Result<(), String> {
+        if symbols.is_empty() {
+            return Ok(());
+        }
         let mut aliases = Vec::with_capacity(symbols.len());
         for symbol in symbols {
             let public_name = c_string(symbol)?;
@@ -585,6 +681,18 @@ impl OrcJit {
             )
         };
         self.define(aliases)
+    }
+
+    /// Drain every lazy-group object emitted since the previous call.
+    pub(crate) fn take_captured_objects(&mut self) -> Vec<(String, Vec<u8>)> {
+        std::mem::take(&mut self.state.capture.borrow_mut().captured)
+    }
+
+    /// Publish each captured object immediately as well as retaining it for the
+    /// ordinary post-run drain. This covers JIT code that terminates the process
+    /// through a native function and therefore never returns to the driver.
+    pub(crate) fn install_object_cache_writer(&mut self, writer: ObjectCacheWriter) {
+        self.state.capture.borrow_mut().writer = Some(writer);
     }
 
     pub(crate) fn lookup(&mut self, symbol: &str) -> Result<usize, String> {
@@ -950,6 +1058,47 @@ mod tests {
 
         assert_eq!(result, (22, 11));
         assert_eq!(generated, ["bar"]);
+        jit.check_reported_errors().expect("no asynchronous errors");
+    }
+
+    /// A tiny lazy body captured by the object transform can be loaded into a
+    /// fresh LLJIT process-equivalent session and reached through aliases alone,
+    /// without installing a custom IR materializer in the second session.
+    #[test]
+    fn captured_object_reloads_in_fresh_jit() {
+        let object = {
+            let context = OrcContext::new();
+            let mut jit = OrcJit::new(&context).expect("capture JIT");
+            jit.register_lazy("answer").expect("answer stub");
+            let mut materialize = |request: &LazyFunction| {
+                Ok(constant_module(
+                    context.context(),
+                    &request.implementation,
+                    42,
+                ))
+            };
+            let value = jit.with_materializer(&mut materialize, |jit| {
+                let address = jit.lookup("answer").expect("answer address");
+                // SAFETY: the generated constant function has this exact ABI.
+                let answer: unsafe extern "C" fn() -> i32 = unsafe { std::mem::transmute(address) };
+                unsafe { answer() }
+            });
+            assert_eq!(value, 42);
+            let captured = jit.take_captured_objects();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0].0, "answer");
+            captured.into_iter().next().expect("captured object").1
+        };
+
+        let context = OrcContext::new();
+        let mut jit = OrcJit::new(&context).expect("reload JIT");
+        jit.add_object(&object).expect("cached object");
+        jit.register_object_group(&["answer".to_string()])
+            .expect("answer alias");
+        let address = jit.lookup("answer").expect("cached answer address");
+        // SAFETY: the cached object defines the same generated constant ABI.
+        let answer: unsafe extern "C" fn() -> i32 = unsafe { std::mem::transmute(address) };
+        assert_eq!(unsafe { answer() }, 42);
         jit.check_reported_errors().expect("no asynchronous errors");
     }
 }
