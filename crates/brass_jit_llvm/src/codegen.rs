@@ -2254,11 +2254,14 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         let frozen = self.mir.frozen_globals.clone();
         let has_main = self.mir.lazy_has_main;
         let precompile = std::mem::take(&mut self.mir.lazy_precompile);
+        let all_groups: Vec<String> = self.mir.lazy_group_symbols.keys().cloned().collect();
         let mut jit = self
             .mir
             .orc
             .take()
             .ok_or("execute called before lazy ORC preparation")?;
+        let precompile_all = jit.object_capture_active()
+            && matches!(std::env::var("BRASS_OBJ_PRECOMPILE").as_deref(), Ok("all"));
         let groups = &self.mir.lazy_groups;
         let modules = &mut self.mir.lazy_modules;
         let mut materialize = |request: &crate::jit::orc::LazyFunction| {
@@ -2279,6 +2282,11 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
 
             for public in &precompile {
                 jit.lookup(&lazy_implementation_symbol(public))?;
+            }
+            if precompile_all {
+                for public in &all_groups {
+                    jit.lookup(&lazy_implementation_symbol(public))?;
+                }
             }
             for symbol in &inits {
                 call(jit, &mangle_fn(symbol))?;

@@ -221,6 +221,7 @@ dependencies = [
 name = "brass_jit_llvm"
 version = "0.2.0"
 dependencies = [
+ "brass_cache",
  "brass_engine",
  "brass_hir",
  "brass_mir",
@@ -230,6 +231,8 @@ dependencies = [
  "fxhash",
  "inkwell",
  "llvm-sys",
+ "postcard",
+ "serde",
  "tracing",
 ]
 

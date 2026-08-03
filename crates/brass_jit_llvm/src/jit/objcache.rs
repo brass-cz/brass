@@ -11,11 +11,9 @@ use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 
 use llvm_sys::core::LLVMDisposeMessage;
-use llvm_sys::target_machine::{
-    LLVMGetDefaultTargetTriple, LLVMGetHostCPUFeatures, LLVMGetHostCPUName,
-};
+use llvm_sys::target_machine::LLVMGetDefaultTargetTriple;
 
-use super::orc::OptTier;
+use super::orc::{OptTier, target_cpu_identity};
 
 type CachedGroups = HashMap<String, (Vec<String>, Vec<u8>)>;
 
@@ -198,10 +196,10 @@ fn load_path(
     let tag = brass_cache::cache_tag(tier.cache_flavor())?;
     let body = brass_cache::decode_file(&bytes, &tag)?;
     let pack: ObjectPack = postcard::from_bytes(body).ok()?;
+    let portable_generic = pack.cpu == "generic" && pack.features.is_empty();
     if pack.analysis_hash != analysis_hash
         || pack.triple != target.triple
-        || pack.cpu != target.cpu
-        || pack.features != target.features
+        || (!portable_generic && (pack.cpu != target.cpu || pack.features != target.features))
     {
         return None;
     }
@@ -304,32 +302,20 @@ fn fallback_path(entry: &Path, tier: OptTier) -> Option<PathBuf> {
 }
 
 fn target_identity() -> Option<TargetIdentity> {
-    // SAFETY: LLVM returns independently allocated, NUL-terminated messages;
-    // each is copied before being disposed exactly once below.
+    let (cpu, features) = target_cpu_identity()?;
+    // SAFETY: LLVM returns an independently allocated, NUL-terminated message
+    // that is copied before being disposed exactly once below.
     unsafe {
         let triple = LLVMGetDefaultTargetTriple();
-        let cpu = LLVMGetHostCPUName();
-        let features = LLVMGetHostCPUFeatures();
-        if triple.is_null() || cpu.is_null() || features.is_null() {
-            if !triple.is_null() {
-                LLVMDisposeMessage(triple);
-            }
-            if !cpu.is_null() {
-                LLVMDisposeMessage(cpu);
-            }
-            if !features.is_null() {
-                LLVMDisposeMessage(features);
-            }
+        if triple.is_null() {
             return None;
         }
         let identity = TargetIdentity {
             triple: CStr::from_ptr(triple).to_string_lossy().into_owned(),
-            cpu: CStr::from_ptr(cpu).to_string_lossy().into_owned(),
-            features: CStr::from_ptr(features).to_string_lossy().into_owned(),
+            cpu,
+            features,
         };
         LLVMDisposeMessage(triple);
-        LLVMDisposeMessage(cpu);
-        LLVMDisposeMessage(features);
         Some(identity)
     }
 }
@@ -402,5 +388,30 @@ mod tests {
                 .matching_object("foo", &["foo".to_string(), "baz".to_string()])
                 .is_none()
         );
+    }
+
+    /// A distribution object deliberately built for LLVM's generic CPU does
+    /// not inherit the packaging machine's feature set and is reusable by a
+    /// different host CPU as long as the complete target triple still matches.
+    #[test]
+    fn generic_pack_accepts_another_cpu_on_the_same_triple() {
+        let path = test_path("generic.czobj");
+        let analysis_hash = [9; 20];
+        let target = TargetIdentity {
+            triple: "test-unknown-linux-gnu".into(),
+            cpu: "different-host".into(),
+            features: "+host-extension".into(),
+        };
+        let pack = ObjectPack {
+            analysis_hash,
+            triple: target.triple.clone(),
+            cpu: "generic".into(),
+            features: String::new(),
+            groups: vec![("foo".into(), vec!["foo".into()], vec![1, 2, 3])],
+        };
+        write_pack(&path, OptTier::O2, &pack);
+
+        assert!(load_path(&path, analysis_hash, OptTier::O2, &target).is_some());
+        let _ = std::fs::remove_file(path);
     }
 }

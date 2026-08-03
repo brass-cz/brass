@@ -639,14 +639,41 @@ fn context_file(key: &[u8; 20]) -> Option<PathBuf> {
     Some(context_dir()?.join(format!("ctx-{hex}.czctx")))
 }
 
-/// Load the context seed for `key`, `None` when absent, foreign, corrupted,
-/// or from another compiler build. The key already encodes the flavor, so the
-/// in-file tag echo only needs the compiler identity; the neutral flavor
-/// keeps it uniform.
+/// Read-only context seeds shipped beside an installed toolchain. An install
+/// rooted at `~/.brass` places the driver in `bin/` and these seeds in
+/// `cache/`; writes continue to use [`context_dir`] exclusively.
+fn shipped_context_dir() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    shipped_context_dir_for(&executable)
+}
+
+fn shipped_context_dir_for(executable: &Path) -> Option<PathBuf> {
+    Some(executable.parent()?.parent()?.join("cache"))
+}
+
+fn load_context_payload<T: serde::de::DeserializeOwned>(
+    file_name: &str,
+    flavor: &str,
+) -> Option<T> {
+    let tag = cache_tag(flavor)?;
+    [context_dir(), shipped_context_dir()]
+        .into_iter()
+        .flatten()
+        .find_map(|directory| {
+            let bytes = std::fs::read(directory.join(file_name)).ok()?;
+            let body = decode_file(&bytes, &tag)?;
+            postcard::from_bytes(body).ok()
+        })
+}
+
+/// Load the context seed for `key` from the user's cache, then from the
+/// read-only `cache/` directory beside the executable's `bin/` directory.
+/// Returns `None` when both are absent, foreign, corrupted, or from another
+/// compiler build. The key already encodes the flavor, so the in-file tag echo
+/// only needs the compiler identity; the neutral flavor keeps it uniform.
 pub fn load_context(key: &[u8; 20]) -> Option<brass_typeck::ContextTables> {
-    let bytes = std::fs::read(context_file(key)?).ok()?;
-    let body = decode_file(&bytes, &cache_tag("ctx")?)?;
-    postcard::from_bytes(body).ok()
+    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    load_context_payload(&format!("ctx-{hex}.czctx"), "ctx")
 }
 
 /// Write the context seed for `key`, best-effort and atomic like [`save`].
@@ -682,12 +709,12 @@ fn context_bundle_file(id: &[u8; 20]) -> Option<PathBuf> {
     Some(context_dir()?.join(format!("ctxb-{hex}.czctx")))
 }
 
-/// Load the incremental sidecar for the context identity `id`; `None` when
-/// absent, foreign, corrupted, or from another compiler build.
+/// Load the incremental sidecar for the context identity `id`, using the same
+/// user-then-shipped lookup as [`load_context`]. Returns `None` when absent,
+/// foreign, corrupted, or from another compiler build.
 pub fn load_context_bundle(id: &[u8; 20]) -> Option<ContextBundle> {
-    let bytes = std::fs::read(context_bundle_file(id)?).ok()?;
-    let body = decode_file(&bytes, &cache_tag("ctxb")?)?;
-    postcard::from_bytes(body).ok()
+    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    load_context_payload(&format!("ctxb-{hex}.czctx"), "ctxb")
 }
 
 /// Write the incremental sidecar, best-effort and atomic like [`save`].
@@ -707,7 +734,8 @@ pub fn save_context_bundle(id: &[u8; 20], bundle: &ContextBundle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_file, encode_file};
+    use super::{decode_file, encode_file, shipped_context_dir_for};
+    use std::path::{Path, PathBuf};
 
     /// Framing accepts an intact body and rejects same-size corruption before
     /// postcard can interpret bytes as a shape-valid payload.
@@ -732,5 +760,15 @@ mod tests {
         for end in 0..encoded.len() {
             assert_eq!(decode_file(&encoded[..end], tag), None, "length {end}");
         }
+    }
+
+    /// A distributed `bin/brass` resolves seeds from the sibling top-level
+    /// `cache` directory without making that directory a write target.
+    #[test]
+    fn shipped_context_cache_follows_the_install_layout() {
+        assert_eq!(
+            shipped_context_dir_for(Path::new("/toolchain/bin/brass")),
+            Some(PathBuf::from("/toolchain/cache"))
+        );
     }
 }

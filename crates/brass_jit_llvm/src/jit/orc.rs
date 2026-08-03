@@ -82,6 +82,39 @@ impl OptTier {
     }
 }
 
+/// The CPU identity used for both instruction selection and native-object
+/// cache tagging. Release packaging sets `BRASS_JIT_CPU=generic`, which also
+/// clears target features so the generated objects stay portable within the
+/// target architecture instead of inheriting the packaging host's extensions.
+pub(super) fn target_cpu_identity() -> Option<(String, String)> {
+    if let Some(cpu) = std::env::var_os("BRASS_JIT_CPU") {
+        return Some((cpu.to_string_lossy().into_owned(), String::new()));
+    }
+
+    // SAFETY: LLVM returns independently allocated, NUL-terminated messages;
+    // each is copied before being disposed exactly once below.
+    unsafe {
+        let cpu = LLVMGetHostCPUName();
+        let features = LLVMGetHostCPUFeatures();
+        if cpu.is_null() || features.is_null() {
+            if !cpu.is_null() {
+                LLVMDisposeMessage(cpu);
+            }
+            if !features.is_null() {
+                LLVMDisposeMessage(features);
+            }
+            return None;
+        }
+        let identity = (
+            CStr::from_ptr(cpu).to_string_lossy().into_owned(),
+            CStr::from_ptr(features).to_string_lossy().into_owned(),
+        );
+        LLVMDisposeMessage(cpu);
+        LLVMDisposeMessage(features);
+        Some(identity)
+    }
+}
+
 /// Owns an LLVM context until it is transferred to ORC. This wrapper makes
 /// context ownership explicit across fallible JIT construction: ordinary Rust
 /// drops it before a transfer, while the ORC session drops it afterwards.
@@ -695,6 +728,11 @@ impl OrcJit {
         self.state.capture.borrow_mut().writer = Some(writer);
     }
 
+    /// Whether emitted objects are being published to a cache session.
+    pub(crate) fn object_capture_active(&self) -> bool {
+        self.state.capture.borrow().writer.is_some()
+    }
+
     pub(crate) fn lookup(&mut self, symbol: &str) -> Result<usize, String> {
         let symbol = c_string(symbol)?;
         let mut address = 0;
@@ -757,13 +795,18 @@ impl OrcJit {
 }
 
 /// Configures LLJIT's target machine for the selected optimization tier.
-/// PIC keeps generated objects relinkable across processes for a future native
-/// object cache while remaining suitable for in-process materialization.
+/// PIC keeps cached objects relinkable across processes while remaining
+/// suitable for in-process materialization.
 fn create_jit(tier: OptTier) -> Result<LLVMOrcLLJITRef, String> {
+    let (cpu, features) = target_cpu_identity()
+        .ok_or_else(|| "failed to read LLVM target CPU identity".to_string())?;
+    let cpu = c_string(&cpu)?;
+    let features = c_string(&features)?;
     unsafe {
         let triple = LLVMGetDefaultTargetTriple();
-        let cpu = LLVMGetHostCPUName();
-        let features = LLVMGetHostCPUFeatures();
+        if triple.is_null() {
+            return Err("failed to read LLVM target triple".to_string());
+        }
         let mut target = ptr::null_mut();
         let mut target_error = ptr::null_mut();
         if LLVMGetTargetFromTriple(triple, &mut target, &mut target_error) != 0 {
@@ -774,8 +817,6 @@ fn create_jit(tier: OptTier) -> Result<LLVMOrcLLJITRef, String> {
                 LLVMDisposeMessage(target_error);
                 error
             };
-            LLVMDisposeMessage(features);
-            LLVMDisposeMessage(cpu);
             LLVMDisposeMessage(triple);
             return Err(error);
         }
@@ -786,14 +827,12 @@ fn create_jit(tier: OptTier) -> Result<LLVMOrcLLJITRef, String> {
         let machine = LLVMCreateTargetMachine(
             target,
             triple,
-            cpu,
-            features,
+            cpu.as_ptr(),
+            features.as_ptr(),
             codegen_level,
             LLVMRelocMode::LLVMRelocPIC,
             LLVMCodeModel::LLVMCodeModelJITDefault,
         );
-        LLVMDisposeMessage(features);
-        LLVMDisposeMessage(cpu);
         LLVMDisposeMessage(triple);
         if machine.is_null() {
             return Err("failed to create LLVM target machine".to_string());
