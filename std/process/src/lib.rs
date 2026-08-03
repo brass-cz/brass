@@ -157,6 +157,42 @@ export! {
             .map_err(handle_error)
     }
 
+    /// Replace THIS process with `program` (looked up on `PATH`), keeping the
+    /// inherited standard streams. `env` follows `process_spawn`'s flat
+    /// name/value convention. On Unix a successful exec never returns, so the
+    /// declared result is only ever produced on failure; platforms without
+    /// exec fall back to spawn + wait + exit, which preserves the observable
+    /// contract (the command's exit status becomes this process's) at the
+    /// cost of one extra resident process.
+    fn process_exec(
+        program: String,
+        args: Vec<String>,
+        env: Vec<String>,
+    ) -> Result<(), String> {
+        if !env.len().is_multiple_of(2) {
+            return Err(format!(
+                "environment overrides must be name/value pairs, got {} entries",
+                env.len()
+            ));
+        }
+        let mut command = Command::new(&program);
+        command.args(&args);
+        for pair in env.chunks_exact(2) {
+            command.env(&pair[0], &pair[1]);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let error = command.exec();
+            Err(format!("failed to exec `{program}`: {error}"))
+        }
+        #[cfg(not(unix))]
+        {
+            let status = command.status().map_err(|e| e.to_string())?;
+            std::process::exit((exit_code(&status) & 0xff) as i32)
+        }
+    }
+
     /// End THIS process with exit code `code` (0 = success, by convention).
     ///
     /// The call does not return, so the declared `Void` result is never
@@ -290,6 +326,7 @@ struct ProcessLib;
 impl BrassLib for ProcessLib {
     fn entry(reg: &mut Registry) {
         reg.export(decl!(process_spawn));
+        reg.export(decl!(process_exec));
         reg.export(decl!(process_exit));
         reg.export(decl!(process_stream));
         reg.export(decl!(process_wait));

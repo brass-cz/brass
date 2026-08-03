@@ -95,7 +95,10 @@ fun main() {
     const deps = join_deps(resolve_deps(manifest.dependencies)!)
 
     if cmd == "run" {
-        exit(run_brass([main_path.to_string()], deps)!)
+        // Replace this process outright: czpm's own compiler session has
+        // nothing left to do, so it must not stay resident for the whole
+        // program run, and the program's exit status becomes czpm's.
+        exec_brass([main_path.to_string()], deps)!
     } else if cmd == "check" {
         const files = list_files(Path.parse("."))!.filter(
             (v) -> v.to_string().ends_with(".cz"),
@@ -230,18 +233,28 @@ fun run_brass(args: string[], deps: string) {
     return run_cmd("brass", args, deps)
 }
 
+/** Replace this process with `brass args...`; returns only on exec failure. */
+fun exec_brass(args: string[], deps: string) {
+    _dep_command("brass", args, deps).exec()!
+}
+
 fun run_czls(deps: string) {
     return run_cmd("czls", [], deps)
 }
 
 fun run_cmd(command: string, args: string[], deps: string) {
+    const child = _dep_command(command, args, deps).spawn()!
+    return child.wait()
+}
+
+// A toolchain command with the dependency map applied. The child inherits the
+// parent's package map -- the toolchain's `std` binding in particular, which
+// the spawned compiler needs to resolve the standard library -- with the
+// manifest's dependencies appended. A name declared in both resolves to the
+// manifest's entry: later entries win in the compiler's name map.
+fun _dep_command(command: string, args: string[], deps: string) -> Command {
     let cmd = Command.new(command)
     cmd.args(args)
-    // The child inherits the parent's package map -- the toolchain's `std`
-    // binding in particular, which the spawned compiler needs to resolve the
-    // standard library -- with the manifest's dependencies appended. A name
-    // declared in both resolves to the manifest's entry: later entries win
-    // in the compiler's name map.
     let packages = env.vars().get_or("BRASS_PACKAGES", "")
     if len(packages) > 0 && len(deps) > 0 {
         packages = "{packages}{env.path_separator()}{deps}"
@@ -249,6 +262,5 @@ fun run_cmd(command: string, args: string[], deps: string) {
         packages = deps
     }
     cmd.env("BRASS_PACKAGES", packages)
-    const child = cmd.spawn()!
-    return child.wait()
+    return cmd
 }

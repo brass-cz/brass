@@ -17,6 +17,7 @@
 import std.fs.{ File }
 import libprocess.{
     process_spawn,
+    process_exec,
     process_exit,
     process_stream,
     process_wait,
@@ -165,6 +166,20 @@ fun Command.stdout(self, mode: Stdio) -> Command {
 fun Command.stderr(self, mode: Stdio) -> Command {
     self._stderr = mode
     return self
+}
+
+/**
+ * Replace the current process with this command: same PID, inherited
+ * standard streams and environment (plus any `env` overrides). On success
+ * it never returns -- the command's exit status becomes this process's --
+ * so it only ever returns an error, for a program that cannot be executed.
+ * The configured stdio modes are ignored; a command that needs pipes must
+ * `spawn` instead.
+ *
+ *     Command.new("brass").args([main_path]).exec()!
+ */
+fun Command.exec(self) {
+    process_exec(self._program, self._args, self._env)!
 }
 
 /** Spawn the process, returning a handle to the running `Child`. */

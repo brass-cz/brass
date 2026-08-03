@@ -2,7 +2,6 @@ import std.process.{ Command, Stdio }
 import std.path.Path
 import std.fs.{ read_file, create_dir, remove_dir }
 import std.hash.{ sha256, hex }
-import std.http.fetch
 
 import manifest.{ Manifest, Dependency, Dependencies }
 
@@ -33,7 +32,7 @@ fun _resolve_deps(
                 base.join(path).canonicalize()!
             },
             Tarball { tarball, hash } => {
-                download_and_extract_tarball(tarball, hash)!
+                _fetch_tarball(tarball, hash)!
             },
             _ => {
                 return error("unsupported dependency source")
@@ -107,33 +106,23 @@ fun git_clone(repo: string, rev: string) {
     return path
 }
 
-fun download_and_extract_tarball(url: string, hash: string) {
-    const path = packages_dir()!.join("tarball").join(hash)
-    if path.is_dir() {
-        return path
-    } else {
-        create_dir(path)!
-    }
-    const downloaded = fetch(url)!
-    const downloaded_hash = hex(sha256(downloaded.body))
-    if downloaded_hash != hash {
-        error(
-            "Downloaded tarball hash `{downloaded_hash}` is differ from expected one `{hash}`",
-        )!
-    }
-    let cmd = Command.new("tar")
-    cmd.args(["xz", "-C", path.to_string()])
-    cmd.stdin(Stdio.Pipe)
+/**
+ * Extract a tarball dependency by running the sibling `fetch.cz` as its own
+ * `brass` entry. The HTTP stack lives only in that entry: importing it here
+ * would add the whole net/http/url closure to every czpm start, while the
+ * tarball source -- the one dependency kind that needs it -- already spawns
+ * `tar` and touches the network, so a short-lived extra process is noise.
+ * The child prints the extracted package directory on stdout.
+ */
+fun _fetch_tarball(url: string, hash: string) {
+    const entry = Path.parse(_PATH).parent().join("fetch.cz")
+    let cmd = Command.new("brass")
+    cmd.args([entry.to_string(), "tarball", url, hash])
+    cmd.stdout(Stdio.Pipe)
     const child = cmd.spawn()!
-    let tar_in = child.stdin()!
-    tar_in.write(downloaded.body)!
-    tar_in.close()!
-    const code = child.wait()!
-    if code != 0 {
-        if path.is_dir() {
-            remove_dir(path)!
-        }
-        error("failed to extract downloaded tarball")!
+    const out = child.output()!
+    if out.code != 0 {
+        return error("failed to fetch tarball `{url}`: exit code {out.code}")
     }
-    return path
+    return Path.parse(to_text(out.stdout)!.trim())
 }

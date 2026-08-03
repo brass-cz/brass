@@ -1,0 +1,69 @@
+// Network-dependent package fetching, kept OUT of czpm's resolve module on
+// purpose: this file is its own `brass` entry that resolve.cz runs as a
+// child process for the rare dependency kinds that need it. Importing
+// `std.http` here instead of in resolve.cz keeps the whole net/http/url
+// stack (and its checking cost) off every czpm start; a tarball dependency
+// already spawns `tar` and hits the network, so one short-lived extra
+// `brass` process is noise on that path.
+//
+// Protocol: `brass fetch.cz tarball <url> <sha256-hex>` prints the extracted
+// package directory on stdout and exits 0; any failure reports on stderr
+// through the normal unhandled-error path and exits non-zero.
+
+import std.env
+import std.fs.{ create_dir, remove_dir }
+import std.hash.{ sha256, hex }
+import std.http.fetch
+import std.path.Path
+import std.process.{ Command, Stdio }
+
+// Duplicated from resolve.cz deliberately: importing it from there would pull
+// the manifest/TOML closure into this entry, and importing it from here would
+// pull HTTP into czpm -- the exact coupling this file exists to break.
+fun _packages_dir() {
+    return Path.home()!.join(".brass").join("packages")
+}
+
+fun download_and_extract_tarball(url: string, hash: string) {
+    const path = _packages_dir()!.join("tarball").join(hash)
+    if path.is_dir() {
+        return path
+    }
+    // The cache directory appears only after the download verified: creating
+    // it first would leave an empty directory behind a failed fetch, and the
+    // next run would mistake that for an extracted package.
+    const downloaded = fetch(url)!
+    const downloaded_hash = hex(sha256(downloaded.body))
+    if downloaded_hash != hash {
+        error(
+            "Downloaded tarball hash `{downloaded_hash}` is differ from expected one `{hash}`",
+        )!
+    }
+    create_dir(path)!
+    let cmd = Command.new("tar")
+    cmd.args(["xz", "-C", path.to_string()])
+    cmd.stdin(Stdio.Pipe)
+    const child = cmd.spawn()!
+    let tar_in = child.stdin()!
+    tar_in.write(downloaded.body)!
+    tar_in.close()!
+    const code = child.wait()!
+    if code != 0 {
+        if path.is_dir() {
+            remove_dir(path)!
+        }
+        error("failed to extract downloaded tarball")!
+    }
+    return path
+}
+
+// The entry `main` runs automatically; an explicit top-level call would run
+// it a second time and print the path twice.
+fun main() {
+    const args = env.args()
+    if args.len() != 4 || args[1] != "tarball" {
+        return error("usage: fetch.cz tarball <url> <sha256-hex>")
+    }
+    const path = download_and_extract_tarball(args[2], args[3])!
+    println(path.to_string())
+}
