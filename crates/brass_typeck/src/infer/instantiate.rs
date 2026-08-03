@@ -315,6 +315,42 @@ impl<'a> Checker<'a> {
         if signature_params.len().saturating_sub(usize::from(has_self)) != arg_types.len() {
             return fallback_ret;
         }
+        // A co-check records return links and an active type-test probe commits
+        // bindings for its holes. Both require the body walk even when its value
+        // types match an earlier elaboration.
+        let memo_enabled = !self.co_checking && self.type_test_holes.is_empty();
+        let memo_key = memo_enabled.then(|| {
+            receiver_ty
+                .as_ref()
+                .map(|ty| self.resolve(ty))
+                // Static methods have no value receiver; their declaring nominal
+                // is the fixed receiver identity that supplies `Self`.
+                .or_else(|| self.program.types.get(self_type).map(TypeInfo::type_ref))
+        });
+        let memo_key = memo_key.flatten().and_then(|resolved_receiver| {
+            if !brass_hir::is_fully_known(&resolved_receiver) {
+                return None;
+            }
+            let variant = owner.split_once('.').map_or("", |(_, variant)| variant);
+            let callable = format!(
+                "{}:{}:{}",
+                brass_hir::type_key(&resolved_receiver),
+                variant,
+                method_name
+            );
+            // Receiver-scheme parameters are derived from the resolved receiver;
+            // an unpinned scheme parameter falls back to its argument type. The
+            // receiver and arguments therefore cover every frame binding. An
+            // ordinary method is not expectation-directed: expected returns only
+            // select reflective methods, whose template bodies do not reach here.
+            self.elaboration_memo_key("m", &callable, arg_types)
+        });
+        if let Some(memo_key) = &memo_key
+            && let Some(ret) = self.elaboration_memo.get(memo_key)
+        {
+            return ret.clone();
+        }
+        let errors_before = self.errors.len();
         // Keyed by the receiver TYPE, not by `owner` (the `Sum.Variant` qualifier
         // this call resolved through): a sum's method lives in every variant's
         // table, so one call resolves to one candidate per variant, all sharing
@@ -355,6 +391,14 @@ impl<'a> Checker<'a> {
         self.self_variant = saved_variant;
         self.current_module = saved_module;
         self.instantiating.remove(&key);
+        if let Some(memo_key) = memo_key
+            && self.errors.len() == errors_before
+        {
+            let resolved = self.resolve(&ret);
+            if brass_hir::is_fully_known(&resolved) {
+                self.elaboration_memo.insert(memo_key, resolved);
+            }
+        }
         ret
     }
 

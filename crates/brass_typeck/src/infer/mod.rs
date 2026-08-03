@@ -1410,17 +1410,18 @@ struct Checker<'a> {
     /// only re-derives what the signature already states. The complete
     /// diagnostic verdict stays `check`'s (eager's) job, where this is off.
     lazy_profile: bool,
-    /// Memoized returns of call-site body re-elaborations, keyed by callee
-    /// symbol and the fully-resolved argument types. The same callee at the
-    /// same argument types re-derives the same span-keyed channel entries and
-    /// the same return, so the first elaboration's answer is reused -- without
-    /// this the repeated subtrees of an unannotated call chain are re-checked
-    /// once per call site, which grows exponentially with chain depth. Only
-    /// clean (error-free) elaborations with fully-known keys and returns land
-    /// here: an open argument means the elaboration would constrain the
-    /// caller's own variables, an open return must stay the shared table entry
-    /// so later pinning reaches every reader, and an erroring body keeps
-    /// reporting at every call site.
+    /// Memoized returns of call-site body re-elaborations, keyed by callable
+    /// identity and the fully-resolved argument types. A method's identity also
+    /// includes its resolved receiver instance and sum variant. The same body at
+    /// the same concrete inputs re-derives the same span-keyed channel entries
+    /// and return, so the first elaboration's answer is reused -- without this
+    /// repeated subtrees of an unannotated call chain are re-checked once per call
+    /// site, and sum dispatch multiplies each method call by its variant count.
+    /// Only clean (error-free) elaborations with fully-known keys and returns land
+    /// here: an open input means the elaboration would constrain the caller's own
+    /// variables, an open return must stay the shared table entry so later pinning
+    /// reaches every reader, and an erroring body keeps reporting at every call
+    /// site.
     elaboration_memo: HashMap<(String, Vec<Type>), Type>,
     /// Fully-known returns from clean call-site elaborations of unannotated
     /// functions. Unlike the memo, these are part of the streaming contract:
