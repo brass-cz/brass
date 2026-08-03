@@ -2032,12 +2032,18 @@ pub trait Codegen {
         method: &str,
         args: &[Operand],
     ) -> Self::Value {
-        let arg_ty = operand_type_of(&args[0], &f.local_types);
-        let v = self.codegen_operand(program, f, &args[0], &arg_ty);
+        let raw_arg_ty = operand_type_of(&args[0], &f.local_types);
         // `string.from(x)` is just `to_string`.
         if ty == "string" {
-            return self.to_string(v, &arg_ty);
+            let v = self.codegen_operand(program, f, &args[0], &raw_arg_ty);
+            return self.to_string(v, &raw_arg_ty);
         }
+        // A checked numeric conversion receives a numeric or string value. A
+        // guard narrows a nullable at the source level without retyping its MIR
+        // local, so evaluate that local as the proven inner type at this call
+        // boundary and pass the same type to the conversion leaf.
+        let arg_ty = unwrap_nullable(&raw_arg_ty);
+        let v = self.codegen_operand(program, f, &args[0], arg_ty);
         let target = if let Some(k) = int_kind_name(ty) {
             Type::Int(k)
         } else if let Some(k) = float_kind_name(ty) {
@@ -2045,7 +2051,7 @@ pub trait Codegen {
         } else {
             return self.unit();
         };
-        self.convert(&target, method, &arg_ty, v)
+        self.convert(&target, method, arg_ty, v)
     }
 
     fn codegen_operand(

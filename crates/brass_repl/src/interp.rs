@@ -955,12 +955,16 @@ impl<'p, 'm> Interp<'p, 'm> {
         method: &str,
         args: &[Operand],
     ) -> Result<Value, String> {
-        let arg_ty = operand_type_of(&args[0], &f.local_types);
-        let v = self.eval_operand(f, frame, &args[0], &arg_ty)?;
+        let raw_arg_ty = operand_type_of(&args[0], &f.local_types);
         if ty == "string" {
+            let v = self.eval_operand(f, frame, &args[0], &raw_arg_ty)?;
             let hir = self.hir;
-            return Ok(Value::str(format_value(hir, &v, &arg_ty)?));
+            return Ok(Value::str(format_value(hir, &v, &raw_arg_ty)?));
         }
+        // Keep the interpreter's conversion contract identical to the typed
+        // backend even though a present nullable is represented transparently.
+        let arg_ty = unwrap_nullable(&raw_arg_ty);
+        let v = self.eval_operand(f, frame, &args[0], arg_ty)?;
         let target = if let Some(k) = IntKind::from_name(ty) {
             Type::Int(k)
         } else if let Some(k) = float_kind_name(ty) {
@@ -968,7 +972,7 @@ impl<'p, 'm> Interp<'p, 'm> {
         } else {
             return Err(format!("unknown conversion target `{ty}`"));
         };
-        Ok(convert(&target, method, &arg_ty, &v))
+        Ok(convert(&target, method, arg_ty, &v))
     }
 
     /// `print`/`println`: render a non-string argument through `to_string`, write

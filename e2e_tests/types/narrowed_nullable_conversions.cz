@@ -1,0 +1,31 @@
+// Numeric conversion arguments use their proven non-null type even though the
+// storage slot retains its declared nullable representation.
+const a: int32? = 77
+if a {
+    println(int64.from(a)!)
+}
+
+const b: int64? = 88
+if b {
+    println(int32.from(b)!)
+}
+
+const c: uint16? = 8935
+if c {
+    println(int32.from(c)!)
+}
+
+const d: uint8? = 201
+if d {
+    println(int64.from(d)!)
+}
+
+type R = {
+    port: uint16?
+}
+
+const r = R { port: 8123 }
+const port = r.port
+if port {
+    println(int32.from(port)!)
+}
