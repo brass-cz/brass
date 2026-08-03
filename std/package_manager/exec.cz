@@ -74,11 +74,12 @@ fun main() {
             return error("failed to find {name}: {name} or {name}.cz not found")
         }
     }
-    const files = list_files(Path.parse("."))!.filter(
-        (v) -> v.to_string().ends_with(".cz"),
-    )
-
     if cmd == "fmt" {
+        // The recursive project walk is only needed by the per-file commands
+        // (`fmt`, `check`); `run`/`lsp` must not pay for it on every start.
+        const files = list_files(Path.parse("."))!.filter(
+            (v) -> v.to_string().ends_with(".cz"),
+        )
         for path in files {
             const code = run_cmd("czfmt", ["--write", path.to_string()], "")!
             if code != 0 {
@@ -96,6 +97,9 @@ fun main() {
     if cmd == "run" {
         exit(run_brass([main_path.to_string()], deps)!)
     } else if cmd == "check" {
+        const files = list_files(Path.parse("."))!.filter(
+            (v) -> v.to_string().ends_with(".cz"),
+        )
         let fail = false
         for path in files {
             const code = run_brass(["check", path.to_string()], deps)!

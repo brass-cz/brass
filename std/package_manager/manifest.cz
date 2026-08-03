@@ -45,7 +45,10 @@ const DEFAULT_REV = "HEAD"
 fun Manifest.parse(s: string) -> Manifest! {
     const toml = TomlValue.parse(s)!
     const package_raw = toml.get("package")!
-    const name: string = package_raw.get("name")!.into()!
+    // `as_string` keeps this module free of keyed (`-> infer!`) calls: one
+    // keyed call anywhere in the closure forces the driver's whole-program
+    // eager pipeline, which costs czpm its lazy start-up path.
+    const name: string = package_raw.get("name")!.as_string()!
     const authors: string[] = match package_raw.get("authors")! {
         String { value } => [value],
         Array { value } => {
@@ -58,7 +61,7 @@ fun Manifest.parse(s: string) -> Manifest! {
         },
         _ => error("Invalid value type in `package.authors`")!,
     }
-    const license: string = package_raw.get("license")!.into()!
+    const license: string = package_raw.get("license")!.as_string()!
     const package = PackageInfo {
         name: name,
         authors: authors,
