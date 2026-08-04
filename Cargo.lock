@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "bootstrap"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "indicatif",
@@ -146,7 +146,7 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 
 [[package]]
 name = "brass_cache"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_hir",
  "brass_metadata",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "brass_driver"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_cache",
  "brass_engine",
@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "brass_engine"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_hir",
  "brass_mir",
@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "brass_formatter"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_metadata",
  "brass_parser",
@@ -210,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "brass_hir"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_parser",
  "fxhash",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "brass_jit_llvm"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_cache",
  "brass_engine",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "brass_language_server"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_cache",
  "brass_formatter",
@@ -259,21 +259,21 @@ dependencies = [
 
 [[package]]
 name = "brass_lib_env"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_plugin",
 ]
 
 [[package]]
 name = "brass_lib_fs"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_plugin",
 ]
 
 [[package]]
 name = "brass_lib_hash"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_plugin",
  "digest",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "brass_lib_net"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_plugin",
  "rustls",
@@ -294,21 +294,21 @@ dependencies = [
 
 [[package]]
 name = "brass_lib_path"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_plugin",
 ]
 
 [[package]]
 name = "brass_lib_process"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_plugin",
 ]
 
 [[package]]
 name = "brass_lib_regex"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_plugin",
  "regex",
@@ -316,14 +316,14 @@ dependencies = [
 
 [[package]]
 name = "brass_metadata"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "fxhash",
 ]
 
 [[package]]
 name = "brass_mir"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_hir",
  "brass_parser",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "brass_parser"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "fxhash",
  "serde",
@@ -340,25 +340,25 @@ dependencies = [
 
 [[package]]
 name = "brass_plugin"
-version = "0.2.0"
+version = "0.2.3"
 
 [[package]]
 name = "brass_plugin_altlib"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_plugin",
 ]
 
 [[package]]
 name = "brass_plugin_faultylib"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_plugin",
 ]
 
 [[package]]
 name = "brass_plugin_host"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_plugin",
  "brass_plugin_host",
@@ -367,14 +367,14 @@ dependencies = [
 
 [[package]]
 name = "brass_plugin_testlib"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_plugin",
 ]
 
 [[package]]
 name = "brass_repl"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_engine",
  "brass_hir",
@@ -388,7 +388,7 @@ dependencies = [
 
 [[package]]
 name = "brass_resolve"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_hir",
  "brass_parser",
@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "brass_runtime"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_plugin_host",
  "brass_utils",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "brass_solver"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_hir",
  "fxhash",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "brass_typeck"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_hir",
  "brass_parser",
@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "brass_typesys"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "brass_hir",
  "brass_parser",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "brass_utils"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "tracing",
  "tracing-subscriber",
