@@ -373,6 +373,34 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Native objects require both this compiler's framed cache tag and the
+    /// exact serialized analysis payload identity. Thus an object containing
+    /// constants from an old wrapper AST cannot outlive that analysis cache.
+    #[test]
+    fn packfile_requires_compiler_and_analysis_identity() {
+        let path = test_path("identity.czobj");
+        let target = target_identity().expect("native target");
+        let analysis_hash = [11; 20];
+        let pack = ObjectPack {
+            analysis_hash,
+            triple: target.triple.clone(),
+            cpu: target.cpu.clone(),
+            features: target.features.clone(),
+            groups: vec![("foo".into(), vec!["foo".into()], vec![1, 2, 3])],
+        };
+        let body = postcard::to_stdvec(&pack).expect("encode pack");
+        std::fs::write(
+            &path,
+            brass_cache::encode_file("obsolete-compiler/obj-o0", &body),
+        )
+        .expect("write obsolete pack");
+        assert!(load_path(&path, analysis_hash, OptTier::O0, &target).is_none());
+
+        write_pack(&path, OptTier::O0, &pack);
+        assert!(load_path(&path, [12; 20], OptTier::O0, &target).is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
     /// The first symbol is only the lookup key. A changed ordered group shape
     /// must miss so codegen emits fresh IR for the entire group.
     #[test]

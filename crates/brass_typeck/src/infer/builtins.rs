@@ -103,7 +103,7 @@ impl<'a> Checker<'a> {
         None
     }
 
-    /// `_plugin_[f]call_<t>(path, name, sig, payload...)`: the loader
+    /// `_plugin_[f]call_<t>(logical_id, name, sig, payload...)`: the loader
     /// synthesizes these with three leading string literals, but the builtin is
     /// nameable from user source, and the runtime reads each payload slot as
     /// the signature's type without re-checking it. A wrong slot is therefore
@@ -118,7 +118,7 @@ impl<'a> Checker<'a> {
     ) {
         if args.len() < 3 {
             self.errors.push(TypeError {
-                message: format!("`{name}` expects at least 3 arguments (path, name, sig)"),
+                message: format!("`{name}` expects at least 3 arguments (logical id, name, sig)"),
                 span,
             });
             for a in args {

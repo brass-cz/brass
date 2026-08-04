@@ -525,11 +525,11 @@ pub trait Codegen {
     fn flush(&mut self);
     /// A native-plugin call (`_plugin_[f]call_<t>`): `rt_name` is one of the
     /// `pp_plugin_call_{int,float,obj}` runtime symbols, picked by return
-    /// class. `strings` are the path/name/sig string objects; `args` are the
-    /// payload values with their MIR types, packed by the back end into i64
-    /// slots (floats bit-cast, objects as addresses) and passed as an array,
-    /// since the arity is per-plugin-function. The raw runtime return (i64 /
-    /// f64 / object pointer) is coerced to `ret` (see
+    /// class. `strings` are the logical-id/name/sig string objects; `args` are
+    /// the payload values with their MIR types, packed by the back end into
+    /// i64 slots (floats bit-cast, objects as addresses) and passed as an
+    /// array, since the arity is per-plugin-function. The raw runtime return
+    /// (i64 / f64 / object pointer) is coerced to `ret` (see
     /// `brass_runtime::plugin`).
     fn plugin_call(
         &mut self,
@@ -1564,7 +1564,7 @@ pub trait Codegen {
         name: &str,
         args: &[Operand],
     ) -> Self::Value {
-        // Native-plugin dispatch: three leading string operands (library path,
+        // Native-plugin dispatch: three leading string operands (logical id,
         // function name, encoded signature) then the payload arguments, whose
         // MIR types drive the slot packing. The runtime symbol is picked by
         // return class: scalars come back in an i64 (void/bool/int), floats in

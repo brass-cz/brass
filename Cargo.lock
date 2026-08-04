@@ -151,6 +151,7 @@ dependencies = [
  "brass_hir",
  "brass_metadata",
  "brass_parser",
+ "brass_plugin_host",
  "brass_resolve",
  "brass_typeck",
  "fxhash",

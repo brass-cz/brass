@@ -6,7 +6,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use brass_plugin_host::{CallFailure, Value, ValueType, call, fixture, load_manifest};
+use brass_plugin_host::{
+    CallFailure, Value, ValueType, call, call_registered, fixture, load_manifest, register_plugin,
+};
 
 /// A private copy of `lib` under `<tmp>/<name>/`, so a test may delete or
 /// overwrite it without disturbing the built artifact or another test.
@@ -113,6 +115,26 @@ fn calls_cross_the_boundary() {
     match call(&lib, "no_such_fn", &[]) {
         Err(CallFailure::Host(msg)) => assert!(msg.contains("no function"), "{msg}"),
         other => panic!("expected a host error, got {other:?}"),
+    }
+}
+
+/// Logical dispatch resolves through the process registry, while a missing
+/// identity is a distinct fatal handoff failure that names that identity.
+#[test]
+fn logical_identity_dispatches_and_reports_missing_registration() {
+    let lib = fixture::build_testlib();
+    register_plugin("tests.mathx", &lib).expect("register fixture");
+    assert_eq!(
+        call_registered("tests.mathx", "add", &[Value::Int(40), Value::Int(2)])
+            .expect("logical call"),
+        Value::Int(42)
+    );
+
+    match call_registered("tests.missing_plugin", "add", &[]) {
+        Err(CallFailure::Unregistered(message)) => {
+            assert!(message.contains("tests.missing_plugin"), "{message}")
+        }
+        other => panic!("expected an unregistered identity, got {other:?}"),
     }
 }
 

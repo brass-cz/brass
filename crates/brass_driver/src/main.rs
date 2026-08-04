@@ -685,9 +685,9 @@ fn reanchor_module_paths(
     search: &brass_resolve::SearchPaths,
 ) {
     for m in modules {
-        // Embedded modules (prelude, nested std) have no location to refresh,
-        // and a plugin wrapper's `_PATH` is its label -- its library is pinned
-        // by an Absolute stamp, so a hit means it did not move.
+        // Embedded modules (prelude, nested std) have no location to refresh.
+        // A plugin wrapper's `_PATH` is its stable logical label; its relocated
+        // library is resolved and registered separately by the plugin stamp.
         if m.is_prelude || m.path.first().is_some_and(|s| s == "core") {
             continue;
         }
@@ -3302,8 +3302,8 @@ fn check_front(
     let stopped = sched.as_deref().is_some_and(|s| s.interrupted());
     // Persist the clean analysis for the next run. Source stamps use the exact
     // parsed text; plugin stamps use the logical module path and current binary
-    // contents. The serialized module clone replaces plugin paths with stable
-    // import identities; loading resolves and injects real paths before
+    // contents. The serialized module clone normalizes wrappers to stable
+    // import identities; loading resolves and registers real paths before
     // lowering. Anything that cannot be stamped makes the build uncacheable.
     if brass_cache::enabled() && !stopped {
         let t = std::time::Instant::now();

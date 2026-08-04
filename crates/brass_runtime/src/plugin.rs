@@ -2,12 +2,12 @@
 //! symbols behind the `_plugin_[f]call_<t>` builtins the loader synthesizes
 //! (see `brass_resolve::plugin`).
 //!
-//! Every call carries the plugin library path, the plugin function name, and
-//! the encoded signature as string objects, plus the payload packed into
-//! 8-byte slots (integers as i64, bools 0/1, floats as raw bits, heap objects
-//! as addresses). The runtime decodes the slots per the signature, marshals
-//! through `brass_plugin_host` (which shares the front end's `dlopen`
-//! cache), and shapes the result:
+//! Every call carries the plugin's logical import identity, the plugin function
+//! name, and the encoded signature as string objects, plus the payload packed
+//! into 8-byte slots (integers as i64, bools 0/1, floats as raw bits, heap
+//! objects as addresses). The runtime resolves the identity through the
+//! process-wide front-end registry, decodes the slots per the signature,
+//! marshals through `brass_plugin_host`, and shapes the result:
 //!
 //! - `_int` returns void/bool/int results in an i64,
 //! - `_float` returns an f64,
@@ -23,8 +23,6 @@
 
 #[cfg(not(target_family = "wasm"))]
 mod real {
-    use std::path::Path;
-
     use brass_plugin_host::{CallFailure, Value, ValueType, parse_sig};
 
     use crate::alloc::{pp_arr_new, pp_str_const, typed_result, typed_result_err, typed_str};
@@ -120,13 +118,14 @@ mod real {
     /// content would cost a lock and a hash to save parsing a handful of
     /// self-delimiting characters.
     unsafe fn run(
-        path: *mut Header,
+        logical_id: *mut Header,
         name: *mut Header,
         sig: *mut Header,
         argv: *const i64,
         argc: i64,
     ) -> (Result<Value, CallFailure>, ValueType, bool) {
-        let (path, name, sig) = unsafe { (typed_str(path), typed_str(name), typed_str(sig)) };
+        let (logical_id, name, sig) =
+            unsafe { (typed_str(logical_id), typed_str(name), typed_str(sig)) };
         let (params, ret, fallible) = match parse_sig(sig) {
             Ok(decoded) => decoded,
             Err(e) => return (Err(CallFailure::Host(e)), ValueType::Void, false),
@@ -136,7 +135,7 @@ mod real {
             Err(e) => return (Err(CallFailure::Host(e)), ret, fallible),
         };
         (
-            brass_plugin_host::call(Path::new(path), name, &args),
+            brass_plugin_host::call_registered(logical_id, name, &args),
             ret,
             fallible,
         )
@@ -209,13 +208,13 @@ mod real {
     /// The string operands must be string objects and `argv` must hold `argc`
     /// slots matching the signature (generated code guarantees both).
     pub unsafe extern "C-unwind" fn pp_plugin_call_int(
-        path: *mut Header,
+        logical_id: *mut Header,
         name: *mut Header,
         sig: *mut Header,
         argv: *const i64,
         argc: i64,
     ) -> i64 {
-        match unsafe { run(path, name, sig, argv, argc) }.0 {
+        match unsafe { run(logical_id, name, sig, argv, argc) }.0 {
             Ok(v) => scalar(&v),
             Err(f) => pp_panic_str(f.message()),
         }
@@ -224,13 +223,13 @@ mod real {
     /// # Safety
     /// See [`pp_plugin_call_int`].
     pub unsafe extern "C-unwind" fn pp_plugin_call_float(
-        path: *mut Header,
+        logical_id: *mut Header,
         name: *mut Header,
         sig: *mut Header,
         argv: *const i64,
         argc: i64,
     ) -> f64 {
-        match unsafe { run(path, name, sig, argv, argc) }.0 {
+        match unsafe { run(logical_id, name, sig, argv, argc) }.0 {
             Ok(Value::Float(f)) => f,
             Ok(other) => pp_panic_str(&format!(
                 "plugin returned {other:?} where a float was typed"
@@ -242,13 +241,16 @@ mod real {
     /// # Safety
     /// See [`pp_plugin_call_int`].
     pub unsafe extern "C-unwind" fn pp_plugin_call_obj(
-        path: *mut Header,
+        logical_id: *mut Header,
         name: *mut Header,
         sig: *mut Header,
         argv: *const i64,
         argc: i64,
     ) -> *mut Header {
-        let (outcome, ret, fallible) = unsafe { run(path, name, sig, argv, argc) };
+        let (outcome, ret, fallible) = unsafe { run(logical_id, name, sig, argv, argc) };
+        if let Err(CallFailure::Unregistered(failure)) = &outcome {
+            pp_panic_str(failure);
+        }
         if !fallible {
             return match outcome {
                 Ok(v) => unsafe { heap_payload(v, &ret) },
@@ -271,8 +273,9 @@ mod real {
                     }
                 })
             },
-            // A fallible call surfaces every failure -- the plugin's own error
-            // or a host-contract break -- as a catchable `Err`.
+            // A fallible call surfaces the plugin's own error or a host
+            // contract break as a catchable `Err`. An unregistered identity
+            // was rejected above because no plugin call was attempted.
             Err(f) => unsafe { typed_result_err(f.message()) },
         }
     }
@@ -295,7 +298,7 @@ mod stub {
     /// # Safety
     /// Never returns.
     pub unsafe extern "C-unwind" fn pp_plugin_call_int(
-        _path: *mut Header,
+        _logical_id: *mut Header,
         _name: *mut Header,
         _sig: *mut Header,
         _argv: *const i64,
@@ -307,7 +310,7 @@ mod stub {
     /// # Safety
     /// Never returns.
     pub unsafe extern "C-unwind" fn pp_plugin_call_float(
-        _path: *mut Header,
+        _logical_id: *mut Header,
         _name: *mut Header,
         _sig: *mut Header,
         _argv: *const i64,
@@ -319,7 +322,7 @@ mod stub {
     /// # Safety
     /// Never returns.
     pub unsafe extern "C-unwind" fn pp_plugin_call_obj(
-        _path: *mut Header,
+        _logical_id: *mut Header,
         _name: *mut Header,
         _sig: *mut Header,
         _argv: *const i64,

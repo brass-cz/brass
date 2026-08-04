@@ -26,9 +26,9 @@
 //! -- so a cache survives the whole project moving. Native plugins are keyed
 //! by their canonical import path and binary contents. A hit resolves that
 //! import again under the current roots, rejects a cached plugin that was
-//! replaced or shadowed, and rewrites the cached wrapper to the library path
-//! it found. Any mismatch, short read, or decode error falls back to the full
-//! pipeline.
+//! replaced or shadowed, and registers the library it found under the stable
+//! identity already carried by the cached wrapper. Any mismatch, short read,
+//! or decode error falls back to the full pipeline.
 //!
 //! Known accepted limit: a cache whose module was served by an include-root
 //! source file does not re-judge whether a native plugin newly added under an
@@ -251,7 +251,8 @@ impl PluginStamp {
     }
 
     /// Resolve and validate the current library through ordinary import
-    /// precedence. A `.cz` source now shadowing the plugin is a cache miss.
+    /// precedence, then register it for runtime dispatch. A `.cz` source now
+    /// shadowing the plugin is a cache miss.
     fn resolve(&self, root: &Path, search: &brass_resolve::SearchPaths) -> Option<PathBuf> {
         let brass_resolve::ModuleFile::Plugin(library) =
             brass_resolve::resolve_module_file(root, search, &self.module)?
@@ -262,17 +263,19 @@ impl PluginStamp {
             return None;
         }
         let bytes = std::fs::read(&library).ok()?;
-        (sha1(&bytes) == self.sha1).then(|| {
+        let library = (sha1(&bytes) == self.sha1).then(|| {
             library
                 .canonicalize()
                 .unwrap_or_else(|_| library.to_path_buf())
-        })
+        })?;
+        brass_plugin_host::register_plugin(&self.module.join("."), &library).ok()?;
+        Some(library)
     }
 }
 
-/// Clone modules for serialization and replace every plugin wrapper's current
-/// library path with its stable import identity. Cache loading always resolves
-/// and injects a real path before the AST can reach lowering or execution.
+/// Clone modules for serialization and normalize every plugin wrapper to its
+/// stable import identity. Cache loading resolves and registers the current
+/// library path without changing the wrapper AST.
 pub fn modules_for_cache(
     modules: &[LoadedModule],
     plugins: &[PluginStamp],
@@ -280,10 +283,7 @@ pub fn modules_for_cache(
     let mut cached = modules.to_vec();
     for plugin in plugins {
         let module = cached.iter_mut().find(|m| m.path == plugin.module)?;
-        brass_resolve::reinject_plugin_path(
-            &mut module.ast,
-            &format!("@plugin:{}", plugin.module.join(".")),
-        );
+        brass_resolve::reinject_plugin_identity(&mut module.ast, &plugin.module.join("."));
     }
     Some(cached)
 }
@@ -488,7 +488,7 @@ pub fn load(
     let path = cache_path(entry);
     let bytes = std::fs::read(&path).ok()?;
     let body = decode_file(&bytes, &cache_tag(flavor)?)?;
-    let mut payload: Payload = postcard::from_bytes(body).ok()?;
+    let payload: Payload = postcard::from_bytes(body).ok()?;
     // The first dep must BE the file the user named: same length, same hash.
     // `still_valid` alone would only prove the recorded file exists somewhere.
     let entry_bytes = std::fs::read(entry).ok()?;
@@ -508,15 +508,14 @@ pub fn load(
         }
     }
     for plugin in &payload.plugins {
-        let Some(library) = plugin.resolve(&roots.entry_dir, search) else {
+        if plugin.resolve(&roots.entry_dir, search).is_none() {
             tracing::debug!(target: "brass::perf", "cache: plugin {} changed, ignoring {}", plugin.module.join("."), path.display());
             return None;
-        };
-        let module = payload
+        }
+        payload
             .modules
-            .iter_mut()
+            .iter()
             .find(|module| module.path == plugin.module)?;
-        brass_resolve::reinject_plugin_path(&mut module.ast, &library.display().to_string());
     }
     Some(LoadedPayload {
         payload,
@@ -734,7 +733,7 @@ pub fn save_context_bundle(id: &[u8; 20], bundle: &ContextBundle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_file, encode_file, shipped_context_dir_for};
+    use super::{FORMAT_VERSION, cache_tag, decode_file, encode_file, shipped_context_dir_for};
     use std::path::{Path, PathBuf};
 
     /// Framing accepts an intact body and rejects same-size corruption before
@@ -760,6 +759,24 @@ mod tests {
         for end in 0..encoded.len() {
             assert_eq!(decode_file(&encoded[..end], tag), None, "length {end}");
         }
+    }
+
+    /// Analysis caches are accepted only under the complete compiler identity
+    /// and format tag. A cache framed by an older compiler never reaches
+    /// postcard decoding, even when its body and checksum are intact.
+    #[test]
+    fn cache_frame_rejects_another_compiler_identity() {
+        let current = cache_tag("jit").expect("cache tag for test executable");
+        assert!(
+            current.starts_with(&format!(
+                "{}/{FORMAT_VERSION}/jit",
+                brass_metadata::compiler_tag()
+            )),
+            "cache tag omits compiler identity: {current}"
+        );
+        let obsolete = format!("obsolete-compiler/{FORMAT_VERSION}/jit");
+        let encoded = encode_file(&obsolete, b"old serialized wrapper AST");
+        assert_eq!(decode_file(&encoded, &current), None);
     }
 
     /// A distributed `bin/brass` resolves seeds from the sibling top-level

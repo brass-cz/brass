@@ -10,6 +10,7 @@ fxhash.workspace = true
 brass_parser.workspace = true
 brass_hir.workspace = true
 brass_resolve.workspace = true
+brass_plugin_host.workspace = true
 brass_typeck.workspace = true
 brass_metadata.workspace = true
 tracing.workspace = true

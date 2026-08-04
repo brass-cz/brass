@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use brass_plugin_host::{PluginFunction, PluginManifest, ValueType, fixture};
 use brass_resolve::plugin::{synthesize_plugin_module, synthesize_source};
-use brass_resolve::{inject_module_path, reinject_plugin_path};
+use brass_resolve::{inject_module_path, reinject_plugin_identity};
 
 /// A manifest holding one exported function of `name` taking no arguments and
 /// returning nothing, optionally documented.
@@ -30,11 +30,11 @@ fn manifest_of(names: &[&str], doc: Option<&str>) -> PluginManifest {
 
 /// The generated module is valid Brass source carrying, per plugin
 /// function: the Rust doc comment, a fully annotated signature, and a body
-/// forwarding to the `_plugin_call_*` builtin with path/name/signature.
+/// forwarding to the `_plugin_call_*` builtin with identity/name/signature.
 #[test]
 fn fixture_manifest_synthesizes_wrappers() {
     let lib = fixture::build_testlib();
-    let src = synthesize_plugin_module(&lib).expect("synthesize");
+    let src = synthesize_plugin_module(&lib, "plugins.mathx").expect("synthesize");
 
     // Doc comment and annotated signature, straight from the Rust source.
     assert!(src.contains("/**\nAdds two integers.\n*/"), "{src}");
@@ -43,7 +43,10 @@ fn fixture_manifest_synthesizes_wrappers() {
         "{src}"
     );
     // The body forwards to the int-returning builtin with the encoded sig.
-    assert!(src.contains("return _plugin_call_i(\""), "{src}");
+    assert!(
+        src.contains("return _plugin_call_i(\"plugins.mathx\""),
+        "{src}"
+    );
     assert!(src.contains("\"add\", \"ii:i\", a, b)"), "{src}");
 
     // A fallible function wraps through the fallible builtin and declares `!`.
@@ -101,40 +104,40 @@ fn fixture_manifest_synthesizes_wrappers() {
     brass_parser::parse(&src).expect("synthesized module parses");
 }
 
-/// A cached synthesized module keeps its spans but receives the library path
-/// found by the current machine's normal import resolution.
+/// A cached synthesized module keeps its spans while its dispatch operand is
+/// normalized to the canonical logical import identity.
 #[test]
-fn synthesized_wrapper_paths_can_be_reanchored() {
-    let src = synthesize_source(&manifest_of(&["run"], None), "/build/libprocess.so")
-        .expect("synthesize");
+fn synthesized_wrapper_identity_can_be_normalized() {
+    let src =
+        synthesize_source(&manifest_of(&["run"], None), "temporary.process").expect("synthesize");
     let mut ast = brass_parser::parse(&src).expect("parse synthesized module");
     inject_module_path(
         &mut ast,
-        "<plugin:/build/libprocess.so>",
+        "<plugin:temporary.process>",
         brass_parser::Span::new(0, 0),
     );
 
-    reinject_plugin_path(&mut ast, "/installed/libprocess.so");
+    reinject_plugin_identity(&mut ast, "plugins.process");
 
     let ast = format!("{ast:?}");
-    assert!(!ast.contains("/build/libprocess.so"), "{ast}");
-    assert!(ast.contains("/installed/libprocess.so"), "{ast}");
-    assert!(ast.contains("<plugin:/installed/libprocess.so>"), "{ast}");
+    assert!(!ast.contains("temporary.process"), "{ast}");
+    assert!(ast.contains("plugins.process"), "{ast}");
+    assert!(ast.contains("<plugin:plugins.process>"), "{ast}");
 }
 
-/// The library path is embedded in a Brass string literal, where `{` opens
-/// interpolation. A checkout under a `{`-containing directory must still
-/// synthesize a module that parses and names the right library.
+/// The resolved library path never enters synthesized source, even when its
+/// spelling would require Brass string-literal escaping.
 #[test]
-fn a_brace_in_the_library_path_is_escaped() {
+fn resolved_library_path_is_not_embedded() {
     let lib = fixture::build_testlib();
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("plug{in}s");
     fs::create_dir_all(&dir).expect("create the brace-named directory");
     let placed = dir.join(lib.file_name().expect("library file name"));
     fs::copy(&lib, &placed).expect("copy the library");
 
-    let src = synthesize_plugin_module(&placed).expect("synthesize");
-    assert!(src.contains("plug\\{in}s"), "{src}");
+    let src = synthesize_plugin_module(&placed, "plugins.mathx").expect("synthesize");
+    assert!(!src.contains(&placed.display().to_string()), "{src}");
+    assert!(src.contains("plugins.mathx"), "{src}");
     brass_parser::parse(&src).expect("synthesized module parses");
 }
 

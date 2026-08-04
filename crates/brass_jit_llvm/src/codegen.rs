@@ -2987,7 +2987,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
                 other => panic!("unsupported plugin argument value {other:?}"),
             }
         }
-        // pp_plugin_call_{int,float,obj}(path, name, sig, argv, argc).
+        // pp_plugin_call_{int,float,obj}(logical_id, name, sig, argv, argc).
         let ptys: Vec<inkwell::types::BasicMetadataTypeEnum> = vec![
             self.abi.ptr().into(),
             self.abi.ptr().into(),

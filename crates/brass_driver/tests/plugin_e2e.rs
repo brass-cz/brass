@@ -109,11 +109,8 @@ fn plugin_import_runs_on_the_interpreter() {
 #[cfg(feature = "jit")]
 #[test]
 fn plugin_return_type_mismatch_aborts_cleanly() {
-    let (dir, lib) = project_dir_with("plugin_bad_return", "");
-    let src = format!(
-        "fun main() {{\n    let b = _plugin_call_y(\"{}\", \"repeat\", \"si:y\", \"a\", 1)\n    println(len(b))\n}}\n",
-        lib.display()
-    );
+    let (dir, _) = project_dir_with("plugin_bad_return", "");
+    let src = "import plugins.mathx\n\nfun main() {\n    let b = _plugin_call_y(\"plugins.mathx\", \"repeat\", \"si:y\", \"a\", 1)\n    println(len(b))\n}\n";
     fs::write(dir.join("main.cz"), src).expect("rewrite main.cz");
 
     let (ok, stdout, stderr) = run(&[], &dir);
@@ -122,6 +119,27 @@ fn plugin_return_type_mismatch_aborts_cleanly() {
         stderr.contains("plugin returned Str(\"a\") where Bytes was typed"),
         "stderr:\n{stderr}"
     );
+}
+
+/// A logical identity absent from the front-end registry is a fatal handoff
+/// error on both execution back ends, even though the builtin is fallible.
+#[test]
+fn missing_logical_plugin_registration_is_fatal_on_both_backends() {
+    let (dir, _) = project_dir_with("plugin_missing_registration", "");
+    fs::write(
+        dir.join("main.cz"),
+        "fun main() {\n    let ignored = _plugin_fcall_i(\"plugins.not_imported\", \"add\", \"ii:i!\", 1, 2)\n    println(ignored)\n}\n",
+    )
+    .expect("write missing-registration program");
+
+    for args in [&[][..], &["repl"][..]] {
+        let (ok, stdout, stderr) = run(args, &dir);
+        assert!(!ok, "missing registration must abort; stdout:\n{stdout}");
+        assert!(
+            stderr.contains("plugin `plugins.not_imported` is not registered"),
+            "stderr:\n{stderr}"
+        );
+    }
 }
 
 /// A rebuilt plugin library must invalidate the analysis cache: the cached

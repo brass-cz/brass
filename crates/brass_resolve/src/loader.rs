@@ -392,46 +392,46 @@ pub fn reinject_module_path(ast: &mut Module, location: &str) {
     }
 }
 
-/// Replace the library operand in every synthesized plugin forwarding call,
-/// preserving all spans and therefore every cached checker channel keyed by
-/// them. The caller has already identified `ast` as a plugin module; ordinary
-/// source modules are never rewritten by this operation.
-pub fn reinject_plugin_path(ast: &mut Module, library: &str) {
-    reinject_module_path(ast, &format!("<plugin:{library}>"));
+/// Replace the logical identity operand in every synthesized plugin forwarding
+/// call, preserving all spans and therefore every cached checker channel keyed
+/// by them. The caller has already identified `ast` as a plugin module;
+/// ordinary source modules are never rewritten by this operation.
+pub fn reinject_plugin_identity(ast: &mut Module, logical_id: &str) {
+    reinject_module_path(ast, &format!("<plugin:{logical_id}>"));
     for item in &mut ast.items {
         if let TopLevel::Fun(fun) = item {
-            reinject_plugin_path_block(&mut fun.body, library);
+            reinject_plugin_identity_block(&mut fun.body, logical_id);
         }
     }
 }
 
-fn reinject_plugin_path_block(block: &mut brass_parser::ast::Block, library: &str) {
+fn reinject_plugin_identity_block(block: &mut brass_parser::ast::Block, logical_id: &str) {
     for stmt in &mut block.stmts {
         match stmt {
             Stmt::Let {
                 value: Some(value), ..
-            } => reinject_plugin_path_expr(value, library),
+            } => reinject_plugin_identity_expr(value, logical_id),
             Stmt::Assign { target, value, .. } => {
-                reinject_plugin_path_expr(target, library);
-                reinject_plugin_path_expr(value, library);
+                reinject_plugin_identity_expr(target, logical_id);
+                reinject_plugin_identity_expr(value, logical_id);
             }
             Stmt::Expr(expr) | Stmt::Return(Some(expr), _) => {
-                reinject_plugin_path_expr(expr, library)
+                reinject_plugin_identity_expr(expr, logical_id)
             }
             Stmt::While { cond, body, .. } => {
-                reinject_plugin_path_expr(cond, library);
-                reinject_plugin_path_block(body, library);
+                reinject_plugin_identity_expr(cond, logical_id);
+                reinject_plugin_identity_block(body, logical_id);
             }
             Stmt::For { iter, body, .. } => {
-                reinject_plugin_path_expr(iter, library);
-                reinject_plugin_path_block(body, library);
+                reinject_plugin_identity_expr(iter, logical_id);
+                reinject_plugin_identity_block(body, logical_id);
             }
             _ => {}
         }
     }
 }
 
-fn reinject_plugin_path_expr(expr: &mut Expr, library: &str) {
+fn reinject_plugin_identity_expr(expr: &mut Expr, logical_id: &str) {
     match expr {
         Expr::Call(callee, args, _) => {
             if let Expr::Ident(name, _) = &**callee
@@ -440,55 +440,55 @@ fn reinject_plugin_path_expr(expr: &mut Expr, library: &str) {
                     expr: Expr::Str(segments, _),
                 }) = args.first_mut()
             {
-                *segments = vec![StrSeg::Lit(library.to_string())];
+                *segments = vec![StrSeg::Lit(logical_id.to_string())];
             }
-            reinject_plugin_path_expr(callee, library);
+            reinject_plugin_identity_expr(callee, logical_id);
             for arg in args {
-                reinject_plugin_path_expr(&mut arg.expr, library);
+                reinject_plugin_identity_expr(&mut arg.expr, logical_id);
             }
         }
         Expr::Field(base, _, _) | Expr::Unary(_, base, _) | Expr::ErrorProp(base, _) => {
-            reinject_plugin_path_expr(base, library)
+            reinject_plugin_identity_expr(base, logical_id)
         }
         Expr::Binary(_, left, right, _)
         | Expr::Index(left, right, _)
         | Expr::Range(left, right, _) => {
-            reinject_plugin_path_expr(left, library);
-            reinject_plugin_path_expr(right, library);
+            reinject_plugin_identity_expr(left, logical_id);
+            reinject_plugin_identity_expr(right, logical_id);
         }
         Expr::Array(items, _) => items
             .iter_mut()
-            .for_each(|item| reinject_plugin_path_expr(item, library)),
+            .for_each(|item| reinject_plugin_identity_expr(item, logical_id)),
         Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => fields
             .iter_mut()
-            .for_each(|(_, value)| reinject_plugin_path_expr(value, library)),
+            .for_each(|(_, value)| reinject_plugin_identity_expr(value, logical_id)),
         Expr::Str(segments, _) => segments.iter_mut().for_each(|segment| {
             if let StrSeg::Expr(expr) = segment {
-                reinject_plugin_path_expr(expr, library);
+                reinject_plugin_identity_expr(expr, logical_id);
             }
         }),
         Expr::If(cond, then, otherwise, _) => {
-            reinject_plugin_path_expr(cond, library);
-            reinject_plugin_path_block(then, library);
+            reinject_plugin_identity_expr(cond, logical_id);
+            reinject_plugin_identity_block(then, logical_id);
             if let Some(otherwise) = otherwise {
-                reinject_plugin_path_expr(otherwise, library);
+                reinject_plugin_identity_expr(otherwise, logical_id);
             }
         }
         Expr::IfLet(_, scrutinee, then, otherwise, _) => {
-            reinject_plugin_path_expr(scrutinee, library);
-            reinject_plugin_path_block(then, library);
+            reinject_plugin_identity_expr(scrutinee, logical_id);
+            reinject_plugin_identity_block(then, logical_id);
             if let Some(otherwise) = otherwise {
-                reinject_plugin_path_expr(otherwise, library);
+                reinject_plugin_identity_expr(otherwise, logical_id);
             }
         }
         Expr::Match(scrutinee, arms, _) => {
-            reinject_plugin_path_expr(scrutinee, library);
+            reinject_plugin_identity_expr(scrutinee, logical_id);
             for arm in arms {
-                reinject_plugin_path_expr(&mut arm.body, library);
+                reinject_plugin_identity_expr(&mut arm.body, logical_id);
             }
         }
-        Expr::Block(block, _) => reinject_plugin_path_block(block, library),
-        Expr::Closure(_, body, _) => reinject_plugin_path_expr(body, library),
+        Expr::Block(block, _) => reinject_plugin_identity_block(block, logical_id),
+        Expr::Closure(_, body, _) => reinject_plugin_identity_expr(body, logical_id),
         _ => {}
     }
 }
@@ -501,7 +501,9 @@ fn reinject_plugin_path_expr(expr: &mut Expr, library: &str) {
 pub fn module_source(root: &Path, search: &SearchPaths, segs: &[String]) -> Option<String> {
     match find_module_file(root, search, segs)? {
         ModuleFile::Source(file) => std::fs::read_to_string(file).ok(),
-        ModuleFile::Plugin(lib) => crate::plugin::synthesize_plugin_module(&lib).ok(),
+        ModuleFile::Plugin(lib) => {
+            crate::plugin::synthesize_plugin_module(&lib, &segs.join(".")).ok()
+        }
     }
 }
 
@@ -724,7 +726,7 @@ fn load_module(path: &[String], trigger_span: Span, context: &mut LoadContext<'_
         // (`plugins/math.so` for `import plugins.math`), as a module
         // synthesized from the plugin's manifest.
         Some(ModuleFile::Plugin(lib)) => {
-            match crate::plugin::synthesize_plugin_module(&lib) {
+            match crate::plugin::synthesize_plugin_module(&lib, &key) {
                 Ok(src) => load_synthesized(
                     &lib,
                     src,
@@ -832,7 +834,7 @@ fn load_synthesized(
     trigger_span: Span,
     errors: &mut Vec<LoadError>,
 ) {
-    let label = format!("<plugin:{}>", lib.display());
+    let label = format!("<plugin:{}>", path.join("."));
     // The library file is registered as this entry's path so the analysis
     // cache stamps the `.so` itself: a rebuilt plugin (new manifest, new
     // native code) must invalidate a cache whose wrapper was synthesized from

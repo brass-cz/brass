@@ -1,11 +1,13 @@
 //! Host side of Brass's native plugin ABI (see the `brass_plugin` crate
 //! for the plugin side and the ABI contract).
 //!
-//! Loading is process-global and cached by library path: the front end reads a
-//! plugin's manifest while resolving an `import`, and the runtime later calls
-//! into the same loaded library, sharing one `dlopen` handle. A loaded plugin
-//! stays loaded for the life of the process (unloading a library whose code may
-//! still be referenced is never safe), including one a rebuild superseded.
+//! Loading is process-global. The front end registers each plugin's stable
+//! logical import identity with the absolute library path it resolved, and the
+//! runtime uses that identity to find the library. The `dlopen` cache remains
+//! keyed by library path, so the front end and runtime share one handle without
+//! embedding a machine-specific path in generated code. A loaded plugin stays
+//! loaded for the life of the process (unloading a library whose code may still
+//! be referenced is never safe), including one a rebuild superseded.
 //!
 //! The two roles treat the cache differently, deliberately:
 //!
@@ -19,8 +21,9 @@
 //! an import of a plugin executes it -- the same trust boundary as running
 //! the program that imports it.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub use brass_plugin::{Bytes, Value, ValueType};
 
@@ -60,14 +63,58 @@ pub enum CallFailure {
     /// The host/plugin contract broke (library missing, function missing,
     /// arity drift after a rebuild). A bug or a stale binary, not a value.
     Host(String),
+    /// Generated code named a logical plugin identity the front end did not
+    /// register in this process. This is always fatal, even for a fallible
+    /// plugin function, because no plugin call was attempted.
+    Unregistered(String),
 }
 
 impl CallFailure {
     pub fn message(&self) -> &str {
         match self {
-            CallFailure::Plugin(m) | CallFailure::Host(m) => m,
+            CallFailure::Plugin(m) | CallFailure::Host(m) | CallFailure::Unregistered(m) => m,
         }
     }
+}
+
+fn plugin_registry() -> &'static Mutex<HashMap<String, PathBuf>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register the absolute library currently serving `logical_id`.
+///
+/// The front end calls this after ordinary import resolution, both for a fresh
+/// module load and when validating a cached module. Re-registering an identity
+/// replaces its path, which lets a long-lived language server or REPL follow a
+/// project or toolchain that moved between analyses.
+pub fn register_plugin(logical_id: &str, path: &Path) -> Result<(), String> {
+    if logical_id.is_empty() {
+        return Err("cannot register a plugin with an empty logical identity".to_string());
+    }
+    let absolute = path.canonicalize().map_err(|e| {
+        format!(
+            "cannot register plugin `{logical_id}` from `{}`: {e}",
+            path.display()
+        )
+    })?;
+    plugin_registry()
+        .lock()
+        .expect("plugin registry lock poisoned")
+        .insert(logical_id.to_string(), absolute);
+    Ok(())
+}
+
+/// The absolute library registered for `logical_id` in this process.
+///
+/// This is exposed for front-end diagnostics and tests. Runtime dispatch should
+/// use [`call_registered`] so a missing identity has one consistent error.
+pub fn registered_plugin_path(logical_id: &str) -> Option<PathBuf> {
+    plugin_registry()
+        .lock()
+        .expect("plugin registry lock poisoned")
+        .get(logical_id)
+        .cloned()
 }
 
 /// The manifest of the plugin library at `path`, revalidated against the file.
@@ -89,6 +136,21 @@ pub fn load_manifest(path: &Path) -> Result<Arc<PluginManifest>, String> {
 /// or rebuilt. Contrast [`load_manifest`], which revalidates.
 pub fn call(path: &Path, name: &str, args: &[Value]) -> Result<Value, CallFailure> {
     imp::call(path, name, args)
+}
+
+/// Call `name` in the library registered for the stable `logical_id`.
+///
+/// A missing identity is [`CallFailure::Unregistered`] and names the identity
+/// in its message. Back ends treat that variant as fatal even when the plugin
+/// function's declared return is fallible; it indicates a broken front-end /
+/// runtime handoff rather than an error returned by the plugin.
+pub fn call_registered(logical_id: &str, name: &str, args: &[Value]) -> Result<Value, CallFailure> {
+    let path = registered_plugin_path(logical_id).ok_or_else(|| {
+        CallFailure::Unregistered(format!(
+            "plugin `{logical_id}` is not registered; resolve its import before execution"
+        ))
+    })?;
+    call(&path, name, args)
 }
 
 /// Decode a signature string (`"ii:i!"`, as carried by the manifest and by

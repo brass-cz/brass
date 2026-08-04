@@ -922,6 +922,11 @@ fn plugin_functions_hover_and_complete() {
     assert!(labels.contains(&"add".to_string()), "{labels:?}");
     assert!(labels.contains(&"checked_div".to_string()), "{labels:?}");
     assert!(labels.contains(&"undocumented".to_string()), "{labels:?}");
+    assert_eq!(
+        brass_plugin_host::registered_plugin_path("plugins.mathx"),
+        Some(target.canonicalize().expect("canonical plugin path")),
+        "czls analysis registers the logical plugin identity"
+    );
     // The library stays mapped for the process's life, but the directory holding
     // it need not: nothing reopens it by path after this point.
     let _ = std::fs::remove_dir_all(&root);

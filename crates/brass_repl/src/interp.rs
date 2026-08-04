@@ -455,12 +455,12 @@ impl<'p, 'm> Interp<'p, 'm> {
         }
     }
 
-    /// `_plugin_[f]call_<t>`: a native-plugin call. The three leading
-    /// operands are the library path, the plugin function name, and the
-    /// encoded signature; the payload operands evaluate and convert per the
-    /// signature's parameter types, and the call marshals through the shared
-    /// plugin host. A fallible call shapes into a `Result` value; a failing
-    /// infallible call is a runtime error like the other unsupported paths.
+    /// `_plugin_[f]call_<t>`: a native-plugin call. The three leading operands
+    /// are the logical plugin identity, function name, and encoded signature;
+    /// the payload operands evaluate and convert per the signature's parameter
+    /// types, and the call marshals through the shared plugin host. A fallible
+    /// call shapes into a `Result` value; a failing infallible call is a runtime
+    /// error like the other unsupported paths.
     fn eval_plugin_call(
         &mut self,
         f: &MonoFunction,
@@ -470,7 +470,7 @@ impl<'p, 'm> Interp<'p, 'm> {
         if args.len() < 3 {
             return Err("malformed plugin call".into());
         }
-        let path = self.eval_operand(f, frame, &args[0], &Type::Str)?;
+        let logical_id = self.eval_operand(f, frame, &args[0], &Type::Str)?;
         let name = self.eval_operand(f, frame, &args[1], &Type::Str)?;
         let sig = self.eval_operand(f, frame, &args[2], &Type::Str)?;
         let (params, _, fallible) = brass_plugin_host::parse_sig(sig.as_str())?;
@@ -494,16 +494,14 @@ impl<'p, 'm> Interp<'p, 'm> {
             let v = self.eval_operand(f, frame, op, mir_ty)?;
             plugin_args.push(to_plugin_value(t, &v)?);
         }
-        let outcome = brass_plugin_host::call(
-            std::path::Path::new(path.as_str()),
-            name.as_str(),
-            &plugin_args,
-        );
+        let outcome =
+            brass_plugin_host::call_registered(logical_id.as_str(), name.as_str(), &plugin_args);
         match outcome {
             Ok(v) => {
                 let value = from_plugin_value(v);
                 Ok(if fallible { result_ok(value) } else { value })
             }
+            Err(brass_plugin_host::CallFailure::Unregistered(message)) => Err(message),
             Err(fail) if fallible => Ok(result_err(fail.message())),
             Err(fail) => Err(fail.message().to_string()),
         }
@@ -807,8 +805,8 @@ impl<'p, 'm> Interp<'p, 'm> {
                     Err(e) => Ok(result_err(&e.to_string())),
                 }
             }
-            // Native-plugin dispatch (`_plugin_[f]call_<t>(path, name, sig,
-            // payload...)`): evaluate per the encoded signature, marshal
+            // Native-plugin dispatch (`_plugin_[f]call_<t>(logical_id, name,
+            // sig, payload...)`): evaluate per the encoded signature, marshal
             // through the shared plugin host, and shape the result. On a
             // platform without plugin support the host's failure surfaces
             // like the other unsupported primitives.
