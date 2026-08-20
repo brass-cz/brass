@@ -1780,3 +1780,124 @@ fn cycle_collector_reclaims_data_owned_by_cycle() {
         "the cycle is reclaimed (only the interned literal remains)"
     );
 }
+
+/// Full-width numeric values render without introducing an LLVM width change.
+#[test]
+fn full_width_numbers_render() {
+    let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let src = "fun render() -> int64 {\n\
+               \x20 let a: int64 = -12\n\
+               \x20 let b: uint64 = 34\n\
+               \x20 let c: float64 = 1.5\n\
+               \x20 let text = \"{a},{b},{c}\"\n\
+               \x20 return len(text)\n\
+               }\n\
+               fun main() {\n}\n";
+    let ast = brass_parser::parse(src).expect("parse");
+    let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
+        path: vec!["main".into()],
+        ast,
+    }]);
+    assert!(errors.is_empty(), "lower: {errors:?}");
+    let mir = lower_program(&program);
+    let mono = monomorphize(&mir, &program).expect("monomorphize");
+    let ctx = Context::create();
+    let mut backend = LlvmCodegen::new_backend(&ctx, &program);
+    Engine::run(&mut backend, &mono).expect("engine run");
+    assert_eq!(backend.run_entry_i64("render"), Some(10));
+}
+
+/// Tuple destruction releases managed elements at their layout offsets.
+#[test]
+fn rc_recursive_tuple_releases_managed_elements() {
+    let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let src = "fun build() -> int32 {\n\
+               \x20 let pair = [string.from(7), 9]\n\
+               \x20 return pair[1]\n\
+               }\n\
+               fun main() {\n}\n";
+    let ast = brass_parser::parse(src).expect("parse");
+    let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
+        path: vec!["main".into()],
+        ast,
+    }]);
+    assert!(errors.is_empty(), "lower: {errors:?}");
+    let mir = lower_program(&program);
+    let mono = monomorphize(&mir, &program).expect("monomorphize");
+    let ctx = Context::create();
+    let mut backend = LlvmCodegen::new_backend(&ctx, &program);
+    Engine::run(&mut backend, &mono).expect("engine run");
+
+    let before = brass_runtime::mem::pp_live_blocks();
+    assert_eq!(backend.run_entry_i32("build"), Some(9));
+    let after = brass_runtime::mem::pp_live_blocks();
+    assert_eq!(after, before, "tuple and its managed element are reclaimed");
+}
+
+/// Repeated aggregate rendering does not retain superseded string results.
+#[test]
+fn aggregate_rendering_releases_intermediate_strings() {
+    let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let src = "type Inner = { value: int32 }\n\
+               type Outer = { inner: Inner, values: int32[] }\n\
+               fun render() -> int64 {\n\
+               \x20 let outer = Outer { inner: Inner { value: 7 }, values: [1, 2, 3] }\n\
+               \x20 let text = \"{outer}\"\n\
+               \x20 return len(text)\n\
+               }\n\
+               fun main() {\n}\n";
+    let ast = brass_parser::parse(src).expect("parse");
+    let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
+        path: vec!["main".into()],
+        ast,
+    }]);
+    assert!(errors.is_empty(), "lower: {errors:?}");
+    let mir = lower_program(&program);
+    let mono = monomorphize(&mir, &program).expect("monomorphize");
+    let ctx = Context::create();
+    let mut backend = LlvmCodegen::new_backend(&ctx, &program);
+    Engine::run(&mut backend, &mono).expect("engine run");
+
+    let expected = backend.run_entry_i64("render").expect("render result");
+    let warmed = brass_runtime::mem::pp_live_blocks();
+    for _ in 0..8 {
+        assert_eq!(backend.run_entry_i64("render"), Some(expected));
+    }
+    assert_eq!(
+        brass_runtime::mem::pp_live_blocks(),
+        warmed,
+        "aggregate rendering has stable live storage"
+    );
+}
+
+/// Sum constructions participate in tracing recursive payload links.
+#[test]
+fn cycle_collector_reclaims_sum_cycle() {
+    let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let src = "type Link =\n  | Node { next: Link? }\n  | End\n\
+               fun main() {\n\
+               \x20 let link = Link.Node { next: null }\n\
+               \x20 link.next = link\n\
+               }\n";
+    let ast = brass_parser::parse(src).expect("parse");
+    let (program, errors) = lower(&[LoadedModule {
+        is_prelude: false,
+        path: vec!["main".into()],
+        ast,
+    }]);
+    assert!(errors.is_empty(), "lower: {errors:?}");
+    let mir = lower_program(&program);
+    let mono = monomorphize(&mir, &program).expect("monomorphize");
+    let ctx = Context::create();
+    let mut backend = LlvmCodegen::new_backend(&ctx, &program);
+    let before = brass_runtime::mem::pp_live_blocks();
+    Engine::run(&mut backend, &mono).expect("engine run");
+    assert_eq!(
+        brass_runtime::mem::pp_live_blocks(),
+        before,
+        "the recursive sum is reclaimed"
+    );
+}

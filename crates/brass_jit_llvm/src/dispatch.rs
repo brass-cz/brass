@@ -84,6 +84,18 @@ thread_local! {
     static CURRENT: Cell<*mut ()> = const { Cell::new(ptr::null_mut()) };
 }
 
+/// Restores a thread-local service slot when a scoped installation ends.
+struct SlotRestore {
+    slot: &'static std::thread::LocalKey<Cell<*mut ()>>,
+    previous: *mut (),
+}
+
+impl Drop for SlotRestore {
+    fn drop(&mut self) {
+        self.slot.with(|slot| slot.set(self.previous));
+    }
+}
+
 /// Install `dispatcher` as this thread's dispatch service for the duration of
 /// `body` (running `main`), so [`pp_resolve`] reaches it. The raw pointer is valid
 /// only within `body`; `body` must not otherwise touch `dispatcher` (the
@@ -91,9 +103,11 @@ thread_local! {
 pub fn with_dispatcher<R>(dispatcher: &mut RuntimeDispatcher, body: impl FnOnce() -> R) -> R {
     let ptr = dispatcher as *mut RuntimeDispatcher as *mut ();
     let prev = CURRENT.with(|c| c.replace(ptr));
-    let out = body();
-    CURRENT.with(|c| c.set(prev));
-    out
+    let _restore = SlotRestore {
+        slot: &CURRENT,
+        previous: prev,
+    };
+    body()
 }
 
 /// Deferred-site addresses already resolved, readable from ANY thread. A
@@ -110,6 +124,30 @@ static RESOLVED: std::sync::LazyLock<std::sync::RwLock<fxhash::FxHashMap<String,
 pub fn prime_resolved(symbol: &str, addr: usize) {
     if let Ok(mut map) = RESOLVED.write() {
         map.insert(symbol.to_string(), addr);
+    }
+}
+
+/// Owns the resolved-address cache for one JIT execution session.
+pub struct ResolvedSession {
+    _private: (),
+}
+
+/// Start a resolved-address session, discarding entries from any prior run.
+pub fn resolved_session() -> ResolvedSession {
+    clear_resolved();
+    ResolvedSession { _private: () }
+}
+
+impl Drop for ResolvedSession {
+    fn drop(&mut self) {
+        clear_resolved();
+    }
+}
+
+/// End the current execution session's resolved-address scope.
+pub(crate) fn clear_resolved() {
+    if let Ok(mut map) = RESOLVED.write() {
+        map.clear();
     }
 }
 
@@ -146,9 +184,11 @@ pub(crate) fn with_deferred_resolver<'ctx, 'p, R>(
             as *mut (),
     };
     let prev = CURRENT_DEFERRED.with(|c| c.replace(&mut slot as *mut DeferredSlot as *mut ()));
-    let out = body();
-    CURRENT_DEFERRED.with(|c| c.set(prev));
-    out
+    let _restore = SlotRestore {
+        slot: &CURRENT_DEFERRED,
+        previous: prev,
+    };
+    body()
 }
 
 /// The dispatch trampoline generated code calls: resolve-or-
@@ -272,9 +312,37 @@ mod tests {
             42
         );
 
+        // Scoped dispatcher slots return to their prior state after unwinding.
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_dispatcher(&mut dispatcher, || panic!("test unwind"));
+        }));
+        assert!(unwind.is_err());
+
         // No service installed -> the trampoline reports a failed dispatch (0).
         let miss = unsafe { pp_resolve(get_age.as_ptr(), get_age.len(), ty.as_ptr(), ty.len()) };
         assert_eq!(miss, 0, "no dispatcher installed -> 0");
+
+        drop(dispatcher);
+        let mut resolve = |_: &mut LlvmCodegen<'_, '_>, _: &str| 0;
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_deferred_resolver(&mut backend, &mut resolve, || panic!("test unwind"));
+        }));
+        assert!(unwind.is_err());
+        assert!(CURRENT_DEFERRED.with(|slot| slot.get().is_null()));
+    }
+
+    /// Resolved entries belong to one execution session and can be drained
+    /// before the session's engine is released.
+    #[test]
+    fn resolved_entries_are_session_scoped() {
+        let symbol = "__dispatch_session_scope_test";
+        let session = resolved_session();
+        prime_resolved(symbol, 17);
+        let found = unsafe { pp_resolve(symbol.as_ptr(), symbol.len(), ptr::null(), 0) };
+        assert_eq!(found, 17);
+        drop(session);
+        let missing = unsafe { pp_resolve(symbol.as_ptr(), symbol.len(), ptr::null(), 0) };
+        assert_eq!(missing, 0);
     }
 
     /// Deferred monomorphization from a *structural* descriptor: the

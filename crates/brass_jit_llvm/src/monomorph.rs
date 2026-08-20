@@ -1,13 +1,11 @@
 //! Symbol mangling and the compiled-function cache.
 //!
-//! Each callable is compiled once against the uniform tagged-value ABI
-//! (`layout::Abi::fn_type`), so a single body serves every concrete type and this
-//! "monomorphization cache" is a name -> LLVM-function map; the deferred path is
-//! realized by runtime tag dispatch rather than per-type recompilation. Typed
-//! monomorphization is the target backend; the uniform ABI is a compatibility
-//! layer to be retired or restricted to dynamic/builtin boundaries. The mangling
-//! is shared with the driver so it can resolve each symbol's JIT address for the
-//! runtime dispatch tables.
+//! Each callable instance is compiled with the concrete, unboxed LLVM parameter
+//! and return types selected by monomorphization. Distinct type arguments have
+//! distinct instance symbols and function bodies; deferred calls materialize the
+//! matching typed instance when its runtime boundary type becomes known. The
+//! mangling is shared with the driver so it can resolve those instance symbols in
+//! the active JIT session.
 
 use fxhash::FxHashMap as HashMap;
 

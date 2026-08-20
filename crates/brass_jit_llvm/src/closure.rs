@@ -124,11 +124,6 @@ fn each_closure_expr(e: &Expr, f: &mut impl FnMut(&[Param], &Block)) {
             f(params, b);
         } else {
             // Expression-bodied closure: wrap as a single-return block view.
-            let mut refs = Block {
-                stmts: vec![],
-                span: e.span(),
-            };
-            let _ = &mut refs;
             f(
                 params,
                 &Block {
@@ -189,7 +184,7 @@ fn idents_expr(e: &Expr, out: &mut HashSet<String>) {
 fn walk_subexprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
     match e {
         Expr::Unary(_, a, _) | Expr::Field(a, _, _) | Expr::ErrorProp(a, _) => f(a),
-        Expr::Binary(_, a, b, _) | Expr::Index(a, b, _) => {
+        Expr::Binary(_, a, b, _) | Expr::Index(a, b, _) | Expr::Range(a, b, _) => {
             f(a);
             f(b);
         }

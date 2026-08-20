@@ -2817,6 +2817,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
     let codegen_started = std::time::Instant::now();
     let context = inkwell::context::Context::create();
     let mut backend = brass_jit_llvm::LlvmCodegen::new_backend(&context, &program);
+    let _resolved_session = brass_jit_llvm::resolved_session();
     backend.begin_program(&mono);
     backend.codegen_program(&mono);
     tracing::debug!(

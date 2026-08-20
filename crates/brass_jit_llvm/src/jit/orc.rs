@@ -37,7 +37,7 @@ use llvm_sys::orc2::{
     LLVMOrcCreateNewThreadSafeContextFromLLVMContext, LLVMOrcCreateNewThreadSafeModule,
     LLVMOrcDisposeIndirectStubsManager, LLVMOrcDisposeLazyCallThroughManager,
     LLVMOrcDisposeMaterializationResponsibility, LLVMOrcDisposeMaterializationUnit,
-    LLVMOrcDisposeSymbols, LLVMOrcDisposeThreadSafeContext, LLVMOrcDisposeThreadSafeModule,
+    LLVMOrcDisposeSymbols, LLVMOrcDisposeThreadSafeContext,
     LLVMOrcExecutionSessionSetErrorReporter, LLVMOrcIRTransformLayerEmit,
     LLVMOrcIRTransformLayerSetTransform, LLVMOrcIndirectStubsManagerRef, LLVMOrcJITDylibDefine,
     LLVMOrcJITDylibRef, LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine,
@@ -456,12 +456,58 @@ pub(crate) struct OrcJit {
     state: Box<MaterializerState>,
 }
 
+/// Owns the helpers created before an [`OrcJit`] has all of its required
+/// resources. Releasing it transfers the complete set to the finished session.
+struct OrcConstruction {
+    jit: LLVMOrcLLJITRef,
+    stubs: LLVMOrcIndirectStubsManagerRef,
+    call_through: LLVMOrcLazyCallThroughManagerRef,
+}
+
+impl OrcConstruction {
+    fn release(
+        mut self,
+    ) -> (
+        LLVMOrcLLJITRef,
+        LLVMOrcIndirectStubsManagerRef,
+        LLVMOrcLazyCallThroughManagerRef,
+    ) {
+        let helpers = (self.jit, self.stubs, self.call_through);
+        self.jit = ptr::null_mut();
+        self.stubs = ptr::null_mut();
+        self.call_through = ptr::null_mut();
+        helpers
+    }
+}
+
+impl Drop for OrcConstruction {
+    fn drop(&mut self) {
+        // SAFETY: every non-null handle is still owned by this construction.
+        unsafe {
+            if !self.stubs.is_null() {
+                LLVMOrcDisposeIndirectStubsManager(self.stubs);
+            }
+            if !self.call_through.is_null() {
+                LLVMOrcDisposeLazyCallThroughManager(self.call_through);
+            }
+            if !self.jit.is_null() {
+                let _ = LLVMOrcDisposeLLJIT(self.jit);
+            }
+        }
+    }
+}
+
 impl OrcJit {
     pub(crate) fn new(context: &OrcContext) -> Result<Self, String> {
         Target::initialize_native(&InitializationConfig::default())
             .map_err(|error| format!("failed to initialize native LLVM target: {error}"))?;
 
         let jit = create_jit(OptTier::from_env())?;
+        let mut construction = OrcConstruction {
+            jit,
+            stubs: ptr::null_mut(),
+            call_through: ptr::null_mut(),
+        };
         // SAFETY: `jit` is live after successful construction and owns both
         // returned references.
         let (dylib, triple, data_layout, execution_session) = unsafe {
@@ -475,15 +521,10 @@ impl OrcJit {
             )
         };
         // SAFETY: the target triple comes from this LLJIT instance.
-        let stubs = unsafe { LLVMOrcCreateLocalIndirectStubsManager(triple.as_ptr()) };
-        if stubs.is_null() {
-            // SAFETY: construction succeeded and no ORC child owns `jit` yet.
-            unsafe {
-                let _ = LLVMOrcDisposeLLJIT(jit);
-            }
+        construction.stubs = unsafe { LLVMOrcCreateLocalIndirectStubsManager(triple.as_ptr()) };
+        if construction.stubs.is_null() {
             return Err("failed to create ORC indirect stubs manager".to_string());
         }
-        let mut call_through = ptr::null_mut();
         // SAFETY: all arguments belong to the same live ORC execution session.
         // A stub whose materialization fails branches to the error-handler
         // address in place of its body, so the handler must never return.
@@ -492,17 +533,10 @@ impl OrcJit {
                 triple.as_ptr(),
                 execution_session,
                 materialization_failed as *const () as u64,
-                &mut call_through,
+                &mut construction.call_through,
             ))
         };
-        if let Err(error) = call_through_result {
-            // SAFETY: these objects were created above and have not been shared.
-            unsafe {
-                LLVMOrcDisposeIndirectStubsManager(stubs);
-                let _ = LLVMOrcDisposeLLJIT(jit);
-            }
-            return Err(error);
-        }
+        call_through_result?;
 
         let raw_context = context.transfer()?;
         // SAFETY: `OrcContext::transfer` gives this thread-safe wrapper sole
@@ -538,6 +572,7 @@ impl OrcJit {
             );
         }
 
+        let (jit, stubs, call_through) = construction.release();
         Ok(Self {
             jit,
             dylib,
@@ -549,16 +584,14 @@ impl OrcJit {
 
     pub(crate) fn add_eager_module(&mut self, module: OrcModule) -> Result<(), String> {
         let thread_safe = self.state.transfer_to_thread_safe_module(module);
-        // SAFETY: the module and dylib belong to this JIT. On success ownership
-        // transfers to LLJIT; on error it remains here and is disposed below.
+        // SAFETY: the module and dylib belong to this JIT. LLJIT consumes the
+        // thread-safe module on every return path.
         let result = unsafe {
             llvm_sys::orc2::lljit::LLVMOrcLLJITAddLLVMIRModule(self.jit, self.dylib, thread_safe)
         };
         if result.is_null() {
             Ok(())
         } else {
-            // SAFETY: failed addition leaves ownership with the caller.
-            unsafe { LLVMOrcDisposeThreadSafeModule(thread_safe) };
             // SAFETY: `result` is an owned LLVM error.
             Err(unsafe { take_error(result) })
         }
@@ -1139,5 +1172,20 @@ mod tests {
         let answer: unsafe extern "C" fn() -> i32 = unsafe { std::mem::transmute(address) };
         assert_eq!(unsafe { answer() }, 42);
         jit.check_reported_errors().expect("no asynchronous errors");
+    }
+
+    /// A rejected second context transfer leaves the first ORC session usable.
+    #[test]
+    fn repeated_context_transfer_is_rejected_cleanly() {
+        let context = OrcContext::new();
+        let mut jit = OrcJit::new(&context).expect("first ORC JIT");
+        assert!(OrcJit::new(&context).is_err());
+
+        let module = constant_module(context.context(), "answer", 42);
+        jit.add_eager_module(module).expect("answer module");
+        let address = jit.lookup("answer").expect("answer address");
+        // SAFETY: the generated constant function has this exact ABI.
+        let answer: unsafe extern "C" fn() -> i32 = unsafe { std::mem::transmute(address) };
+        assert_eq!(unsafe { answer() }, 42);
     }
 }

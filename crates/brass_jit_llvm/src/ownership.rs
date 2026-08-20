@@ -267,30 +267,143 @@ fn root_ident(e: &Expr) -> Option<&str> {
     }
 }
 
-/// Names referenced (and thus captured) inside a spawn closure body. `bound` is
-/// the closure's own params and top-level locals. Names a *nested* closure binds
-/// are also excluded: they belong to the inner scope, so a nested spawn's loop
-/// counter is not mistaken for a capture of this one.
+/// Names referenced free inside a closure body. `bound` contains bindings that
+/// enter with the body, normally its parameters. Local declarations are applied
+/// in source order and control-flow/pattern scopes are kept distinct, so a
+/// shadowed name does not suppress a reference to a different binding.
 pub fn captured(body: &Block, bound: &HashSet<String>) -> HashSet<String> {
-    let mut refs = HashSet::default();
-    crate::closure::idents_block(body, &mut refs);
-    let mut nested = HashSet::default();
-    collect_nested_closure_bindings(body, &mut nested);
-    refs.into_iter()
-        .filter(|r| !bound.contains(r) && !nested.contains(r))
-        .collect()
+    let mut scopes = vec![bound.clone()];
+    let mut free = HashSet::default();
+    capture_block(body, &mut scopes, &mut free, HashSet::default());
+    free
 }
 
-/// Collect the params and locals bound inside any closure nested in `body`. Used
-/// by [`captured`] to drop an inner closure's own bindings from the outer
-/// closure's capture set.
-fn collect_nested_closure_bindings(body: &Block, out: &mut HashSet<String>) {
-    crate::closure::each_nested_closure(body, |params, cbody| {
-        for p in params {
-            out.insert(p.name.clone());
+fn capture_block(
+    block: &Block,
+    scopes: &mut Vec<HashSet<String>>,
+    free: &mut HashSet<String>,
+    bindings: HashSet<String>,
+) {
+    scopes.push(bindings);
+    for stmt in &block.stmts {
+        capture_stmt(stmt, scopes, free);
+    }
+    scopes.pop();
+}
+
+fn capture_stmt(stmt: &Stmt, scopes: &mut Vec<HashSet<String>>, free: &mut HashSet<String>) {
+    match stmt {
+        Stmt::Let { pat, value, .. } => {
+            if let Some(value) = value {
+                capture_expr(value, scopes, free);
+            }
+            collect_pattern_bindings(pat, scopes.last_mut().expect("capture scope"));
         }
-        collect_local_bindings(&cbody.stmts, out);
-    });
+        Stmt::Assign { target, value, .. } => {
+            capture_expr(target, scopes, free);
+            capture_expr(value, scopes, free);
+        }
+        Stmt::Expr(expr) | Stmt::Return(Some(expr), _) => capture_expr(expr, scopes, free),
+        Stmt::While { cond, body, .. } => {
+            capture_expr(cond, scopes, free);
+            capture_block(body, scopes, free, HashSet::default());
+        }
+        Stmt::For {
+            pat, iter, body, ..
+        } => {
+            capture_expr(iter, scopes, free);
+            let mut bindings = HashSet::default();
+            collect_pattern_bindings(pat, &mut bindings);
+            capture_block(body, scopes, free, bindings);
+        }
+        Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => {}
+    }
+}
+
+fn capture_expr(expr: &Expr, scopes: &mut Vec<HashSet<String>>, free: &mut HashSet<String>) {
+    match expr {
+        Expr::Ident(name, _) => {
+            if !scopes.iter().rev().any(|scope| scope.contains(name)) {
+                free.insert(name.clone());
+            }
+        }
+        Expr::SelfExpr(_) => {
+            if !scopes.iter().rev().any(|scope| scope.contains("self")) {
+                free.insert("self".to_string());
+            }
+        }
+        Expr::Unary(_, inner, _) | Expr::Field(inner, _, _) | Expr::ErrorProp(inner, _) => {
+            capture_expr(inner, scopes, free)
+        }
+        Expr::Binary(_, left, right, _)
+        | Expr::Index(left, right, _)
+        | Expr::Range(left, right, _) => {
+            capture_expr(left, scopes, free);
+            capture_expr(right, scopes, free);
+        }
+        Expr::Call(callee, args, _) => {
+            capture_expr(callee, scopes, free);
+            for arg in args {
+                capture_expr(&arg.expr, scopes, free);
+            }
+        }
+        Expr::Closure(params, body, _) => {
+            let bindings = params.iter().map(|param| param.name.clone()).collect();
+            scopes.push(bindings);
+            capture_expr(body, scopes, free);
+            scopes.pop();
+        }
+        Expr::Array(items, _) => {
+            for item in items {
+                capture_expr(item, scopes, free);
+            }
+        }
+        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => {
+            for (_, value) in fields {
+                capture_expr(value, scopes, free);
+            }
+        }
+        Expr::Str(segments, _) => {
+            for segment in segments {
+                if let StrSeg::Expr(value) = segment {
+                    capture_expr(value, scopes, free);
+                }
+            }
+        }
+        Expr::If(cond, then, els, _) => {
+            capture_expr(cond, scopes, free);
+            capture_block(then, scopes, free, HashSet::default());
+            if let Some(els) = els {
+                capture_expr(els, scopes, free);
+            }
+        }
+        Expr::IfLet(pat, scrutinee, then, els, _) => {
+            capture_expr(scrutinee, scopes, free);
+            let mut bindings = HashSet::default();
+            collect_pattern_bindings(pat, &mut bindings);
+            capture_block(then, scopes, free, bindings);
+            if let Some(els) = els {
+                capture_expr(els, scopes, free);
+            }
+        }
+        Expr::Match(scrutinee, arms, _) => {
+            capture_expr(scrutinee, scopes, free);
+            for arm in arms {
+                let mut bindings = HashSet::default();
+                collect_pattern_bindings(&arm.pattern, &mut bindings);
+                scopes.push(bindings);
+                capture_expr(&arm.body, scopes, free);
+                scopes.pop();
+            }
+        }
+        Expr::Block(block, _) => capture_block(block, scopes, free, HashSet::default()),
+        Expr::TypeTest(subject, _, _) => capture_expr(subject, scopes, free),
+        Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Null(_) => {}
+    }
+}
+
+fn param_names(params: &[Param]) -> HashSet<String> {
+    params.iter().map(|param| param.name.clone()).collect()
 }
 
 /// One captured variable's automatically chosen ownership at a `spawn` site.
@@ -316,11 +429,9 @@ pub fn analyze_spawns(body: &Block, params: &HashSet<String>) -> Vec<CaptureDeci
 /// automatically. Only these locals are subject to ownership transfer: a free
 /// name that is a function or global is not a captured value.
 pub fn analyze_spawns_stmts(stmts: &[Stmt], params: &HashSet<String>) -> Vec<CaptureDecision> {
-    let mut locals = params.clone();
-    collect_local_bindings(stmts, &mut locals);
     let fn_scope = stmts_block(stmts);
     let mut out = Vec::new();
-    analyze_block(stmts, &locals, params, &fn_scope, &mut out);
+    analyze_block(stmts, params, params, &fn_scope, &mut out);
     out
 }
 
@@ -339,36 +450,158 @@ fn analyze_block(
     fn_scope: &Block,
     out: &mut Vec<CaptureDecision>,
 ) {
+    let mut visible = locals.clone();
     for (i, stmt) in stmts.iter().enumerate() {
-        // Descend into every nested block (loops, conditionals, match arms, block
-        // exprs), which may contain their own spawns.
-        nested_block_stmts(stmt, &mut |inner| {
-            analyze_block(inner, locals, params, fn_scope, out)
-        });
-        let Some(closure_body) = spawn_closure_body(stmt) else {
-            continue;
-        };
-        // A nested spawn inside the spawned closure is its own site.
-        analyze_block(&closure_body.stmts, locals, params, fn_scope, out);
-        let bound = closure_bound_in(stmt);
-        let mut captures: Vec<String> = captured(&closure_body, &bound)
-            .into_iter()
-            .filter(|name| locals.contains(name))
-            .collect();
-        captures.sort();
-        let rest = &stmts[i + 1..];
-        for var in captures {
-            // Liveness must see through aliases: the object stays reachable after
-            // the spawn through any handle bound from the capture (`let w = Wrap {
-            // c }; ...; w.c.add(1)` keeps `c`'s object live even though the name
-            // `c` never recurs), so a use of any alias keeps it from being moved.
-            let handles = alias_closure(fn_scope, &var);
-            let live_after = handles.iter().any(|h| stmts_reference(rest, h));
-            out.push(CaptureDecision {
-                ownership: decide(&var, live_after, fn_scope, params),
-                var,
-            });
+        analyze_nested_spawns_stmt(stmt, &visible, params, fn_scope, out);
+        if let Some(closure_body) = spawn_closure_body(stmt) {
+            let bound = closure_bound_in(stmt);
+            let mut closure_visible = visible.clone();
+            closure_visible.extend(bound.iter().cloned());
+            // A nested spawn inside the spawned closure is its own site.
+            analyze_block(&closure_body.stmts, &closure_visible, params, fn_scope, out);
+            let mut captures: Vec<String> = captured(&closure_body, &bound)
+                .into_iter()
+                .filter(|name| visible.contains(name))
+                .collect();
+            captures.sort();
+            let rest = &stmts[i + 1..];
+            for var in captures {
+                // Liveness must see through aliases: the object stays reachable after
+                // the spawn through any handle bound from the capture.
+                let handles = alias_closure(fn_scope, &var);
+                let live_after = handles.iter().any(|h| stmts_reference(rest, h));
+                out.push(CaptureDecision {
+                    ownership: decide(&var, live_after, fn_scope, params),
+                    var,
+                });
+            }
         }
+        if let Stmt::Let { pat, .. } = stmt {
+            collect_pattern_bindings(pat, &mut visible);
+        }
+    }
+}
+
+fn analyze_nested_spawns_stmt(
+    stmt: &Stmt,
+    visible: &HashSet<String>,
+    params: &HashSet<String>,
+    fn_scope: &Block,
+    out: &mut Vec<CaptureDecision>,
+) {
+    match stmt {
+        Stmt::Let {
+            value: Some(value), ..
+        }
+        | Stmt::Expr(value)
+        | Stmt::Return(Some(value), _) => {
+            analyze_nested_spawns_expr(value, visible, params, fn_scope, out)
+        }
+        Stmt::Assign { target, value, .. } => {
+            analyze_nested_spawns_expr(target, visible, params, fn_scope, out);
+            analyze_nested_spawns_expr(value, visible, params, fn_scope, out);
+        }
+        Stmt::While { cond, body, .. } => {
+            analyze_nested_spawns_expr(cond, visible, params, fn_scope, out);
+            analyze_block(&body.stmts, visible, params, fn_scope, out);
+        }
+        Stmt::For {
+            pat, iter, body, ..
+        } => {
+            analyze_nested_spawns_expr(iter, visible, params, fn_scope, out);
+            let mut inner = visible.clone();
+            collect_pattern_bindings(pat, &mut inner);
+            analyze_block(&body.stmts, &inner, params, fn_scope, out);
+        }
+        Stmt::Let { value: None, .. }
+        | Stmt::Return(None, _)
+        | Stmt::Break(_)
+        | Stmt::Continue(_) => {}
+    }
+}
+
+fn analyze_nested_spawns_expr(
+    expr: &Expr,
+    visible: &HashSet<String>,
+    params: &HashSet<String>,
+    fn_scope: &Block,
+    out: &mut Vec<CaptureDecision>,
+) {
+    match expr {
+        Expr::Unary(_, inner, _) | Expr::Field(inner, _, _) | Expr::ErrorProp(inner, _) => {
+            analyze_nested_spawns_expr(inner, visible, params, fn_scope, out)
+        }
+        Expr::Binary(_, left, right, _)
+        | Expr::Index(left, right, _)
+        | Expr::Range(left, right, _) => {
+            analyze_nested_spawns_expr(left, visible, params, fn_scope, out);
+            analyze_nested_spawns_expr(right, visible, params, fn_scope, out);
+        }
+        Expr::Call(callee, args, _) => {
+            analyze_nested_spawns_expr(callee, visible, params, fn_scope, out);
+            for arg in args {
+                analyze_nested_spawns_expr(&arg.expr, visible, params, fn_scope, out);
+            }
+        }
+        Expr::Array(items, _) => {
+            for item in items {
+                analyze_nested_spawns_expr(item, visible, params, fn_scope, out);
+            }
+        }
+        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => {
+            for (_, value) in fields {
+                analyze_nested_spawns_expr(value, visible, params, fn_scope, out);
+            }
+        }
+        Expr::Str(segments, _) => {
+            for segment in segments {
+                if let StrSeg::Expr(value) = segment {
+                    analyze_nested_spawns_expr(value, visible, params, fn_scope, out);
+                }
+            }
+        }
+        Expr::If(cond, then, els, _) => {
+            analyze_nested_spawns_expr(cond, visible, params, fn_scope, out);
+            analyze_block(&then.stmts, visible, params, fn_scope, out);
+            if let Some(els) = els {
+                analyze_nested_spawns_expr(els, visible, params, fn_scope, out);
+            }
+        }
+        Expr::IfLet(pat, scrutinee, then, els, _) => {
+            analyze_nested_spawns_expr(scrutinee, visible, params, fn_scope, out);
+            let mut inner = visible.clone();
+            collect_pattern_bindings(pat, &mut inner);
+            analyze_block(&then.stmts, &inner, params, fn_scope, out);
+            if let Some(els) = els {
+                analyze_nested_spawns_expr(els, visible, params, fn_scope, out);
+            }
+        }
+        Expr::Match(scrutinee, arms, _) => {
+            analyze_nested_spawns_expr(scrutinee, visible, params, fn_scope, out);
+            for arm in arms {
+                let mut inner = visible.clone();
+                collect_pattern_bindings(&arm.pattern, &mut inner);
+                match &arm.body {
+                    Expr::Block(block, _) => {
+                        analyze_block(&block.stmts, &inner, params, fn_scope, out)
+                    }
+                    body => analyze_nested_spawns_expr(body, &inner, params, fn_scope, out),
+                }
+            }
+        }
+        Expr::Block(block, _) => analyze_block(&block.stmts, visible, params, fn_scope, out),
+        Expr::TypeTest(subject, _, _) => {
+            analyze_nested_spawns_expr(subject, visible, params, fn_scope, out)
+        }
+        // Spawned closure bodies are handled from their enclosing call statement;
+        // plain closures are separate execution scopes.
+        Expr::Closure(..)
+        | Expr::Int(..)
+        | Expr::Float(..)
+        | Expr::Bool(..)
+        | Expr::Null(_)
+        | Expr::Ident(..)
+        | Expr::SelfExpr(_) => {}
     }
 }
 
@@ -413,13 +646,9 @@ fn collect_mention_aliases(stmts: &[Stmt], handles: &mut HashSet<String>) {
     }
 }
 
-/// Collect names bound by `let`/`for` anywhere in a statement slice. Scoping is
-/// ignored (a superset is safe: it only widens the set of names treated as
-/// captured locals rather than globals). Every nested block -- loop bodies, `if`
-/// / `if let` branches, `match` arms, block expressions -- is descended into, so a
-/// capture bound inside one is still recognised as a transferable local.
-/// Closure bodies are *not* descended into: their bindings belong to the
-/// closure's own scope (see [`process_scope`]'s recursion).
+/// Collect the broad local namespace used for scope-wide guarding. Spawn
+/// capture classification uses [`lexical_scopes`] instead, preserving the
+/// source order and nesting of bindings.
 fn collect_local_bindings(stmts: &[Stmt], out: &mut HashSet<String>) {
     for stmt in stmts {
         match stmt {
@@ -431,15 +660,168 @@ fn collect_local_bindings(stmts: &[Stmt], out: &mut HashSet<String>) {
     }
 }
 
+#[derive(Default)]
+struct LexicalScopes {
+    spawn_sites: HashMap<Span, HashSet<String>>,
+    closure_bindings: HashMap<Span, HashSet<String>>,
+}
+
+/// Record the bindings visible at each spawn site and closure-valued binding.
+fn lexical_scopes(stmts: &[Stmt], in_scope: &HashSet<String>) -> LexicalScopes {
+    let mut scopes = LexicalScopes::default();
+    collect_lexical_stmts(stmts, in_scope, &mut scopes);
+    scopes
+}
+
+fn collect_lexical_stmts(stmts: &[Stmt], in_scope: &HashSet<String>, scopes: &mut LexicalScopes) {
+    let mut visible = in_scope.clone();
+    for stmt in stmts {
+        if spawn_arg(stmt).is_some() {
+            scopes
+                .spawn_sites
+                .insert(spawn_stmt_span(stmt), visible.clone());
+        }
+        if matches!(
+            stmt,
+            Stmt::Let {
+                value: Some(Expr::Closure(..)),
+                ..
+            } | Stmt::Assign {
+                value: Expr::Closure(..),
+                ..
+            }
+        ) {
+            scopes
+                .closure_bindings
+                .insert(stmt_span(stmt), visible.clone());
+        }
+        collect_lexical_stmt_exprs(stmt, &visible, scopes);
+        if let Stmt::Let { pat, .. } = stmt {
+            collect_pattern_bindings(pat, &mut visible);
+        }
+    }
+}
+
+fn collect_lexical_stmt_exprs(stmt: &Stmt, visible: &HashSet<String>, scopes: &mut LexicalScopes) {
+    match stmt {
+        Stmt::Let {
+            value: Some(value), ..
+        }
+        | Stmt::Expr(value)
+        | Stmt::Return(Some(value), _) => collect_lexical_expr(value, visible, scopes),
+        Stmt::Assign { target, value, .. } => {
+            collect_lexical_expr(target, visible, scopes);
+            collect_lexical_expr(value, visible, scopes);
+        }
+        Stmt::While { cond, body, .. } => {
+            collect_lexical_expr(cond, visible, scopes);
+            collect_lexical_stmts(&body.stmts, visible, scopes);
+        }
+        Stmt::For {
+            pat, iter, body, ..
+        } => {
+            collect_lexical_expr(iter, visible, scopes);
+            let mut inner = visible.clone();
+            collect_pattern_bindings(pat, &mut inner);
+            collect_lexical_stmts(&body.stmts, &inner, scopes);
+        }
+        Stmt::Let { value: None, .. }
+        | Stmt::Return(None, _)
+        | Stmt::Break(_)
+        | Stmt::Continue(_) => {}
+    }
+}
+
+fn collect_lexical_expr(expr: &Expr, visible: &HashSet<String>, scopes: &mut LexicalScopes) {
+    match expr {
+        Expr::Unary(_, inner, _) | Expr::Field(inner, _, _) | Expr::ErrorProp(inner, _) => {
+            collect_lexical_expr(inner, visible, scopes);
+        }
+        Expr::Binary(_, left, right, _)
+        | Expr::Index(left, right, _)
+        | Expr::Range(left, right, _) => {
+            collect_lexical_expr(left, visible, scopes);
+            collect_lexical_expr(right, visible, scopes);
+        }
+        Expr::Call(callee, args, _) => {
+            collect_lexical_expr(callee, visible, scopes);
+            for arg in args {
+                collect_lexical_expr(&arg.expr, visible, scopes);
+            }
+        }
+        Expr::Array(items, _) => {
+            for item in items {
+                collect_lexical_expr(item, visible, scopes);
+            }
+        }
+        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => {
+            for (_, value) in fields {
+                collect_lexical_expr(value, visible, scopes);
+            }
+        }
+        Expr::Str(segments, _) => {
+            for segment in segments {
+                if let StrSeg::Expr(value) = segment {
+                    collect_lexical_expr(value, visible, scopes);
+                }
+            }
+        }
+        Expr::If(cond, then, els, _) => {
+            collect_lexical_expr(cond, visible, scopes);
+            collect_lexical_stmts(&then.stmts, visible, scopes);
+            if let Some(els) = els {
+                collect_lexical_expr(els, visible, scopes);
+            }
+        }
+        Expr::IfLet(pat, scrutinee, then, els, _) => {
+            collect_lexical_expr(scrutinee, visible, scopes);
+            let mut inner = visible.clone();
+            collect_pattern_bindings(pat, &mut inner);
+            collect_lexical_stmts(&then.stmts, &inner, scopes);
+            if let Some(els) = els {
+                collect_lexical_expr(els, visible, scopes);
+            }
+        }
+        Expr::Match(scrutinee, arms, _) => {
+            collect_lexical_expr(scrutinee, visible, scopes);
+            for arm in arms {
+                let mut inner = visible.clone();
+                collect_pattern_bindings(&arm.pattern, &mut inner);
+                collect_lexical_expr(&arm.body, &inner, scopes);
+            }
+        }
+        Expr::Block(block, _) => collect_lexical_stmts(&block.stmts, visible, scopes),
+        Expr::TypeTest(subject, _, _) => collect_lexical_expr(subject, visible, scopes),
+        Expr::Closure(..)
+        | Expr::Int(..)
+        | Expr::Float(..)
+        | Expr::Bool(..)
+        | Expr::Null(_)
+        | Expr::Ident(..)
+        | Expr::SelfExpr(_) => {}
+    }
+}
+
 /// Apply `f` to every statement list directly nested in `stmt` through control
 /// flow: loop bodies, `if`/`if let` branches, `match` arms (block bodies), and
 /// block expressions. Closures are *not* descended into (a spawn closure is a
 /// separate execution scope). The mutable twin is [`nested_block_stmts_mut`].
 fn nested_block_stmts(stmt: &Stmt, f: &mut dyn FnMut(&[Stmt])) {
     match stmt {
-        Stmt::While { body, .. } | Stmt::For { body, .. } => f(&body.stmts),
+        Stmt::While { cond, body, .. } => {
+            nested_block_stmts_expr(cond, f);
+            f(&body.stmts);
+        }
+        Stmt::For { iter, body, .. } => {
+            nested_block_stmts_expr(iter, f);
+            f(&body.stmts);
+        }
         Stmt::Expr(e) | Stmt::Let { value: Some(e), .. } | Stmt::Return(Some(e), _) => {
             nested_block_stmts_expr(e, f)
+        }
+        Stmt::Assign { target, value, .. } => {
+            nested_block_stmts_expr(target, f);
+            nested_block_stmts_expr(value, f);
         }
         _ => {}
     }
@@ -447,21 +829,67 @@ fn nested_block_stmts(stmt: &Stmt, f: &mut dyn FnMut(&[Stmt])) {
 
 fn nested_block_stmts_expr(e: &Expr, f: &mut dyn FnMut(&[Stmt])) {
     match e {
-        Expr::If(_, t, els, _) | Expr::IfLet(_, _, t, els, _) => {
+        Expr::Unary(_, inner, _) | Expr::Field(inner, _, _) | Expr::ErrorProp(inner, _) => {
+            nested_block_stmts_expr(inner, f)
+        }
+        Expr::Binary(_, left, right, _)
+        | Expr::Index(left, right, _)
+        | Expr::Range(left, right, _) => {
+            nested_block_stmts_expr(left, f);
+            nested_block_stmts_expr(right, f);
+        }
+        Expr::Call(callee, args, _) => {
+            nested_block_stmts_expr(callee, f);
+            for arg in args {
+                nested_block_stmts_expr(&arg.expr, f);
+            }
+        }
+        Expr::Array(items, _) => {
+            for item in items {
+                nested_block_stmts_expr(item, f);
+            }
+        }
+        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => {
+            for (_, value) in fields {
+                nested_block_stmts_expr(value, f);
+            }
+        }
+        Expr::Str(segments, _) => {
+            for segment in segments {
+                if let StrSeg::Expr(value) = segment {
+                    nested_block_stmts_expr(value, f);
+                }
+            }
+        }
+        Expr::If(cond, t, els, _) => {
+            nested_block_stmts_expr(cond, f);
+            f(&t.stmts);
+            if let Some(els) = els {
+                nested_block_stmts_expr(els, f);
+            }
+        }
+        Expr::IfLet(_, scrutinee, t, els, _) => {
+            nested_block_stmts_expr(scrutinee, f);
             f(&t.stmts);
             if let Some(els) = els {
                 nested_block_stmts_expr(els, f);
             }
         }
         Expr::Block(b, _) => f(&b.stmts),
-        Expr::Match(_, arms, _) => {
+        Expr::Match(scrutinee, arms, _) => {
+            nested_block_stmts_expr(scrutinee, f);
             for arm in arms {
-                if let Expr::Block(b, _) = &arm.body {
-                    f(&b.stmts);
-                }
+                nested_block_stmts_expr(&arm.body, f);
             }
         }
-        _ => {}
+        Expr::TypeTest(subject, _, _) => nested_block_stmts_expr(subject, f),
+        Expr::Closure(..)
+        | Expr::Int(..)
+        | Expr::Float(..)
+        | Expr::Bool(..)
+        | Expr::Null(_)
+        | Expr::Ident(..)
+        | Expr::SelfExpr(_) => {}
     }
 }
 
@@ -470,9 +898,20 @@ fn nested_block_stmts_expr(e: &Expr, f: &mut dyn FnMut(&[Stmt])) {
 /// conditionals and blocks, not only at the top level of a function or loop.
 fn nested_block_stmts_mut(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Vec<Stmt>)) {
     match stmt {
-        Stmt::While { body, .. } | Stmt::For { body, .. } => f(&mut body.stmts),
+        Stmt::While { cond, body, .. } => {
+            nested_block_stmts_expr_mut(cond, f);
+            f(&mut body.stmts);
+        }
+        Stmt::For { iter, body, .. } => {
+            nested_block_stmts_expr_mut(iter, f);
+            f(&mut body.stmts);
+        }
         Stmt::Expr(e) | Stmt::Let { value: Some(e), .. } | Stmt::Return(Some(e), _) => {
             nested_block_stmts_expr_mut(e, f)
+        }
+        Stmt::Assign { target, value, .. } => {
+            nested_block_stmts_expr_mut(target, f);
+            nested_block_stmts_expr_mut(value, f);
         }
         _ => {}
     }
@@ -480,21 +919,67 @@ fn nested_block_stmts_mut(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Vec<Stmt>)) {
 
 fn nested_block_stmts_expr_mut(e: &mut Expr, f: &mut dyn FnMut(&mut Vec<Stmt>)) {
     match e {
-        Expr::If(_, t, els, _) | Expr::IfLet(_, _, t, els, _) => {
+        Expr::Unary(_, inner, _) | Expr::Field(inner, _, _) | Expr::ErrorProp(inner, _) => {
+            nested_block_stmts_expr_mut(inner, f)
+        }
+        Expr::Binary(_, left, right, _)
+        | Expr::Index(left, right, _)
+        | Expr::Range(left, right, _) => {
+            nested_block_stmts_expr_mut(left, f);
+            nested_block_stmts_expr_mut(right, f);
+        }
+        Expr::Call(callee, args, _) => {
+            nested_block_stmts_expr_mut(callee, f);
+            for arg in args {
+                nested_block_stmts_expr_mut(&mut arg.expr, f);
+            }
+        }
+        Expr::Array(items, _) => {
+            for item in items {
+                nested_block_stmts_expr_mut(item, f);
+            }
+        }
+        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => {
+            for (_, value) in fields {
+                nested_block_stmts_expr_mut(value, f);
+            }
+        }
+        Expr::Str(segments, _) => {
+            for segment in segments {
+                if let StrSeg::Expr(value) = segment {
+                    nested_block_stmts_expr_mut(value, f);
+                }
+            }
+        }
+        Expr::If(cond, t, els, _) => {
+            nested_block_stmts_expr_mut(cond, f);
+            f(&mut t.stmts);
+            if let Some(els) = els {
+                nested_block_stmts_expr_mut(els, f);
+            }
+        }
+        Expr::IfLet(_, scrutinee, t, els, _) => {
+            nested_block_stmts_expr_mut(scrutinee, f);
             f(&mut t.stmts);
             if let Some(els) = els {
                 nested_block_stmts_expr_mut(els, f);
             }
         }
         Expr::Block(b, _) => f(&mut b.stmts),
-        Expr::Match(_, arms, _) => {
+        Expr::Match(scrutinee, arms, _) => {
+            nested_block_stmts_expr_mut(scrutinee, f);
             for arm in arms {
-                if let Expr::Block(b, _) = &mut arm.body {
-                    f(&mut b.stmts);
-                }
+                nested_block_stmts_expr_mut(&mut arm.body, f);
             }
         }
-        _ => {}
+        Expr::TypeTest(subject, _, _) => nested_block_stmts_expr_mut(subject, f),
+        Expr::Closure(..)
+        | Expr::Int(..)
+        | Expr::Float(..)
+        | Expr::Bool(..)
+        | Expr::Null(_)
+        | Expr::Ident(..)
+        | Expr::SelfExpr(_) => {}
     }
 }
 
@@ -583,9 +1068,9 @@ fn closure_bound_in(stmt: &Stmt) -> HashSet<String> {
         _ => return HashSet::default(),
     };
     if let Expr::Call(_, args, _) = expr
-        && let Some(Expr::Closure(params, body, _)) = args.first().map(|a| &a.expr)
+        && let Some(Expr::Closure(params, _, _)) = args.first().map(|a| &a.expr)
     {
-        return crate::closure::bound_names(params, &closure_block(body));
+        return param_names(params);
     }
     HashSet::default()
 }
@@ -606,35 +1091,197 @@ fn stmts_reference(stmts: &[Stmt], var: &str) -> bool {
     refs.contains(var)
 }
 
-/// The names of the local variables that are spawned as closure variables
-/// (`spawn(name)`) anywhere in this scope's control-flow tree.
-fn spawned_var_names(stmts: &[Stmt], out: &mut HashSet<String>) {
-    for stmt in stmts {
+/// Resolve the closure-valued binding visible at one spawn site. Bindings are
+/// applied in source order and nested statement scopes receive an environment
+/// copy, so declarations in a sibling or later scope cannot satisfy the spawn.
+#[derive(Clone)]
+struct ClosureBinding {
+    params: Vec<Param>,
+    body: Block,
+    span: Span,
+}
+
+fn closure_bindings_at(stmts: &[Stmt], target: Span, name: &str) -> Vec<ClosureBinding> {
+    let mut env: HashMap<String, Vec<ClosureBinding>> = HashMap::default();
+    find_spawn_bindings_stmts(stmts, target, name, &mut env).unwrap_or_default()
+}
+
+/// Closure-valued declarations selected by actual `spawn(name)` sites in this
+/// scope, resolved with source-order and nested-scope visibility.
+fn spawned_binding_spans(stmts: &[Stmt]) -> HashSet<Span> {
+    let mut spans = HashSet::default();
+    each_spawn_site(stmts, &mut |stmt| {
         if let Some(SpawnArg::Var(name, _)) = spawn_arg(stmt) {
-            out.insert(name.to_string());
+            spans.extend(
+                closure_bindings_at(stmts, spawn_stmt_span(stmt), name)
+                    .into_iter()
+                    .map(|binding| binding.span),
+            );
         }
-        nested_block_stmts(stmt, &mut |inner| spawned_var_names(inner, out));
+    });
+    spans
+}
+
+fn find_spawn_bindings_stmts(
+    stmts: &[Stmt],
+    target: Span,
+    name: &str,
+    env: &mut HashMap<String, Vec<ClosureBinding>>,
+) -> Option<Vec<ClosureBinding>> {
+    for stmt in stmts {
+        if spawn_stmt_span(stmt) == target
+            && matches!(spawn_arg(stmt), Some(SpawnArg::Var(found, _)) if found == name)
+        {
+            return Some(env.get(name).cloned().unwrap_or_default());
+        }
+        if let Some(found) = find_spawn_bindings_stmt_exprs(stmt, target, name, env) {
+            return Some(found);
+        }
+        if let Stmt::Let { pat, value, .. } = stmt {
+            let closure = match (pat, value) {
+                (Pattern::Binding(binding, _), Some(Expr::Closure(params, body, _))) => Some((
+                    binding.clone(),
+                    vec![ClosureBinding {
+                        params: params.clone(),
+                        body: closure_block(body),
+                        span: stmt_span(stmt),
+                    }],
+                )),
+                (Pattern::Binding(binding, _), _) => Some((binding.clone(), Vec::new())),
+                _ => None,
+            };
+            if let Some((binding, values)) = closure {
+                env.insert(binding, values);
+            }
+            if !matches!(pat, Pattern::Binding(..)) {
+                for binding in pat.bound_names() {
+                    env.insert(binding.to_string(), Vec::new());
+                }
+            }
+        } else if let Stmt::Assign {
+            target: Expr::Ident(binding, _),
+            value,
+            ..
+        } = stmt
+        {
+            let values = match value {
+                Expr::Closure(params, body, _) => vec![ClosureBinding {
+                    params: params.clone(),
+                    body: closure_block(body),
+                    span: stmt_span(stmt),
+                }],
+                _ => Vec::new(),
+            };
+            env.insert(binding.clone(), values);
+        }
+    }
+    None
+}
+
+fn find_spawn_bindings_stmt_exprs(
+    stmt: &Stmt,
+    target: Span,
+    name: &str,
+    env: &HashMap<String, Vec<ClosureBinding>>,
+) -> Option<Vec<ClosureBinding>> {
+    match stmt {
+        Stmt::Let {
+            value: Some(value), ..
+        }
+        | Stmt::Expr(value)
+        | Stmt::Return(Some(value), _) => find_spawn_bindings_expr(value, target, name, env),
+        Stmt::Assign {
+            target: lhs, value, ..
+        } => find_spawn_bindings_expr(lhs, target, name, env)
+            .or_else(|| find_spawn_bindings_expr(value, target, name, env)),
+        Stmt::While { cond, body, .. } => find_spawn_bindings_expr(cond, target, name, env)
+            .or_else(|| {
+                let mut inner = env.clone();
+                find_spawn_bindings_stmts(&body.stmts, target, name, &mut inner)
+            }),
+        Stmt::For {
+            pat, iter, body, ..
+        } => find_spawn_bindings_expr(iter, target, name, env).or_else(|| {
+            let mut inner = env.clone();
+            for binding in pat.bound_names() {
+                inner.insert(binding.to_string(), Vec::new());
+            }
+            find_spawn_bindings_stmts(&body.stmts, target, name, &mut inner)
+        }),
+        Stmt::Let { value: None, .. }
+        | Stmt::Return(None, _)
+        | Stmt::Break(_)
+        | Stmt::Continue(_) => None,
     }
 }
 
-/// The closure literals bound to `name` (via `let name = <closure>` or
-/// `name = <closure>`) in this scope's control-flow tree, as `(params, body)`.
-fn closure_bindings_of(stmts: &[Stmt], name: &str, out: &mut Vec<(Vec<Param>, Block)>) {
-    for stmt in stmts {
-        match stmt {
-            Stmt::Let {
-                pat: Pattern::Binding(n, _),
-                value: Some(Expr::Closure(params, body, _)),
-                ..
-            } if n == name => out.push((params.clone(), closure_block(body))),
-            Stmt::Assign {
-                target: Expr::Ident(n, _),
-                value: Expr::Closure(params, body, _),
-                ..
-            } if n == name => out.push((params.clone(), closure_block(body))),
-            _ => {}
+fn find_spawn_bindings_expr(
+    expr: &Expr,
+    target: Span,
+    name: &str,
+    env: &HashMap<String, Vec<ClosureBinding>>,
+) -> Option<Vec<ClosureBinding>> {
+    let find = |expr| find_spawn_bindings_expr(expr, target, name, env);
+    match expr {
+        Expr::Unary(_, inner, _) | Expr::Field(inner, _, _) | Expr::ErrorProp(inner, _) => {
+            find(inner)
         }
-        nested_block_stmts(stmt, &mut |inner| closure_bindings_of(inner, name, out));
+        Expr::Binary(_, left, right, _)
+        | Expr::Index(left, right, _)
+        | Expr::Range(left, right, _) => find(left).or_else(|| find(right)),
+        Expr::Call(callee, args, _) => find(callee).or_else(|| {
+            args.iter()
+                .find_map(|arg| find_spawn_bindings_expr(&arg.expr, target, name, env))
+        }),
+        Expr::Array(items, _) => items.iter().find_map(find),
+        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => {
+            fields.iter().find_map(|(_, value)| find(value))
+        }
+        Expr::Str(segments, _) => segments.iter().find_map(|segment| match segment {
+            StrSeg::Expr(value) => find(value),
+            StrSeg::Lit(_) => None,
+        }),
+        Expr::If(cond, then, els, _) => find(cond)
+            .or_else(|| {
+                let mut inner = env.clone();
+                find_spawn_bindings_stmts(&then.stmts, target, name, &mut inner)
+            })
+            .or_else(|| els.as_deref().and_then(find)),
+        Expr::IfLet(pat, scrutinee, then, els, _) => find(scrutinee)
+            .or_else(|| {
+                let mut inner = env.clone();
+                for binding in pat.bound_names() {
+                    inner.insert(binding.to_string(), Vec::new());
+                }
+                find_spawn_bindings_stmts(&then.stmts, target, name, &mut inner)
+            })
+            .or_else(|| els.as_deref().and_then(find)),
+        Expr::Match(scrutinee, arms, _) => find(scrutinee).or_else(|| {
+            arms.iter().find_map(|arm| {
+                let mut inner = env.clone();
+                for binding in arm.pattern.bound_names() {
+                    inner.insert(binding.to_string(), Vec::new());
+                }
+                match &arm.body {
+                    Expr::Block(block, _) => {
+                        find_spawn_bindings_stmts(&block.stmts, target, name, &mut inner)
+                    }
+                    body => find_spawn_bindings_expr(body, target, name, &inner),
+                }
+            })
+        }),
+        Expr::Block(block, _) => {
+            let mut inner = env.clone();
+            find_spawn_bindings_stmts(&block.stmts, target, name, &mut inner)
+        }
+        Expr::TypeTest(subject, _, _) => find(subject),
+        Expr::Closure(..)
+        | Expr::Int(..)
+        | Expr::Float(..)
+        | Expr::Bool(..)
+        | Expr::Null(_)
+        | Expr::Ident(..)
+        | Expr::SelfExpr(_) => None,
     }
 }
 
@@ -718,33 +1365,31 @@ fn each_scope_spawn_body(
     all: &[Stmt],
     f: &mut impl FnMut(&Block, &HashSet<String>),
 ) {
-    let mut vars = HashSet::default();
-    spawned_var_names(stmts, &mut vars);
-    for name in &vars {
-        let mut bindings = Vec::new();
-        closure_bindings_of(all, name, &mut bindings);
-        for (params, body) in bindings {
-            let bound = crate::closure::bound_names(&params, &body);
-            f(&body, &bound);
-            each_scope_spawn_body(&body.stmts, &body.stmts, f);
+    each_spawn_site(stmts, &mut |stmt| match spawn_arg(stmt) {
+        Some(SpawnArg::Literal) => {
+            if let Some(body) = spawn_closure_body(stmt) {
+                let bound = closure_bound_in(stmt);
+                f(&body, &bound);
+                each_scope_spawn_body(&body.stmts, &body.stmts, f);
+            }
         }
-    }
-    each_literal_spawn(stmts, &mut |stmt| {
-        if let Some(body) = spawn_closure_body(stmt) {
-            let bound = closure_bound_in(stmt);
-            f(&body, &bound);
-            each_scope_spawn_body(&body.stmts, &body.stmts, f);
+        Some(SpawnArg::Var(name, _)) => {
+            for binding in closure_bindings_at(all, spawn_stmt_span(stmt), name) {
+                let bound = param_names(&binding.params);
+                f(&binding.body, &bound);
+                each_scope_spawn_body(&binding.body.stmts, &binding.body.stmts, f);
+            }
         }
+        Some(SpawnArg::Opaque(_)) | None => {}
     });
 }
 
-/// Visit every statement in the control-flow tree that is a literal spawn site.
-fn each_literal_spawn(stmts: &[Stmt], f: &mut impl FnMut(&Stmt)) {
+fn each_spawn_site(stmts: &[Stmt], f: &mut impl FnMut(&Stmt)) {
     for stmt in stmts {
-        if matches!(spawn_arg(stmt), Some(SpawnArg::Literal)) {
+        if spawn_arg(stmt).is_some() {
             f(stmt);
         }
-        nested_block_stmts(stmt, &mut |inner| each_literal_spawn(inner, f));
+        nested_block_stmts(stmt, &mut |inner| each_spawn_site(inner, f));
     }
 }
 
@@ -853,10 +1498,12 @@ struct ScopeCtx<'a> {
     /// closure variable's binding wherever it sits in the scope (the spawn may be
     /// in a nested list, the binding in an enclosing or sibling one).
     pristine_scope: Block,
+    /// Lexical binding environments for spawn sites and stored closures.
+    lexical: LexicalScopes,
     /// Interprocedural spawn-capture summaries.
     summaries: &'a SpawnSummaries,
-    /// Locals of this scope that are spawned as closure variables.
-    spawned_vars: HashSet<String>,
+    /// Closure-valued declarations selected by a lexical `spawn(name)` site.
+    spawned_bindings: HashSet<Span>,
     /// Locals promoted to cowns because they are passed to a call position that
     /// a callee spawn captures (per the summaries).
     summary_cowns: BTreeSet<String>,
@@ -900,69 +1547,74 @@ pub fn pre_spawn_errors(
     mutated_globals: &HashSet<String>,
 ) -> Vec<SpawnError> {
     let mut errors = Vec::new();
-    let mut bound = params.clone();
-    collect_local_bindings(stmts, &mut bound);
-    pre_scan_scope(stmts, stmts, &bound, mutated_globals, &mut errors);
+    pre_scan_scope(stmts, params, mutated_globals, &mut errors);
     errors
 }
 
 fn pre_scan_scope(
     stmts: &[Stmt],
-    all: &[Stmt],
-    bound: &HashSet<String>,
+    in_scope: &HashSet<String>,
     mutated_globals: &HashSet<String>,
     errors: &mut Vec<SpawnError>,
 ) {
-    let mut spawned = HashSet::default();
-    spawned_var_names(stmts, &mut spawned);
+    let lexical = lexical_scopes(stmts, in_scope);
+    let spawned = spawned_binding_spans(stmts);
+    pre_scan_scope_stmts(stmts, stmts, &lexical, &spawned, mutated_globals, errors);
+}
+
+fn pre_scan_scope_stmts(
+    stmts: &[Stmt],
+    all: &[Stmt],
+    lexical: &LexicalScopes,
+    spawned: &HashSet<Span>,
+    mutated_globals: &HashSet<String>,
+    errors: &mut Vec<SpawnError>,
+) {
     for stmt in stmts {
         match spawn_arg(stmt) {
             Some(SpawnArg::Literal) => {
                 if let Some(body) = spawn_closure_body(stmt) {
-                    pre_check_spawn_body(&body, stmt.span(), bound, mutated_globals, errors);
+                    let mut visible = lexical
+                        .spawn_sites
+                        .get(&spawn_stmt_span(stmt))
+                        .cloned()
+                        .unwrap_or_default();
+                    visible.extend(closure_bound_in(stmt));
+                    pre_check_spawn_body(&body, stmt.span(), &visible, mutated_globals, errors);
                 }
                 continue;
             }
-            // The variable's binding closures are visited below; an opaque
-            // argument is reported by `auto_acquire` itself.
-            Some(SpawnArg::Var(..)) | Some(SpawnArg::Opaque(..)) => continue,
+            Some(SpawnArg::Var(name, _)) => {
+                for binding in closure_bindings_at(all, spawn_stmt_span(stmt), name) {
+                    let mut visible = lexical
+                        .closure_bindings
+                        .get(&binding.span)
+                        .cloned()
+                        .unwrap_or_default();
+                    visible.extend(param_names(&binding.params));
+                    pre_check_spawn_body(
+                        &binding.body,
+                        binding.span,
+                        &visible,
+                        mutated_globals,
+                        errors,
+                    );
+                }
+                continue;
+            }
+            // An opaque argument is reported by `auto_acquire` itself.
+            Some(SpawnArg::Opaque(..)) => continue,
             None => {}
         }
-        // A `let f = () -> ...` binding of a variable that IS spawned in this
-        // scope is a spawn body, not a plain closure.
-        if let Stmt::Let {
-            pat: brass_parser::ast::Pattern::Binding(name, _),
-            value: Some(Expr::Closure(..)),
-            ..
-        } = stmt
-            && spawned.contains(name)
-        {
-            continue;
-        }
-        if let Stmt::Assign {
-            target: Expr::Ident(name, _),
-            value: Expr::Closure(..),
-            ..
-        } = stmt
-            && spawned.contains(name)
-        {
+        // A closure selected by an actual `spawn(name)` site is checked as a
+        // spawn body, not as an ordinary closure.
+        if spawned.contains(&stmt_span(stmt)) {
             continue;
         }
         nested_block_stmts(stmt, &mut |inner| {
-            pre_scan_scope(inner, all, bound, mutated_globals, errors)
+            pre_scan_scope_stmts(inner, all, lexical, spawned, mutated_globals, errors)
         });
         each_stmt_expr(stmt, &mut |e| pre_check_plain_expr(e, errors));
-    }
-    // Spawned-variable bindings: their closure bodies are spawn scopes.
-    for name in &spawned {
-        let mut bindings = Vec::new();
-        closure_bindings_of(all, name, &mut bindings);
-        for (cparams, body) in bindings {
-            let span = body.span;
-            let mut cbound = bound.clone();
-            cbound.extend(cparams.iter().map(|p| p.name.clone()));
-            pre_check_spawn_body(&body, span, &cbound, mutated_globals, errors);
-        }
     }
 }
 
@@ -975,7 +1627,7 @@ fn pre_check_spawn_body(
     mutated_globals: &HashSet<String>,
     errors: &mut Vec<SpawnError>,
 ) {
-    let cbound = crate::closure::bound_names(&[], body);
+    let cbound = HashSet::default();
     let mut frees: Vec<String> = captured(body, &cbound)
         .into_iter()
         .filter(|n| !enclosing_bound.contains(n) && mutated_globals.contains(n))
@@ -990,9 +1642,7 @@ fn pre_check_spawn_body(
             span,
         });
     }
-    let mut inner = enclosing_bound.clone();
-    collect_local_bindings(&body.stmts, &mut inner);
-    pre_scan_scope(&body.stmts, &body.stmts, &inner, mutated_globals, errors);
+    pre_scan_scope(&body.stmts, enclosing_bound, mutated_globals, errors);
 }
 
 /// A closure literal in a plain expression position (not a spawn argument or a
@@ -1200,16 +1850,16 @@ fn process_scope(
 ) {
     let mut locals = in_scope.clone();
     collect_local_bindings(stmts, &mut locals);
+    let lexical = lexical_scopes(stmts, in_scope);
 
     // ---- analysis over the pristine scope ----
-    let mut spawned_vars = HashSet::default();
-    spawned_var_names(stmts, &mut spawned_vars);
+    let spawned_bindings = spawned_binding_spans(stmts);
 
     // Union of every site's cowned captures in this scope (literal sites plus
     // resolved closure-variable sites), for the scope-wide guard set.
     let mut all_cowns: BTreeSet<String> = BTreeSet::new();
-    each_scope_site_shallow(stmts, stmts, &mut |cbody, bound| {
-        let (cowns, _) = classify_captures(cbody, bound, &locals, fn_params, pristine_fn);
+    each_scope_site_shallow(stmts, stmts, &lexical, &mut |cbody, bound, visible| {
+        let (cowns, _) = classify_captures(cbody, bound, visible, fn_params, pristine_fn);
         all_cowns.extend(cowns);
     });
 
@@ -1220,11 +1870,12 @@ fn process_scope(
     let ctx = ScopeCtx {
         guards: guard_map(stmts, &all_cowns),
         pristine_scope: stmts_block(stmts),
+        lexical,
         locals,
         fn_params,
         pristine_fn,
         summaries,
-        spawned_vars,
+        spawned_bindings,
         summary_cowns,
     };
 
@@ -1238,6 +1889,9 @@ fn process_scope(
     // into here).
     if !ctx.guards.is_empty() {
         for stmt in stmts.iter_mut() {
+            if ctx.spawned_bindings.contains(&stmt_span(stmt)) {
+                continue;
+            }
             guard_stmt_accesses(stmt, &ctx.guards);
         }
     }
@@ -1254,23 +1908,31 @@ fn process_scope(
 fn each_scope_site_shallow(
     stmts: &[Stmt],
     all: &[Stmt],
-    f: &mut impl FnMut(&Block, &HashSet<String>),
+    lexical: &LexicalScopes,
+    f: &mut impl FnMut(&Block, &HashSet<String>, &HashSet<String>),
 ) {
-    let mut vars = HashSet::default();
-    spawned_var_names(stmts, &mut vars);
-    for name in &vars {
-        let mut bindings = Vec::new();
-        closure_bindings_of(all, name, &mut bindings);
-        for (params, body) in bindings {
-            let bound = crate::closure::bound_names(&params, &body);
-            f(&body, &bound);
+    each_spawn_site(stmts, &mut |stmt| match spawn_arg(stmt) {
+        Some(SpawnArg::Literal) => {
+            if let Some(body) = spawn_closure_body(stmt) {
+                let bound = closure_bound_in(stmt);
+                let visible = lexical
+                    .spawn_sites
+                    .get(&spawn_stmt_span(stmt))
+                    .expect("spawn site has a lexical environment");
+                f(&body, &bound, visible);
+            }
         }
-    }
-    each_literal_spawn(stmts, &mut |stmt| {
-        if let Some(body) = spawn_closure_body(stmt) {
-            let bound = closure_bound_in(stmt);
-            f(&body, &bound);
+        Some(SpawnArg::Var(name, _)) => {
+            for binding in closure_bindings_at(all, spawn_stmt_span(stmt), name) {
+                let bound = param_names(&binding.params);
+                let visible = lexical
+                    .closure_bindings
+                    .get(&binding.span)
+                    .expect("closure binding has a lexical environment");
+                f(&binding.body, &bound, visible);
+            }
         }
+        Some(SpawnArg::Opaque(_)) | None => {}
     });
 }
 
@@ -1418,14 +2080,21 @@ fn transform_stmts(stmts: &mut Vec<Stmt>, ctx: &ScopeCtx, errors: &mut Vec<Spawn
             Some(SpawnArg::Literal) => {
                 let body = spawn_closure_body(&stmts[i]).expect("literal spawn body");
                 let bound = closure_bound_in(&stmts[i]);
+                let visible = ctx
+                    .lexical
+                    .spawn_sites
+                    .get(&spawn_stmt_span(&stmts[i]))
+                    .unwrap_or(&ctx.locals);
                 let (cowns, freezes) =
-                    classify_captures(&body, &bound, &ctx.locals, ctx.fn_params, ctx.pristine_fn);
+                    classify_captures(&body, &bound, visible, ctx.fn_params, ctx.pristine_fn);
                 // The spawned body is its own execution scope; nested spawns in
                 // it are classified against its own locals.
                 if let Some(inner) = spawn_closure_body_mut(&mut stmts[i]) {
+                    let mut inner_scope = visible.clone();
+                    inner_scope.extend(bound.iter().cloned());
                     process_scope(
                         inner,
-                        &ctx.locals,
+                        &inner_scope,
                         ctx.fn_params,
                         ctx.pristine_fn,
                         ctx.summaries,
@@ -1443,8 +2112,11 @@ fn transform_stmts(stmts: &mut Vec<Stmt>, ctx: &ScopeCtx, errors: &mut Vec<Spawn
                 // binding in an enclosing or sibling one; a binding in a
                 // *different* scope -- another closure's body -- is a different
                 // thread context and does not resolve).
-                let mut bindings = Vec::new();
-                closure_bindings_of(&ctx.pristine_scope.stmts, name, &mut bindings);
+                let bindings = closure_bindings_at(
+                    &ctx.pristine_scope.stmts,
+                    spawn_stmt_span(&stmts[i]),
+                    name,
+                );
                 if bindings.is_empty() {
                     errors.push(SpawnError {
                         message: format!(
@@ -1458,12 +2130,17 @@ fn transform_stmts(stmts: &mut Vec<Stmt>, ctx: &ScopeCtx, errors: &mut Vec<Spawn
                     // whichever closure the spawn actually runs.
                     let mut cowns: BTreeSet<String> = BTreeSet::new();
                     let mut freezes: BTreeSet<String> = BTreeSet::new();
-                    for (params, body) in &bindings {
-                        let bound = crate::closure::bound_names(params, body);
+                    for binding in &bindings {
+                        let bound = param_names(&binding.params);
+                        let visible = ctx
+                            .lexical
+                            .closure_bindings
+                            .get(&binding.span)
+                            .unwrap_or(&ctx.locals);
                         let (c, f) = classify_captures(
-                            body,
+                            &binding.body,
                             &bound,
-                            &ctx.locals,
+                            visible,
                             ctx.fn_params,
                             ctx.pristine_fn,
                         );
@@ -1498,36 +2175,42 @@ fn transform_stmts(stmts: &mut Vec<Stmt>, ctx: &ScopeCtx, errors: &mut Vec<Spawn
 /// this scope, process the closure body as its own scope and wrap it for its
 /// cowned captures (mirroring a literal spawn argument).
 fn transform_spawned_binding(stmt: &mut Stmt, ctx: &ScopeCtx, errors: &mut Vec<SpawnError>) {
-    let (name, params, body) = match stmt {
+    let binding_span = stmt_span(stmt);
+    let (params, body) = match stmt {
         Stmt::Let {
-            pat: Pattern::Binding(name, _),
+            pat: Pattern::Binding(_, _),
             value: Some(Expr::Closure(params, body, _)),
             ..
-        } => (name, params, body),
+        } => (params, body),
         Stmt::Assign {
-            target: Expr::Ident(name, _),
+            target: Expr::Ident(_, _),
             value: Expr::Closure(params, body, _),
             ..
-        } => (name, params, body),
+        } => (params, body),
         _ => return,
     };
-    if !ctx.spawned_vars.contains(name.as_str()) {
+    if !ctx.spawned_bindings.contains(&binding_span) {
         return;
     }
     let block = closure_block(body);
-    let bound = crate::closure::bound_names(params, &block);
-    let (cowns, _) = classify_captures(&block, &bound, &ctx.locals, ctx.fn_params, ctx.pristine_fn);
+    let bound = param_names(params);
+    let visible = ctx
+        .lexical
+        .closure_bindings
+        .get(&binding_span)
+        .unwrap_or(&ctx.locals);
+    let (cowns, _) = classify_captures(&block, &bound, visible, ctx.fn_params, ctx.pristine_fn);
     // The bound closure body is its own execution scope once spawned.
-    if let Expr::Block(b, _) = body.as_mut() {
-        process_scope(
-            &mut b.stmts,
-            &ctx.locals,
-            ctx.fn_params,
-            ctx.pristine_fn,
-            ctx.summaries,
-            errors,
-        );
-    }
+    let mut inner_scope = visible.clone();
+    inner_scope.extend(bound);
+    process_scope(
+        closure_body_stmts_mut(body),
+        &inner_scope,
+        ctx.fn_params,
+        ctx.pristine_fn,
+        ctx.summaries,
+        errors,
+    );
     if !cowns.is_empty() {
         let span = body.span();
         let original = std::mem::replace(body.as_mut(), Expr::Null(span));
@@ -1600,10 +2283,27 @@ fn spawn_closure_body_mut(stmt: &mut Stmt) -> Option<&mut Vec<Stmt>> {
     let Expr::Closure(_, body, _) = &mut args.first_mut()?.expr else {
         return None;
     };
-    match body.as_mut() {
-        Expr::Block(b, _) => Some(&mut b.stmts),
-        _ => None,
+    Some(closure_body_stmts_mut(body))
+}
+
+/// Return a mutable statement view of a closure body, preserving the value of
+/// an expression body as the final expression of a synthesized block.
+fn closure_body_stmts_mut(body: &mut Box<Expr>) -> &mut Vec<Stmt> {
+    if !matches!(body.as_ref(), Expr::Block(..)) {
+        let span = body.span();
+        let value = std::mem::replace(body.as_mut(), Expr::Null(span));
+        *body.as_mut() = Expr::Block(
+            Block {
+                stmts: vec![Stmt::Expr(value)],
+                span,
+            },
+            span,
+        );
     }
+    let Expr::Block(block, _) = body.as_mut() else {
+        unreachable!("closure body normalized to a block")
+    };
+    &mut block.stmts
 }
 
 // ----- access guarding -----
@@ -1777,11 +2477,23 @@ fn guard_children(expr: &mut Expr, guards: &BTreeMap<String, BTreeSet<String>>) 
             arms.iter_mut()
                 .for_each(|arm| guard_expr_accesses(&mut arm.body, guards));
         }
-        // A closure here is a non-spawn closure value; its body is not part of the
-        // spawner's straight-line flow, so leave it (a spawn closure was already
-        // handled at the spawn site).
-        Expr::Closure(..)
-        | Expr::Int(..)
+        Expr::Closure(params, body, _) => {
+            let block = closure_block(body);
+            let bound = param_names(params);
+            let captures = captured(&block, &bound);
+            let roots: BTreeSet<String> = captures
+                .iter()
+                .filter_map(|name| guards.get(name))
+                .flat_map(|roots| roots.iter().cloned())
+                .collect();
+            if !roots.is_empty() {
+                let roots: Vec<String> = roots.into_iter().collect();
+                let span = body.span();
+                let original = std::mem::replace(body.as_mut(), Expr::Null(span));
+                *body.as_mut() = wrap_with(original, &roots);
+            }
+        }
+        Expr::Int(..)
         | Expr::Float(..)
         | Expr::Bool(..)
         | Expr::Null(_)
@@ -2356,6 +3068,122 @@ mod tests {
         assert!(
             contains_call(&body.stmts, "with"),
             "the caller's own accesses must be lock-guarded"
+        );
+    }
+
+    #[test]
+    fn range_endpoints_are_captured() {
+        // Both range endpoints participate in the closure's lexical captures.
+        let d = decisions(
+            "fun main() {\n    let lo = 1\n    let hi = 4\n    spawn(() -> { println([lo..hi]) })\n    println(lo)\n}\n",
+        );
+        assert_eq!(
+            d,
+            vec![
+                CaptureDecision {
+                    var: "hi".into(),
+                    ownership: Ownership::Move,
+                },
+                CaptureDecision {
+                    var: "lo".into(),
+                    ownership: Ownership::Freeze,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_shadow_does_not_hide_outer_capture() {
+        // A nested closure parameter shadows only its own uses of the name.
+        let d = decisions(
+            "fun main() {\n    let data = [1, 2]\n    spawn(() -> {\n        println(data)\n        let inner = (data) -> println(data)\n        inner([3])\n    })\n    println(data)\n}\n",
+        );
+        assert!(
+            d.iter().any(|decision| decision.var == "data"),
+            "the outer reference remains a capture"
+        );
+    }
+
+    #[test]
+    fn compound_expression_blocks_are_transformed() {
+        // A spawn inside a block nested under an array/call expression is visited.
+        let mut body = main_body(
+            "fun main() {\n    let c = make()\n    consume([if true {\n        spawn(() -> { c.add(1) })\n        1\n    } else { 0 }])\n    c.add(2)\n}\n",
+        );
+        let errors = acquire(&mut body);
+        assert!(errors.is_empty());
+        assert!(contains_call(&body.stmts, "_cown"));
+    }
+
+    #[test]
+    fn expression_bodied_spawn_scope_processes_nested_spawn() {
+        // Expression-bodied spawned closures receive the same scoped transform.
+        let mut body = main_body(
+            "fun main() {\n    let c = make()\n    spawn(() -> spawn(() -> { c.add(1) }))\n    c.add(2)\n}\n",
+        );
+        let errors = acquire(&mut body);
+        assert!(errors.is_empty());
+        assert!(contains_call(&body.stmts, "_cown"));
+    }
+
+    #[test]
+    fn ordinary_closure_cown_access_is_guarded() {
+        // A closure invoked while a spawned task may run acquires captured cowns.
+        let mut body = main_body(
+            "fun main() {\n    let c = make()\n    let helper = () -> { c.add(2) }\n    spawn(() -> { c.add(1) })\n    helper()\n}\n",
+        );
+        let errors = acquire(&mut body);
+        assert!(errors.is_empty());
+        let guarded = body.stmts.iter().any(|stmt| {
+            let Stmt::Let {
+                pat: Pattern::Binding(name, _),
+                value: Some(Expr::Closure(_, body, _)),
+                ..
+            } = stmt
+            else {
+                return false;
+            };
+            name == "helper"
+                && matches!(body.as_ref(), Expr::Call(callee, _, _)
+                    if matches!(callee.as_ref(), Expr::Ident(name, _) if name == "with"))
+        });
+        assert!(guarded, "the ordinary closure body acquires the cown");
+    }
+
+    #[test]
+    fn spawned_closure_variable_resolves_lexically() {
+        // A same-named binding in a sibling block is not a candidate at the spawn.
+        let mut body = main_body(
+            "fun main() {\n    let a = make()\n    let b = make()\n    let task = () -> { a.add(1) }\n    if true {\n        let task = () -> { b.add(1) }\n    }\n    spawn(task)\n    a.add(2)\n}\n",
+        );
+        let errors = acquire(&mut body);
+        assert!(errors.is_empty(), "outer task resolves: {errors:?}");
+        let promotion_count = body
+            .stmts
+            .iter()
+            .filter(|stmt| {
+                matches!(stmt, Stmt::Expr(Expr::Call(callee, _, _))
+                    if matches!(callee.as_ref(), Expr::Ident(name, _) if name == "_cown"))
+            })
+            .count();
+        assert_eq!(
+            promotion_count, 1,
+            "only the visible task capture is promoted"
+        );
+    }
+
+    #[test]
+    fn spawned_binding_diagnostics_resolve_lexically() {
+        // A same-named sibling closure is still checked as an ordinary closure.
+        let body = main_body(
+            "fun main() {\n    let data = make()\n    let task = () -> println(data)\n    if true {\n        let task = () -> spawn(() -> println(data))\n    }\n    spawn(task)\n}\n",
+        );
+        let errors = pre_spawn_errors(&body.stmts, &HashSet::default(), &HashSet::default());
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("spawn` inside a closure")),
+            "the unspawned sibling closure keeps its diagnostic"
         );
     }
 

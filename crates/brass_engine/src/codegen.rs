@@ -1015,9 +1015,11 @@ pub trait Codegen {
             // buffer, a sum variant's payload fields) run a per-type destructor; a
             // closure runs the capture-releasing destructor stored in its object; a
             // string is a leaf, freed directly.
-            Type::Record(..) | Type::Slice(..) | Type::Array(..) | Type::Sum(..) => {
-                self.release_obj(value, ty)
-            }
+            Type::Record(..)
+            | Type::Slice(..)
+            | Type::Array(..)
+            | Type::Tuple(..)
+            | Type::Sum(..) => self.release_obj(value, ty),
             // A nullable cell runs a destructor too: it releases its value (when that
             // value is itself managed), then frees the cell.
             Type::Nullable(..) => self.release_obj(value, ty),

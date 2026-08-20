@@ -78,6 +78,23 @@ fn is_traced(ty: &Type) -> bool {
     is_managed_heap(ty) || matches!(ty, Type::Nullable(_))
 }
 
+/// Whether [`LlvmCodegen::to_string`] returns a caller-owned temporary for this
+/// exact type. String identities are borrowed and opaque fallbacks are interned.
+fn rendered_string_is_owned(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Bool
+            | Type::Int(_)
+            | Type::Float(_)
+            | Type::Nullable(_)
+            | Type::Slice(_)
+            | Type::Array(..)
+            | Type::Tuple(_)
+            | Type::Record(_)
+            | Type::Sum(_)
+    )
+}
+
 /// State used only by the typed MIR-driven backend path (the
 /// `brass_engine::Codegen` implementation), kept apart from the AST-walking
 /// `compile` state so the two coexist during the migration. Populated as
@@ -537,6 +554,12 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         let Some(tracer) = self.get_or_emit_tracer(ty) else {
             return;
         };
+        self.register_with_tracer(obj, tracer);
+    }
+
+    /// Register an object whose trace layout is selected by its construction
+    /// site rather than by its erased public type.
+    fn register_with_tracer(&self, obj: BasicValueEnum<'ctx>, tracer: FunctionValue<'ctx>) {
         let i64t = self.abi.i64t();
         let tracefn = self
             .builder
@@ -552,6 +575,59 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             .unwrap();
     }
 
+    /// Emit the trace function for one concrete closure environment layout.
+    fn get_or_emit_closure_tracer(
+        &mut self,
+        capture_types: &[Type],
+    ) -> Option<FunctionValue<'ctx>> {
+        let (offsets, _) = closure_layout(capture_types);
+        let children: Vec<u64> = capture_types
+            .iter()
+            .zip(offsets)
+            .filter_map(|(ty, offset)| is_traced(ty).then_some(offset))
+            .collect();
+        if children.is_empty() {
+            return None;
+        }
+        let signature = capture_types
+            .iter()
+            .map(Type::display_full)
+            .collect::<Vec<_>>()
+            .join("_");
+        let key = mangle_fn(&format!("trace_closure_{signature}"));
+        if let Some(tracer) = self.tracers.get(&key) {
+            return *tracer;
+        }
+
+        let ptrt = self.abi.ptr();
+        let fty = self
+            .ctx
+            .void_type()
+            .fn_type(&[ptrt.into(), ptrt.into()], false);
+        let tracer = self.module.add_function(&key, fty, Some(Linkage::Private));
+        self.tracers.insert(key, Some(tracer));
+        let saved = self.builder.get_insert_block();
+        let entry = self.ctx.append_basic_block(tracer, "entry");
+        self.builder.position_at_end(entry);
+        let obj = tracer.get_nth_param(0).unwrap().into_pointer_value();
+        let visit = tracer.get_nth_param(1).unwrap().into_pointer_value();
+        let visit_ty = self.ctx.void_type().fn_type(&[ptrt.into()], false);
+        for offset in children {
+            let child = self
+                .builder
+                .build_load(ptrt, self.field_ptr(obj, offset), "capture")
+                .unwrap();
+            self.builder
+                .build_indirect_call(visit_ty, visit, &[child.into()], "")
+                .unwrap();
+        }
+        self.builder.build_return(None).unwrap();
+        if let Some(block) = saved {
+            self.builder.position_at_end(block);
+        }
+        Some(tracer)
+    }
+
     fn get_or_emit_destructor(&mut self, ty: &Type) -> FunctionValue<'ctx> {
         let key = mangle_fn(&format!("drop_{}", ty.display_full()));
         if let Some(f) = self.destructors.get(&key) {
@@ -563,7 +639,6 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             .fn_type(&[self.abi.ptr().into()], false);
         let f = self.module.add_function(&key, fty, Some(Linkage::Private));
         self.destructors.insert(key, f);
-
         // Collect each heap field's (type, byte offset, llvm type) before emitting,
         // so the program/abi borrows end before the recursive release calls. Field
         // offsets mirror `record_layout`.
@@ -586,6 +661,19 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
                     offset += size;
                 }
             }
+        }
+
+        // Tuples use the same packed heap layout as construction: release every
+        // managed element at its computed aligned offset.
+        if let Type::Tuple(elems) = ty {
+            let (layout, _) = self.tuple_layout(elems);
+            heap_fields.extend(
+                elems
+                    .iter()
+                    .zip(layout)
+                    .filter(|(elem, _)| is_traced(elem))
+                    .map(|(elem, (llty, offset))| (elem.clone(), offset, llty)),
+            );
         }
 
         // A nullable cell `{ header16 | value@16 }`: release its value (when that
@@ -1083,14 +1171,41 @@ fn immutable_heap_globals(program: &MonoProgram) -> Vec<String> {
         .collect()
 }
 
-/// Whether a global of this type is stored as a single heap pointer (so its slot
-/// holds a `*Header` the freeze can read). Excludes inline fixed arrays (`T[n]`)
-/// and the closure struct, whose global slots are not a lone pointer.
+/// Whether a global's runtime representation is a managed heap pointer that the
+/// freeze entry can read from its slot. Passing-mode wrappers preserve that
+/// representation.
 fn is_heap_pointer_type(ty: &Type) -> bool {
     matches!(
-        ty,
-        Type::Str | Type::Record(..) | Type::Sum(..) | Type::Slice(..) | Type::Nullable(..)
+        unwrap_copy_wrappers(ty),
+        Type::Str
+            | Type::Record(..)
+            | Type::Sum(..)
+            | Type::Slice(..)
+            | Type::Array(..)
+            | Type::Fun(..)
+            | Type::Tuple(..)
+            | Type::Nullable(..)
     )
+}
+
+#[cfg(test)]
+mod managed_global_tests {
+    use super::*;
+
+    #[test]
+    fn every_managed_pointer_shape_is_freezable() {
+        // Global freezing follows the runtime representation through mode wrappers.
+        let managed = [
+            Type::Array(Box::new(Type::Bool), 2),
+            Type::Tuple(vec![Type::Bool, Type::Str]),
+            Type::Fun(Vec::new(), Box::new(Type::Void)),
+            Type::Ref(Box::new(Type::Mut(Box::new(Type::Slice(Box::new(
+                Type::Str,
+            )))))),
+        ];
+        assert!(managed.iter().all(is_heap_pointer_type));
+        assert!(!is_heap_pointer_type(&Type::Int(IntKind::I64)));
+    }
 }
 
 /// The module-level global symbol for a program global of the given name.
@@ -1742,7 +1857,8 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
                     false,
                 );
                 let df = self.abi.runtime_fn(&self.module, "pp_arr_deep_copy", dty);
-                self.builder
+                let copied = self
+                    .builder
                     .build_call(
                         df,
                         &[obj.into(), self.i64c(esize as i64).into(), copy_fn.into()],
@@ -1750,7 +1866,9 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
                     )
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_basic()
+                    .unwrap_basic();
+                self.register_for_gc(copied, ty);
+                copied
             }
             // A string/closure (or any other managed value) is immutable or never
             // mutated through this copy, so it is shared with its count raised.
@@ -1936,6 +2054,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             return self.const_str(&format!("{header} {{}}"));
         }
         let mut acc = self.const_str(&format!("{header} {{\n"));
+        let mut acc_owned = false;
         for (fname, fty, offset) in fields {
             // A string-typed field value renders QUOTED, so the struct output
             // distinguishes the string "1" from the number 1 (and shows empty
@@ -1949,14 +2068,22 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             } else {
                 self.const_str(&format!("    {fname}: "))
             };
-            acc = self.str_concat2(acc, prefix);
+            let next = self.str_concat2(acc, prefix);
+            if acc_owned {
+                self.release(acc);
+            }
+            acc = next;
+            acc_owned = true;
             let llty = self.abi.typed_basic(fty);
             let fp = self.field_ptr(obj, *offset);
             let fv = self.builder.build_load(llty, fp, "fld").unwrap();
             // Indent the field's rendering one level so a nested record/sum (which
             // is itself multi-line) sits under its label with deeper indentation.
-            let fs = self.to_string(fv, fty);
-            let mut fs = self.str_indent(fs);
+            let rendered = self.to_string(fv, fty);
+            let mut fs = self.str_indent(rendered);
+            if rendered_string_is_owned(fty) {
+                self.release(rendered);
+            }
             if is_opt_str {
                 let f = self.cur_fn.unwrap();
                 let ptrt = self.abi.ptr();
@@ -1975,22 +2102,31 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
                 let open = self.const_str("\"");
                 let close = self.const_str("\"");
                 let quoted = self.str_concat2(open, fs);
-                let quoted = self.str_concat2(quoted, close);
-                self.builder.build_store(slot, quoted).unwrap();
+                self.release(fs);
+                let closed = self.str_concat2(quoted, close);
+                self.release(quoted);
+                self.builder.build_store(slot, closed).unwrap();
                 self.builder.build_unconditional_branch(done_bb).unwrap();
                 self.builder.position_at_end(done_bb);
                 fs = self.builder.build_load(ptrt, slot, "optstr_v").unwrap();
             }
-            acc = self.str_concat2(acc, fs);
+            let next = self.str_concat2(acc, fs);
+            self.release(acc);
+            self.release(fs);
+            acc = next;
             let comma = if is_str {
                 self.const_str("\",\n")
             } else {
                 self.const_str(",\n")
             };
-            acc = self.str_concat2(acc, comma);
+            let next = self.str_concat2(acc, comma);
+            self.release(acc);
+            acc = next;
         }
         let close = self.const_str("}");
-        self.str_concat2(acc, close)
+        let result = self.str_concat2(acc, close);
+        self.release(acc);
+        result
     }
 
     /// Render a sum value: read the runtime tag (i32 @16) and, for the active
@@ -2429,6 +2565,8 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         let saved_fns = std::mem::take(&mut self.fns);
         let saved_globals = std::mem::take(&mut self.mir.globals);
         let saved_inits = std::mem::take(&mut self.mir.init_symbols);
+        let saved_frozen = std::mem::take(&mut self.mir.frozen_globals);
+        let saved_has_main = self.mir.lazy_has_main;
         // Destructors are per-module (a `__drop_*` can only be called within the
         // module that defines it); give the fresh module its own memo. The
         // per-type `to_string` renderers are module-local for the same reason.
@@ -2457,6 +2595,8 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         self.fns = saved_fns;
         self.mir.globals = saved_globals;
         self.mir.init_symbols = saved_inits;
+        self.mir.frozen_globals = saved_frozen;
+        self.mir.lazy_has_main = saved_has_main;
         self.destructors = saved_destructors;
         self.to_string_fns = saved_to_string_fns;
         self.deep_copy_fns = saved_deep_copy_fns;
@@ -2496,39 +2636,57 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         }
         let inits = self.mir.init_symbols.clone();
         let frozen = self.mir.frozen_globals.clone();
-        let (init_addrs, freeze_addr, main_addr) = {
-            let engine = self
-                .mir
-                .engine
-                .as_ref()
-                .ok_or("execute called before finalize")?;
-            let addr_of = |sym: &str| engine.get_function_address(&mangle_fn(sym)).ok();
-            let init_addrs: Vec<Option<usize>> = inits.iter().map(|s| addr_of(s)).collect();
-            let freeze_addr = if frozen.is_empty() {
-                None
-            } else {
-                engine.get_function_address(FREEZE_GLOBALS_FN).ok()
+        let has_main = self.mir.lazy_has_main;
+        let result = (|| -> Result<(), String> {
+            let (init_addrs, freeze_addr, main_addr) = {
+                let engine = self
+                    .mir
+                    .engine
+                    .as_ref()
+                    .ok_or("execute called before finalize")?;
+                let addr_of = |symbol: &str| {
+                    let llvm_symbol = mangle_fn(symbol);
+                    engine
+                        .get_function_address(&llvm_symbol)
+                        .map_err(|error| format!("JIT entry `{symbol}` is unavailable: {error}"))
+                };
+                let init_addrs = inits
+                    .iter()
+                    .map(|symbol| addr_of(symbol))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let freeze_addr = (!frozen.is_empty())
+                    .then(|| {
+                        engine
+                            .get_function_address(FREEZE_GLOBALS_FN)
+                            .map_err(|error| {
+                                format!("JIT entry `{FREEZE_GLOBALS_FN}` is unavailable: {error}")
+                            })
+                    })
+                    .transpose()?;
+                let main_addr = has_main.then(|| addr_of("main")).transpose()?;
+                (init_addrs, freeze_addr, main_addr)
             };
-            (init_addrs, freeze_addr, addr_of("main"))
-        };
-        let call = |addr: usize| {
-            let f: unsafe extern "C" fn() = unsafe { std::mem::transmute(addr) };
-            unsafe { f() };
-        };
-        crate::dispatch::with_deferred_resolver(self, resolve, || {
-            for a in init_addrs.iter().flatten() {
-                call(*a);
-            }
-            if let Some(a) = freeze_addr {
-                call(a);
-            }
-            if let Some(a) = main_addr {
-                call(a);
-            }
-        });
+            let call = |address: usize| {
+                let f: unsafe extern "C" fn() = unsafe { std::mem::transmute(address) };
+                unsafe { f() };
+            };
+            crate::dispatch::with_deferred_resolver(self, resolve, || {
+                for address in init_addrs {
+                    call(address);
+                }
+                if let Some(address) = freeze_addr {
+                    call(address);
+                }
+                if let Some(address) = main_addr {
+                    call(address);
+                }
+            });
+            Ok(())
+        })();
         brass_runtime::conc::pp_join_all();
+        crate::dispatch::clear_resolved();
         brass_runtime::gc::pp_gc_collect();
-        Ok(())
+        result
     }
 }
 
@@ -2587,6 +2745,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
         self.declare_globals(program);
         self.mir.init_symbols = program.init_symbols.clone();
         self.mir.frozen_globals = immutable_heap_globals(program);
+        self.mir.lazy_has_main = program.lookup("main").is_some();
     }
 
     fn finalize(&mut self) -> Result<(), String> {
@@ -2604,39 +2763,48 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
         }
         let inits = self.mir.init_symbols.clone();
         let frozen = self.mir.frozen_globals.clone();
+        let has_main = self.mir.lazy_has_main;
         let engine = self
             .mir
             .engine
             .as_ref()
             .ok_or("execute called before finalize")?;
-        let call = |sym: &str| {
-            if let Ok(addr) = engine.get_function_address(&mangle_fn(sym)) {
-                let f: unsafe extern "C" fn() = unsafe { std::mem::transmute(addr) };
+        let call = |symbol: &str| -> Result<(), String> {
+            let llvm_symbol = mangle_fn(symbol);
+            let address = engine
+                .get_function_address(&llvm_symbol)
+                .map_err(|error| format!("JIT entry `{symbol}` is unavailable: {error}"))?;
+            let f: unsafe extern "C" fn() = unsafe { std::mem::transmute(address) };
+            unsafe { f() };
+            Ok(())
+        };
+        let result = (|| -> Result<(), String> {
+            // Module initializers run (in order), populating the globals.
+            for symbol in &inits {
+                call(symbol)?;
+            }
+            // Module init is complete: auto-freeze the namespace's immutable heap
+            // globals before `main` runs.
+            if !frozen.is_empty() {
+                let address = engine
+                    .get_function_address(FREEZE_GLOBALS_FN)
+                    .map_err(|error| {
+                        format!("JIT entry `{FREEZE_GLOBALS_FN}` is unavailable: {error}")
+                    })?;
+                let f: unsafe extern "C" fn() = unsafe { std::mem::transmute(address) };
                 unsafe { f() };
             }
-        };
-        // Module initializers run (in order), populating the globals.
-        for sym in &inits {
-            call(sym);
-        }
-        // Module init is complete: auto-freeze the namespace's immutable heap
-        // globals so they are deeply immutable and safely
-        // shareable across threads before `main` (which may `spawn`) runs. The
-        // freeze is a generated function (`emit_freeze_globals_fn`) that reads each
-        // global and deep-freezes it.
-        if !frozen.is_empty()
-            && let Ok(addr) = engine.get_function_address(FREEZE_GLOBALS_FN)
-        {
-            let f: unsafe extern "C" fn() = unsafe { std::mem::transmute(addr) };
-            unsafe { f() };
-        }
-        call("main");
+            if has_main {
+                call("main")?;
+            }
+            Ok(())
+        })();
         // Wait for threads `spawn`ed during the run so their work completes and
         // output is deterministic before the program ends.
         brass_runtime::conc::pp_join_all();
         // Reclaim reference cycles that plain reference counting could not free, so a long-running program does not leak them.
         brass_runtime::gc::pp_gc_collect();
-        Ok(())
+        result
     }
 
     fn begin_body(&mut self, func: &MonoFunction) {
@@ -3157,21 +3325,29 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
             }
             Type::Int(k) => {
                 let iv = v.into_int_value();
-                let wide = if k.is_signed() {
-                    self.builder.build_int_s_extend(iv, self.abi.i64t(), "sx")
+                let wide = if k.bits() == 64 {
+                    iv
+                } else if k.is_signed() {
+                    self.builder
+                        .build_int_s_extend(iv, self.abi.i64t(), "sx")
+                        .unwrap()
                 } else {
-                    self.builder.build_int_z_extend(iv, self.abi.i64t(), "zx")
-                }
-                .unwrap();
+                    self.builder
+                        .build_int_z_extend(iv, self.abi.i64t(), "zx")
+                        .unwrap()
+                };
                 let signed = self.i64c(k.is_signed() as i64);
                 self.call_to_str("pp_int_to_str", &[wide.into(), signed.into()])
             }
-            Type::Float(_) => {
+            Type::Float(k) => {
                 let fv = v.into_float_value();
-                let wide = self
-                    .builder
-                    .build_float_ext(fv, self.ctx.f64_type(), "fx")
-                    .unwrap();
+                let wide = if k.bits() == 64 {
+                    fv
+                } else {
+                    self.builder
+                        .build_float_ext(fv, self.ctx.f64_type(), "fx")
+                        .unwrap()
+                };
                 self.call_to_str("pp_float_to_str", &[wide.into()])
             }
             // A nullable renders its value when present, else "null" -- a branch
@@ -3227,7 +3403,14 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
                     .runtime_fn(&self.module, "pp_str_concat", concat_ty);
                 let result = self.builder.build_alloca(ptrt, "arrstr").unwrap();
                 let open = self.const_str("[");
-                self.builder.build_store(result, open).unwrap();
+                let empty = self.const_str("");
+                let initial = self
+                    .builder
+                    .build_call(concat, &[open.into(), empty.into()], "initial")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                self.builder.build_store(result, initial).unwrap();
                 let len = self
                     .builder
                     .build_load(i64t, self.field_ptr(arr, 16), "len")
@@ -3273,6 +3456,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
                     .unwrap()
                     .try_as_basic_value()
                     .unwrap_basic();
+                self.release(cur);
                 self.builder.build_store(result, ws).unwrap();
                 self.builder.build_unconditional_branch(elembb).unwrap();
                 self.builder.position_at_end(elembb);
@@ -3286,6 +3470,10 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
                     .unwrap()
                     .try_as_basic_value()
                     .unwrap_basic();
+                self.release(cur2);
+                if rendered_string_is_owned(&elem_ty) {
+                    self.release(es);
+                }
                 self.builder.build_store(result, ap).unwrap();
                 let inc = self
                     .builder
@@ -3296,11 +3484,14 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
                 self.builder.position_at_end(exit);
                 let cur3 = self.builder.build_load(ptrt, result, "cur3").unwrap();
                 let close = self.const_str("]");
-                self.builder
+                let finished = self
+                    .builder
                     .build_call(concat, &[cur3.into(), close.into()], "fin")
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_basic()
+                    .unwrap_basic();
+                self.release(cur3);
+                finished
             }
             // A tuple renders as `[e0, e1, ...]`. Its length and element types are
             // statically known, so the rendering is unrolled: each element is loaded
@@ -3313,34 +3504,51 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
                     .runtime_fn(&self.module, "pp_str_concat", concat_ty);
                 let (layout, _) = self.tuple_layout(elems);
                 let tup = v.into_pointer_value();
-                let mut cur = self.const_str("[");
+                let open = self.const_str("[");
+                let empty = self.const_str("");
+                let mut cur = self
+                    .builder
+                    .build_call(concat, &[open.into(), empty.into()], "initial")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 for (i, ety) in elems.iter().enumerate() {
                     if i > 0 {
                         let comma = self.const_str(", ");
-                        cur = self
+                        let next = self
                             .builder
                             .build_call(concat, &[cur.into(), comma.into()], "ws")
                             .unwrap()
                             .try_as_basic_value()
                             .unwrap_basic();
+                        self.release(cur);
+                        cur = next;
                     }
                     let (llty, offset) = layout[i];
                     let fp = self.field_ptr(tup, offset);
                     let ev = self.builder.build_load(llty, fp, "te").unwrap();
                     let es = self.to_string(ev, ety);
-                    cur = self
+                    let next = self
                         .builder
                         .build_call(concat, &[cur.into(), es.into()], "ap")
                         .unwrap()
                         .try_as_basic_value()
                         .unwrap_basic();
+                    self.release(cur);
+                    if rendered_string_is_owned(ety) {
+                        self.release(es);
+                    }
+                    cur = next;
                 }
                 let close = self.const_str("]");
-                self.builder
+                let result = self
+                    .builder
                     .build_call(concat, &[cur.into(), close.into()], "cl")
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_basic()
+                    .unwrap_basic();
+                self.release(cur);
+                result
             }
             // A record/sum renders through a memoized per-type formatter so a
             // self-referential type recurses by call rather than inlining forever.
@@ -3709,6 +3917,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
                 self.builder.build_store(fp, *v).unwrap();
             }
         }
+        self.register_for_gc(base.into(), sum_ty);
         base.into()
     }
 
@@ -3990,6 +4199,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
             let ep = self.elem_ptr(base, llty, self.i64c(i as i64));
             self.builder.build_store(ep, *v).unwrap();
         }
+        self.register_for_gc(base.into(), &Type::Slice(Box::new(elem_ty.clone())));
         base.into()
     }
 
@@ -4267,6 +4477,9 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
         for ((_, v), off) in captures.iter().zip(offsets) {
             let cp = self.field_ptr(base, off);
             self.builder.build_store(cp, *v).unwrap();
+        }
+        if let Some(tracer) = self.get_or_emit_closure_tracer(&capture_types) {
+            self.register_with_tracer(base.into(), tracer);
         }
         base.into()
     }
