@@ -32,7 +32,7 @@ impl<'a> Checker<'a> {
     }
 
     fn narrow_non_null(&mut self, name: &str, scopes: &mut ScopeStack) {
-        for scope in scopes.iter_mut().rev() {
+        for (frame, scope) in scopes.iter_mut().enumerate().rev() {
             if let Some(original) = scope.get(name).cloned() {
                 let Type::Nullable(inner) = self.resolve(&original) else {
                     return;
@@ -42,8 +42,11 @@ impl<'a> Checker<'a> {
                 // Remember the pre-narrowing type so a later call can undo the
                 // narrowing when the binding is reachable by the callee (a
                 // global or a closure-assigned local).
-                self.narrowed_bindings
-                    .push((name.to_string(), Type::Nullable(inner)));
+                self.narrowed_bindings.push(NarrowedBinding {
+                    name: name.to_string(),
+                    frame,
+                    original: Type::Nullable(inner),
+                });
                 break;
             }
         }
@@ -60,20 +63,25 @@ impl<'a> Checker<'a> {
             return;
         }
         let narrowed = self.narrowed_bindings.clone();
-        for (name, original) in narrowed {
-            let Some(frame_idx) = scopes.iter().rposition(|s| s.contains_key(&name)) else {
+        for NarrowedBinding {
+            name,
+            frame,
+            original,
+        } in narrowed
+        {
+            let Some(scope) = scopes.get_mut(frame) else {
                 continue;
             };
-            let global = frame_idx == 0;
+            let global = frame == 0;
             if !global && !self.closure_write_targets.contains(&name) {
                 continue;
             }
-            let still_narrowed = scopes[frame_idx]
+            let still_narrowed = scope
                 .get(&name)
                 .is_some_and(|t| !matches!(self.resolve(t), Type::Nullable(_)));
             if still_narrowed {
                 tracing::debug!(name, "re-widening narrowed binding after call");
-                scopes[frame_idx].insert(name.clone(), original.clone());
+                scope.insert(name, original);
             }
         }
     }

@@ -26,9 +26,11 @@ impl<'a> Checker<'a> {
         }
         let tn = self.resolve_self_name(name);
         let Some(symbol) = self.resolve_type_symbol(&tn) else {
+            self.check_supplied_field_exprs(fields, scopes);
             return self.fresh_unknown();
         };
         let Some(info) = self.program.types.get(&symbol) else {
+            self.check_supplied_field_exprs(fields, scopes);
             return self.fresh_unknown();
         };
         let TypeKind::Record {
@@ -48,6 +50,7 @@ impl<'a> Checker<'a> {
                     span,
                 });
             }
+            self.check_supplied_field_exprs(fields, scopes);
             return self.fresh_unknown();
         };
         let ret = info.type_ref();
@@ -65,12 +68,15 @@ impl<'a> Checker<'a> {
     ) -> Type {
         let tn = self.resolve_self_name(t);
         let Some(symbol) = self.resolve_type_symbol(&tn) else {
+            self.check_supplied_field_exprs(fields, scopes);
             return self.fresh_unknown();
         };
         let Some(info) = self.program.types.get(&symbol) else {
+            self.check_supplied_field_exprs(fields, scopes);
             return self.fresh_unknown();
         };
         let Some(var) = info.variant(variant) else {
+            self.check_supplied_field_exprs(fields, scopes);
             return self.fresh_unknown();
         };
         let ret = info.type_ref();
@@ -83,6 +89,15 @@ impl<'a> Checker<'a> {
             scopes,
         );
         apply_nominal_substitution(ret, substitution)
+    }
+
+    /// Recovery from an unresolved literal still evaluates every supplied field
+    /// for typing purposes; otherwise the outer construction error would mask
+    /// unrelated errors inside those expressions.
+    fn check_supplied_field_exprs(&mut self, fields: &[(String, Expr)], scopes: &mut ScopeStack) {
+        for (_, expr) in fields {
+            self.check_expr(expr, scopes);
+        }
     }
 
     fn check_lit_fields(

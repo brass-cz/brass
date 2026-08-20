@@ -821,6 +821,44 @@ mod tests {
         check(&prog).into_iter().map(|e| e.message).collect()
     }
 
+    fn infer_errs(src: &str) -> Vec<String> {
+        let ast = parse(src).expect("parse");
+        let (prog, lerr) = lower(&[LoadedModule {
+            is_prelude: false,
+            path: vec!["main".into()],
+            ast,
+        }]);
+        assert!(lerr.is_empty(), "lower errors: {lerr:?}");
+        super::infer::analyze(&prog)
+            .errors
+            .into_iter()
+            .map(|e| e.message)
+            .collect()
+    }
+
+    fn prelude_infer_errs(src: &str) -> Vec<String> {
+        let core = parse(include_str!("../../../core/error.cz")).expect("parse core error module");
+        let main = parse(src).expect("parse main module");
+        let (prog, lerr) = lower(&[
+            LoadedModule {
+                is_prelude: true,
+                path: vec!["core".into(), "error".into()],
+                ast: core,
+            },
+            LoadedModule {
+                is_prelude: false,
+                path: vec!["main".into()],
+                ast: main,
+            },
+        ]);
+        assert!(lerr.is_empty(), "lower errors: {lerr:?}");
+        super::infer::analyze(&prog)
+            .errors
+            .into_iter()
+            .map(|e| e.message)
+            .collect()
+    }
+
     fn analysis(src: &str) -> Analysis {
         let ast = parse(src).expect("parse");
         let (prog, lerr) = lower(&[LoadedModule {
@@ -3042,6 +3080,31 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_literal_recovery_checks_every_field_expression() {
+        let e = infer_errs(
+            "type Choice = A | B\n\
+             fun main() {\n\
+                 Missing { value: missing_record_value }\n\
+                 Choice.Nope { value: missing_variant_value }\n\
+                 Choice { value: missing_sum_value }\n\
+             }\n",
+        );
+        // Construction recovery must not hide independent failures nested in
+        // unknown records, missing variants, or direct sum constructions.
+        for name in [
+            "missing_record_value",
+            "missing_variant_value",
+            "missing_sum_value",
+        ] {
+            assert!(
+                e.iter()
+                    .any(|m| m.contains(&format!("unknown name `{name}`"))),
+                "{name}: {e:?}"
+            );
+        }
+    }
+
+    #[test]
     fn missing_record_field_access_is_nullable_not_an_error() {
         // Accessing a field a structure does not have is not an error: it yields a
         // nullable (null at runtime), so the access is allowed but the result must
@@ -3079,6 +3142,27 @@ mod tests {
             "fun f(x: int32?) -> int32 {\n    if x != null {\n        return x + 1\n    }\n    return 0\n}\n",
         );
         assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn call_invalidation_widens_the_exact_shadowed_global_binding() {
+        let e = errs(
+            "let state: string? = \"ready\"\n\
+             fun clear() { state = null }\n\
+             fun main() {\n\
+                 if state {\n\
+                     { let state = \"shadow\"\n clear() }\n\
+                     state.len()\n\
+                 }\n\
+             }\n",
+        );
+        // The inner `state` must not hide the narrowed global from call
+        // invalidation: `clear` can re-null the global before the final use.
+        assert!(
+            e.iter()
+                .any(|m| m.contains("nullable value must be checked for null before use")),
+            "{e:?}"
+        );
     }
 
     #[test]
@@ -4118,6 +4202,62 @@ mod tests {
     }
 
     #[test]
+    fn string_find_checks_types_and_nested_excess_diagnostics() {
+        let e = infer_errs("fun main() {\n    _string_find(1, \"x\", missing_find_argument)\n}\n");
+        assert!(
+            e.iter()
+                .any(|m| m.contains("cannot use `int32` where `string` is required")),
+            "{e:?}"
+        );
+        assert!(
+            e.iter()
+                .any(|m| m.contains("unknown name `missing_find_argument`")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn zero_argument_runtime_builtins_walk_excess_arguments() {
+        let e = infer_errs(
+            "fun main() {\n    _flush(missing_flush_argument)\n    _argv(missing_argv_argument)\n}\n",
+        );
+        // Arity recovery still visits each supplied expression, preserving the
+        // diagnostics users can fix independently of the outer call.
+        for name in ["missing_flush_argument", "missing_argv_argument"] {
+            assert!(
+                e.iter()
+                    .any(|m| m.contains(&format!("unknown name `{name}`"))),
+                "{name}: {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_error_call_keeps_its_resolved_signature_contract() {
+        let e = prelude_infer_errs(
+            "fun main() {\n\
+                 error()\n\
+                 error(\"x\", 1)\n\
+                 error(\"x\", Location { file: \"main.cz\", line: 1, col: 1 }, missing_extra)\n\
+             }\n",
+        );
+        assert!(
+            e.iter()
+                .any(|m| m.contains("`error` expects 1 to 2 argument(s), got 0")),
+            "{e:?}"
+        );
+        assert!(
+            e.iter()
+                .any(|m| m.contains("cannot use `int32` where `Location` is required")),
+            "{e:?}"
+        );
+        assert!(
+            e.iter().any(|m| m.contains("unknown name `missing_extra`")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
     fn array_runtime_builtins_check_element_contracts() {
         let e = errs(
             "fun main() {\n    let xs = [1]\n    _array_push(xs, 2)\n    let x: int32? = _array_pop(xs)\n}\n",
@@ -4192,6 +4332,16 @@ mod tests {
         let e = errs("fun main() {\n    spawn(1)\n}\n");
         assert!(
             e.iter().any(|m| m.contains("`spawn` expects a closure")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_requires_a_void_returning_closure() {
+        let e = infer_errs("fun main() {\n    spawn(() -> 1)\n}\n");
+        assert!(
+            e.iter()
+                .any(|m| m.contains("expects a closure returning `void`")),
             "{e:?}"
         );
     }
@@ -4321,6 +4471,40 @@ mod tests {
         assert!(e.is_empty(), "{e:?}");
     }
 
+    #[test]
+    fn slice_methods_enforce_exact_arity_and_walk_excess_arguments() {
+        let e = infer_errs(
+            "fun main() {\n\
+                 let xs: int32[] = []\n\
+                 xs.push()\n\
+                 xs.insert(0)\n\
+                 xs.pop(missing_pop_argument)\n\
+                 xs.remove()\n\
+                 xs.len(missing_len_argument)\n\
+             }\n",
+        );
+        for (method, arity) in [
+            ("push", 1),
+            ("insert", 2),
+            ("pop", 0),
+            ("remove", 1),
+            ("len", 0),
+        ] {
+            assert!(
+                e.iter()
+                    .any(|m| m.contains(&format!("method `{method}` takes {arity}"))),
+                "{method}: {e:?}"
+            );
+        }
+        for name in ["missing_pop_argument", "missing_len_argument"] {
+            assert!(
+                e.iter()
+                    .any(|m| m.contains(&format!("unknown name `{name}`"))),
+                "{name}: {e:?}"
+            );
+        }
+    }
+
     // --- Milestone R2: closure body constraints are verified at call sites ---
 
     #[test]
@@ -4374,6 +4558,21 @@ mod tests {
         // `(x) -> x.speak()` requires a receiver with a `speak` method; an
         // `int32` has none.
         let e = errs("fun main() {\n    let f = (x) -> x.speak()\n    f(1)\n}\n");
+        assert!(
+            e.iter()
+                .any(|m| m.contains("`int32` has no method `speak`")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn closure_method_constraint_ignores_same_named_free_function() {
+        let e = infer_errs(
+            "fun speak() {}\n\
+             fun main() {\n    let f = (x) -> x.speak()\n    f(1)\n}\n",
+        );
+        // Instance-call dispatch has no UFCS fallback, so an unrelated free
+        // function cannot satisfy the receiver's recorded method shape.
         assert!(
             e.iter()
                 .any(|m| m.contains("`int32` has no method `speak`")),

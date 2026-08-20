@@ -440,10 +440,12 @@ impl<'p> Hm<'p> {
         }
         let ra = self.solver.resolve(a);
         let rb = self.solver.resolve(b);
+        let snapshot = self.solver.snapshot();
         let message =
             self.solver.unify(&ra, &rb).err().unwrap_or_else(|| {
                 format!("cannot unify `{}` with `{}`", ra.display(), rb.display())
             });
+        self.solver.rollback(snapshot);
         self.errors.push(TypeError { message, span });
     }
 
@@ -1651,27 +1653,43 @@ impl<'p> Hm<'p> {
     /// record this is the named field; for a sum it is a field common to *every*
     /// variant (common-field access) -- `None` if any variant
     /// lacks it.
-    fn record_field_type(&self, ty: &Type, field: &str) -> Option<Type> {
-        match &self.type_def(ty)?.kind {
-            TypeKind::Record { fields, .. } => fields
-                .iter()
-                .find(|f| f.name == field)
-                .and_then(|f| f.resolved_ty.clone()),
+    fn record_field_type(&mut self, ty: &Type, field: &str) -> Option<Type> {
+        let common_types = match &self.type_def(ty)?.kind {
+            TypeKind::Record { fields, .. } => {
+                return fields
+                    .iter()
+                    .find(|f| f.name == field)
+                    .and_then(|f| f.resolved_ty.clone());
+            }
             // Common-field access: the field must exist in every
             // variant. The principled pass stays permissive about an unannotated
             // (dynamic) common field -- it returns the declared type, which the
             // access path freshens -- and the `infer` pass makes the sound decision
             // (a bare sum with a dynamic variant field is rejected, a refined one is
             // resolved through its substitution).
-            TypeKind::Sum { variants } => {
-                let mut common = None;
-                for v in variants {
-                    let f = v.fields.iter().find(|f| f.name == field)?;
-                    common = f.resolved_ty.clone();
-                }
-                common
-            }
-        }
+            TypeKind::Sum { variants } => variants
+                .iter()
+                .map(|variant| {
+                    variant
+                        .fields
+                        .iter()
+                        .find(|candidate| candidate.name == field)?
+                        .resolved_ty
+                        .clone()
+                })
+                .collect::<Option<Vec<_>>>()?,
+        };
+        let (candidate, rest) = common_types.split_first()?;
+        // Probe the whole group in one snapshot so constraints learned from an
+        // earlier variant participate in later comparisons. Independent pairwise
+        // probes would accept `U`, `int32`, `string` even though no single `U`
+        // can satisfy both concrete variants.
+        let snapshot = self.solver.snapshot();
+        let agrees = rest
+            .iter()
+            .all(|ty| self.solver.unify(candidate, ty).is_ok());
+        self.solver.rollback(snapshot);
+        agrees.then(|| candidate.clone())
     }
 
     /// Method `method` on the type of `ty`: its non-self parameter types and
@@ -1913,27 +1931,51 @@ fn expr_constructs_error(e: &Expr) -> bool {
                 || expr_constructs_error(callee)
                 || args.iter().any(|a| expr_constructs_error(&a.expr))
         }
-        Expr::Field(b, _, _) | Expr::Index(b, _, _) | Expr::Unary(_, b, _) => {
-            expr_constructs_error(b)
-        }
+        Expr::Str(segments, _) => segments.iter().any(|segment| match segment {
+            StrSeg::Lit(_) => false,
+            StrSeg::Expr(expr) => expr_constructs_error(expr),
+        }),
+        Expr::Field(base, _, _) | Expr::Unary(_, base, _) => expr_constructs_error(base),
+        Expr::Index(base, index, _) => expr_constructs_error(base) || expr_constructs_error(index),
         Expr::Binary(_, a, b, _) => expr_constructs_error(a) || expr_constructs_error(b),
+        Expr::Array(elements, _) => elements.iter().any(expr_constructs_error),
+        Expr::Range(lo, hi, _) => expr_constructs_error(lo) || expr_constructs_error(hi),
+        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => {
+            fields.iter().any(|(_, value)| expr_constructs_error(value))
+        }
         Expr::Block(block, _) => block_constructs_error(block),
         Expr::If(c, t, e, _) => {
             expr_constructs_error(c)
                 || block_constructs_error(t)
                 || e.as_ref().is_some_and(|e| expr_constructs_error(e))
         }
+        Expr::IfLet(_, scrut, then, els, _) => {
+            expr_constructs_error(scrut)
+                || block_constructs_error(then)
+                || els.as_ref().is_some_and(|expr| expr_constructs_error(expr))
+        }
+        Expr::TypeTest(subject, _, _) => expr_constructs_error(subject),
         Expr::Match(scrut, arms, _) => {
             expr_constructs_error(scrut) || arms.iter().any(|a| expr_constructs_error(&a.body))
         }
         // A nested closure has its own fallibility; do not descend.
-        _ => false,
+        Expr::Closure(..)
+        | Expr::Int(..)
+        | Expr::Float(..)
+        | Expr::Bool(..)
+        | Expr::Null(_)
+        | Expr::Ident(..)
+        | Expr::SelfExpr(_) => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::check;
+    use super::{Hm, block_constructs_error, check};
+    use crate::solver::InferenceVarKind;
+    use brass_hir::{IntKind, Program, Type};
+    use brass_parser::Span;
+    use brass_parser::ast::TopLevel;
 
     fn errors(src: &str) -> Vec<String> {
         let ast = brass_parser::parse(src).expect("parse");
@@ -1946,6 +1988,15 @@ mod tests {
         check(&program).into_iter().map(|e| e.message).collect()
     }
 
+    fn parsed_block_constructs_error(expr: &str) -> bool {
+        let module = brass_parser::parse(&format!("fun f() {{\n  let value = {expr}\n}}\n"))
+            .expect("parse compound expression");
+        let TopLevel::Fun(fun) = &module.items[0] else {
+            panic!("expected function");
+        };
+        block_constructs_error(&fun.body)
+    }
+
     #[test]
     fn let_bound_closure_is_polymorphic() {
         // The defining HM property: a `let`-bound `(x) -> x` is generalized, so
@@ -1953,6 +2004,60 @@ mod tests {
         // the other. A monomorphic binding would unify the two and fail.
         let errs = errors("fun run() {\n  let id = (x) -> x\n  id(1)\n  id(\"hi\")\n}\n");
         assert!(errs.is_empty(), "polymorphic use should check: {errs:?}");
+    }
+
+    #[test]
+    fn failed_diagnostic_unification_rolls_back_partial_bindings() {
+        let program = Program::empty();
+        let mut hm = Hm::new(&program);
+        let open = hm.solver.fresh(InferenceVarKind::Source);
+        let left = Type::Tuple(vec![open.clone(), Type::Str]);
+        let right = Type::Tuple(vec![Type::Bool, Type::Int(IntKind::I32)]);
+
+        hm.unify(&left, &right, Span::new(0, 1));
+
+        // The second diagnostic-only attempt sees the same composite failure as
+        // flow unification and must not retain its first component's binding.
+        assert!(hm.solver.resolve(&open).is_unknown());
+    }
+
+    #[test]
+    fn common_sum_field_requires_one_type_across_every_variant() {
+        let errs = errors(
+            "type Mixed =\n\
+                 | Number { value: int32 }\n\
+                 | Text { value: string }\n\
+             fun read(m: Mixed) {\n  let value = m.value\n}\n",
+        );
+        // A field name alone is not sufficient for common access: each variant
+        // must expose a mutually unifiable field type.
+        assert!(
+            errs.iter()
+                .any(|message| message.contains("`Mixed` has no field `value`")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn error_construction_scanner_visits_every_compound_payload_position() {
+        for expr in [
+            "[error(\"array\")]",
+            "[error(\"range\")..1]",
+            "Missing { value: error(\"record\") }",
+            "Missing.Variant { value: error(\"variant\") }",
+            "\"interpolated {error(payload)}\"",
+            "values[error(\"index\")]",
+            "if let x = error(\"if-let\") { x } else { null }",
+        ] {
+            assert!(
+                parsed_block_constructs_error(expr),
+                "scanner missed compound expression: {expr}"
+            );
+        }
+        assert!(
+            !parsed_block_constructs_error("() -> error(\"nested closure\")"),
+            "a nested closure must retain its own fallibility"
+        );
     }
 
     #[test]

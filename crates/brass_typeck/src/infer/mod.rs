@@ -97,6 +97,16 @@ impl DerefMut for Scope {
 
 type ScopeStack = Vec<Scope>;
 
+/// One exact lexical binding whose nullable type was narrowed for control flow.
+/// The frame index keeps invalidation aimed at that binding when an inner scope
+/// shadows the same source name before a call.
+#[derive(Clone)]
+struct NarrowedBinding {
+    name: String,
+    frame: usize,
+    original: Type,
+}
+
 struct MethodCall<'a> {
     owner: &'a str,
     self_type: &'a str,
@@ -1719,7 +1729,7 @@ struct Checker<'a> {
     /// closure value may run during the call), so those narrowings are undone
     /// after every call (`invalidate_narrowed_after_call`). Plain locals are
     /// unaffected: no callee can rebind them.
-    narrowed_bindings: Vec<(String, Type)>,
+    narrowed_bindings: Vec<NarrowedBinding>,
     /// Names assigned anywhere inside a closure literal of the callable body
     /// currently being checked; see `narrowed_bindings`.
     closure_write_targets: HashSet<String>,

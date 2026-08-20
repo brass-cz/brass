@@ -164,7 +164,7 @@ impl<'a> Checker<'a> {
                 );
             }
             let frame = self.finish_elaboration_journal();
-            if memoizable && frame.is_journalable() {
+            if memoizable {
                 // Recursive return pinning changes the shared solver entry during
                 // this first walk. It is not a journal observation: later hits see
                 // the already-linked entry, just as repeated elaborations do.
@@ -384,8 +384,7 @@ impl<'a> Checker<'a> {
         // Call-site re-inference does not report conflicts; the definition
         // site already did.
         let normal_ty = self.reconcile_return_types(&normal, false);
-        let err_ty = self.reconcile_error_payloads(&props.errors, false);
-        let base = self.result_from_payloads(normal_ty, err_ty);
+        let base = self.result_from_payloads(normal_ty, &props.errors, false);
         let light = super::precompute::wrap_null_propagated_return(base, &props.nulls);
         let collected = std::mem::take(&mut self.last_returns);
         if let Some(t) = full_ret
@@ -615,7 +614,7 @@ impl<'a> Checker<'a> {
             let resolved = self.resolve(&ret);
             let memoizable = self.errors.len() == errors_before;
             let frame = self.finish_elaboration_journal();
-            if memoizable && frame.is_journalable() {
+            if memoizable {
                 let entry = self.build_elaboration_memo_entry(&resolved, frame, &memo_key);
                 self.elaboration_memo.insert(memo_key.key, Rc::new(entry));
             }

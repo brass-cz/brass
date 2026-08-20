@@ -288,7 +288,10 @@ impl<'a> Checker<'a> {
         if got.is_unknown() {
             return;
         }
-        let _ = self.solver.unify(&want, &got);
+        let snapshot = self.solver.snapshot();
+        if self.solver.unify(&want, &got).is_err() {
+            self.solver.rollback(snapshot);
+        }
     }
 
     /// A `Result`'s Ok payload, or the type itself when it is not one.
@@ -586,8 +589,7 @@ or drop the `!`"
         // `infer_function_return`.
         let report = !block_has_type_test(body);
         let normal_ty = self.reconcile_return_types(&normal, report);
-        let err_ty = self.reconcile_error_payloads(&props.errors, report);
-        let base = self.result_from_payloads(normal_ty, err_ty);
+        let base = self.result_from_payloads(normal_ty, &props.errors, report);
         (wrap_null_propagated_return(base, &props.nulls), has_props)
     }
 
@@ -751,8 +753,7 @@ or drop the `!`"
         // their disagreement. Each instance reconciles its own live path.
         let report = !block_has_type_test(body);
         let normal_ty = self.reconcile_return_types(&normal, report);
-        let err_ty = self.reconcile_error_payloads(&props.errors, report);
-        let base = self.result_from_payloads(normal_ty, err_ty);
+        let base = self.result_from_payloads(normal_ty, &props.errors, report);
         wrap_null_propagated_return(base, &props.nulls)
     }
 
@@ -771,35 +772,44 @@ or drop the `!`"
     pub(super) fn result_from_payloads(
         &mut self,
         normal_ty: Option<Type>,
-        err_ty: Option<Type>,
+        errors: &[(Type, Span)],
+        report: bool,
     ) -> Type {
-        match (normal_ty, err_ty) {
-            (Some(ok), Some(err)) => {
+        match normal_ty {
+            Some(ok) => {
                 let resolved = self.resolve(&ok);
                 if let Some((fwd_ok, fwd_err)) = resolved.result_payloads() {
                     // The forwarded Result's error payload and the body's own
-                    // error sites must describe one type; prefer the concrete
-                    // side when only one is known. (Two concrete but
-                    // different payloads keep the forwarded one -- the same
-                    // first-wins policy `reconcile_error_payloads` applies.)
-                    let merged = if fwd_err.is_unknown() {
-                        err
-                    } else {
-                        fwd_err.clone()
-                    };
+                    // error sites must describe one type. Put the forwarded
+                    // payload first so a conflict is attributed to the concrete
+                    // local site's span and recovery retains the forwarded shape.
+                    if errors.is_empty() {
+                        return ok;
+                    }
+                    let mut payloads = Vec::with_capacity(errors.len() + 1);
+                    payloads.push((fwd_err.clone(), Span::new(0, 0)));
+                    payloads.extend(errors.iter().cloned());
+                    let merged = self
+                        .reconcile_error_payloads(&payloads, report)
+                        .map(|ty| self.resolve(&ty))
+                        .unwrap_or_else(|| fwd_err.clone());
                     // Keep the forwarded Result's nominal (a shadow included).
                     resolved.rebuild_result(fwd_ok.clone(), merged)
-                } else {
+                } else if let Some(err) = self.reconcile_error_payloads(errors, report) {
                     let span = brass_parser::Span::new(0, 0);
                     self.scoped_result(ok, err, span)
+                } else {
+                    ok
                 }
             }
-            (Some(ty), None) => ty,
-            (None, Some(err)) => {
-                let ok = self.fresh_error_only_ok();
-                self.scoped_result(ok, err, brass_parser::Span::new(0, 0))
+            None => {
+                if let Some(err) = self.reconcile_error_payloads(errors, report) {
+                    let ok = self.fresh_error_only_ok();
+                    self.scoped_result(ok, err, brass_parser::Span::new(0, 0))
+                } else {
+                    Type::Void
+                }
             }
-            (None, None) => Type::Void,
         }
     }
 
@@ -1079,4 +1089,42 @@ fn block_has_type_test(b: &Block) -> bool {
     let mut finder = Finder(false);
     crate::walk::walk_block(b, &mut finder);
     finder.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_inferred_return_link_rolls_back_partial_bindings() {
+        let program = Program::empty();
+        let mut checker =
+            Checker::new(&program, Rc::new(brass_typesys::RowInfo::analyze(&program)));
+        let open = checker.fresh_unknown();
+        let precomputed = Type::Tuple(vec![open.clone(), Type::Str]);
+        let inferred = Type::Tuple(vec![Type::Bool, Type::Int(IntKind::I32)]);
+
+        checker.link_inferred_return(&precomputed, &inferred);
+
+        // Linking is an optional refinement: a later component mismatch must undo
+        // the earlier component binding instead of poisoning the shared solver.
+        assert!(checker.resolve(&open).is_unknown());
+    }
+
+    #[test]
+    fn forwarded_and_local_error_payloads_must_reconcile() {
+        let program = Program::empty();
+        let mut checker =
+            Checker::new(&program, Rc::new(brass_typesys::RowInfo::analyze(&program)));
+        let local_span = Span::new(10, 12);
+        let forwarded = Type::result(Type::Int(IntKind::I32), Type::Str);
+
+        checker.result_from_payloads(Some(forwarded), &[(Type::Bool, local_span)], true);
+
+        // A concrete local error cannot be silently discarded in favor of the
+        // forwarded Result; the disagreement is reported at the local site.
+        assert!(checker.errors.iter().any(|error| {
+            error.span == local_span && error.message.contains("incompatible error payloads")
+        }));
+    }
 }

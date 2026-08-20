@@ -513,14 +513,10 @@ pub(super) fn block_rebinds(block: &Block, var: &str) -> bool {
         }
         Stmt::For {
             pat, iter, body, ..
-        } => {
-            pat_binds(pat, var) || expr_rebinds(iter, var) || block_rebinds(body, var)
-        }
+        } => pat_binds(pat, var) || expr_rebinds(iter, var) || block_rebinds(body, var),
         Stmt::While { cond, body, .. } => expr_rebinds(cond, var) || block_rebinds(body, var),
         Stmt::Expr(e) | Stmt::Return(Some(e), _) => expr_rebinds(e, var),
-        Stmt::Assign { target, value, .. } => {
-            expr_rebinds(target, var) || expr_rebinds(value, var)
-        }
+        Stmt::Assign { target, value, .. } => expr_rebinds(target, var) || expr_rebinds(value, var),
         Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => false,
     })
 }

@@ -87,6 +87,9 @@ impl<'a> Checker<'a> {
         if name == "_flush" {
             // `_flush()`: push buffered output to the operating system.
             self.check_arg_count(name, 0, args.len(), span);
+            for arg in args {
+                self.check_expr(&arg.expr, scopes);
+            }
             return Some(Type::Void);
         }
         if name == "_argv" {
@@ -94,6 +97,9 @@ impl<'a> Checker<'a> {
             // program file, then everything after it on the command line).
             // The primitive behind the env library's `args()`.
             self.check_arg_count(name, 0, args.len(), span);
+            for arg in args {
+                self.check_expr(&arg.expr, scopes);
+            }
             return Some(Type::Slice(Box::new(Type::Str)));
         }
         if let Some(ret) = brass_hir::plugin_builtin_return(name) {
@@ -269,7 +275,20 @@ impl<'a> Checker<'a> {
                                 span: arg.expr.span(),
                             });
                         }
-                        Type::Fun(_, _) | Type::Unknown(_) => {}
+                        Type::Fun(_, ret) => {
+                            let ret = self.resolve(&ret);
+                            if !matches!(ret, Type::Void | Type::Unknown(_)) {
+                                self.errors.push(TypeError {
+                                    message: format!(
+                                        "`spawn` expects a closure returning `void`, found \
+                                         `() -> {}`",
+                                        ret.display()
+                                    ),
+                                    span: arg.expr.span(),
+                                });
+                            }
+                        }
+                        Type::Unknown(_) => {}
                         other => {
                             self.errors.push(TypeError {
                                 message: format!(
@@ -555,13 +574,6 @@ impl<'a> Checker<'a> {
         span: brass_parser::Span,
         scopes: &mut ScopeStack,
     ) -> Option<Type> {
-        if name == "_string_find" {
-            self.check_arg_count(name, 2, args.len(), span);
-            args.iter().for_each(|arg| {
-                self.check_expr(&arg.expr, scopes);
-            });
-            return Some(Type::Nullable(Box::new(Type::Int(IntKind::I64))));
-        }
         let i64_ty = Type::Int(IntKind::I64);
         let bytes_ty = Type::Slice(Box::new(Type::Int(IntKind::U8)));
         let (params, ret) = match name {
@@ -571,6 +583,10 @@ impl<'a> Checker<'a> {
             "_string_from_bytes" => (vec![bytes_ty], Type::result(Type::Str, Type::Str)),
             "_string_char_at" => (vec![Type::Str, i64_ty], Type::Str),
             "_string_cmp" => (vec![Type::Str, Type::Str], Type::Int(IntKind::I32)),
+            "_string_find" => (
+                vec![Type::Str, Type::Str],
+                Type::Nullable(Box::new(Type::Int(IntKind::I64))),
+            ),
             _ => return None,
         };
         self.check_builtin_args_against(name, args, &params, span, scopes);
@@ -717,13 +733,11 @@ impl<'a> Checker<'a> {
                     let got = self.check_expr(&arg.expr, scopes);
                     self.expect_element_assignable(&got, elem, &arg.expr);
                 }
-                self.reject_extra_args(method, args, 1, scopes, span);
+                self.check_method_arg_count(method, args, 1, scopes, span);
                 Some(Type::Void)
             }
             ("pop", Some(elem)) => {
-                args.iter().for_each(|arg| {
-                    self.check_expr(&arg.expr, scopes);
-                });
+                self.check_method_arg_count(method, args, 0, scopes, span);
                 Some(Type::Nullable(Box::new(elem.clone())))
             }
             // `arr.insert(idx, v)`: idx is int64, v is the element.
@@ -736,7 +750,7 @@ impl<'a> Checker<'a> {
                     let got = self.check_expr(&value.expr, scopes);
                     self.expect_element_assignable(&got, elem, &value.expr);
                 }
-                self.reject_extra_args(method, args, 2, scopes, span);
+                self.check_method_arg_count(method, args, 2, scopes, span);
                 Some(Type::Void)
             }
             // `arr.remove(idx) -> T`: removes and returns the element.
@@ -745,32 +759,24 @@ impl<'a> Checker<'a> {
                     let got = self.check_expr(&idx.expr, scopes);
                     self.expect_expr_assignable(&got, &Type::Int(IntKind::I64), &idx.expr);
                 }
-                for arg in args.iter().skip(1) {
-                    self.check_expr(&arg.expr, scopes);
-                }
+                self.check_method_arg_count(method, args, 1, scopes, span);
                 Some(elem.clone())
             }
             ("len", Some(_)) => {
-                args.iter().for_each(|arg| {
-                    self.check_expr(&arg.expr, scopes);
-                });
+                self.check_method_arg_count(method, args, 0, scopes, span);
                 Some(Type::Int(IntKind::I64))
             }
             _ if method == "len" && matches!(base, Type::Str) => {
-                args.iter().for_each(|arg| {
-                    self.check_expr(&arg.expr, scopes);
-                });
+                self.check_method_arg_count(method, args, 0, scopes, span);
                 Some(Type::Int(IntKind::I64))
             }
             _ => None,
         }
     }
 
-    /// Report (and still type-check, to surface their own errors) arguments beyond
-    /// the fixed arity of a builtin slice mutator, so `a.push(x, y)` is rejected
-    /// rather than silently dropping `y` -- which previously let `a.push(a, 2)`
-    /// parse as a self-push.
-    fn reject_extra_args(
+    /// Enforce a builtin method's fixed arity while still checking every excess
+    /// expression, so an arity error does not hide independent nested diagnostics.
+    fn check_method_arg_count(
         &mut self,
         method: &str,
         args: &[Arg],
@@ -781,7 +787,7 @@ impl<'a> Checker<'a> {
         for arg in args.iter().skip(arity) {
             self.check_expr(&arg.expr, scopes);
         }
-        if args.len() > arity {
+        if args.len() != arity {
             self.errors.push(TypeError {
                 message: format!(
                     "method `{method}` takes {arity} argument(s), found {}",

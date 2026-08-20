@@ -72,22 +72,11 @@ pub(super) struct ElaborationMemoEntry {
     journal: Vec<ElaborationJournalEntry>,
 }
 
+#[derive(Default)]
 pub(super) struct ElaborationJournalFrame {
     journal: Vec<ElaborationJournalEntry>,
     shapes: Vec<(Type, ShapeConstraint)>,
     journal_seen: Option<FxHashMap<u64, Vec<usize>>>,
-    journalable: bool,
-}
-
-impl Default for ElaborationJournalFrame {
-    fn default() -> Self {
-        Self {
-            journal: Vec::new(),
-            shapes: Vec::new(),
-            journal_seen: None,
-            journalable: true,
-        }
-    }
 }
 
 impl ElaborationJournalFrame {
@@ -134,11 +123,6 @@ impl ElaborationJournalFrame {
             self.push(entry.clone());
         }
         self.shapes.extend(child.shapes.iter().cloned());
-        self.journalable &= child.journalable;
-    }
-
-    pub(super) fn is_journalable(&self) -> bool {
-        self.journalable
     }
 }
 
@@ -279,15 +263,15 @@ impl Checker<'_> {
             .into_iter()
             .map(|(ty, constraint)| {
                 (
-                    self.apply_memo_skeleton_type(&ty, &skeleton),
-                    self.apply_memo_skeleton_shape(constraint, &skeleton),
+                    self.memo_skeleton_type(&ty, &mut skeleton),
+                    self.memo_skeleton_shape(constraint, &mut skeleton),
                 )
             })
             .collect();
         let journal = frame
             .journal
             .into_iter()
-            .map(|entry| self.apply_memo_skeleton_journal_entry(entry, &skeleton))
+            .map(|entry| self.memo_skeleton_journal_entry(entry, &mut skeleton))
             .collect();
         ElaborationMemoEntry {
             ret,
@@ -332,7 +316,8 @@ impl Checker<'_> {
                 .find_map(|(candidate, actual)| (*candidate == *var).then_some(actual))
                 .expect("memo key and binding slots must agree");
             let binding = brass_hir::substitute_vars(binding, &substitution);
-            debug_assert!(self.solver.unify(actual, &binding).is_ok());
+            let outcome = self.solver.unify(actual, &binding);
+            debug_assert!(outcome.is_ok());
         }
         for (ty, constraint) in &entry.shapes {
             let ty = brass_hir::substitute_vars(ty, &substitution);
@@ -390,32 +375,23 @@ impl Checker<'_> {
         }
     }
 
-    fn apply_memo_skeleton_type(&self, ty: &Type, skeleton: &MemoSkeleton) -> Type {
-        let resolved = self.resolve(ty);
-        if skeleton.vars.is_empty() {
-            resolved
-        } else {
-            brass_hir::substitute_vars(&resolved, &skeleton.vars)
-        }
-    }
-
-    fn apply_memo_skeleton_shape(
+    fn memo_skeleton_shape(
         &self,
         constraint: ShapeConstraint,
-        skeleton: &MemoSkeleton,
+        skeleton: &mut MemoSkeleton,
     ) -> ShapeConstraint {
         match constraint {
             ShapeConstraint::Equals(ty) => {
-                ShapeConstraint::Equals(self.apply_memo_skeleton_type(&ty, skeleton))
+                ShapeConstraint::Equals(self.memo_skeleton_type(&ty, skeleton))
             }
             other => other,
         }
     }
 
-    fn apply_memo_skeleton_journal_entry(
+    fn memo_skeleton_journal_entry(
         &self,
         entry: ElaborationJournalEntry,
-        skeleton: &MemoSkeleton,
+        skeleton: &mut MemoSkeleton,
     ) -> ElaborationJournalEntry {
         match entry {
             ElaborationJournalEntry::Typed {
@@ -426,34 +402,33 @@ impl Checker<'_> {
             } => ElaborationJournalEntry::Typed {
                 kind,
                 span,
-                ty: self.apply_memo_skeleton_type(&ty, skeleton),
+                ty: self.memo_skeleton_type(&ty, skeleton),
                 constness,
             },
             ElaborationJournalEntry::SumView(span, ty) => {
-                ElaborationJournalEntry::SumView(span, self.apply_memo_skeleton_type(&ty, skeleton))
+                ElaborationJournalEntry::SumView(span, self.memo_skeleton_type(&ty, skeleton))
             }
             ElaborationJournalEntry::TypeOf(span, ty) => {
-                ElaborationJournalEntry::TypeOf(span, self.apply_memo_skeleton_type(&ty, skeleton))
+                ElaborationJournalEntry::TypeOf(span, self.memo_skeleton_type(&ty, skeleton))
             }
-            ElaborationJournalEntry::TypeTest(span, ty) => ElaborationJournalEntry::TypeTest(
-                span,
-                self.apply_memo_skeleton_type(&ty, skeleton),
-            ),
+            ElaborationJournalEntry::TypeTest(span, ty) => {
+                ElaborationJournalEntry::TypeTest(span, self.memo_skeleton_type(&ty, skeleton))
+            }
             ElaborationJournalEntry::KeyedCall(span, receiver, method, key) => {
                 ElaborationJournalEntry::KeyedCall(
                     span,
                     receiver,
                     method,
-                    self.apply_memo_skeleton_type(&key, skeleton),
+                    self.memo_skeleton_type(&key, skeleton),
                 )
             }
             ElaborationJournalEntry::InstanceReturn(symbol, args, ret) => {
                 ElaborationJournalEntry::InstanceReturn(
                     symbol,
                     args.into_iter()
-                        .map(|arg| self.apply_memo_skeleton_type(&arg, skeleton))
+                        .map(|arg| self.memo_skeleton_type(&arg, skeleton))
                         .collect(),
-                    self.apply_memo_skeleton_type(&ret, skeleton),
+                    self.memo_skeleton_type(&ret, skeleton),
                 )
             }
             other => other,
@@ -700,5 +675,86 @@ mod tests {
         assert!(matches!(replayed.prop_kinds.get(&span), Some(None)));
         assert_eq!(replayed.errors.len(), 1);
         assert_eq!(replayed.typed.expressions.len(), 1);
+    }
+
+    #[test]
+    fn memo_skeleton_discovers_variables_in_shape_and_journal_payloads() {
+        let program = Program::empty();
+        let mut checker =
+            Checker::new(&program, Rc::new(brass_typesys::RowInfo::analyze(&program)));
+        let span = Span::new(0, 1);
+        let vars: Vec<Type> = (0..9).map(|_| checker.fresh_unknown()).collect();
+        let mut frame = ElaborationJournalFrame::default();
+        frame
+            .shapes
+            .push((vars[0].clone(), ShapeConstraint::Equals(vars[1].clone())));
+        frame.journal.extend([
+            ElaborationJournalEntry::Typed {
+                kind: TypedExprKind::Ident("payload".to_string()),
+                span,
+                ty: vars[2].clone(),
+                constness: Constness::Unknown,
+            },
+            ElaborationJournalEntry::SumView(span, vars[3].clone()),
+            ElaborationJournalEntry::TypeOf(span, vars[4].clone()),
+            ElaborationJournalEntry::TypeTest(span, vars[5].clone()),
+            ElaborationJournalEntry::KeyedCall(
+                span,
+                "Receiver".to_string(),
+                "method".to_string(),
+                vars[6].clone(),
+            ),
+            ElaborationJournalEntry::InstanceReturn(
+                "callee".to_string(),
+                vec![vars[7].clone()],
+                vars[8].clone(),
+            ),
+        ]);
+
+        let memo = checker.build_elaboration_memo_entry(&Type::Bool, frame, &concrete_context());
+
+        // Every payload-only variable needs a replay-local placeholder; retaining
+        // any checker-local id would couple otherwise independent memo hits.
+        assert_eq!(memo.fresh.len(), vars.len());
+    }
+
+    #[test]
+    fn memo_replay_applies_saved_input_bindings() {
+        let program = Program::empty();
+        let rows = Rc::new(brass_typesys::RowInfo::analyze(&program));
+        let mut recorded = Checker::new(&program, Rc::clone(&rows));
+        let input = recorded.fresh_unknown();
+        recorded.solver.unify(&input, &Type::Str).unwrap();
+        let canon = CanonVar {
+            slot: 0,
+            kind: InferenceVarKind::Source,
+        };
+        let context = ElaborationMemoContext {
+            key: ElaborationMemoKey {
+                callable: "input-binding".to_string(),
+                receiver: None,
+                args: vec![Type::Unknown(canon.slot)],
+                scheme_inputs: Vec::new(),
+                canon_vars: vec![canon],
+            },
+            inputs: vec![(canon, input)],
+        };
+        let memo = recorded.build_elaboration_memo_entry(
+            &Type::Void,
+            ElaborationJournalFrame::default(),
+            &context,
+        );
+
+        let mut replayed = Checker::new(&program, rows);
+        let replay_input = replayed.fresh_unknown();
+        let replay_context = ElaborationMemoContext {
+            key: context.key,
+            inputs: vec![(canon, replay_input.clone())],
+        };
+        replayed.replay_elaboration_memo_entry(&memo, &replay_context);
+
+        // The replay is responsible for constraining the new caller variable to
+        // the binding learned while the memo entry was recorded.
+        assert_eq!(replayed.resolve(&replay_input), Type::Str);
     }
 }

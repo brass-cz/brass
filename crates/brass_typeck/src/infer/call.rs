@@ -72,13 +72,30 @@ impl<'a> Checker<'a> {
             // `error` is a reserved callee name: a local binding (a match's
             // `Err { error }` payload) never shadows it in call position.
             if name == "error" {
-                let value_ty = args
-                    .first()
-                    .map(|a| self.check_expr(&a.expr, scopes))
-                    .unwrap_or(Type::Void);
-                for a in args.iter().skip(1) {
-                    self.check_expr(&a.expr, scopes);
-                }
+                let signature_params = self
+                    .lookup_function(name)
+                    .map(|info| info.signature.params.clone());
+                let value_ty = if let Some(params) = signature_params {
+                    // The specialized result construction below changes only the
+                    // return type. The ordinary signature still owns arity and the
+                    // explicit trailing Location argument's type.
+                    self.check_arg_count_range(name, &params, args.len(), span);
+                    self.check_signature_args_collect(&params, args, scopes)
+                        .into_iter()
+                        .next()
+                        .unwrap_or(Type::Void)
+                } else {
+                    // A program without the prelude has no resolved signature;
+                    // keep the legacy raw-payload fallback for embedders.
+                    let value_ty = args
+                        .first()
+                        .map(|a| self.check_expr(&a.expr, scopes))
+                        .unwrap_or(Type::Void);
+                    for a in args.iter().skip(1) {
+                        self.check_expr(&a.expr, scopes);
+                    }
+                    value_ty
+                };
                 // A program without the prelude (unit tests, embedders) keeps
                 // the legacy raw payload.
                 let err_ty = match self.program.types.get("Error") {

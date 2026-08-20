@@ -515,21 +515,25 @@ impl<'a> Checker<'a> {
             // `K` and `V`), so a nullable container fixes its element from the
             // values inserted while still accepting `null`. Otherwise the value
             // refines the element directly.
+            let snapshot = self.solver.snapshot();
             let outcome = match &want {
                 Type::Nullable(inner) if !got.is_null() && !matches!(got, Type::Nullable(_)) => {
                     self.solver.unify(inner, &got)
                 }
                 _ => self.solver.unify(elem, &got),
             };
-            if outcome.is_err() && want.is_unknown() {
-                // The only hard failure on a *bare* element variable is the occurs
-                // check: pushing the array into itself, an infinite element type.
-                self.errors.push(TypeError {
-                    message: "cannot push a value whose type contains this array; \
-                              the element type would be infinite"
-                        .to_string(),
-                    span: expr.span(),
-                });
+            if outcome.is_err() {
+                self.solver.rollback(snapshot);
+                if want.is_unknown() {
+                    // The only hard failure on a *bare* element variable is the occurs
+                    // check: pushing the array into itself, an infinite element type.
+                    self.errors.push(TypeError {
+                        message: "cannot push a value whose type contains this array; \
+                                  the element type would be infinite"
+                            .to_string(),
+                        span: expr.span(),
+                    });
+                }
             }
             // A failure against a *partially* fixed element (a record/array with
             // open components) is left to defer rather than reported: the store may
@@ -686,5 +690,27 @@ fn nullable_common_side(ty: &Type) -> Type {
     match ty {
         Type::Unknown(_) | Type::Nullable(_) => ty.clone(),
         other => Type::Nullable(Box::new(other.clone())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_composite_element_unification_rolls_back_earlier_bindings() {
+        let program = Program::empty();
+        let mut checker =
+            Checker::new(&program, Rc::new(brass_typesys::RowInfo::analyze(&program)));
+        let open = checker.fresh_unknown();
+        let elem = Type::Tuple(vec![open.clone(), Type::Bool]);
+        let got = Type::Tuple(vec![Type::Str, Type::Int(IntKind::I32)]);
+        let expr = Expr::Null(Span::new(0, 1));
+
+        checker.expect_element_assignable(&got, &elem, &expr);
+
+        // Tuple unification binds the first component before the second fails;
+        // suppressing that failure must not leave the first binding behind.
+        assert!(checker.resolve(&open).is_unknown());
     }
 }

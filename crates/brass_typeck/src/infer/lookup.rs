@@ -483,8 +483,8 @@ impl<'a> Checker<'a> {
     }
 
     /// Whether a resolved concrete type definitely exposes a callable method,
-    /// considering user methods, builtin collection/file/string methods, and
-    /// UFCS free functions. Conservative: a non-concrete type (an unsolved
+    /// considering user methods and builtin collection/file/string methods.
+    /// Conservative: a non-concrete type (an unsolved
     /// variable, nullable, function, ...) returns `true` so only a method that
     /// is genuinely absent on a concrete receiver is rejected.
     fn concrete_type_has_method(&self, ty: &Type, method: &str) -> bool {
@@ -514,10 +514,6 @@ impl<'a> Checker<'a> {
             _ => false,
         };
         if has_declared_method {
-            return true;
-        }
-        // UFCS: `recv.m(..)` falls back to a visible free function `m(recv, ..)`.
-        if self.program.functions.contains_key(method) {
             return true;
         }
         match resolved {
