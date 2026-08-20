@@ -33,12 +33,10 @@ pub fn render_record_fields(program: &Program, n: &NominalType) -> Option<Vec<(S
         let TypeKind::Record { fields, .. } = &info.kind else {
             return None;
         };
-        return Some(
-            fields
-                .iter()
-                .filter_map(|f| f.resolved_ty.clone().map(|t| (f.name.clone(), t)))
-                .collect(),
-        );
+        return fields
+            .iter()
+            .map(|f| f.resolved_ty.clone().map(|t| (f.name.clone(), t)))
+            .collect();
     }
     let names: Vec<String> = match program.type_by_id(n.id) {
         Some(info) => match &info.kind {
@@ -93,4 +91,44 @@ pub fn render_variant_fields(
         })
         .collect::<Option<Vec<_>>>()?;
     Some((v.tag, fields))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_record_with_unresolved_field_has_no_partial_layout() {
+        // The renderer's Option describes the entire layout. One unresolved
+        // declaration invalidates it instead of silently dropping that field.
+        let ast = brass_parser::parse("type Open = { known: int32, missing }\n").expect("parse");
+        let (mut program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+            is_prelude: false,
+            path: vec!["main".into()],
+            ast,
+        }]);
+        assert!(errors.is_empty(), "{errors:?}");
+        let symbol = program
+            .resolve_type(&["main".into()], "Open")
+            .expect("Open")
+            .symbol
+            .clone();
+        let TypeKind::Record { fields, .. } = &mut program.types.get_mut(&symbol).unwrap().kind
+        else {
+            panic!("Open is a record");
+        };
+        fields
+            .iter_mut()
+            .find(|field| field.name == "missing")
+            .expect("missing field")
+            .resolved_ty = None;
+        let Type::Record(nominal) = program
+            .resolve_type(&["main".into()], "Open")
+            .expect("Open")
+            .type_ref()
+        else {
+            panic!("Open is a record");
+        };
+        assert!(render_record_fields(&program, &nominal).is_none());
+    }
 }

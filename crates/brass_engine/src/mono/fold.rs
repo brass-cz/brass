@@ -193,8 +193,9 @@ fn type_test_of<'b>(body: &'b MirBody, cond: &Operand) -> Option<(&'b Operand, &
     None
 }
 
-/// If `cond` is the result of the `__present` builtin (the `if let` presence
-/// test emitted by MIR lowering), the type of the subject it tests.
+/// If `cond` is the result of a MIR nullable-presence test, the type of its
+/// subject. Propagation uses a distinct marker so return inference can identify
+/// it, but both tests fold by the same subject type.
 fn presence_subject_type<'t>(
     body: &MirBody,
     local_types: &'t [Type],
@@ -207,7 +208,7 @@ fn presence_subject_type<'t>(
         for stmt in &block.stmts {
             if let MirStmt::Assign(dest, Rvalue::Call(Callee::Builtin(name), args)) = stmt
                 && dest == id
-                && name == "__present"
+                && matches!(name.as_str(), "__present" | "__null_prop_present")
                 && let Some(Operand::Local(subj)) = args.first()
             {
                 return Some(&local_types[subj.index()]);

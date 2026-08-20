@@ -1,0 +1,18 @@
+// A variant payload is emitted at its declared destination type, including
+// construction of the nullable cell around a present managed value.
+type MaybeText = | Text { value: string? } | Empty
+
+fun make(value: string) -> MaybeText {
+    return MaybeText.Text { value: value }
+}
+
+fun main() {
+    match make("hello") {
+        Text { value } => {
+            if let text = value {
+                println(text)
+            }
+        },
+        Empty => { println("empty") },
+    }
+}

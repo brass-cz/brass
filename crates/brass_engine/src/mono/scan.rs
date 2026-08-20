@@ -22,6 +22,7 @@ use super::*;
 pub(super) fn seed_returned_aggregate(
     body: &MirBody,
     ret_ty: &Type,
+    program: &Program,
     local_types: &mut [Option<Type>],
 ) {
     let returned: Vec<LocalId> = body
@@ -53,13 +54,16 @@ pub(super) fn seed_returned_aggregate(
             if !returned.contains(dest) {
                 continue;
             }
-            let fields = match rv {
-                Rvalue::Record { fields, .. } | Rvalue::Variant { fields, .. } => fields,
+            let (variant, fields) = match rv {
+                Rvalue::Record { fields, .. } => (None, fields),
+                Rvalue::Variant {
+                    variant, fields, ..
+                } => (Some(variant.as_str()), fields),
                 _ => continue,
             };
             for (fname, op) in fields {
                 let Operand::Local(fl) = op else { continue };
-                let Some(fty) = aggregate_field_type(ret_ty, fname) else {
+                let Some(fty) = aggregate_field_type(ret_ty, variant, fname, program) else {
                     continue;
                 };
                 if !is_supported(&fty) {
@@ -67,7 +71,11 @@ pub(super) fn seed_returned_aggregate(
                 }
                 // Seed the field operand and every temporary it was copied from.
                 let mut cur = *fl;
+                let mut visited = HashSet::default();
                 loop {
+                    if !visited.insert(cur) {
+                        break;
+                    }
                     if local_types[cur.index()].is_none() {
                         local_types[cur.index()] = Some(fty.clone());
                     }
@@ -83,9 +91,42 @@ pub(super) fn seed_returned_aggregate(
 
 /// A field's resolved type from an aggregate's instance substitution (the
 /// checker-resolved record/variant carries each field's concrete type there).
-fn aggregate_field_type(ty: &Type, field: &str) -> Option<Type> {
+fn aggregate_field_type(
+    ty: &Type,
+    variant: Option<&str>,
+    field: &str,
+    program: &Program,
+) -> Option<Type> {
     match ty {
-        Type::Record(n) | Type::Sum(n) => n.substitution.get(field).cloned(),
+        Type::Record(n) => n.substitution.get(field).cloned().or_else(|| {
+            let info = program.type_by_id(n.id)?;
+            let TypeKind::Record { fields, .. } = &info.kind else {
+                return None;
+            };
+            fields
+                .iter()
+                .find(|decl| decl.name == field)?
+                .resolved_ty
+                .clone()
+        }),
+        Type::Sum(n) => variant
+            .and_then(|variant| n.substitution.get(&format!("{variant}.{field}")))
+            .cloned()
+            .or_else(|| {
+                let variant = variant?;
+                let info = program.type_by_id(n.id)?;
+                let TypeKind::Sum { variants } = &info.kind else {
+                    return None;
+                };
+                variants
+                    .iter()
+                    .find(|decl| decl.name == variant)?
+                    .fields
+                    .iter()
+                    .find(|decl| decl.name == field)?
+                    .resolved_ty
+                    .clone()
+            }),
         _ => None,
     }
 }
@@ -165,7 +206,8 @@ pub(super) fn propagated_result_returns(body: &MirBody) -> HashSet<(usize, Local
 }
 
 /// The return blocks created by the null arm of a nullable-operand `expr!`:
-/// the else-target of a branch on a `__present` test, returning the `null`
+/// the else-target of a branch on the compiler-only
+/// `__null_prop_present` marker, returning the `null`
 /// constant. Those returns type the enclosing callable's return NULLABLE (an
 /// outer `?` around the fallible `Result`); they carry no Ok/Err payload. A
 /// USER-written `return null` in a fallible body is not of this shape and
@@ -175,7 +217,7 @@ pub(super) fn null_prop_returns(body: &MirBody) -> HashSet<usize> {
     for block in &body.blocks {
         for stmt in &block.stmts {
             if let MirStmt::Assign(test, Rvalue::Call(Callee::Builtin(name), _)) = stmt
-                && name == "__present"
+                && name == "__null_prop_present"
             {
                 present_tests.insert(*test);
             }
@@ -366,13 +408,25 @@ pub(super) fn collect_record_field_closures(
     let mut out: HashMap<LocalId, (LocalId, String, String)> = HashMap::default();
     for block in &body.blocks {
         for stmt in &block.stmts {
-            let MirStmt::Assign(dest, Rvalue::Record { ty, fields }) = stmt else {
-                continue;
+            let (dest, ty, variant, fields) = match stmt {
+                MirStmt::Assign(dest, Rvalue::Record { ty, fields }) => (dest, ty, None, fields),
+                MirStmt::Assign(
+                    dest,
+                    Rvalue::Variant {
+                        ty,
+                        variant,
+                        fields,
+                    },
+                ) => (dest, ty, Some(variant.as_str()), fields),
+                _ => continue,
             };
             for (fname, op) in fields {
                 if let Operand::Local(l) = op {
+                    let field = variant
+                        .map(|variant| format!("{variant}.{fname}"))
+                        .unwrap_or_else(|| fname.clone());
                     out.entry(resolve_alias(&alias, *l))
-                        .or_insert_with(|| (*dest, ty.clone(), fname.clone()));
+                        .or_insert_with(|| (*dest, ty.clone(), field));
                 }
             }
         }
@@ -414,9 +468,9 @@ pub(super) fn collect_closure_passes(
 }
 
 /// type of an empty array literal `[]` from how it is later filled.
-pub(super) fn collect_array_pushes(body: &MirBody) -> HashMap<LocalId, Operand> {
+pub(super) fn collect_array_pushes(body: &MirBody) -> HashMap<LocalId, Vec<Operand>> {
     let alias = use_aliases(body);
-    let mut out: HashMap<LocalId, Operand> = HashMap::default();
+    let mut out: HashMap<LocalId, Vec<Operand>> = HashMap::default();
     for block in &body.blocks {
         for stmt in &block.stmts {
             let (MirStmt::Assign(_, rv) | MirStmt::Eval(rv)) = stmt else {
@@ -433,7 +487,8 @@ pub(super) fn collect_array_pushes(body: &MirBody) -> HashMap<LocalId, Operand> 
                 };
                 if let (Some(Operand::Local(g)), Some(elem)) = (args.first(), elem) {
                     out.entry(resolve_alias(&alias, *g))
-                        .or_insert_with(|| elem.clone());
+                        .or_default()
+                        .push(elem.clone());
                 }
             }
         }
@@ -463,6 +518,54 @@ pub(super) fn resolve_alias(alias: &HashMap<LocalId, LocalId>, mut l: LocalId) -
         }
     }
     l
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brass_mir::{BasicBlock, BlockId, LocalDecl, TypeRef};
+
+    #[test]
+    fn returned_field_seed_stops_at_a_copy_cycle() {
+        // Reassignments can make the backward Use graph cyclic. Seeding the
+        // returned field must visit each local once rather than loop forever.
+        let body = MirBody {
+            locals: (0..3)
+                .map(|id| LocalDecl {
+                    ty: TypeRef::var(id),
+                    name: None,
+                })
+                .collect(),
+            blocks: vec![BasicBlock {
+                stmts: vec![
+                    MirStmt::Assign(LocalId(1), Rvalue::Use(Operand::Local(LocalId(2)))),
+                    MirStmt::Assign(LocalId(2), Rvalue::Use(Operand::Local(LocalId(1)))),
+                    MirStmt::Assign(
+                        LocalId(0),
+                        Rvalue::Record {
+                            ty: "Box".into(),
+                            fields: vec![("value".into(), Operand::Local(LocalId(1)))],
+                        },
+                    ),
+                ],
+                term: Terminator::Return(Operand::Local(LocalId(0))),
+            }],
+            entry: BlockId(0),
+            params: vec![],
+            declared_fallible: false,
+        };
+        let mut substitution = brass_hir::Substitution::empty();
+        substitution.insert("value", Type::Int(brass_hir::IntKind::I32));
+        let ret = Type::Record(brass_hir::NominalType::with_substitution(
+            99,
+            "Box",
+            substitution,
+        ));
+        let mut locals = vec![None; 3];
+        seed_returned_aggregate(&body, &ret, &Program::empty(), &mut locals);
+        assert_eq!(locals[1], Some(Type::Int(brass_hir::IntKind::I32)));
+        assert_eq!(locals[2], Some(Type::Int(brass_hir::IntKind::I32)));
+    }
 }
 
 /// The source name `local`'s value is bound to, for diagnostics. A value

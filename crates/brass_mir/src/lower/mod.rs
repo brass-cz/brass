@@ -48,9 +48,13 @@ pub struct LowerTables {
     /// them to count handing the parameter to a mutating position (a
     /// `m.set(..)` receiver) as a mutation, exactly like the const checker.
     mutation: brass_hir::MutationInfo,
-    /// Every sum-variant name in the program, used to tell a binding pattern
-    /// (`x`) from a unit-variant pattern (`Red`) during match lowering.
+    /// Unit sum-variant names, used to tell a binding pattern (`x`) from a
+    /// complete unit-variant pattern (`Red`) during match lowering.
     variant_names: fxhash::FxHashSet<String>,
+    /// Every sum-variant name, including payload variants. Record-pattern
+    /// lowering needs this wider set to emit the tag test and qualify payload
+    /// projections without treating the same name as a bare unit pattern.
+    record_variant_names: fxhash::FxHashSet<String>,
     /// Names each module's init binds as module-level globals (top-level
     /// `let`s), used to key global storage per defining module.
     module_globals: HashMap<Vec<String>, fxhash::FxHashSet<String>>,
@@ -63,10 +67,17 @@ pub struct LowerTables {
 impl LowerTables {
     pub fn new(program: &Program) -> Self {
         let mut variant_names = fxhash::FxHashSet::default();
+        let mut record_variant_names = fxhash::FxHashSet::default();
         for info in program.types.values() {
             if let TypeKind::Sum { variants } = &info.kind {
                 for v in &variants[..] {
-                    variant_names.insert(v.name.clone());
+                    record_variant_names.insert(v.name.clone());
+                    // Only a unit variant is also a complete pattern by name.
+                    // Payload variants must remain ordinary bindings unless
+                    // their enclosing record pattern names the variant.
+                    if v.fields.is_empty() {
+                        variant_names.insert(v.name.clone());
+                    }
                 }
             }
         }
@@ -96,6 +107,7 @@ impl LowerTables {
         LowerTables {
             mutation: brass_hir::MutationInfo::analyze(program),
             variant_names,
+            record_variant_names,
             module_globals,
             prelude_globals,
         }
@@ -106,12 +118,14 @@ pub(crate) struct ProgramCtx<'p> {
     program: &'p Program,
     /// The shared program-wide tables (see [`LowerTables`]).
     tables: &'p LowerTables,
-    /// Checker-resolved types of selected expressions, keyed by source span. A
-    /// call whose result is a constructed aggregate is looked up here so its
-    /// result local is seeded `Known`, carrying the instance type the back end
-    /// would otherwise be unable to infer (a witness-free constructor). Empty
-    /// when lowering without a checked program (tests, deferred re-lowering).
+    /// Checker-resolved aggregate result types, keyed by source span. These
+    /// seed MIR locals whose representation cannot be reconstructed from their
+    /// operands. Empty without a checked program.
     expr_types: &'p HashMap<Span, Type>,
+    /// Checker-resolved method receiver types, keyed by the enclosing call
+    /// span. Kept separate from result seeds so receiver evidence can never
+    /// force the representation of an unrelated MIR local.
+    receiver_types: &'p HashMap<Span, Type>,
     /// Spans of free-call arguments the checker verified as anonymous
     /// structural values fitting a view-ELIGIBLE callee parameter's row. Only
     /// these arguments are wrapped in [`crate::Rvalue::RecordView`]; lowering
@@ -172,6 +186,7 @@ impl<'p> ProgramCtx<'p> {
             program,
             tables,
             expr_types: channels.expr_types,
+            receiver_types: channels.receiver_types,
             view_args: channels.view_args,
             sum_views: channels.sum_views,
             call_locations: channels.call_locations,
@@ -244,42 +259,73 @@ impl<'p> ProgramCtx<'p> {
             .unwrap_or_else(|| ("<unknown>".to_string(), 0, 0))
     }
 
-    /// The full parameter count of free function `name` when its LAST
-    /// parameter is the implicit caller-location (a `Location`-annotated
-    /// trailing parameter a call may omit; lowering fills the call site in).
-    fn free_fn_wants_location(&self, module: &[String], name: &str) -> Option<usize> {
+    fn free_call_defaults(&self, module: &[String], name: &str) -> Option<Vec<CallDefault>> {
         let info = self.program.resolve_function(module, name)?;
-        params_want_location(&info.signature.params)
+        Some(call_defaults(&info.signature.params))
     }
 
-    /// Like [`Self::free_fn_wants_location`] for a method name: the fill is
-    /// routed by name (lowering is type-free), so it applies only when every
-    /// method of that name agrees on the trailing-location arity.
-    fn method_wants_location(&self, method: &str) -> Option<usize> {
-        let mut want: Option<usize> = None;
-        for info in self.program.types.values() {
-            let sigs: Vec<_> = match &info.kind {
-                TypeKind::Record { methods, .. } => methods
-                    .get(method)
-                    .map(|m| &m.signature)
-                    .into_iter()
-                    .collect(),
-                TypeKind::Sum { variants } => variants
+    /// Defaults for the static method selected by `qualifier` in `module`.
+    /// Sum methods are duplicated on their variants, whose declarations share
+    /// the signature checked for this call.
+    fn static_call_defaults(
+        &self,
+        module: &[String],
+        qualifier: &str,
+        method: &str,
+    ) -> Option<Vec<CallDefault>> {
+        let info = self
+            .program
+            .resolve_type_or_alias(module, qualifier)
+            .or_else(|| {
+                let (sum, _) = qualifier.split_once('.')?;
+                self.program.resolve_type_or_alias(module, sum)
+            })?;
+        let signature = match &info.kind {
+            TypeKind::Record { methods, .. } => &methods.get(method)?.signature,
+            TypeKind::Sum { variants } => {
+                &variants
                     .iter()
-                    .filter_map(|v| v.methods.get(method).map(|m| &m.signature))
-                    .collect(),
-            };
-            for sig in sigs {
-                match (want, params_want_location(&sig.params)) {
-                    (None, Some(n)) => want = Some(n),
-                    (Some(prev), Some(n)) if prev == n => {}
-                    // Disagreement (or a same-named method without the
-                    // parameter): no fill, the checker's arity check governs.
-                    _ => return None,
-                }
+                    .find_map(|v| v.methods.get(method))?
+                    .signature
             }
-        }
-        want
+        };
+        Some(call_defaults(&signature.params))
+    }
+
+    /// Defaults for the instance method resolved at this call site. The
+    /// receiver's checker type is keyed by its source span, so an unrelated
+    /// same-named method elsewhere cannot suppress completion.
+    fn instance_call_defaults(&self, call: Span, method: &str) -> Option<Vec<CallDefault>> {
+        let receiver_ty = brass_hir::peel_modes(self.receiver_types.get(&call)?);
+        let params = match receiver_ty {
+            Type::Record(n) => {
+                let info = self.program.type_by_id(n.id)?;
+                let TypeKind::Record { methods, .. } = &info.kind else {
+                    return None;
+                };
+                &methods.get(method)?.signature.params
+            }
+            Type::Sum(n) => {
+                let info = self.program.type_by_id(n.id)?;
+                let TypeKind::Sum { variants } = &info.kind else {
+                    return None;
+                };
+                &variants
+                    .iter()
+                    .find_map(|v| v.methods.get(method))?
+                    .signature
+                    .params
+            }
+            ty => {
+                let class = ty.primitive_class()?;
+                let symbol = self
+                    .program
+                    .primitive_methods
+                    .get(&(class.to_string(), method.to_string()))?;
+                &self.program.functions.get(symbol)?.signature.params
+            }
+        };
+        Some(call_defaults(params))
     }
 
     /// The storage key of module-level global `name` as referenced from
@@ -363,13 +409,14 @@ impl<'p> ProgramCtx<'p> {
         self.expr_types.get(&span)
     }
 
-    /// The type named `sym` (a storage symbol, falling back to a bare source
-    /// name for types whose symbol is module-qualified), if any.
-    pub(crate) fn type_info(&self, sym: &str) -> Option<&brass_hir::TypeInfo> {
+    /// The type named `sym` as visible from `module`. A direct storage symbol
+    /// remains authoritative; a bare source name follows the program's module
+    /// and import resolution instead of selecting an unrelated definition.
+    pub(crate) fn type_info(&self, module: &[String], sym: &str) -> Option<&brass_hir::TypeInfo> {
         self.program
             .types
             .get(sym)
-            .or_else(|| self.program.types.values().find(|i| i.name == sym))
+            .or_else(|| self.program.resolve_type_or_alias(module, sym))
     }
 
     /// The type with nominal id `id`, if any.
@@ -467,16 +514,6 @@ impl<'p> ProgramCtx<'p> {
         self.program
             .resolve_function(module, name)
             .map(|info| info.signature.params.len())
-    }
-
-    fn fn_param_nullability(&self, module: &[String], name: &str) -> Option<Vec<bool>> {
-        self.program.resolve_function(module, name).map(|info| {
-            info.signature
-                .params
-                .iter()
-                .map(|p| matches!(p.ty, Some(brass_parser::ast::TypeExpr::Nullable(..))))
-                .collect()
-        })
     }
 
     /// Whether an annotated parameter type is passed by deep copy: a non-reference
@@ -638,10 +675,9 @@ impl<'a, 'p> FnLower<'a, 'p> {
     /// Lower a function/method body: bind parameters, run the statement
     /// sequence, and close any open tail with `return void`.
     fn lower_callable(&mut self, params: &[Param], body: &Block) -> Vec<LocalId> {
-        // Candidate names for heap promotion to shared cells. Each binder
-        // decides for its own binding: a parameter has no `let` to wrap, so it
-        // binds plainly (via `bind`, never a cell) -- but a `let` that shadows a
-        // parameter's name is a different binding and is still promoted.
+        // Candidate names for heap promotion to shared cells. Each binder,
+        // including a parameter, decides for its own binding; a shadowing `let`
+        // is a distinct binding and is promoted independently.
         self.cells = crate::analysis::cell_promotions(body);
         let copies = self.entry_param_copies(params, body);
         let param_locals = self.bind_params(params, &copies);
@@ -691,8 +727,9 @@ impl<'a, 'p> FnLower<'a, 'p> {
 
     /// Bind each parameter to a fresh named local, returning the formals in order.
     /// A parameter received by copy is bound to a private `__deep_copy` of the
-    /// formal, so the body works on its own value; the formal still receives the
-    /// caller's argument for monomorphization.
+    /// formal, so the body works on its own value. A captured-and-mutated
+    /// parameter is then wrapped in the same shared cell as a local binding;
+    /// the formal remains in `body.params` for the callable ABI.
     fn bind_params(&mut self, params: &[Param], copies: &[bool]) -> Vec<LocalId> {
         params
             .iter()
@@ -707,12 +744,20 @@ impl<'a, 'p> FnLower<'a, 'p> {
                     Some(t) => self.b.fresh_local_typed(Some(p.name.clone()), t),
                     None => self.b.fresh_local(Some(p.name.clone())),
                 };
-                if copy {
-                    let copied = self.b.emit(crate::value::Rvalue::Call(
+                let value = if copy {
+                    self.b.emit(crate::value::Rvalue::Call(
                         crate::value::Callee::Builtin("__deep_copy".into()),
                         vec![crate::value::Operand::Local(formal)],
-                    ));
-                    let local = self.b.make_local(copied);
+                    ))
+                } else {
+                    crate::value::Operand::Local(formal)
+                };
+                if self.cells.contains(&p.name) {
+                    let cell = self.b.emit(crate::value::Rvalue::Array(vec![value]));
+                    let local = self.b.make_local(cell);
+                    self.bind_as(&p.name, local, true);
+                } else if copy {
+                    let local = self.b.make_local(value);
                     self.bind(&p.name, local);
                 } else {
                     self.bind(&p.name, formal);
@@ -784,6 +829,7 @@ pub fn lower_body(
     let tables = LowerTables::new(program);
     let channels = CheckerChannels {
         expr_types: &no_types,
+        receiver_types: &no_types,
         view_args: &no_views,
         sum_views: &no_sum_views,
         call_locations: &no_call_locations,
@@ -809,12 +855,31 @@ pub fn lower_body(
     (body, closures)
 }
 
-/// The full parameter count when the last parameter is the implicit
-/// caller-location (annotated with the prelude's `Location` record).
-fn params_want_location(params: &[brass_hir::ParamInfo]) -> Option<usize> {
-    let last = params.last()?;
-    matches!(&last.resolved_ty, Some(Type::Record(n)) if n.is_name("Location"))
-        .then_some(params.len())
+#[derive(Clone, Copy)]
+enum CallDefault {
+    Required,
+    Nullable,
+    Location,
+}
+
+/// Classify a resolved callable's parameters for source-level omission. MIR
+/// needs only the default kind and declaration order; the checker already
+/// validated every explicit argument against the full parameter types.
+fn call_defaults(params: &[brass_hir::ParamInfo]) -> Vec<CallDefault> {
+    params
+        .iter()
+        .map(|param| {
+            if matches!(&param.resolved_ty, Some(Type::Record(n)) if n.is_name("Location")) {
+                CallDefault::Location
+            } else if matches!(param.resolved_ty, Some(Type::Nullable(_)))
+                || matches!(param.ty, Some(brass_parser::ast::TypeExpr::Nullable(..)))
+            {
+                CallDefault::Nullable
+            } else {
+                CallDefault::Required
+            }
+        })
+        .collect()
 }
 
 /// Lower one callable into a [`MirBody`] using a shared context.
@@ -842,6 +907,7 @@ pub fn lower_program(program: &Program) -> MirProgram {
         program,
         &CheckerChannels {
             expr_types: &HashMap::default(),
+            receiver_types: &HashMap::default(),
             view_args: &fxhash::FxHashSet::default(),
             sum_views: &HashMap::default(),
             call_locations: &HashMap::default(),
@@ -864,6 +930,7 @@ pub fn lower_program(program: &Program) -> MirProgram {
 /// rebuilding a positional argument list at every lowering boundary.
 pub struct CheckerChannels<'a> {
     pub expr_types: &'a HashMap<Span, Type>,
+    pub receiver_types: &'a HashMap<Span, Type>,
     pub view_args: &'a fxhash::FxHashSet<Span>,
     pub sum_views: &'a HashMap<Span, Type>,
     pub call_locations: &'a HashMap<Span, (String, u32, u32)>,

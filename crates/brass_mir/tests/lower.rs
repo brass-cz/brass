@@ -259,3 +259,72 @@ fun Box.get(self) {
     assert!(text.contains("method Box.get"), "{text}");
     assert!(text.contains("load _0.value"), "{text}");
 }
+
+#[test]
+fn payload_variant_name_remains_a_nested_binding() {
+    // A payload-carrying variant name used inside another pattern is a binding,
+    // not a unit-variant discriminator from an unrelated sum.
+    let text = lower_whole(
+        "type Wrapped = | Wrap { value: int32 } | Empty\n\
+         type Number = | Value { value: int32 }\n\
+         fun f(n: Number) -> int32 {\n\
+           return match n { Value { value: Wrap } => Wrap + 1 }\n\
+         }\n",
+    );
+    assert!(!text.contains("value_matches(_1, \"Wrap\")"), "{text}");
+    assert!(text.contains("Add 1"), "{text}");
+}
+
+#[test]
+fn shadowed_for_element_does_not_enable_writeback() {
+    // Reassigning a `let` that shadows the element is unrelated to the array
+    // slot, so lowering must not emit the loop's element write-back store.
+    let (body, _) = lower_first(
+        "fun f(values) {\n  for value in values {\n    let value = 10\n    value = 11\n  }\n}",
+    );
+    let text = body_to_string(&body);
+    assert!(!text.contains("store "), "{text}");
+}
+
+#[test]
+fn uninitialized_nominal_uses_the_visible_module_definition() {
+    // Two modules may declare the same source type name. An uninitialized slot
+    // in b must build b.Node's skeleton rather than the first Node in the table.
+    let a = brass_parser::parse("type Node = { text: string }\n").expect("a parses");
+    let b = brass_parser::parse(
+        "type Node = { value: int32 }\n\
+         fun make() -> Node {\n  let node: Node\n  node.value = 4\n  return node\n}\n",
+    )
+    .expect("b parses");
+    let modules = [
+        LoadedModule {
+            is_prelude: false,
+            path: vec!["a".to_string()],
+            ast: a,
+        },
+        LoadedModule {
+            is_prelude: false,
+            path: vec!["b".to_string()],
+            ast: b,
+        },
+    ];
+    let (program, errors) = brass_hir::lower(&modules);
+    assert!(errors.is_empty(), "{errors:?}");
+    let text = program_to_string(&lower_program(&program));
+    let symbol = &program
+        .resolve_type(&["b".to_string()], "Node")
+        .expect("b.Node")
+        .symbol;
+    assert!(text.contains(&format!("{symbol} {{ value:")), "{text}");
+}
+
+#[test]
+fn closure_constant_array_is_promoted() {
+    // Closure bodies participate in the same safe literal promotion as named
+    // callables, so a read-only constant array is initialized once globally.
+    let text = lower_whole(
+        "fun make() {\n  return () -> {\n    let values = [2, 3]\n    return values[0]\n  }\n}\n",
+    );
+    assert!(text.contains("global __arr0@consts"), "{text}");
+    assert!(text.contains("= global __arr0@consts"), "{text}");
+}

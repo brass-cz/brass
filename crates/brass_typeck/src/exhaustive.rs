@@ -4,7 +4,7 @@
 
 use fxhash::FxHashSet as HashSet;
 
-use brass_hir::{Program, Type, TypeInfo, TypeKind, TypedProgram, peel_modes};
+use brass_hir::{Program, Type, TypeInfo, TypeKind, TypedExprKind, TypedProgram, peel_modes};
 use brass_parser::Span;
 use brass_parser::ast::*;
 
@@ -131,7 +131,11 @@ impl ExhaustiveVisitor<'_> {
         self.typed
             .expressions
             .iter()
-            .filter(|expr| expr.span == scrutinee.span())
+            // Method-receiver evidence deliberately shares the enclosing call's
+            // span; it is not the scrutinee expression's result type.
+            .filter(|expr| {
+                expr.span == scrutinee.span() && !matches!(expr.kind, TypedExprKind::MethodReceiver)
+            })
             .filter_map(|expr| match peel_modes(&expr.ty) {
                 Type::Sum(sum) => Some(sum.id),
                 _ => None,

@@ -48,6 +48,7 @@ fn three_shapes_collapse_to_one_display_instance() {
         &program,
         &brass_mir::CheckerChannels {
             expr_types: &fxhash::FxHashMap::default(),
+            receiver_types: &fxhash::FxHashMap::default(),
             view_args: &analysis.view_args,
             sum_views: &analysis.sum_views,
             call_locations: &fxhash::FxHashMap::default(),

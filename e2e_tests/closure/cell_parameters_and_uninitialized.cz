@@ -1,0 +1,24 @@
+// Captured mutations must share the parameter or uninitialized binding that
+// the enclosing function subsequently reads.
+fun bump_parameter(value: int32) -> int32 {
+    let bump = () -> {
+        value += 1
+    }
+    bump()
+    return value
+}
+
+fun bump_uninitialized() -> int32 {
+    let value: int32
+    value = 10
+    let bump = () -> {
+        value += 1
+    }
+    bump()
+    return value
+}
+
+fun main() {
+    println(bump_parameter(4))
+    println(bump_uninitialized())
+}

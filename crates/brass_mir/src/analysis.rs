@@ -383,8 +383,10 @@ fn scan_expr(e: &Expr, props: Props) -> bool {
                 || scan_expr(c, props)
                 || args.iter().any(|a| scan_expr(&a.expr, props))
         }
-        Expr::Unary(_, a, _) | Expr::Field(a, _, _) => scan_expr(a, props),
-        Expr::Binary(_, a, b, _) | Expr::Index(a, b, _) => {
+        Expr::Unary(_, a, _) | Expr::Field(a, _, _) | Expr::TypeTest(a, _, _) => {
+            scan_expr(a, props)
+        }
+        Expr::Binary(_, a, b, _) | Expr::Index(a, b, _) | Expr::Range(a, b, _) => {
             scan_expr(a, props) || scan_expr(b, props)
         }
         Expr::Array(es, _) => es.iter().any(|e| scan_expr(e, props)),
@@ -408,6 +410,14 @@ fn scan_expr(e: &Expr, props: Props) -> bool {
             scan_expr(s, props) || arms.iter().any(|a| scan_expr(&a.body, props))
         }
         Expr::Block(b, _) => scan_block(b, props),
-        _ => false,
+        // A closure is a separate callable with its own return ABI. Its body
+        // must not make the enclosing callable fallible.
+        Expr::Closure(..)
+        | Expr::Int(..)
+        | Expr::Float(..)
+        | Expr::Bool(..)
+        | Expr::Null(..)
+        | Expr::Ident(..)
+        | Expr::SelfExpr(..) => false,
     }
 }

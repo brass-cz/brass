@@ -1,0 +1,22 @@
+// Returned sum fields use their qualified substitution, and function-typed
+// variant payloads provide parameter context to unannotated closures.
+type Built =
+    | Items { values: int64[] }
+    | Handler { run: (int32) -> int32 }
+
+fun items() -> Built {
+    let values = []
+    return Built.Items { values: values }
+}
+
+fun main() {
+    match items() {
+        Items { values } => { println(values.len()) },
+        Handler { run } => { println(run(0)) },
+    }
+    const callable = Built.Handler { run: (value) -> value + 1 }
+    match callable {
+        Items { values } => { println(values.len()) },
+        Handler { run } => { println(run(4)) },
+    }
+}

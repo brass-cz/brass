@@ -151,17 +151,36 @@ impl FnLower<'_, '_> {
                     && let Pattern::Binding(var, _) = pat
                 {
                     let fields = fields.clone();
+                    let exit = self.b.new_block();
                     for (i, field) in fields.iter().enumerate() {
+                        let next = self.b.new_block();
                         let expanded = brass_hir::expand_fields_body(body, var, field, i);
                         self.push_scope();
+                        // The compile-time copies form one logical loop. A
+                        // `break` leaves the whole sequence, while `continue`
+                        // advances to the next expanded field.
+                        self.loops.push(crate::lower::LoopFrame {
+                            cont: next,
+                            brk: exit,
+                            writeback: None,
+                        });
                         for stmt in &expanded.stmts {
                             if self.b.terminated() {
                                 break;
                             }
                             self.lower_stmt(stmt);
                         }
+                        if !self.b.terminated() {
+                            self.b.terminate(Terminator::Goto(next));
+                        }
+                        self.loops.pop();
                         self.pop_scope();
+                        self.b.switch_to(next);
                     }
+                    if !self.b.terminated() {
+                        self.b.terminate(Terminator::Goto(exit));
+                    }
+                    self.b.switch_to(exit);
                     return;
                 }
                 self.lower_for(pat, iter, body)
@@ -311,7 +330,7 @@ impl FnLower<'_, '_> {
             if let Some(op) = self.default_operand(&slot_ty, &mut Vec::new()) {
                 self.b.push(MirStmt::Assign(local, Rvalue::Use(op)));
             }
-            self.bind(name, local);
+            self.bind_uninitialized(name, local, &slot_ty);
             return;
         }
         // Other nominal annotations are not "simple" types; resolve them
@@ -322,7 +341,7 @@ impl FnLower<'_, '_> {
                 .and_then(|id| self.ctx.type_info_by_id(id))
                 .or_else(|| {
                     let sym = self.resolve_self_name(type_name);
-                    self.ctx.type_info(&sym)
+                    self.ctx.type_info(&self.module, &sym)
                 });
             if let Some(info) = info {
                 let slot_ty = info.type_ref();
@@ -332,7 +351,7 @@ impl FnLower<'_, '_> {
                 if let Some(op) = self.default_operand(&slot_ty, &mut Vec::new()) {
                     self.b.push(MirStmt::Assign(local, Rvalue::Use(op)));
                 }
-                self.bind(name, local);
+                self.bind_uninitialized(name, local, &slot_ty);
                 return;
             }
         }
@@ -342,7 +361,7 @@ impl FnLower<'_, '_> {
                 if let Some(op) = self.default_operand(&t, &mut Vec::new()) {
                     self.b.push(MirStmt::Assign(local, Rvalue::Use(op)));
                 }
-                self.bind(name, local);
+                self.bind_uninitialized(name, local, &t);
             }
             None => {
                 // No resolvable annotation (the checker already required one);
@@ -350,6 +369,23 @@ impl FnLower<'_, '_> {
                 let local = self.b.fresh_local(Some(name.clone()));
                 self.bind(name, local);
             }
+        }
+    }
+
+    /// Bind an annotated uninitialized slot, promoting it when a closure shares
+    /// later mutations. The slot already contains the type's hidden default
+    /// whenever one is constructible, so copying it into the cell preserves the
+    /// declared element representation without exposing the value to source code.
+    fn bind_uninitialized(&mut self, name: &str, local: LocalId, ty: &Type) {
+        if self.cells.contains(name) {
+            let cell = self.b.emit_known(
+                Rvalue::Array(vec![Operand::Local(local)]),
+                Type::Slice(Box::new(ty.clone())),
+            );
+            let cell_local = self.b.make_local(cell);
+            self.bind_as(name, cell_local, true);
+        } else {
+            self.bind(name, local);
         }
     }
 
@@ -697,16 +733,34 @@ impl FnLower<'_, '_> {
 /// as opposed to mutating a field/element of it. Such a reassignment of a `for`
 /// loop variable is the signal that the element must be written back to the array.
 fn reassigns_var(block: &Block, var: &str) -> bool {
-    block.stmts.iter().any(|s| stmt_reassigns_var(s, var))
+    for stmt in &block.stmts {
+        if stmt_reassigns_var(stmt, var) {
+            return true;
+        }
+        // A `let` shadows from its declaration to the end of this lexical
+        // block. Its initializer still sees the outer loop element and was
+        // scanned above.
+        if matches!(stmt, Stmt::Let { pat, .. } if pat.bound_names().contains(&var)) {
+            return false;
+        }
+    }
+    false
 }
 
 fn stmt_reassigns_var(stmt: &Stmt, var: &str) -> bool {
     match stmt {
-        Stmt::Assign { target, .. } => matches!(target, Expr::Ident(n, _) if n == var),
-        Stmt::While { body, .. } => reassigns_var(body, var),
+        Stmt::Assign { target, value, .. } => {
+            matches!(target, Expr::Ident(n, _) if n == var)
+                || expr_reassigns_var(target, var)
+                || expr_reassigns_var(value, var)
+        }
+        Stmt::While { cond, body, .. } => expr_reassigns_var(cond, var) || reassigns_var(body, var),
         // A nested `for` that rebinds the same name shadows it, so stop there.
-        Stmt::For { pat, body, .. } => {
-            !pat.bound_names().contains(&var) && reassigns_var(body, var)
+        Stmt::For {
+            pat, iter, body, ..
+        } => {
+            expr_reassigns_var(iter, var)
+                || (!pat.bound_names().contains(&var) && reassigns_var(body, var))
         }
         Stmt::Expr(e) | Stmt::Return(Some(e), _) => expr_reassigns_var(e, var),
         Stmt::Let { value, .. } => value.as_ref().is_some_and(|v| expr_reassigns_var(v, var)),
@@ -716,11 +770,52 @@ fn stmt_reassigns_var(stmt: &Stmt, var: &str) -> bool {
 
 fn expr_reassigns_var(e: &Expr, var: &str) -> bool {
     match e {
-        Expr::Block(b, _) => reassigns_var(b, var),
-        Expr::If(_, t, els, _) | Expr::IfLet(_, _, t, els, _) => {
-            reassigns_var(t, var) || els.as_ref().is_some_and(|e| expr_reassigns_var(e, var))
+        Expr::Unary(_, inner, _) | Expr::Field(inner, _, _) | Expr::ErrorProp(inner, _) => {
+            expr_reassigns_var(inner, var)
         }
-        Expr::Match(_, arms, _) => arms.iter().any(|a| expr_reassigns_var(&a.body, var)),
-        _ => false,
+        Expr::Binary(_, left, right, _)
+        | Expr::Index(left, right, _)
+        | Expr::Range(left, right, _) => {
+            expr_reassigns_var(left, var) || expr_reassigns_var(right, var)
+        }
+        Expr::Call(callee, args, _) => {
+            expr_reassigns_var(callee, var)
+                || args.iter().any(|arg| expr_reassigns_var(&arg.expr, var))
+        }
+        Expr::Closure(params, body, _) => {
+            !params.iter().any(|param| param.name == var) && expr_reassigns_var(body, var)
+        }
+        Expr::Array(items, _) => items.iter().any(|item| expr_reassigns_var(item, var)),
+        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => fields
+            .iter()
+            .any(|(_, value)| expr_reassigns_var(value, var)),
+        Expr::Str(segments, _) => segments.iter().any(
+            |segment| matches!(segment, brass_parser::ast::StrSeg::Expr(e) if expr_reassigns_var(e, var)),
+        ),
+        Expr::Block(b, _) => reassigns_var(b, var),
+        Expr::If(cond, then, els, _) => {
+            expr_reassigns_var(cond, var)
+                || reassigns_var(then, var)
+                || els.as_ref().is_some_and(|e| expr_reassigns_var(e, var))
+        }
+        Expr::IfLet(pat, subject, then, els, _) => {
+            expr_reassigns_var(subject, var)
+                || (!pat.bound_names().contains(&var) && reassigns_var(then, var))
+                || els.as_ref().is_some_and(|e| expr_reassigns_var(e, var))
+        }
+        Expr::TypeTest(subject, _, _) => expr_reassigns_var(subject, var),
+        Expr::Match(subject, arms, _) => {
+            expr_reassigns_var(subject, var)
+                || arms.iter().any(|arm| {
+                    !arm.pattern.bound_names().contains(&var)
+                        && expr_reassigns_var(&arm.body, var)
+                })
+        }
+        Expr::Int(..)
+        | Expr::Float(..)
+        | Expr::Bool(..)
+        | Expr::Null(..)
+        | Expr::Ident(..)
+        | Expr::SelfExpr(..) => false,
     }
 }

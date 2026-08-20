@@ -43,7 +43,7 @@ impl FnLower<'_, '_> {
                 // refutable field sub-pattern, guarded so its field is loaded only
                 // when the variant already matched.
                 let mut cond = self.value_matches(subj, name);
-                let variant = self.is_variant_name(name).then(|| name.clone());
+                let variant = self.is_record_variant_name(name).then(|| name.clone());
                 for fp in fps {
                     let Some(subpat) = &fp.pat else { continue };
                     if !self.pattern_is_refutable(subpat) {
@@ -105,7 +105,7 @@ impl FnLower<'_, '_> {
                 // field's type and offset in the matched variant -- several variants
                 // may declare a field of the same name with different types. A plain
                 // record (struct) pattern uses the bare field name.
-                let variant = self.is_variant_name(name).then(|| name.clone());
+                let variant = self.is_record_variant_name(name).then(|| name.clone());
                 for fp in fps {
                     let field = field_proj_name(&variant, &fp.name);
                     let fv = self.b.emit(Rvalue::Load(Place::projected(
@@ -143,7 +143,7 @@ impl FnLower<'_, '_> {
             Pattern::Binding(name, _) => self.is_variant_name(name),
             Pattern::Literal(_, _) | Pattern::Array(_, _) => true,
             Pattern::Record(name, fps, _) => {
-                self.is_variant_name(name)
+                self.is_record_variant_name(name)
                     || fps.iter().any(|fp| {
                         fp.pat
                             .as_ref()
@@ -185,6 +185,10 @@ impl FnLower<'_, '_> {
 
     pub(crate) fn is_variant_name(&self, name: &str) -> bool {
         self.ctx.tables.variant_names.contains(name)
+    }
+
+    fn is_record_variant_name(&self, name: &str) -> bool {
+        self.ctx.tables.record_variant_names.contains(name)
     }
 
     fn value_matches(&mut self, subj: LocalId, name: &str) -> Operand {

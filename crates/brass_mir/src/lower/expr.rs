@@ -541,7 +541,10 @@ impl<'a, 'p> FnLower<'a, 'p> {
         let res = self.b.fresh_local(None);
         // A nullable operand succeeds on presence; a Result succeeds on `Ok`.
         let test = if nullable {
-            "__present"
+            // This marker is reserved for compiler-generated propagation. A
+            // user-written `if let ... else { return null }` uses `__present`
+            // and must remain an ordinary nullable return in inference.
+            "__null_prop_present"
         } else {
             "result_is_ok"
         };
@@ -957,7 +960,9 @@ impl<'a, 'p> FnLower<'a, 'p> {
                     return Rvalue::RecordFrom { ty: tn, source };
                 }
                 let qualifier = self.ctx.static_qualifier(&self.module, &tn);
-                let ops = self.lower_args(args);
+                let mut ops = self.lower_args(args);
+                let defaults = self.ctx.static_call_defaults(&self.module, &tn, method);
+                self.complete_call_args(defaults.as_deref(), &mut ops, span);
                 return Rvalue::Call(
                     Callee::Static {
                         ty: qualifier,
@@ -993,7 +998,9 @@ impl<'a, 'p> FnLower<'a, 'p> {
                     return Rvalue::RecordFrom { ty: tn, source };
                 }
                 let qualifier = self.ctx.static_qualifier(&self.module, &tn);
-                let ops = self.lower_args(args);
+                let mut ops = self.lower_args(args);
+                let defaults = self.ctx.static_call_defaults(&self.module, &tn, method);
+                self.complete_call_args(defaults.as_deref(), &mut ops, span);
                 return Rvalue::Call(
                     Callee::Static {
                         ty: qualifier,
@@ -1024,14 +1031,8 @@ impl<'a, 'p> FnLower<'a, 'p> {
             }
             let mut ops = vec![recv];
             ops.extend(self.lower_args(args));
-            // A method call may omit the callee's trailing `Location`
-            // parameter; complete it with the call site.
-            if let Some(full) = self.ctx.method_wants_location(method)
-                && ops.len() + 1 == full
-            {
-                let loc = self.location_operand(span);
-                ops.push(loc);
-            }
+            let defaults = self.ctx.instance_call_defaults(span, method);
+            self.complete_call_args(defaults.as_deref(), &mut ops, span);
             let method = self
                 .ctx
                 .keyed_dispatch
@@ -1070,15 +1071,8 @@ impl<'a, 'p> FnLower<'a, 'p> {
                         ops.push(v);
                     }
                 }
-                self.pad_trailing_nullable(name, &mut ops);
-                // A call may omit the callee's trailing `Location` parameter;
-                // complete it with the call site.
-                if let Some(full) = self.ctx.free_fn_wants_location(&self.module, name)
-                    && ops.len() + 1 == full
-                {
-                    let loc = self.location_operand(span);
-                    ops.push(loc);
-                }
+                let defaults = self.ctx.free_call_defaults(&self.module, name);
+                self.complete_call_args(defaults.as_deref(), &mut ops, span);
                 return Rvalue::Call(Callee::Free(symbol), ops);
             }
             // A module GLOBAL holding a closure/function value is called
@@ -1141,19 +1135,27 @@ impl<'a, 'p> FnLower<'a, 'p> {
         ops
     }
 
-    /// Pad a free-function call's argument list with `null` for each omitted
-    /// trailing nullable parameter of `name`, so a call may leave them off. The
-    /// type checker has already verified the omitted parameters are nullable;
-    /// padding stops at the first non-nullable one.
-    fn pad_trailing_nullable(&self, name: &str, ops: &mut Vec<Operand>) {
-        let Some(nullable) = self.ctx.fn_param_nullability(&self.module, name) else {
+    /// Fill every omitted optional parameter from one resolved signature.
+    /// Nullable defaults and the implicit caller location may be interleaved in
+    /// the trailing optional run accepted by the checker.
+    fn complete_call_args(
+        &mut self,
+        defaults: Option<&[super::CallDefault]>,
+        ops: &mut Vec<Operand>,
+        span: Span,
+    ) {
+        let Some(defaults) = defaults else {
             return;
         };
-        for &is_nullable in nullable.iter().skip(ops.len()) {
-            if !is_nullable {
-                break;
+        for default in defaults.iter().skip(ops.len()) {
+            match default {
+                super::CallDefault::Nullable => ops.push(Operand::Const(Literal::Null)),
+                super::CallDefault::Location => {
+                    let location = self.location_operand(span);
+                    ops.push(location);
+                }
+                super::CallDefault::Required => break,
             }
-            ops.push(Operand::Const(Literal::Null));
         }
     }
 

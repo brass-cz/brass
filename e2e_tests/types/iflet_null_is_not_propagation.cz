@@ -1,0 +1,25 @@
+// A user-written if-let null return remains the nullable Ok payload of a
+// fallible function; only expr! null arms propagate outside the Result.
+fun choose(value: string?) {
+    if let text = value {
+        if text == "bad" {
+            return error("bad")
+        }
+        return text
+    } else {
+        return null
+    }
+}
+
+fun main() {
+    match choose(null) {
+        Ok { value } => {
+            if value {
+                println("value")
+            } else {
+                println("null ok")
+            }
+        },
+        Err { error } => { println(error) },
+    }
+}

@@ -62,6 +62,7 @@ fn collect_cases(dir: &Path, out: &mut Vec<PathBuf>) {
 /// The in-repo `std/` directory, bound to every case as the `std` package --
 /// the same layout a distributed toolchain ships, so the cases exercise
 /// exactly what users get.
+#[cfg(feature = "jit")]
 fn std_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../std")
 }

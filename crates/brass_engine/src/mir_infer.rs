@@ -183,6 +183,16 @@ pub fn infer_body<R: Resolver>(
         let v = t.solver.fresh(InferenceVarKind::Source);
         t.locals.push(v);
     }
+    // A MIR local declaration marked Known is an equality constraint, not only
+    // a reservation in the solver's id space. Seed every such declaration
+    // before flow constraints so annotations and checker witnesses participate
+    // in conflict detection.
+    for (index, decl) in body.locals.iter().enumerate() {
+        if let Some(known) = decl.ty.as_known() {
+            let local = t.locals[index].clone();
+            t.unify(&local, known);
+        }
+    }
     // Seed parameters with their concrete instance types.
     for (i, p) in body.params.iter().enumerate() {
         if let Some(pty) = params.get(i) {
@@ -354,6 +364,18 @@ impl BodyTyper {
     /// Record that a deferred value (an unresolved variable `id`) is read with
     /// field `name` of type `fty`.
     fn note_field(&mut self, id: u32, name: &str, fty: Type) {
+        let existing = self
+            .requirements
+            .get(&id)
+            .and_then(|req| req.fields.get(name))
+            .cloned();
+        if let Some(existing) = existing {
+            // Every read of one deferred field describes the same slot. Keep
+            // the first variable and unify later requirements into it so an
+            // incompatible pair is reported instead of silently overwritten.
+            self.unify(&existing, &fty);
+            return;
+        }
         self.requirements
             .entry(id)
             .or_default()
@@ -879,5 +901,76 @@ mod tests {
         // `age` is used in a numeric-literal context, so its required type is int32.
         assert_eq!(req.fields.get("age"), Some(&Type::Int(IntKind::I32)));
         assert!(req.methods.is_empty());
+    }
+
+    #[test]
+    fn known_local_declaration_is_a_constraint() {
+        // A Known string local assigned an integer must conflict; merely moving
+        // the solver's id counter past the declaration would accept it as int32.
+        let body = MirBody {
+            locals: vec![
+                LocalDecl {
+                    ty: TypeRef::known(Type::Str),
+                    name: Some("value".into()),
+                },
+                LocalDecl {
+                    ty: TypeRef::known(Type::Int(IntKind::I32)),
+                    name: Some("source".into()),
+                },
+            ],
+            blocks: vec![BasicBlock {
+                stmts: vec![MirStmt::Assign(
+                    LocalId(0),
+                    Rvalue::Use(Operand::Local(LocalId(1))),
+                )],
+                term: Terminator::Return(Operand::void()),
+            }],
+            entry: BlockId(0),
+            params: vec![],
+            declared_fallible: false,
+        };
+        assert!(infer_body(&body, &[], &[], None, false, &mut NullResolver).is_err());
+    }
+
+    #[test]
+    fn repeated_deferred_field_requirements_must_agree() {
+        // Both loads describe one deferred field. Pinning one result to int32
+        // and the other to string must be recorded as a conflict.
+        let body = MirBody {
+            locals: vec![
+                local(0),
+                LocalDecl {
+                    ty: TypeRef::known(Type::Int(IntKind::I32)),
+                    name: None,
+                },
+                LocalDecl {
+                    ty: TypeRef::known(Type::Str),
+                    name: None,
+                },
+            ],
+            blocks: vec![BasicBlock {
+                stmts: vec![
+                    MirStmt::Assign(
+                        LocalId(1),
+                        Rvalue::Load(Place::projected(
+                            LocalId(0),
+                            vec![Projection::Field("field".into())],
+                        )),
+                    ),
+                    MirStmt::Assign(
+                        LocalId(2),
+                        Rvalue::Load(Place::projected(
+                            LocalId(0),
+                            vec![Projection::Field("field".into())],
+                        )),
+                    ),
+                ],
+                term: Terminator::Return(Operand::void()),
+            }],
+            entry: BlockId(0),
+            params: vec![],
+            declared_fallible: false,
+        };
+        assert!(infer_body(&body, &[], &[], None, false, &mut NullResolver).is_err());
     }
 }

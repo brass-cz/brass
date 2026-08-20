@@ -1,0 +1,18 @@
+// The unrolled fields sequence is one logical loop: continue advances to the
+// next field and break exits all remaining copies.
+type Triple = {
+    a: int32,
+    b: int32,
+    c: int32,
+}
+
+fun main() {
+    const value = Triple { a: 1, b: 2, c: 3 }
+    for field in fields(value) {
+        if field == "a" {
+            continue
+        }
+        println(field)
+        break
+    }
+}

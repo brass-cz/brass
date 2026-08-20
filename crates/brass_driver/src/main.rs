@@ -551,10 +551,12 @@ struct Checked {
     /// Serialized full-analysis identity. Present only on a validated disk
     /// cache hit, where native objects can be soundly bound to this program.
     analysis_hash: Option<[u8; 20]>,
-    /// Checker-resolved instance types of aggregate-producing expressions, keyed
-    /// by span; the back-end seeding channel (see
-    /// `brass_typeck::stream::aggregate_result_types`).
+    /// Checker-resolved aggregate result types that seed MIR locals, keyed by
+    /// span (see `brass_typeck::stream::aggregate_result_types`).
     expr_types: HashMap<Span, brass_hir::Type>,
+    /// Method receiver types are isolated from aggregate result seeds so their
+    /// source observations can only affect signature selection.
+    receiver_types: HashMap<Span, brass_hir::Type>,
     /// Spans of anonymous structural arguments the checker approved for view
     /// conversion; MIR lowering wraps exactly these in `Rvalue::RecordView`.
     view_args: HashSet<Span>,
@@ -591,6 +593,7 @@ impl Checked {
     fn channels(&self) -> brass_mir::CheckerChannels<'_> {
         brass_mir::CheckerChannels {
             expr_types: &self.expr_types,
+            receiver_types: &self.receiver_types,
             view_args: &self.view_args,
             sum_views: &self.sum_views,
             call_locations: &self.call_locations,
@@ -1011,6 +1014,7 @@ fn assemble_checked(analyzed: AnalyzedProgram) -> Result<Checked, Vec<String>> {
         program,
         analysis_hash: None,
         expr_types: c.expr_types.into_iter().collect(),
+        receiver_types: c.receiver_types.into_iter().collect(),
         view_args: c.view_args.into_iter().collect(),
         sum_views: c.sum_views.into_iter().collect(),
         call_locations: c.call_locations.into_iter().collect(),
@@ -1180,6 +1184,7 @@ impl brass_typeck::stream::Scheduler for ThreadScheduler {
 #[derive(Default)]
 struct MergedChannels {
     expr_types: HashMap<Span, brass_hir::Type>,
+    receiver_types: HashMap<Span, brass_hir::Type>,
     /// Checker-reported instance returns of demanded UNANNOTATED bodies,
     /// keyed by `(symbol, argument types)`: the runtime-deferral contracts
     /// `monomorphize_entry_with_returns` compiles call sites against.
@@ -1226,6 +1231,11 @@ impl MergedChannels {
                 .iter()
                 .map(|(s, t)| (*s, t.clone()))
                 .collect(),
+            receiver_types: snap
+                .receivers_flushed
+                .iter()
+                .map(|(s, t)| (*s, t.clone()))
+                .collect(),
             // Contracts are not snapshotted: a resumed run's repeat demand
             // revives the real instance pass, which re-emits them.
             instance_returns: HashMap::default(),
@@ -1265,6 +1275,9 @@ impl MergedChannels {
         for s in &d.expr_types_removed {
             self.expr_types.remove(s);
         }
+        for s in &d.receiver_types_removed {
+            self.receiver_types.remove(s);
+        }
         for s in &d.typeof_types_removed {
             self.typeof_types.remove(s);
         }
@@ -1272,6 +1285,7 @@ impl MergedChannels {
             self.type_tests.remove(s);
         }
         self.expr_types.extend(d.expr_types);
+        self.receiver_types.extend(d.receiver_types);
         for (symbol, args, ret) in d.instance_returns {
             self.instance_returns.insert((symbol, args), ret);
         }
@@ -1728,6 +1742,7 @@ impl LazyState {
     ) -> brass_mir::CheckerChannels<'a> {
         brass_mir::CheckerChannels {
             expr_types: &self.merged.expr_types,
+            receiver_types: &self.merged.receiver_types,
             view_args: &self.merged.view_args,
             sum_views: &self.merged.sum_views,
             call_locations,
@@ -3283,9 +3298,11 @@ fn check_front(
     }
 
     let expr_types = brass_typeck::stream::aggregate_result_types(&analysis.typed, &program);
+    let receiver_types = brass_typeck::stream::method_receiver_types(&analysis.typed, &program);
     let call_locations = call_site_locations(&modules, &sources, search);
     let channels = brass_cache::Channels {
         expr_types: expr_types.into_iter().collect(),
+        receiver_types: receiver_types.into_iter().collect(),
         view_args: analysis.view_args.into_iter().collect(),
         sum_views: analysis.sum_views.into_iter().collect(),
         call_locations: call_locations.into_iter().collect(),
@@ -3346,6 +3363,9 @@ fn analysis_channel_delta(
 ) -> brass_typeck::stream::ChannelDelta {
     brass_typeck::stream::ChannelDelta {
         expr_types: brass_typeck::stream::aggregate_result_types(&analysis.typed, program)
+            .into_iter()
+            .collect(),
+        receiver_types: brass_typeck::stream::method_receiver_types(&analysis.typed, program)
             .into_iter()
             .collect(),
         view_args: analysis.view_args.iter().copied().collect(),

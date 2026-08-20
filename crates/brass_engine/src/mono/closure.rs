@@ -14,18 +14,26 @@ impl Monomorphizer<'_, '_> {
     /// The declared parameter types of record `ty`'s field `field` when the
     /// field is annotated with a concrete function type -- the typing source for
     /// a closure stored into that field.
-    fn record_field_fun_params(
+    fn aggregate_field_fun_params(
         &self,
         module: &[String],
         ty: &str,
         field: &str,
     ) -> Option<Vec<Type>> {
         let info = self.program.resolve_type(module, ty)?;
-        let TypeKind::Record { fields, .. } = &info.kind else {
-            return None;
+        let resolved = match &info.kind {
+            TypeKind::Record { fields, .. } => fields.iter().find(|f| f.name == field),
+            TypeKind::Sum { variants } => {
+                let (variant, field) = field.split_once('.')?;
+                variants
+                    .iter()
+                    .find(|v| v.name == variant)?
+                    .fields
+                    .iter()
+                    .find(|f| f.name == field)
+            }
         };
-        let f = fields.iter().find(|f| f.name == field)?;
-        match f.resolved_ty.as_ref() {
+        match resolved?.resolved_ty.as_ref() {
             Some(Type::Fun(params, _)) if params.iter().all(brass_hir::is_fully_known) => {
                 Some(params.clone())
             }
@@ -161,9 +169,9 @@ impl Monomorphizer<'_, '_> {
                 // field -- the constructed instance's substitution entry when the
                 // checker seeded the destination local (`Iter { trans: (x) -> .. }`
                 // takes `trans`'s per-instance type from the seed).
-                self.record_field_fun_params(module, ty, field).or_else(|| {
-                    match local_types[dest.index()].as_ref() {
-                        Some(Type::Record(n)) => match n.substitution.get(field) {
+                self.aggregate_field_fun_params(module, ty, field)
+                    .or_else(|| match local_types[dest.index()].as_ref() {
+                        Some(Type::Record(n) | Type::Sum(n)) => match n.substitution.get(field) {
                             Some(Type::Fun(params, _))
                                 if params.iter().all(brass_hir::is_fully_known) =>
                             {
@@ -172,8 +180,7 @@ impl Monomorphizer<'_, '_> {
                             _ => None,
                         },
                         _ => None,
-                    }
-                })
+                    })
             })
         {
             pt
@@ -346,13 +353,32 @@ impl Monomorphizer<'_, '_> {
                     // the field's declared function type is the call contract, the
                     // same source a closure stored into a literal directly takes
                     // (`record_field_closures`) -- just one call boundary away.
-                    Rvalue::Record { ty, fields } | Rvalue::Variant { ty, fields, .. } => {
+                    Rvalue::Record { ty, fields } => {
                         for (fname, op) in fields {
                             let Operand::Local(g) = op else { continue };
                             if resolve_alias(&alias, *g) != *p_local {
                                 continue;
                             }
-                            if let Some(pt) = self.record_field_fun_params(callee_module, ty, fname)
+                            if let Some(pt) =
+                                self.aggregate_field_fun_params(callee_module, ty, fname)
+                            {
+                                return Ok(Some(pt));
+                            }
+                        }
+                    }
+                    Rvalue::Variant {
+                        ty,
+                        variant,
+                        fields,
+                    } => {
+                        for (fname, op) in fields {
+                            let Operand::Local(g) = op else { continue };
+                            if resolve_alias(&alias, *g) != *p_local {
+                                continue;
+                            }
+                            let field = format!("{variant}.{fname}");
+                            if let Some(pt) =
+                                self.aggregate_field_fun_params(callee_module, ty, &field)
                             {
                                 return Ok(Some(pt));
                             }

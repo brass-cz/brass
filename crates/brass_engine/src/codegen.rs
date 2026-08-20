@@ -420,6 +420,19 @@ fn binds_alias(rv: &Rvalue, local_types: &[Type]) -> bool {
     false
 }
 
+/// Whether a discarded call result borrows a managed value already owned by a
+/// local. Identity conversions and nullable narrowing return their argument;
+/// releasing that borrowed result would consume the local's reference. A
+/// constant argument has no other owner, so its identity result remains an
+/// owned temporary and is released normally.
+fn discarded_call_borrows_alias(rv: &Rvalue, local_types: &[Type]) -> bool {
+    binds_alias(rv, local_types)
+        && matches!(
+            rv,
+            Rvalue::Call(_, args) if matches!(args.first(), Some(Operand::Local(_)))
+        )
+}
+
 /// Whether the program uses `with` -- and so opens regions and needs the write
 /// barrier on heap stores. A back end consults this so a sequential (region-free)
 /// program emits no barriers and pays no barrier cost.
@@ -799,6 +812,7 @@ pub trait Codegen {
 
     fn codegen_function(&mut self, program: &MonoProgram, f: &MonoFunction) {
         self.begin_body(f);
+        let spawn_moved = spawn_moved_locals(f);
         // A statically-folded `if` (a `never?` or non-nullable condition) leaves
         // one arm unreachable. Such an arm may hold values the back end cannot
         // emit -- a bare `null` narrowed to `never` -- so it is skipped, its
@@ -808,7 +822,7 @@ pub trait Codegen {
         for (i, live) in reachable.iter().enumerate() {
             let id = BlockId(i as u32);
             if *live {
-                self.codegen_block(program, f, id);
+                self.codegen_block(program, f, id, &spawn_moved);
             } else {
                 self.begin_block(id);
                 self.emit_unreachable();
@@ -817,16 +831,28 @@ pub trait Codegen {
         self.end_body();
     }
 
-    fn codegen_block(&mut self, program: &MonoProgram, f: &MonoFunction, id: BlockId) {
+    fn codegen_block(
+        &mut self,
+        program: &MonoProgram,
+        f: &MonoFunction,
+        id: BlockId,
+        spawn_moved: &fxhash::FxHashSet<LocalId>,
+    ) {
         self.begin_block(id);
         let block = f.body.block(id);
         for s in &block.stmts {
-            self.codegen_stmt(program, f, s);
+            self.codegen_stmt(program, f, s, spawn_moved);
         }
         self.codegen_terminator(program, f, &block.term);
     }
 
-    fn codegen_stmt(&mut self, program: &MonoProgram, f: &MonoFunction, s: &MirStmt) {
+    fn codegen_stmt(
+        &mut self,
+        program: &MonoProgram,
+        f: &MonoFunction,
+        s: &MirStmt,
+        spawn_moved: &fxhash::FxHashSet<LocalId>,
+    ) {
         match s {
             MirStmt::Assign(local, rv) => {
                 let dest = f.local_type(*local).clone();
@@ -839,7 +865,7 @@ pub trait Codegen {
                 // local (a `spawn` in a loop) frees a closure a thread still runs.
                 let old = if rc_managed(&dest)
                     && !f.body.params.contains(local)
-                    && !(matches!(dest, Type::Fun(..)) && spawn_moved_locals(f).contains(local))
+                    && !(matches!(dest, Type::Fun(..)) && spawn_moved.contains(local))
                 {
                     Some(self.load_local(*local))
                 } else {
@@ -868,7 +894,16 @@ pub trait Codegen {
             }
             // A call run for its side effect; the result (if any) is discarded.
             MirStmt::Eval(rv) => {
-                let _ = self.codegen_rvalue(program, f, rv, &Type::Void);
+                let result_ty = match rv {
+                    Rvalue::Call(callee, args) => self
+                        .call_result_type(program, f, callee, args, &Type::Void)
+                        .unwrap_or(Type::Void),
+                    _ => Type::Void,
+                };
+                let value = self.codegen_rvalue(program, f, rv, &Type::Void);
+                if rc_managed(&result_ty) && !discarded_call_borrows_alias(rv, &f.local_types) {
+                    self.emit_release(value, &result_ty);
+                }
             }
             // Store into a record field or an array element. The container gains a
             // reference to the stored value (retain), the slot's previous value is
@@ -1285,12 +1320,28 @@ pub trait Codegen {
             Rvalue::Variant {
                 variant, fields, ..
             } => {
+                let Type::Sum(nominal) = dest_ty else {
+                    panic!("internal error: variant destination is not a sum type");
+                };
+                let (_, layout) =
+                    crate::render::render_variant_fields(program.hir, nominal, variant)
+                        .unwrap_or_else(|| {
+                            panic!("internal error: unresolved variant layout `{variant}`")
+                        });
                 let mut named: Vec<(&str, Self::Value)> = Vec::with_capacity(fields.len());
                 let mut managed: Vec<Self::Value> = Vec::new();
                 for (name, op) in fields {
-                    let fty = operand_type_of(op, &f.local_types);
-                    let v = self.codegen_operand(program, f, op, &fty);
-                    if rc_managed(&fty) && operand_is_alias(op) {
+                    let fty = layout
+                        .iter()
+                        .find_map(|(field, ty)| (field == name).then_some(ty))
+                        .unwrap_or_else(|| {
+                            panic!("internal error: unknown field `{name}` of variant `{variant}`")
+                        });
+                    let op_ty = operand_type_of(op, &f.local_types);
+                    let v = self.codegen_operand(program, f, op, fty);
+                    // Match record construction: a nullable wrap is a fresh
+                    // payload cell that already owns its managed content.
+                    if rc_managed(fty) && operand_is_alias(op) && !is_nullable_wrap(fty, &op_ty) {
                         managed.push(v);
                     }
                     named.push((name.as_str(), v));
@@ -1615,7 +1666,7 @@ pub trait Codegen {
             // nullable subject reaches runtime (non-nullable subjects fold in
             // `cond_static_truthiness`), where truthiness of a nullable is the
             // non-null test.
-            "__present" => {
+            "__present" | "__null_prop_present" => {
                 let ty = operand_type_of(&args[0], &f.local_types);
                 let v = self.codegen_operand(program, f, &args[0], &ty);
                 self.truthy(v, &ty)
@@ -1958,7 +2009,10 @@ pub trait Codegen {
                 Type::Fun(_, ret) => Some(*ret),
                 _ => None,
             },
-            CallKind::Instance(target) => program.lookup(&target).map(|inst| inst.ret.clone()),
+            CallKind::Instance(target) => program
+                .lookup(&target)
+                .map(|inst| inst.ret.clone())
+                .or_else(|| program.deferred.get(&target).map(|sig| sig.ret.clone())),
         }
     }
 

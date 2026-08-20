@@ -1,0 +1,8 @@
+// Empty-array inference joins every push operand, so source order cannot make
+// a null-first sequence lose the later concrete element representation.
+fun main() {
+    let values = []
+    values.push(null)
+    values.push("text")
+    println(values)
+}

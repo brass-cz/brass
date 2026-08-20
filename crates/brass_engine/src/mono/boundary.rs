@@ -22,15 +22,19 @@ pub fn boundary_record_type_by_id(program: &Program, id: i32) -> Option<Type> {
     boundary_record_type_of(program.type_by_id(id)?)
 }
 
-/// Like [`boundary_record_type`] but found by the type's source name across all
-/// modules (the deserialize boundary names its target type); the first match
-/// wins. Used by the dispatch trampoline.
+/// Like [`boundary_record_type`] but accepting a storage symbol or an
+/// unambiguous source name. A bare name shared by modules has no deterministic
+/// runtime identity and is rejected; callers can pass the qualified symbol.
 pub fn boundary_record_type_by_name(program: &Program, name: &str) -> Option<Type> {
-    program
-        .types
-        .values()
-        .find(|t| t.name == name)
-        .and_then(boundary_record_type_of)
+    if let Some(info) = program.types.get(name) {
+        return boundary_record_type_of(info);
+    }
+    let mut matches = program.types.values().filter(|ty| ty.name == name);
+    let info = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    boundary_record_type_of(info)
 }
 
 /// The sentinel type id for a *structural* record built at the deserialize boundary
@@ -62,18 +66,28 @@ pub fn boundary_record_type_from_fields(fields: &[(String, Type)]) -> Type {
 /// `deserialize` boundary produces. Returns `None` on a malformed
 /// descriptor or an unknown field type tag.
 pub fn parse_structural_descriptor(desc: &str) -> Option<Vec<(String, Type)>> {
-    let body = desc
-        .trim()
-        .trim_start_matches('{')
-        .trim_end_matches('}')
-        .trim();
+    let trimmed = desc.trim();
+    let body = match (trimmed.starts_with('{'), trimmed.ends_with('}')) {
+        (true, true) => &trimmed[1..trimmed.len() - 1],
+        (false, false) => trimmed,
+        _ => return None,
+    }
+    .trim();
     if body.is_empty() {
         return None;
     }
+    if body.contains(['{', '}']) {
+        return None;
+    }
     let mut out = Vec::new();
+    let mut names = HashSet::default();
     for field in body.split(',') {
         let (name, tag) = field.split_once(':')?;
-        out.push((name.trim().to_string(), type_from_tag(tag.trim())?));
+        let name = name.trim();
+        if name.is_empty() || !names.insert(name.to_string()) {
+            return None;
+        }
+        out.push((name.to_string(), type_from_tag(tag.trim())?));
     }
     Some(out)
 }
@@ -105,4 +119,52 @@ fn boundary_record_type_of(info: &brass_hir::TypeInfo) -> Option<Type> {
         info.name.clone(),
         subst,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structural_descriptor_rejects_malformed_field_sets() {
+        // Boundary layouts require balanced braces and unique non-empty names.
+        for invalid in [
+            "{x:int32",
+            "x:int32}",
+            "{}",
+            ":int32",
+            "x:int32,x:string",
+            "{x:int32,{y:string}}",
+        ] {
+            assert!(parse_structural_descriptor(invalid).is_none(), "{invalid}");
+        }
+        assert_eq!(
+            parse_structural_descriptor("{ x:int32, label:string }")
+                .expect("valid descriptor")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn bare_runtime_type_name_rejects_cross_module_ambiguity() {
+        // A source name shared by modules is not a runtime identity; each
+        // module-qualified storage symbol remains resolvable.
+        let modules: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|module| brass_hir::LoadedModule {
+                is_prelude: false,
+                path: vec![module.to_string()],
+                ast: brass_parser::parse("type Item = { value: int32 }\n").expect("parse"),
+            })
+            .collect();
+        let (program, errors) = brass_hir::lower(&modules);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(boundary_record_type_by_name(&program, "Item").is_none());
+        let symbol = &program
+            .resolve_type(&["a".to_string()], "Item")
+            .expect("a.Item")
+            .symbol;
+        assert!(boundary_record_type_by_name(&program, symbol).is_some());
+    }
 }

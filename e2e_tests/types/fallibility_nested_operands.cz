@@ -1,0 +1,21 @@
+// Range endpoints and type-test subjects are part of the enclosing callable's
+// error path, so successful returns must still use the fallible Result ABI.
+fun value(n: int32) -> int32! {
+    return n
+}
+
+fun range_value() {
+    return [0..value(3)!]
+}
+
+fun tested_value() {
+    if value(4)!: int32 {
+        return 4
+    }
+    return 0
+}
+
+fun main() {
+    println(range_value()!)
+    println(tested_value()!)
+}

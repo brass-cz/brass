@@ -93,7 +93,7 @@ pub fn local_var_type(full: &FullAnalysis, global_off: usize, name: &str) -> Opt
     let (_, body) = enclosing(&full.main_ast, global_off)?;
     // Precise: the cursor is on a `let name = value` binding -> the value's type.
     if let Some(value_span) = let_value_span(body, global_off, name)
-        && let Some(e) = full.typed.expressions.iter().find(|e| e.span == value_span)
+        && let Some(e) = source_expr_at(full, value_span)
     {
         return Some(e.ty.clone());
     }
@@ -228,7 +228,7 @@ pub fn generic_return_type(full: &FullAnalysis, f: &FunInfo) -> Option<Type> {
     full.typed
         .expressions
         .iter()
-        .find(|e| e.span == span)
+        .find(|e| e.span == span && !matches!(e.kind, TypedExprKind::MethodReceiver))
         .map(|e| e.ty.clone())
 }
 
@@ -287,12 +287,18 @@ pub fn call_args_at_span(full: &FullAnalysis, call_span: Span) -> Option<Vec<Typ
 }
 
 fn arg_type(full: &FullAnalysis, span: Span) -> Type {
+    source_expr_at(full, span)
+        .map(|e| e.ty.clone())
+        .unwrap_or(Type::Unknown(u32::MAX))
+}
+
+/// The source expression at `span`, excluding checker-only method-receiver
+/// evidence that intentionally uses the enclosing call's span.
+fn source_expr_at(full: &FullAnalysis, span: Span) -> Option<&TypedExpr> {
     full.typed
         .expressions
         .iter()
-        .find(|e| e.span == span)
-        .map(|e| e.ty.clone())
-        .unwrap_or(Type::Unknown(u32::MAX))
+        .find(|e| e.span == span && !matches!(e.kind, TypedExprKind::MethodReceiver))
 }
 
 /// Bind the inference variables of a `generic` type to the corresponding parts

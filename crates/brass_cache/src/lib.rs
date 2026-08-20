@@ -49,7 +49,7 @@ use brass_parser::Span;
 
 /// Bumped whenever the payload layout changes, so an old file is discarded by
 /// the header check instead of misread by postcard (which carries no schema).
-pub const FORMAT_VERSION: u16 = 7;
+pub const FORMAT_VERSION: u16 = 8;
 
 /// Leading magic, so a foreign file is rejected before any decoding.
 const MAGIC: &[u8; 8] = b"PPCACHE\0";
@@ -302,6 +302,8 @@ fn sha1(bytes: &[u8]) -> [u8; 20] {
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct Channels {
     pub expr_types: Vec<(Span, Type)>,
+    #[serde(default)]
+    pub receiver_types: Vec<(Span, Type)>,
     pub view_args: Vec<Span>,
     pub sum_views: Vec<(Span, Type)>,
     pub call_locations: Vec<(Span, (String, u32, u32))>,

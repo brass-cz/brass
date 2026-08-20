@@ -46,13 +46,16 @@ pub enum BodyId {
 /// span); removals are listed separately and must be applied first.
 #[derive(Clone, Debug, Default)]
 pub struct ChannelDelta {
-    /// Checker-resolved aggregate result types to seed onto MIR locals (the
-    /// [`aggregate_result_types`] channel). An entry is emitted only once its
-    /// type is fully known and every instantiation seen so far agrees; a span
-    /// listed in `expr_types_removed` was contradicted by a later
-    /// instantiation and must no longer be seeded.
+    /// Checker-resolved aggregate result types that seed MIR locals. An entry
+    /// is emitted only once fully known and cross-instantiation-agreeing; a span
+    /// listed in `expr_types_removed` was later contradicted and must be removed.
     pub expr_types: Vec<(Span, Type)>,
     pub expr_types_removed: Vec<Span>,
+    /// Checker-resolved method receiver types, kept separate from aggregate
+    /// seeds so observing an identifier never forces that type onto a result
+    /// local at an unrelated use of the same source span.
+    pub receiver_types: Vec<(Span, Type)>,
+    pub receiver_types_removed: Vec<Span>,
     /// Append-only span sets (never retracted by later work).
     pub view_args: Vec<Span>,
     pub lift_errs: Vec<Span>,
@@ -93,6 +96,8 @@ impl ChannelDelta {
     pub fn is_empty(&self) -> bool {
         self.expr_types.is_empty()
             && self.expr_types_removed.is_empty()
+            && self.receiver_types.is_empty()
+            && self.receiver_types_removed.is_empty()
             && self.view_args.is_empty()
             && self.lift_errs.is_empty()
             && self.null_props.is_empty()
@@ -225,6 +230,8 @@ pub(crate) struct FlushState {
     pub(crate) errors_seen: usize,
     pub(crate) agg: AggState,
     pub(crate) expr_flushed: HashMap<Span, Type>,
+    pub(crate) receivers: ReceiverState,
+    pub(crate) receivers_flushed: HashMap<Span, Type>,
     pub(crate) view_args: fxhash::FxHashSet<Span>,
     pub(crate) lift_errs: fxhash::FxHashSet<Span>,
     pub(crate) null_props: fxhash::FxHashSet<Span>,
@@ -256,6 +263,11 @@ pub struct StreamSnapshot {
     /// miscompile a second instantiation.
     pub agg: Vec<(Span, Option<(Type, bool)>)>,
     pub expr_flushed: Vec<(Span, Type)>,
+    /// Method-receiver agreement history and the receiver map already emitted.
+    #[serde(default)]
+    pub receivers: Vec<(Span, Option<Type>)>,
+    #[serde(default)]
+    pub receivers_flushed: Vec<(Span, Type)>,
     pub view_args: Vec<Span>,
     pub lift_errs: Vec<Span>,
     pub null_props: Vec<Span>,
@@ -291,6 +303,17 @@ impl FlushState {
                 .collect(),
             expr_flushed: self
                 .expr_flushed
+                .iter()
+                .map(|(s, t)| (*s, t.clone()))
+                .collect(),
+            receivers: self
+                .receivers
+                .per_span
+                .iter()
+                .map(|(s, t)| (*s, t.clone()))
+                .collect(),
+            receivers_flushed: self
+                .receivers_flushed
                 .iter()
                 .map(|(s, t)| (*s, t.clone()))
                 .collect(),
@@ -341,6 +364,18 @@ impl FlushState {
                 .iter()
                 .map(|(s, t)| (*s, t.clone()))
                 .collect(),
+            receivers: ReceiverState {
+                per_span: snap
+                    .receivers
+                    .iter()
+                    .map(|(s, t)| (*s, t.clone()))
+                    .collect(),
+            },
+            receivers_flushed: snap
+                .receivers_flushed
+                .iter()
+                .map(|(s, t)| (*s, t.clone()))
+                .collect(),
             view_args: snap.view_args.iter().copied().collect(),
             lift_errs: snap.lift_errs.iter().copied().collect(),
             null_props: snap.null_props.iter().copied().collect(),
@@ -373,14 +408,9 @@ impl FlushState {
     }
 }
 
-/// Resolve each aggregate-producing expression's source span to its
-/// checker-resolved instance type, for the back end to follow. This carries
-/// the element/field types the checker inferred from use into MIR lowering,
-/// so a witness-free constructor (`HashMap.new()`) whose result type the back
-/// end could not infer on its own is seeded from the caller's resolved type.
-/// Only fully-known aggregates (record/sum/array, no remaining inference
-/// variable) are kept; a span recorded with conflicting types (a polymorphic
-/// position) is dropped so a wrong type is never seeded.
+/// Resolve aggregate-producing expression spans to checker-resolved instance
+/// types the back end cannot reconstruct. Only fully-known,
+/// cross-instantiation-agreeing types are retained.
 pub fn aggregate_result_types(typed: &TypedProgram, program: &Program) -> HashMap<Span, Type> {
     let mut agg = AggState::default();
     for e in &typed.expressions {
@@ -456,6 +486,57 @@ impl AggState {
                 Some((ty, true)) => Some((*span, ty.clone())),
                 _ => None,
             })
+            .collect()
+    }
+}
+
+/// Resolve every checker-recorded method receiver by its enclosing call span.
+/// This channel is intentionally distinct from aggregate result seeds: receiver
+/// evidence is used only to select the signature at that exact call site.
+pub fn method_receiver_types(typed: &TypedProgram, program: &Program) -> HashMap<Span, Type> {
+    let mut receivers = ReceiverState::default();
+    for expression in &typed.expressions {
+        receivers.observe(expression, program);
+    }
+    receivers.agreed_map()
+}
+
+/// Per-span agreement for method receiver types. A generic body can be checked
+/// at several concrete receiver types; disagreement poisons the shared span so
+/// lowering never completes arguments from the wrong instance.
+#[derive(Default)]
+pub(crate) struct ReceiverState {
+    per_span: HashMap<Span, Option<Type>>,
+}
+
+impl ReceiverState {
+    pub(crate) fn observe(&mut self, expression: &brass_hir::TypedExpr, program: &Program) {
+        if !matches!(expression.kind, brass_hir::TypedExprKind::MethodReceiver) {
+            return;
+        }
+        let ty = brass_hir::peel_modes(&expression.ty);
+        if !matches!(ty, Type::Record(_) | Type::Sum(_)) && ty.primitive_class().is_none() {
+            return;
+        }
+        if !brass_hir::is_fully_known(ty) {
+            return;
+        }
+        let ty = complete_aggregate(ty, program);
+        match self.per_span.get(&expression.span) {
+            None => {
+                self.per_span.insert(expression.span, Some(ty));
+            }
+            Some(Some(previous)) if previous != &ty => {
+                self.per_span.insert(expression.span, None);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn agreed_map(&self) -> HashMap<Span, Type> {
+        self.per_span
+            .iter()
+            .filter_map(|(span, ty)| ty.clone().map(|ty| (*span, ty)))
             .collect()
     }
 }
@@ -663,6 +744,7 @@ mod tests {
     #[derive(Default)]
     struct Merged {
         expr_types: HashMap<Span, Type>,
+        receiver_types: HashMap<Span, Type>,
         view_args: HashSet<Span>,
         lift_errs: HashSet<Span>,
         null_props: HashSet<Span>,
@@ -681,11 +763,17 @@ mod tests {
             for s in &d.expr_types_removed {
                 self.expr_types.remove(s);
             }
+            for s in &d.receiver_types_removed {
+                self.receiver_types.remove(s);
+            }
             for s in &d.typeof_types_removed {
                 self.typeof_types.remove(s);
             }
             for (s, t) in &d.expr_types {
                 self.expr_types.insert(*s, t.clone());
+            }
+            for (s, t) in &d.receiver_types {
+                self.receiver_types.insert(*s, t.clone());
             }
             self.view_args.extend(d.view_args.iter().copied());
             self.lift_errs.extend(d.lift_errs.iter().copied());
@@ -750,6 +838,14 @@ mod tests {
             aggregate_result_types(&streamed.typed, &program)
         );
         assert_eq!(m.expr_types, aggregate_result_types(&eager.typed, &program));
+        assert_eq!(
+            m.receiver_types,
+            method_receiver_types(&streamed.typed, &program)
+        );
+        assert_eq!(
+            m.receiver_types,
+            method_receiver_types(&eager.typed, &program)
+        );
         assert_eq!(m.view_args, eager.view_args);
         assert_eq!(m.lift_errs, eager.lift_errs);
         assert_eq!(m.null_props, eager.null_props);
@@ -806,12 +902,14 @@ mod tests {
         // Rebuild a plausible delivered state from the recorded stream.
         let merged = merge(&rec.events);
         state.expr_flushed = merged.expr_types.clone();
+        state.receivers_flushed = merged.receiver_types.clone();
         state.sum_views = merged.sum_views.clone();
         state.view_args = merged.view_args.clone();
         let fields: HashMap<Span, Vec<String>> = HashMap::default();
         let snap = state.snapshot(vec!["make".into(), "main".into()], 1, &fields);
         let back = FlushState::from_snapshot(&snap);
         assert_eq!(back.expr_flushed, state.expr_flushed);
+        assert_eq!(back.receivers_flushed, state.receivers_flushed);
         assert_eq!(back.sum_views, state.sum_views);
         assert_eq!(back.view_args, state.view_args);
         assert_eq!(snap.checked, vec!["make".to_string(), "main".to_string()]);

@@ -297,6 +297,13 @@ impl<'a> Checker<'a> {
                 return ret;
             }
             let recv_ty = self.check_expr(base, scopes);
+            let resolved_receiver = self.resolve(&recv_ty);
+            self.record_typed(
+                brass_hir::TypedExprKind::MethodReceiver,
+                span,
+                resolved_receiver,
+                Constness::Unknown,
+            );
             if let Type::Nullable(_) = self.resolve_head(&recv_ty) {
                 self.report_nullable_use(base.span());
             }

@@ -569,3 +569,16 @@ fn narrowed_nullable_array_ops_type_and_keep_the_init() {
         );
     }
 }
+
+#[test]
+fn discarded_owned_call_result_is_released() {
+    // A statement call returning a freshly owned string has no local whose
+    // scope cleanup can release it, so codegen must drop the result immediately.
+    let out = render(
+        "fun make() -> string { return \"owned\" }\n\
+         fun discard() { make() }\n",
+    );
+    let discard = out.split("fn discard()").nth(1).expect("discard body");
+    assert!(discard.contains("call make"), "{out}");
+    assert!(discard.contains("release v"), "{out}");
+}

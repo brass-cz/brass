@@ -1404,6 +1404,7 @@ fn flush_delta(
     if terminal {
         state.typed_seen = 0;
         state.agg = Default::default();
+        state.receivers = Default::default();
     }
     for e in &checker.typed.expressions[state.typed_seen..] {
         // An entry was resolved when it was RECORDED, which can be mid-body:
@@ -1416,6 +1417,7 @@ fn flush_delta(
         let mut e = e.clone();
         e.ty = checker.resolve(&e.ty);
         state.agg.observe(&e, checker.program);
+        state.receivers.observe(&e, checker.program);
     }
     state.typed_seen = checker.typed.expressions.len();
     let want = state.agg.seedable_map();
@@ -1430,6 +1432,18 @@ fn flush_delta(
         }
     }
     state.expr_flushed = want;
+    let want = state.receivers.agreed_map();
+    for (span, ty) in &want {
+        if state.receivers_flushed.get(span) != Some(ty) {
+            delta.receiver_types.push((*span, ty.clone()));
+        }
+    }
+    for span in state.receivers_flushed.keys() {
+        if !want.contains_key(span) {
+            delta.receiver_types_removed.push(*span);
+        }
+    }
+    state.receivers_flushed = want;
     // Append-only span sets.
     for s in checker.view_args.difference(&state.view_args) {
         delta.view_args.push(*s);

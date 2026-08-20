@@ -1,0 +1,29 @@
+// Free, static, and instance calls all complete the resolved signature's
+// nullable defaults and implicit source Location in declaration order.
+type A = { value: int32 }
+type B = { value: int32 }
+
+fun free_default(loc: Location) -> int32 {
+    return loc.line + 10
+}
+
+fun A.static_default(value: int32?, loc: Location) -> int32 {
+    return loc.line
+}
+
+fun A.instance_default(self, value: int32?, loc: Location) -> int32 {
+    return self.value + loc.line
+}
+
+// This unrelated same-named method deliberately has a different arity. It
+// must not suppress Location completion for the A receiver above.
+fun B.instance_default(self, value: int32) -> int32 {
+    return self.value + value
+}
+
+fun main() {
+    const a = A { value: 3 }
+    println(free_default() > 10)
+    println(A.static_default() > 0)
+    println(a.instance_default() > 3)
+}

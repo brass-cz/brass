@@ -1024,7 +1024,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         if let Some(seed) = ret.clone().or(seed_ret)
             && is_return_polymorphic_result(&seed)
         {
-            seed_returned_aggregate(body, &seed, &mut local_types);
+            seed_returned_aggregate(body, &seed, self.program, &mut local_types);
         }
 
         // Closure parameter sources: a direct in-body call, being passed to a
@@ -1494,7 +1494,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         indirect_args: &HashMap<LocalId, Vec<Vec<Operand>>>,
         closure_passes: &HashMap<LocalId, (String, Vec<Operand>, usize)>,
         record_field_closures: &HashMap<LocalId, (LocalId, String, String)>,
-        array_pushes: &HashMap<LocalId, Operand>,
+        array_pushes: &HashMap<LocalId, Vec<Operand>>,
         local_types: &mut [Option<Type>],
         cur_ret: &Option<Type>,
         fallible: bool,
@@ -1521,7 +1521,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                             }
                         }
                     }
-                    let Some(elem_op) = array_pushes.get(local) else {
+                    let Some(elem_ops) = array_pushes.get(local) else {
                         let binding = match binding_name_of(body, *local) {
                             Some(n) => format!(" bound to `{n}`"),
                             None => String::new(),
@@ -1540,7 +1540,17 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                              it first{context}"
                         ));
                     };
-                    if let Some(elem) = self.operand_type(elem_op, local_types)? {
+                    let mut elem = None;
+                    for op in elem_ops {
+                        let Some(next) = self.operand_type(op, local_types)? else {
+                            return Ok(());
+                        };
+                        elem = Some(match elem {
+                            Some(cur) => merge_return_types(&cur, &next),
+                            None => next,
+                        });
+                    }
+                    if let Some(elem) = elem {
                         local_types[local.index()] = Some(Type::Slice(Box::new(elem)));
                         *changed = true;
                     }
@@ -1836,7 +1846,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 // `__present(x)` is the `if let x = e` presence test: false for a
                 // null, true for anything else. Non-nullable subjects fold
                 // statically (see `cond_static_truthiness`).
-                "__present" => Ok(Some(Type::Bool)),
+                "__present" | "__null_prop_present" => Ok(Some(Type::Bool)),
                 // `__nonnull(x)` narrows a nullable to its inner type (the if-let
                 // binding of a nullable, proven non-null); a non-nullable is itself.
                 "__nonnull" => match args.first() {
@@ -2292,7 +2302,6 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
     /// Resolve a call to an already-located method/static body: handle
     /// self-recursion and mutual recursion, instantiate, and return the instance
     /// return type.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn resolve_callable(
         &mut self,

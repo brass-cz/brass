@@ -58,6 +58,10 @@ pub enum TypedExprKind {
     Unary(UnaryOp),
     Binary(BinOp),
     Call,
+    /// Checker-only evidence for the receiver selected by a method call, keyed
+    /// by the enclosing call span. MIR consumes it to complete that call's
+    /// omitted arguments without aggregating unrelated same-named methods.
+    MethodReceiver,
     Field(String),
     Index,
     ErrorPropagate,

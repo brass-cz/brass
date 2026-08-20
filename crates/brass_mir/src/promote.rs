@@ -48,6 +48,9 @@ pub fn promote_const_array_literals(program: &mut MirProgram) {
     for m in &mut program.methods {
         promote_in_body(&mut m.body, &safe, &mut globals);
     }
+    for closure in &mut program.closures {
+        promote_in_body(&mut closure.body, &safe, &mut globals);
+    }
     for init in &mut program.inits {
         promote_in_body(&mut init.body, &safe, &mut globals);
     }
