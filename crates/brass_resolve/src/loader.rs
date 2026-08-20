@@ -653,6 +653,12 @@ pub fn canonicalize_imports(
         if imp.bare {
             classify_bare(base, root, imp, search);
         }
+        if is_prelude_path(&imp.path) {
+            // Embedded modules already exist in the prelude set, so canonicalize
+            // the stored identity without scheduling a disk load.
+            imp.path = qualified_core_path(&imp.path);
+            continue;
+        }
         if let Some(canonical) = relativize(base, &imp.path, root, search) {
             imp.path = canonical.clone();
             targets.push((canonical, imp.span));
@@ -861,7 +867,7 @@ fn load_synthesized(
 
 #[cfg(test)]
 mod search_path_tests {
-    use super::{include_paths, package_paths};
+    use super::{SearchPaths, canonicalize_imports, include_paths, package_paths};
 
     /// Search-path parsing follows the platform's own list separator and drops
     /// malformed or empty package entries without losing valid neighbors.
@@ -888,5 +894,21 @@ mod search_path_tests {
                 std::path::PathBuf::from("two")
             ]
         );
+    }
+
+    #[test]
+    fn bare_core_imports_store_the_loaded_module_identity() {
+        // `io` is embedded as `core.io`: the import keeps its source alias but
+        // points qualified-use resolution at the canonical loaded path.
+        let mut imports = brass_parser::parse("import io\n").expect("parse").imports;
+        let targets = canonicalize_imports(
+            &[],
+            std::path::Path::new("."),
+            &mut imports,
+            &SearchPaths::default(),
+        );
+        assert!(targets.is_empty(), "embedded modules are not disk targets");
+        assert_eq!(imports[0].path, ["core", "io"]);
+        assert_eq!(imports[0].alias.as_deref(), Some("io"));
     }
 }

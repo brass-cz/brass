@@ -125,6 +125,12 @@ impl Subst {
     fn unify_function_part(&mut self, a: &Type, b: &Type) -> Result<(), String> {
         let a = self.resolve(a);
         let b = self.resolve(b);
+        // A whole open signature part has not chosen a calling convention yet.
+        // Bind it to the complete counterpart before splitting wrappers;
+        // otherwise `U` unified with `ref(T)` or `mut(T)` would become bare `T`.
+        if matches!(a, Type::Unknown(_)) || matches!(b, Type::Unknown(_)) {
+            return self.unify(&a, &b);
+        }
         if !passing_modes_match(&a, &b) {
             return Err(format!(
                 "function passing mode mismatch between `{}` and `{}`",
@@ -353,5 +359,22 @@ mod tests {
         assert_eq!(s.resolve(&nullable(var.clone())), nullable(var.clone()));
         s.unify(&var, &Type::Int(IntKind::I32)).unwrap();
         assert_eq!(s.resolve(&nullable(var)), nullable(Type::Int(IntKind::I32)));
+    }
+
+    #[test]
+    fn whole_function_unknowns_retain_inferred_passing_modes() {
+        // A signature-level unknown represents the entire parameter type, so
+        // inference must retain reference/copy wrappers chosen by its peer.
+        let mut s = Subst::new();
+        let borrowed = Type::Unknown(0);
+        let mutable = Type::Unknown(1);
+        let ref_string = Type::Ref(Box::new(Type::Str));
+        let mut_int = Type::Mut(Box::new(Type::Int(brass_hir::IntKind::I32)));
+
+        s.unify_function_part(&borrowed, &ref_string).unwrap();
+        s.unify_function_part(&mut_int, &mutable).unwrap();
+
+        assert_eq!(s.resolve_deep(&borrowed), ref_string);
+        assert_eq!(s.resolve_deep(&mutable), mut_int);
     }
 }

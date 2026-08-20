@@ -158,6 +158,15 @@ fn resolve_type_alias<'a>(
         &full.program.import_renames,
         module,
         name,
+        |alias| {
+            brass_hir::definition_is_visible(
+                &full.program.import_origins,
+                &full.program.prelude_modules,
+                module,
+                name,
+                &alias.module,
+            )
+        },
     )
 }
 

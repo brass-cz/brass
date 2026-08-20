@@ -1410,7 +1410,9 @@ fn hover_import_bare_single_name() {
     assert!(text.contains("fun pow("), "signature: {text}");
     let (doc, pos) = position(src, "math", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the module segment"));
-    assert!(text.contains("module math"), "module path: {text}");
+    // Bare core imports canonicalize to their `core.*` identity, and hover
+    // reports the module that actually loaded.
+    assert!(text.contains("module core.math"), "module path: {text}");
 }
 
 /// After a sum type name (`Shape.`), offer its variants.

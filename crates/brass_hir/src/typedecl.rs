@@ -143,6 +143,7 @@ pub(crate) fn resolve_type_decls(
         nominal_by_symbol,
         import_origins: &program.import_origins,
         import_renames: &program.import_renames,
+        prelude_modules: &program.prelude_modules,
         next_unknown,
         resolved: HashMap::default(),
         alias_resolved: HashMap::default(),
@@ -209,6 +210,7 @@ struct Resolver<'a> {
     nominal_by_symbol: &'a HashMap<String, NominalInfo>,
     import_origins: &'a HashMap<Vec<String>, HashMap<String, Vec<String>>>,
     import_renames: &'a HashMap<Vec<String>, HashMap<String, String>>,
+    prelude_modules: &'a HashSet<Vec<String>>,
     next_unknown: &'a mut u32,
     /// Memoized resolved field types, keyed by (owner symbol, field name).
     resolved: HashMap<(String, String), Type>,
@@ -230,12 +232,22 @@ impl Resolver<'_> {
 
     /// The unique symbol a NOMINAL type name resolves to from `module`.
     fn symbol_of(&self, module: &[String], name: &str) -> Option<String> {
-        self.symbol_in(module, name, |s| self.meta.contains_key(s))
+        self.symbol_in(
+            module,
+            name,
+            |s| self.meta.contains_key(s),
+            |s| self.meta.get(s).map(|meta| meta.module.clone()),
+        )
     }
 
     /// The unique symbol a `type Alias = ..` name resolves to from `module`.
     fn alias_symbol_of(&self, module: &[String], name: &str) -> Option<String> {
-        self.symbol_in(module, name, |s| self.alias_meta.contains_key(s))
+        self.symbol_in(
+            module,
+            name,
+            |s| self.alias_meta.contains_key(s),
+            |s| self.alias_meta.get(s).map(|meta| meta.module.clone()),
+        )
     }
 
     /// The unique symbol a type NAME resolves to from `module` (its own/unique,
@@ -247,7 +259,19 @@ impl Resolver<'_> {
         module: &[String],
         name: &str,
         in_table: impl Fn(&str) -> bool,
+        definition_module: impl Fn(&str) -> Option<Vec<String>>,
     ) -> Option<String> {
+        let bare_is_visible = |symbol: &str| {
+            definition_module(symbol).is_some_and(|definition| {
+                crate::hir::definition_is_visible(
+                    self.import_origins,
+                    self.prelude_modules,
+                    module,
+                    name,
+                    &definition,
+                )
+            })
+        };
         // Rename first, as in `resolve_qualified`: a renamed local must not be
         // captured by an unrelated module's unique definition of that name.
         if let Some(remote) = self.import_renames.get(module).and_then(|m| m.get(name)) {
@@ -256,18 +280,23 @@ impl Resolver<'_> {
             if in_table(&qo) {
                 return Some(qo);
             }
-            return in_table(remote).then(|| remote.clone());
-        }
-        if in_table(name) {
-            return Some(name.to_string());
+            return (in_table(remote) && bare_is_visible(remote)).then(|| remote.clone());
         }
         let q = crate::hir::qualify(name, module);
         if in_table(&q) {
             return Some(q);
         }
-        let origin = self.import_origins.get(module)?.get(name)?;
-        let qo = crate::hir::qualify(name, origin);
-        in_table(&qo).then_some(qo)
+        if let Some(origin) = self
+            .import_origins
+            .get(module)
+            .and_then(|origins| origins.get(name))
+        {
+            let qo = crate::hir::qualify(name, origin);
+            if in_table(&qo) {
+                return Some(qo);
+            }
+        }
+        (in_table(name) && bare_is_visible(name)).then(|| name.to_string())
     }
 
     /// Expand `type Alias = <type expr>` by symbol, memoized.
@@ -444,6 +473,18 @@ impl Resolver<'_> {
             self.import_renames,
             module,
             name,
+            |info| {
+                self.meta.values().any(|meta| {
+                    meta.id == info.id
+                        && crate::hir::definition_is_visible(
+                            self.import_origins,
+                            self.prelude_modules,
+                            module,
+                            name,
+                            &meta.module,
+                        )
+                })
+            },
         )
         .copied()
     }

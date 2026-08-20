@@ -11,19 +11,54 @@
 pub struct Span {
     pub lo: usize,
     pub hi: usize,
+    /// Source coordinates retained by synthetic span shifts. Keeping this
+    /// provenance in the span makes diagnostic restoration independent of any
+    /// assumed maximum source-map offset.
+    #[serde(default)]
+    source: Option<(usize, usize)>,
 }
 
 impl Span {
     pub fn new(lo: usize, hi: usize) -> Self {
-        Span { lo, hi }
+        Span {
+            lo,
+            hi,
+            source: None,
+        }
     }
 
     /// Merge two spans into one covering both.
     pub fn merge(self, other: Span) -> Span {
+        let source = if self.source.is_some() || other.source.is_some() {
+            let left = self.source_span();
+            let right = other.source_span();
+            Some((left.lo.min(right.lo), left.hi.max(right.hi)))
+        } else {
+            None
+        };
         Span {
             lo: self.lo.min(other.lo),
             hi: self.hi.max(other.hi),
+            source,
         }
+    }
+
+    /// Return a synthetic copy shifted by `delta`, retaining the first source
+    /// coordinates across any later nested shifts.
+    pub fn shifted(self, delta: usize) -> Span {
+        Span {
+            lo: self.lo.checked_add(delta).expect("synthetic span overflow"),
+            hi: self.hi.checked_add(delta).expect("synthetic span overflow"),
+            source: self.source.or(Some((self.lo, self.hi))),
+        }
+    }
+
+    /// Restore the original source coordinates of a synthetic span. Ordinary
+    /// parser spans are returned unchanged.
+    pub fn source_span(self) -> Span {
+        self.source
+            .map(|(lo, hi)| Span::new(lo, hi))
+            .unwrap_or(self)
     }
 }
 

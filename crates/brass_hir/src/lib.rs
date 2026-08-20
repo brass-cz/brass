@@ -17,7 +17,8 @@ pub use expand::{
 pub use hir::{
     CallableSignature, FieldInfo, FunInfo, GeneratedDecl, LoadedModule, MethodInfo, ModuleInit,
     ParamInfo, Program, QualifiedName, RESERVED_FUNCTION_NAMES, RESULT_TYPE_ID, SchemeMethod,
-    TypeAlias, TypeInfo, TypeKind, TypeScheme, VariantInfo, qualify, resolve_qualified,
+    TypeAlias, TypeInfo, TypeKind, TypeScheme, VariantInfo, definition_is_visible,
+    generated_type_id, generated_type_name, qualify, resolve_qualified,
 };
 pub use lower::{LowerError, lower, lower_generated_into};
 pub use mutation::{

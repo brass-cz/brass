@@ -24,8 +24,12 @@ impl<T> Scope<T> {
         self.frames.push(HashMap::default());
     }
 
+    /// Leave the innermost nested scope. The root frame is permanent so a
+    /// mismatched cleanup cannot make later definitions panic.
     pub fn pop(&mut self) {
-        self.frames.pop();
+        if self.frames.len() > 1 {
+            self.frames.pop();
+        }
     }
 
     pub fn define(&mut self, name: &str, value: T) {
@@ -42,5 +46,20 @@ impl<T> Scope<T> {
 
     pub fn in_scope(&self, name: &str) -> bool {
         self.lookup(name).is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Scope;
+
+    #[test]
+    fn root_scope_cannot_be_removed() {
+        // Extra cleanup calls are harmless and the scope remains usable.
+        let mut scope = Scope::new();
+        scope.pop();
+        scope.pop();
+        scope.define("value", 7);
+        assert_eq!(scope.lookup("value"), Some(&7));
     }
 }

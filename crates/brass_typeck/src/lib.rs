@@ -366,6 +366,15 @@ fn check_result_shadows(program: &Program, modules: AnalysisModules<'_>) -> Vec<
             &program.import_renames,
             &alias.module,
             brass_hir::RESULT_TYPE_NAME,
+            |candidate| {
+                brass_hir::definition_is_visible(
+                    &program.import_origins,
+                    &program.prelude_modules,
+                    &alias.module,
+                    brass_hir::RESULT_TYPE_NAME,
+                    &candidate.module,
+                )
+            },
         );
         if key.is_some_and(|a| a.span == alias.span) {
             errors.push(TypeError {
@@ -534,6 +543,15 @@ fn resolve_annotations(program: &Program, modules: AnalysisModules<'_>) -> Vec<T
             &program.import_renames,
             module,
             name,
+            |alias| {
+                brass_hir::definition_is_visible(
+                    &program.import_origins,
+                    &program.prelude_modules,
+                    module,
+                    name,
+                    &alias.module,
+                )
+            },
         ) {
             return match &alias.ty {
                 brass_hir::Type::Record(n) => Some(NominalInfo::record(n.id)),
@@ -2339,8 +2357,20 @@ mod tests {
 
     #[test]
     fn unknown_type_name_is_reported() {
-        let e = errs("fun f(x: Nope) {\n}\n");
-        assert!(e.iter().any(|m| m.contains("unknown type `Nope`")), "{e:?}");
+        // Signature annotations are resolved during HIR lowering, so the
+        // diagnostic is available before the type checker starts.
+        let ast = parse("fun f(x: Nope) {\n}\n").expect("parse");
+        let (_, errors) = lower(&[LoadedModule {
+            is_prelude: false,
+            path: vec!["main".into()],
+            ast,
+        }]);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("unknown type `Nope`")),
+            "{errors:?}"
+        );
     }
 
     #[test]

@@ -176,6 +176,29 @@ mod tests {
     }
 
     #[test]
+    fn interpolation_braces_inside_comments_are_ignored() {
+        // Both comment forms can contain unmatched braces without closing the
+        // interpolation; block comments remain nested as in ordinary source.
+        let k = kinds("\"{ value // }\n + other /* } /* { */ } */ }\"");
+        let TokenKind::Str(parts) = &k[0] else {
+            panic!("expected string");
+        };
+        assert_eq!(
+            parts[0],
+            StrPart::Interp(" value // }\n + other /* } /* { */ } */ ".into(), 2)
+        );
+    }
+
+    #[test]
+    fn trailing_nested_string_escape_has_an_in_bounds_error_span() {
+        // A final backslash in a nested interpolation string has no escaped
+        // byte; the diagnostic must still end at the source boundary.
+        let src = "\"{ \"abc\\";
+        let err = lex(src).expect_err("nested string is unterminated");
+        assert_eq!(err.span.hi, src.len());
+    }
+
+    #[test]
     fn operators() {
         let k = kinds("a += b % c << d");
         assert_eq!(

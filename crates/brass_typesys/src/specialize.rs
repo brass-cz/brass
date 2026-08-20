@@ -92,7 +92,7 @@ pub fn specialize_all(program: &Program, roots: &[KeyedNeed]) -> Result<Vec<Gene
         // kinds, expr types) would then collide across specializations. Shift
         // each into its own span band, wide enough to also clear the fields-loop
         // unroll's own per-field shifts inside it; a diagnostic maps back with
-        // `unshift_span` (`% SPAN_SHIFT_UNIT`).
+        // `unshift_span` through the source coordinates retained by `Span`.
         let base = (out.len() + 1) * SPAN_BAND * brass_hir::SPAN_SHIFT_UNIT;
         decl.body = shift_spans(&decl.body, base);
         out.push(Generated {
@@ -605,6 +605,9 @@ fn is_static_call(callee: &Expr, ty: &str, method: &str) -> bool {
 /// annotation. Covers the types a decoder targets.
 pub fn type_to_expr(t: &Type, span: brass_hir::Span) -> TypeExpr {
     match t {
+        Type::Record(n) | Type::Sum(n) if n.id >= 0 => {
+            TypeExpr::Named(brass_hir::generated_type_name(n.id), span)
+        }
         Type::Record(n) | Type::Sum(n) => TypeExpr::Named(n.name.clone(), span),
         Type::Nullable(i) => TypeExpr::Nullable(Box::new(type_to_expr(i, span)), span),
         Type::Slice(i) => TypeExpr::Array(Box::new(type_to_expr(i, span)), None, span),

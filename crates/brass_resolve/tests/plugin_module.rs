@@ -157,6 +157,28 @@ fn a_rename_collision_is_reported() {
     synthesize_source(&manifest_of(&["a", "b"], None), "lib.so").expect("no collision");
 }
 
+#[test]
+fn parameter_rename_collisions_are_reported() {
+    // Keyword sanitization must not synthesize two bindings with one Brass
+    // name, even when the original manifest names are distinct.
+    let manifest = PluginManifest {
+        functions: vec![PluginFunction {
+            name: "call".into(),
+            doc: None,
+            params: vec![
+                ("match".into(), ValueType::Int),
+                ("match_".into(), ValueType::Int),
+            ],
+            ret: ValueType::Void,
+            fallible: false,
+            index: 0,
+        }],
+    };
+    let err = synthesize_source(&manifest, "plugins.collision").expect_err("collision");
+    assert!(err.contains("parameters `match` and `match_`"), "{err}");
+    assert!(err.contains("Brass name `match_`"), "{err}");
+}
+
 /// A doc comment consisting of a lone `/*` has no closer to rewrite, yet still
 /// raises the nesting depth of the wrapper's own block comment.
 #[test]

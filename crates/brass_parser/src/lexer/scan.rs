@@ -336,7 +336,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// Read the raw source of an interpolated `{expr}`, balancing braces and
-    /// skipping over nested string literals so their braces are not counted.
+    /// skipping over nested strings and comments so their braces are not counted.
     fn read_interpolation(&mut self, str_start: usize) -> Result<String, LexError> {
         self.pos += 1; // consume '{'
         let expr_start = self.pos;
@@ -360,10 +360,49 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                 }
                 b'"' => self.skip_nested_string()?,
+                b'/' if self.peek(1) == Some(b'/') => {
+                    while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
+                        self.pos += 1;
+                    }
+                }
+                b'#' => {
+                    while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
+                        self.pos += 1;
+                    }
+                }
+                b'/' if self.peek(1) == Some(b'*') => self.skip_interpolation_block_comment()?,
                 _ => self.pos += 1,
             }
         }
         Err(self.err(str_start, "unterminated interpolation"))
+    }
+
+    /// Skip a nested block comment without recording it as documentation: the
+    /// comment belongs to the interpolation fragment, which is lexed again by
+    /// the expression sub-parser.
+    fn skip_interpolation_block_comment(&mut self) -> Result<(), LexError> {
+        let start = self.pos;
+        self.pos += 2;
+        let mut depth = 1;
+        while self.pos < self.src.len() && depth > 0 {
+            if self.src[self.pos] == b'/' && self.peek(1) == Some(b'*') {
+                depth += 1;
+                self.pos += 2;
+            } else if self.src[self.pos] == b'*' && self.peek(1) == Some(b'/') {
+                depth -= 1;
+                self.pos += 2;
+            } else {
+                self.pos += 1;
+            }
+        }
+        if depth == 0 {
+            Ok(())
+        } else {
+            Err(LexError {
+                message: "unterminated block comment".into(),
+                span: Span::new(start, self.pos),
+            })
+        }
     }
 
     /// Skip a nested string literal while inside an interpolation, honoring
@@ -373,7 +412,7 @@ impl<'a> Lexer<'a> {
         self.pos += 1;
         while self.pos < self.src.len() {
             match self.src[self.pos] {
-                b'\\' => self.pos += 2,
+                b'\\' => self.pos = (self.pos + 2).min(self.src.len()),
                 b'"' => {
                     self.pos += 1;
                     return Ok(());

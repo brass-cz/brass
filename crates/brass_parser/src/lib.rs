@@ -546,4 +546,28 @@ mod tests {
             other => panic!("expected variant literal, got {other:?}"),
         }
     }
+
+    #[test]
+    fn deeply_nested_prefix_expressions_are_rejected_without_recursing() {
+        // Prefix operators form nested AST nodes, so the common syntax budget
+        // stops an adversarial chain before parsing or later visitors overflow.
+        let src = format!("fun main() {{\n let x = {}true\n}}\n", "!".repeat(500));
+        let err = parse(&src).expect_err("prefix chain should hit the nesting limit");
+        assert_eq!(err.message, "expression nesting is too deep");
+    }
+
+    #[test]
+    fn deeply_nested_types_and_patterns_are_rejected() {
+        // Type and destructuring-pattern recursion share the expression budget
+        // instead of bypassing the parser's stack bound.
+        let ty = format!("{}int32{}", "[".repeat(500), "]".repeat(500));
+        let err = parse(&format!("fun f(x: {ty}) {{}}\n"))
+            .expect_err("tuple type should hit the nesting limit");
+        assert_eq!(err.message, "type nesting is too deep");
+
+        let pat = format!("{}x{}", "[".repeat(500), "]".repeat(500));
+        let err = parse(&format!("fun f() {{\n let {pat} = value\n}}\n"))
+            .expect_err("array pattern should hit the nesting limit");
+        assert_eq!(err.message, "pattern nesting is too deep");
+    }
 }

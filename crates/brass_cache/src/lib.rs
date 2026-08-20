@@ -49,7 +49,7 @@ use brass_parser::Span;
 
 /// Bumped whenever the payload layout changes, so an old file is discarded by
 /// the header check instead of misread by postcard (which carries no schema).
-pub const FORMAT_VERSION: u16 = 6;
+pub const FORMAT_VERSION: u16 = 7;
 
 /// Leading magic, so a foreign file is rejected before any decoding.
 const MAGIC: &[u8; 8] = b"PPCACHE\0";

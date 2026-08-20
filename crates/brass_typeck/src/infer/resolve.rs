@@ -149,6 +149,13 @@ impl<'a> Checker<'a> {
     }
 
     fn resolve_named(&mut self, name: &str) -> Result<Type, String> {
+        if let Some(id) = brass_hir::generated_type_id(name) {
+            return self
+                .program
+                .type_by_id(id)
+                .map(TypeInfo::type_ref)
+                .ok_or_else(|| format!("unknown generated type id `{id}`"));
+        }
         if let Some(k) = IntKind::from_name(name) {
             return Ok(Type::Int(k));
         }
@@ -188,6 +195,15 @@ impl<'a> Checker<'a> {
             &self.program.import_renames,
             &self.current_module,
             name,
+            |alias| {
+                brass_hir::definition_is_visible(
+                    &self.program.import_origins,
+                    &self.program.prelude_modules,
+                    &self.current_module,
+                    name,
+                    &alias.module,
+                )
+            },
         )?;
         let ty = alias.ty.clone();
         Some(brass_hir::freshen_infer(ty, &mut || self.fresh_unknown()))

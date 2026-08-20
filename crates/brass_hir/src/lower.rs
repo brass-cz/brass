@@ -757,8 +757,14 @@ fn resolve_program_annotations(
             (symbol.clone(), nominal)
         })
         .collect();
+    let nominal_modules: HashMap<i32, Vec<String>> = program
+        .types
+        .values()
+        .map(|info| (info.id, info.module.clone()))
+        .collect();
     let import_origins = program.import_origins.clone();
     let import_renames_snap = program.import_renames.clone();
+    let prelude_modules = program.prelude_modules.clone();
     // Resolve a bare type name to its nominal info from a given module: its own
     // bare/unique symbol, this module's qualified definition, or the imported
     // one. Captures only the snapshots above, so it does not borrow
@@ -770,6 +776,17 @@ fn resolve_program_annotations(
             &import_renames_snap,
             module,
             name,
+            |info| {
+                nominal_modules.get(&info.id).is_some_and(|definition| {
+                    crate::hir::definition_is_visible(
+                        &import_origins,
+                        &prelude_modules,
+                        module,
+                        name,
+                        definition,
+                    )
+                })
+            },
         )
         .copied()
     };
@@ -791,11 +808,7 @@ fn resolve_program_annotations(
     // `resolve_type_decls` just filled, so the field's declared type reaches
     // the back ends -- a bare sum crossing a function boundary has no
     // construction substitution to fall back on.
-    let alias_types: HashMap<String, Type> = program
-        .type_aliases
-        .iter()
-        .map(|(k, a)| (k.clone(), a.ty.clone()))
-        .collect();
+    let alias_types = program.type_aliases.clone();
     for info in program.types.values_mut() {
         let module = info.module.clone();
         let nominal = |name: &str| resolve_nominal(&module, name);
@@ -806,8 +819,17 @@ fn resolve_program_annotations(
                 &import_renames_snap,
                 &module,
                 name,
+                |alias| {
+                    crate::hir::definition_is_visible(
+                        &import_origins,
+                        &prelude_modules,
+                        &module,
+                        name,
+                        &alias.module,
+                    )
+                },
             )
-            .cloned()
+            .map(|alias| alias.ty.clone())
         };
         match &mut info.kind {
             // Record fields are resolved by `resolve_type_decls` above; only the
@@ -822,6 +844,7 @@ fn resolve_program_annotations(
                         &mut next_unknown,
                         true,
                         assign_ret_unknown,
+                        errors,
                     )
                 });
             }
@@ -839,6 +862,7 @@ fn resolve_program_annotations(
                             &mut next_unknown,
                             true,
                             assign_ret_unknown,
+                            errors,
                         )
                     });
                 }
@@ -856,8 +880,17 @@ fn resolve_program_annotations(
                 &import_renames_snap,
                 &module,
                 name,
+                |alias| {
+                    crate::hir::definition_is_visible(
+                        &import_origins,
+                        &prelude_modules,
+                        &module,
+                        name,
+                        &alias.module,
+                    )
+                },
             )
-            .cloned()
+            .map(|alias| alias.ty.clone())
         };
         resolve_signature_annotations(
             &mut fun.signature,
@@ -866,6 +899,7 @@ fn resolve_program_annotations(
             &mut next_unknown,
             false,
             false,
+            errors,
         )
     });
 
@@ -911,12 +945,20 @@ fn resolve_signature_annotations(
     next_unknown: &mut u32,
     assign_param_unknowns: bool,
     assign_ret_unknown: bool,
+    errors: &mut Vec<LowerError>,
 ) {
     for param in &mut signature.params {
         param.resolved_ty = match &param.ty {
-            Some(ty) => crate::types::resolve_with_aliases(ty, nominal, alias)
-                .ok()
-                .map(|t| crate::freshen_infer(t, &mut || fresh_unknown(next_unknown))),
+            Some(ty) => match crate::types::resolve_with_aliases(ty, nominal, alias) {
+                Ok(t) => Some(crate::freshen_infer(t, &mut || fresh_unknown(next_unknown))),
+                Err(message) => {
+                    errors.push(LowerError {
+                        message,
+                        span: ty.span(),
+                    });
+                    Some(fresh_unknown(next_unknown))
+                }
+            },
             None if assign_param_unknowns && param.name != "self" => {
                 Some(fresh_unknown(next_unknown))
             }
@@ -924,9 +966,16 @@ fn resolve_signature_annotations(
         };
     }
     signature.ret_ty = match &signature.ret {
-        Some(ty) => crate::types::resolve_with_aliases(ty, nominal, alias)
-            .ok()
-            .map(|t| crate::freshen_infer(t, &mut || fresh_unknown(next_unknown))),
+        Some(ty) => match crate::types::resolve_with_aliases(ty, nominal, alias) {
+            Ok(t) => Some(crate::freshen_infer(t, &mut || fresh_unknown(next_unknown))),
+            Err(message) => {
+                errors.push(LowerError {
+                    message,
+                    span: ty.span(),
+                });
+                Some(fresh_unknown(next_unknown))
+            }
+        },
         None if assign_ret_unknown => Some(fresh_unknown(next_unknown)),
         None => None,
     };
@@ -1210,6 +1259,48 @@ mod tests {
     }
 
     #[test]
+    fn programwide_unique_names_still_require_module_visibility() {
+        // A bare storage symbol is an implementation detail of global table
+        // layout; it does not make another module's declaration implicitly
+        // visible to the checker or back ends.
+        let program = lower_program(&[
+            (
+                &["hidden"],
+                "type Secret = { value: int32 }\nfun reveal() -> int32 { return 1 }\n",
+            ),
+            (&["main"], "fun run() -> int32 { return 0 }\n"),
+        ]);
+        let main = vec!["main".to_string()];
+        assert!(program.resolve_type(&main, "Secret").is_none());
+        assert!(program.resolve_function(&main, "reveal").is_none());
+    }
+
+    #[test]
+    fn prelude_unique_names_remain_visible_everywhere() {
+        // Prelude declarations intentionally cross module boundaries without
+        // imports even when their global storage symbol is bare.
+        let loaded = vec![
+            LoadedModule {
+                is_prelude: true,
+                path: vec!["core".into(), "test".into()],
+                ast: parse("fun builtin_value() -> int32 { return 1 }\n").expect("parse"),
+            },
+            LoadedModule {
+                is_prelude: false,
+                path: vec!["main".into()],
+                ast: parse("fun run() -> int32 { return builtin_value() }\n").expect("parse"),
+            },
+        ];
+        let (program, errors) = lower(&loaded);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            program
+                .resolve_function(&["main".into()], "builtin_value")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn resolve_type_follows_imports() {
         // Same-named type in two modules -> qualified symbols; the import decides
         // which one a bare annotation in `main` resolves to.
@@ -1373,6 +1464,36 @@ mod tests {
             }),
             Some(box_id)
         );
+    }
+
+    #[test]
+    fn invalid_signature_annotations_report_and_recover_with_unknowns() {
+        // Failed annotations remain represented by fresh variables so later
+        // passes can continue, but both declaration sites are diagnosed.
+        let ast = parse("fun bad(value: MissingParam) -> MissingReturn { return value }\n")
+            .expect("parse");
+        let (program, errors) = lower(&[LoadedModule {
+            is_prelude: false,
+            path: vec!["main".into()],
+            ast,
+        }]);
+        assert_eq!(
+            errors
+                .iter()
+                .map(|error| error.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "unknown type `MissingParam`",
+                "unknown type `MissingReturn`"
+            ]
+        );
+        let signature = &program.functions["bad"].signature;
+        assert!(matches!(
+            signature.params[0].resolved_ty,
+            Some(Type::Unknown(_))
+        ));
+        assert!(matches!(signature.ret_ty, Some(Type::Unknown(_))));
+        assert_ne!(signature.params[0].resolved_ty, signature.ret_ty);
     }
 
     #[test]

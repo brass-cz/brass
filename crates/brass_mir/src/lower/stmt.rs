@@ -305,8 +305,13 @@ impl FnLower<'_, '_> {
         // them against the program's types for the slot type and, for records,
         // the skeleton's field list.
         if let Some(TypeExpr::Named(type_name, _)) = ty {
-            let sym = self.resolve_self_name(type_name);
-            if let Some(info) = self.ctx.type_info(&sym) {
+            let info = brass_hir::generated_type_id(type_name)
+                .and_then(|id| self.ctx.type_info_by_id(id))
+                .or_else(|| {
+                    let sym = self.resolve_self_name(type_name);
+                    self.ctx.type_info(&sym)
+                });
+            if let Some(info) = info {
                 let slot_ty = info.type_ref();
                 let local = self
                     .b

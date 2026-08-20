@@ -210,7 +210,11 @@ impl<'p> ProgramCtx<'p> {
     /// slot with. A generic nominal's open fields must stay inferred -- the
     /// witness machinery owns them -- so it yields `None`.
     fn concrete_nominal_ref(&self, module: &[String], name: &str) -> Option<Type> {
-        let info = self.program.resolve_type(module, name)?;
+        let info = if let Some(id) = brass_hir::generated_type_id(name) {
+            self.program.type_by_id(id)?
+        } else {
+            self.program.resolve_type(module, name)?
+        };
         if !info.slots.is_empty() {
             return None;
         }

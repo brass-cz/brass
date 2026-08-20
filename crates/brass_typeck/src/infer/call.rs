@@ -746,9 +746,9 @@ impl<'a> Checker<'a> {
     /// How every record type declaring `method` relates to the structural
     /// (anonymous) receiver `record`: whether the type is visible from the
     /// current module and which of its fields the value fails to provide.
-    /// Sorted by name for deterministic diagnostics. Only types whose bare
-    /// name resolves from the current module to that definition are listed,
-    /// so a name defined in several modules keeps its usual resolution.
+    /// Sorted by name for deterministic diagnostics. Visibility is evaluated
+    /// from each definition's module and the import-origin table below; doing a
+    /// second bare-name lookup here would incorrectly discard renamed imports.
     fn structural_method_types(
         &mut self,
         record: &NominalType,
@@ -770,9 +770,6 @@ impl<'a> Checker<'a> {
             .collect();
         let mut out: Vec<StructuralMethodType> = Vec::new();
         for (name, symbol, module) in infos {
-            if self.resolve_type_symbol(&name).as_deref() != Some(symbol.as_str()) {
-                continue;
-            }
             let Some(info) = self.program.types.get(&symbol) else {
                 continue;
             };

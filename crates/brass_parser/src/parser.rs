@@ -88,8 +88,8 @@ struct Parser {
     /// re-lexed from offset zero, so their sub-parser shifts spans by this base
     /// plus the fragment's in-file offset to stay file-attributable.
     base: usize,
-    /// Current expression nesting depth; bounded by [`MAX_EXPR_DEPTH`].
-    expr_depth: usize,
+    /// Current recursive syntax nesting depth; bounded by [`MAX_SYNTAX_DEPTH`].
+    syntax_depth: usize,
     /// Bracket nesting depth; when > 0 newlines are skipped automatically.
     depth: usize,
     /// When true, a bare `Ident {` is NOT a type literal (used inside `if`,
@@ -112,9 +112,10 @@ const MAX_PARSE_ERRORS: usize = 20;
 /// Maximum expression nesting the recursive-descent parser accepts. Deep enough
 /// for any hand-written program; bounded so adversarial input gets a diagnostic
 /// rather than a native stack overflow. The bound must hold for DEBUG builds
-/// too, whose stack frames are several times larger (a debug binary overflows
-/// near depth 300; 150 leaves the rest of the pipeline headroom as well).
-const MAX_EXPR_DEPTH: usize = 150;
+/// too, whose stack frames are several times larger. Type and pattern forms use
+/// more frames per level than expressions, so 64 leaves headroom for every
+/// guarded syntax kind and for the later visitors that consume the AST.
+const MAX_SYNTAX_DEPTH: usize = 64;
 
 impl Parser {
     fn new(tokens: Vec<Token>, docs: Vec<DocComment>, base: usize) -> Self {
@@ -123,7 +124,7 @@ impl Parser {
             docs,
             pos: 0,
             base,
-            expr_depth: 0,
+            syntax_depth: 0,
             depth: 0,
             no_struct: false,
             ns_save: Vec::new(),
@@ -285,9 +286,9 @@ impl Parser {
     }
 
     /// Reset the bracket bookkeeping a half-parsed top-level construct left
-    /// behind (an `open()` whose `close()` never ran). `expr_depth` is NOT
-    /// reset: `parse_expr` re-balances it even when an error propagates, and
-    /// live enclosing frames still decrement it on their way out.
+    /// behind (an `open()` whose `close()` never ran). `syntax_depth` is NOT
+    /// reset: each guarded parser re-balances it even when an error propagates,
+    /// and live enclosing frames still decrement it on their way out.
     fn reset_nesting(&mut self) {
         self.depth = 0;
         self.no_struct = false;
@@ -887,15 +888,15 @@ impl Parser {
         // Recursive descent consumes native stack per nesting level; without a
         // bound, deeply nested source (thousands of `(`) aborts the whole
         // process with a stack overflow instead of a diagnostic.
-        if self.expr_depth >= MAX_EXPR_DEPTH {
+        if self.syntax_depth >= MAX_SYNTAX_DEPTH {
             return Err(ParseError {
                 message: "expression nesting is too deep".into(),
                 span: self.span(),
             });
         }
-        self.expr_depth += 1;
+        self.syntax_depth += 1;
         let result = self.parse_or();
-        self.expr_depth -= 1;
+        self.syntax_depth -= 1;
         result
     }
 
@@ -1024,23 +1025,32 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
-        let op = match self.peek() {
-            TokenKind::Minus => Some(UnaryOp::Neg),
-            TokenKind::Bang => Some(UnaryOp::Not),
-            TokenKind::Tilde => Some(UnaryOp::BitNot),
-            _ => None,
-        };
-        if let Some(op) = op {
-            let lo = self.bump().span;
-            let inner = self.parse_unary()?;
-            Ok(Expr::Unary(
-                op,
-                Box::new(inner.clone()),
-                lo.merge(inner.span()),
-            ))
-        } else {
-            self.parse_postfix()
+        // Prefix chains are collected iteratively so adversarial input cannot
+        // consume one native stack frame per operator. They still count as
+        // syntax nesting because the resulting AST and later visitors recurse
+        // through the same chain.
+        let mut prefixes = Vec::new();
+        loop {
+            let op = match self.peek() {
+                TokenKind::Minus => UnaryOp::Neg,
+                TokenKind::Bang => UnaryOp::Not,
+                TokenKind::Tilde => UnaryOp::BitNot,
+                _ => break,
+            };
+            if self.syntax_depth + prefixes.len() >= MAX_SYNTAX_DEPTH {
+                return Err(ParseError {
+                    message: "expression nesting is too deep".into(),
+                    span: self.span(),
+                });
+            }
+            prefixes.push((op, self.bump().span));
         }
+        let mut inner = self.parse_postfix()?;
+        for (op, lo) in prefixes.into_iter().rev() {
+            let span = lo.merge(inner.span());
+            inner = Expr::Unary(op, Box::new(inner), span);
+        }
+        Ok(inner)
     }
 
     fn parse_postfix(&mut self) -> PResult<Expr> {
@@ -1359,6 +1369,19 @@ impl Parser {
     // ----- patterns -----
 
     fn parse_pattern(&mut self) -> PResult<Pattern> {
+        if self.syntax_depth >= MAX_SYNTAX_DEPTH {
+            return Err(ParseError {
+                message: "pattern nesting is too deep".into(),
+                span: self.span(),
+            });
+        }
+        self.syntax_depth += 1;
+        let result = self.parse_pattern_inner();
+        self.syntax_depth -= 1;
+        result
+    }
+
+    fn parse_pattern_inner(&mut self) -> PResult<Pattern> {
         let span = self.span();
         match self.peek().clone() {
             TokenKind::Ident(name) => {
@@ -1472,14 +1495,30 @@ impl Parser {
     // ----- types -----
 
     fn parse_type(&mut self) -> PResult<TypeExpr> {
-        self.parse_type_refine(true)
+        self.parse_nested_type(true)
     }
 
     /// A return type (after `->`) never grabs a `Base { .. }` refinement: the
     /// `{` there begins the function body, not a refinement. Refinements in a
     /// return position are written through a type alias instead.
     fn parse_return_type(&mut self) -> PResult<TypeExpr> {
-        self.parse_type_refine(false)
+        self.parse_nested_type(false)
+    }
+
+    /// Guard every recursive type form with the same budget as expressions and
+    /// patterns. Keeping one counter also bounds mixed nesting such as
+    /// `typeof` inside an anonymous-record annotation.
+    fn parse_nested_type(&mut self, allow_refine: bool) -> PResult<TypeExpr> {
+        if self.syntax_depth >= MAX_SYNTAX_DEPTH {
+            return Err(ParseError {
+                message: "type nesting is too deep".into(),
+                span: self.span(),
+            });
+        }
+        self.syntax_depth += 1;
+        let result = self.parse_type_refine(allow_refine);
+        self.syntax_depth -= 1;
+        result
     }
 
     /// Parse a type with its postfix suffixes. `allow_refine` gates whether a

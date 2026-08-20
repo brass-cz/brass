@@ -16,11 +16,9 @@
 use brass_parser::Span;
 use brass_parser::ast::*;
 
-/// The per-iteration span-shift unit. Real source offsets stay below this, so
-/// `offset % SPAN_SHIFT_UNIT` recovers the source position no matter how many
-/// nested expansions shifted it. Sources are capped at 16 MiB by construction
-/// (far above any real module) and the total shift stays within a 32-bit
-/// usize for the wasm build as long as nested unrolls stay below 256 copies.
+/// The per-iteration span-shift unit used to keep expansion copies distinct in
+/// span-keyed sidecars. The original coordinates travel in [`Span`] itself, so
+/// this unit imposes no maximum source-map offset.
 pub const SPAN_SHIFT_UNIT: usize = 1 << 24;
 
 /// The `(loop var, fields(..) argument)` of a fields-loop statement, if `stmt`
@@ -63,7 +61,7 @@ pub fn keyed_return(ret: Option<&TypeExpr>) -> bool {
 
 /// Map a possibly-shifted span offset back to its source position.
 pub fn unshift_span(span: Span) -> Span {
-    Span::new(span.lo % SPAN_SHIFT_UNIT, span.hi % SPAN_SHIFT_UNIT)
+    span.source_span()
 }
 
 /// One unrolled copy of a fields-loop body: the loop variable `var` decays to
@@ -74,24 +72,51 @@ pub fn expand_fields_body(body: &Block, var: &str, field: &str, iteration: usize
         var,
         field,
         delta: (iteration + 1) * SPAN_SHIFT_UNIT,
+        shadowed: false,
     };
     cx.block(body)
 }
 
+#[derive(Clone, Copy)]
 struct Expander<'a> {
     var: &'a str,
     field: &'a str,
     delta: usize,
+    /// Whether a nested lexical binder has hidden the fields-loop descriptor.
+    shadowed: bool,
 }
 
 impl Expander<'_> {
     fn span(&self, s: Span) -> Span {
-        Span::new(s.lo + self.delta, s.hi + self.delta)
+        s.shifted(self.delta)
+    }
+
+    fn pattern_binds_var(&self, pattern: &Pattern) -> bool {
+        pattern.bound_names().contains(&self.var)
+    }
+
+    fn under_pattern(&self, pattern: &Pattern) -> Self {
+        Self {
+            shadowed: self.shadowed || self.pattern_binds_var(pattern),
+            ..*self
+        }
     }
 
     fn block(&self, b: &Block) -> Block {
+        let mut current = *self;
+        let mut stmts = Vec::with_capacity(b.stmts.len());
+        for stmt in &b.stmts {
+            stmts.push(current.stmt(stmt));
+            // A let initializer sees the outer descriptor; its pattern shadows
+            // the name only for the statements that follow in this block.
+            if let Stmt::Let { pat, .. } = stmt
+                && current.pattern_binds_var(pat)
+            {
+                current.shadowed = true;
+            }
+        }
         Block {
-            stmts: b.stmts.iter().map(|s| self.stmt(s)).collect(),
+            stmts,
             span: self.span(b.span),
         }
     }
@@ -134,9 +159,9 @@ impl Expander<'_> {
                 body,
                 span,
             } => Stmt::For {
-                pat: pat.clone(),
+                pat: self.pattern(pat),
                 iter: self.expr(iter),
-                body: self.block(body),
+                body: self.under_pattern(pat).block(body),
                 span: self.span(*span),
             },
             Stmt::Return(e, span) => {
@@ -150,11 +175,13 @@ impl Expander<'_> {
     fn expr(&self, e: &Expr) -> Expr {
         match e {
             // The descriptor decays to the field name as a string constant...
-            Expr::Ident(name, span) if name == self.var => {
+            Expr::Ident(name, span) if !self.shadowed && name == self.var => {
                 Expr::Str(vec![StrSeg::Lit(self.field.to_string())], self.span(*span))
             }
             // ...except as an index, where it projects the field.
-            Expr::Index(base, idx, span) if matches!(&**idx, Expr::Ident(name, _) if name == self.var) => {
+            Expr::Index(base, idx, span)
+                if !self.shadowed && matches!(&**idx, Expr::Ident(name, _) if name == self.var) =>
+            {
                 Expr::Field(
                     Box::new(self.expr(base)),
                     self.field.to_string(),
@@ -206,7 +233,15 @@ impl Expander<'_> {
                 Expr::ErrorProp(Box::new(self.expr(inner)), self.span(*span))
             }
             Expr::Closure(params, body, span) => {
-                Expr::Closure(params.clone(), Box::new(self.expr(body)), self.span(*span))
+                let body_expander = Self {
+                    shadowed: self.shadowed || params.iter().any(|param| param.name == self.var),
+                    ..*self
+                };
+                Expr::Closure(
+                    params.iter().map(|param| self.param(param)).collect(),
+                    Box::new(body_expander.expr(body)),
+                    self.span(*span),
+                )
             }
             Expr::Array(es, span) => {
                 Expr::Array(es.iter().map(|e| self.expr(e)).collect(), self.span(*span))
@@ -242,7 +277,7 @@ impl Expander<'_> {
             Expr::IfLet(pat, scrut, then, els, span) => Expr::IfLet(
                 self.pattern(pat),
                 Box::new(self.expr(scrut)),
-                self.block(then),
+                self.under_pattern(pat).block(then),
                 els.as_ref().map(|e| Box::new(self.expr(e))),
                 self.span(*span),
             ),
@@ -256,7 +291,7 @@ impl Expander<'_> {
                 arms.iter()
                     .map(|arm| MatchArm {
                         pattern: self.pattern(&arm.pattern),
-                        body: self.expr(&arm.body),
+                        body: self.under_pattern(&arm.pattern).expr(&arm.body),
                         span: self.span(arm.span),
                     })
                     .collect(),
@@ -287,6 +322,14 @@ impl Expander<'_> {
                 ps.iter().map(|p| self.pattern(p)).collect(),
                 self.span(*span),
             ),
+        }
+    }
+
+    fn param(&self, param: &Param) -> Param {
+        Param {
+            name: param.name.clone(),
+            ty: param.ty.as_ref().map(|ty| self.type_expr(ty)),
+            span: self.span(param.span),
         }
     }
 
@@ -338,5 +381,86 @@ impl Expander<'_> {
                 self.span(*span),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use brass_parser::parse;
+
+    use super::*;
+
+    fn fields_body(src: &str) -> Block {
+        let module = parse(src).expect("parse");
+        let TopLevel::Fun(fun) = &module.items[0] else {
+            panic!("expected function");
+        };
+        let Stmt::For { body, .. } = &fun.body.stmts[0] else {
+            panic!("expected fields loop");
+        };
+        body.clone()
+    }
+
+    #[test]
+    fn shifted_spans_retain_offsets_above_the_shift_unit() {
+        // SourceMap bases can exceed 16 MiB; explicit provenance restores the
+        // real coordinates instead of truncating them with modulo arithmetic.
+        let source = Span::new(SPAN_SHIFT_UNIT + 17, SPAN_SHIFT_UNIT + 23);
+        let shifted = source.shifted(3 * SPAN_SHIFT_UNIT);
+        assert_eq!(unshift_span(shifted), source);
+    }
+
+    #[test]
+    fn descriptor_substitution_stops_at_nested_binders() {
+        // Let, loop, match, and closure binders each hide the descriptor only
+        // in their lexical scope; a later outer use is still substituted.
+        let body = fields_body(
+            "fun f(value, values) {\n\
+             for field in fields(value) {\n\
+               let closure = (field) -> field\n\
+               for field in values { println(field) }\n\
+               match value { field => field }\n\
+               println(field)\n\
+               let field = \"local\"\n\
+               println(field)\n\
+             }\n\
+             }\n",
+        );
+        let expanded = expand_fields_body(&body, "field", "name", 0);
+
+        let Stmt::Let {
+            value: Some(Expr::Closure(_, closure_body, _)),
+            ..
+        } = &expanded.stmts[0]
+        else {
+            panic!("expected closure");
+        };
+        assert!(matches!(&**closure_body, Expr::Ident(name, _) if name == "field"));
+
+        let Stmt::For { body, .. } = &expanded.stmts[1] else {
+            panic!("expected nested loop");
+        };
+        assert!(matches!(
+            &body.stmts[0],
+            Stmt::Expr(Expr::Call(_, args, _))
+                if matches!(&args[0].expr, Expr::Ident(name, _) if name == "field")
+        ));
+
+        assert!(matches!(
+            &expanded.stmts[2],
+            Stmt::Expr(Expr::Match(_, arms, _))
+                if matches!(&arms[0].body, Expr::Ident(name, _) if name == "field")
+        ));
+        assert!(matches!(
+            &expanded.stmts[3],
+            Stmt::Expr(Expr::Call(_, args, _))
+                if matches!(&args[0].expr, Expr::Str(parts, _)
+                    if matches!(&parts[0], StrSeg::Lit(name) if name == "name"))
+        ));
+        assert!(matches!(
+            &expanded.stmts[5],
+            Stmt::Expr(Expr::Call(_, args, _))
+                if matches!(&args[0].expr, Expr::Ident(name, _) if name == "field")
+        ));
     }
 }

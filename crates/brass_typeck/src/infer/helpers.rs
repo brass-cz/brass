@@ -449,51 +449,79 @@ pub(super) fn closure_write_targets_block(b: &Block) -> HashSet<String> {
     acc
 }
 
-/// Whether `block` (transitively, ignoring nested closures' parameter lists)
-/// re-binds `var` -- a `let`, a `for` variable, or a pattern binding of that
-/// name. Used to reject shadowing of a fields-loop variable, which is
-/// substituted textually into the expanded copies.
+/// Whether `block` (transitively) re-binds `var` -- a `let`, a `for` variable,
+/// a pattern binding, or a closure parameter of that name. The fields-loop
+/// variable is substituted into every expanded copy, so a shadowing binding in
+/// the body is rejected as a language rule rather than silently changing
+/// meaning; this walk therefore covers every expression position a binder can
+/// appear in.
 pub(super) fn block_rebinds(block: &Block, var: &str) -> bool {
     fn pat_binds(pat: &Pattern, var: &str) -> bool {
-        match pat {
-            Pattern::Binding(n, _) => n == var,
-            Pattern::Array(ps, _) => ps.iter().any(|p| pat_binds(p, var)),
-            Pattern::Record(_, fields, _) => fields.iter().any(|f| match &f.pat {
-                Some(p) => pat_binds(p, var),
-                None => f.name == var,
-            }),
-            _ => false,
-        }
+        pat.bound_names().contains(&var)
     }
     fn expr_rebinds(e: &Expr, var: &str) -> bool {
         match e {
-            Expr::IfLet(pat, _, then, els, _) => {
+            Expr::IfLet(pat, scrutinee, then, els, _) => {
                 pat_binds(pat, var)
+                    || expr_rebinds(scrutinee, var)
                     || block_rebinds(then, var)
                     || els.as_ref().is_some_and(|e| expr_rebinds(e, var))
             }
-            Expr::If(_, then, els, _) => {
-                block_rebinds(then, var) || els.as_ref().is_some_and(|e| expr_rebinds(e, var))
+            Expr::If(cond, then, els, _) => {
+                expr_rebinds(cond, var)
+                    || block_rebinds(then, var)
+                    || els.as_ref().is_some_and(|e| expr_rebinds(e, var))
             }
-            Expr::Match(_, arms, _) => arms
-                .iter()
-                .any(|a| pat_binds(&a.pattern, var) || expr_rebinds(&a.body, var)),
+            Expr::Match(scrutinee, arms, _) => {
+                expr_rebinds(scrutinee, var)
+                    || arms
+                        .iter()
+                        .any(|a| pat_binds(&a.pattern, var) || expr_rebinds(&a.body, var))
+            }
             Expr::Block(b, _) => block_rebinds(b, var),
             Expr::Closure(params, body, _) => {
                 params.iter().any(|p| p.name == var) || expr_rebinds(body, var)
             }
-            _ => false,
+            Expr::Unary(_, a, _) | Expr::ErrorProp(a, _) | Expr::TypeTest(a, _, _) => {
+                expr_rebinds(a, var)
+            }
+            Expr::Field(a, _, _) => expr_rebinds(a, var),
+            Expr::Binary(_, a, b, _) | Expr::Index(a, b, _) | Expr::Range(a, b, _) => {
+                expr_rebinds(a, var) || expr_rebinds(b, var)
+            }
+            Expr::Call(callee, args, _) => {
+                expr_rebinds(callee, var) || args.iter().any(|a| expr_rebinds(&a.expr, var))
+            }
+            Expr::Array(items, _) => items.iter().any(|e| expr_rebinds(e, var)),
+            Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => {
+                fields.iter().any(|(_, v)| expr_rebinds(v, var))
+            }
+            Expr::Str(segs, _) => segs
+                .iter()
+                .any(|s| matches!(s, StrSeg::Expr(e) if expr_rebinds(e, var))),
+            Expr::Int(..)
+            | Expr::Float(..)
+            | Expr::Bool(..)
+            | Expr::Null(_)
+            | Expr::Ident(..)
+            | Expr::SelfExpr(_) => false,
         }
     }
     block.stmts.iter().any(|stmt| match stmt {
         Stmt::Let { pat, value, .. } => {
             pat_binds(pat, var) || value.as_ref().is_some_and(|v| expr_rebinds(v, var))
         }
-        Stmt::For { pat, body: b, .. } => pat.bound_names().contains(&var) || block_rebinds(b, var),
-        Stmt::While { body: b, .. } => block_rebinds(b, var),
+        Stmt::For {
+            pat, iter, body, ..
+        } => {
+            pat_binds(pat, var) || expr_rebinds(iter, var) || block_rebinds(body, var)
+        }
+        Stmt::While { cond, body, .. } => expr_rebinds(cond, var) || block_rebinds(body, var),
         Stmt::Expr(e) | Stmt::Return(Some(e), _) => expr_rebinds(e, var),
-        Stmt::Assign { value, .. } => expr_rebinds(value, var),
-        _ => false,
+        Stmt::Assign { target, value, .. } => {
+            expr_rebinds(target, var) || expr_rebinds(value, var)
+        }
+        Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => false,
     })
 }
 

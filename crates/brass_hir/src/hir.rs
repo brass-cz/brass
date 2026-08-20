@@ -61,16 +61,55 @@ pub fn qualify(local: &str, module: &[String]) -> String {
     QualifiedName::new(local, module).symbol()
 }
 
+const GENERATED_TYPE_PREFIX: &str = "\0brass-type:";
+
+/// Encode a nominal id in an internal type-expression name. Reflective
+/// specialization synthesizes annotations after module validation; carrying
+/// the id prevents those annotations from reopening bare-name lookup in the
+/// template's module or choosing the wrong same-named type.
+pub fn generated_type_name(id: i32) -> String {
+    format!("{GENERATED_TYPE_PREFIX}{id}")
+}
+
+/// Decode an internal nominal-id name produced by [`generated_type_name`].
+/// Source text cannot spell the NUL-prefixed form, so it never bypasses normal
+/// module visibility for user-written annotations.
+pub fn generated_type_id(name: &str) -> Option<i32> {
+    name.strip_prefix(GENERATED_TYPE_PREFIX)?.parse().ok()
+}
+
+/// Whether a definition from `definition_module` is visible under bare
+/// `local_name` in `module`. Empty-module definitions are compiler intrinsics;
+/// every other cross-module definition must be prelude-provided or imported
+/// from its actual origin.
+pub fn definition_is_visible(
+    import_origins: &HashMap<Vec<String>, HashMap<String, Vec<String>>>,
+    prelude_modules: &HashSet<Vec<String>>,
+    module: &[String],
+    local_name: &str,
+    definition_module: &[String],
+) -> bool {
+    definition_module.is_empty()
+        || definition_module == module
+        || prelude_modules.contains(definition_module)
+        || import_origins
+            .get(module)
+            .and_then(|origins| origins.get(local_name))
+            .is_some_and(|origin| origin == definition_module)
+}
+
 /// Resolve a bare top-level `name` referenced from `module` against a program
-/// table keyed by qualified symbol: its own/unique definition, this module's
-/// qualified definition, or the one imported into this module. This is the one
-/// resolution rule shared by type, function, and annotation lookups.
+/// table keyed by qualified symbol. `bare_is_visible` must validate the origin
+/// of a program-wide unique bare entry; uniqueness alone does not put a name in
+/// every module's scope. This is the one resolution rule shared by type,
+/// function, and annotation lookups.
 pub fn resolve_qualified<'a, T>(
     table: &'a HashMap<String, T>,
     import_origins: &HashMap<Vec<String>, HashMap<String, Vec<String>>>,
     import_renames: &HashMap<Vec<String>, HashMap<String, String>>,
     module: &[String],
     name: &str,
+    bare_is_visible: impl Fn(&T) -> bool,
 ) -> Option<&'a T> {
     // A renamed import (`import m.{ X as Y }`): the local name exists ONLY as
     // this module's alias for the origin's remote name, so it must not fall
@@ -81,7 +120,7 @@ pub fn resolve_qualified<'a, T>(
         let origin = import_origins.get(module)?.get(name)?;
         return table
             .get(&qualify(remote, origin))
-            .or_else(|| table.get(remote.as_str()));
+            .or_else(|| table.get(remote.as_str()).filter(|v| bare_is_visible(v)));
     }
     // The defining module's own qualified entry wins over a bare (unique)
     // definition elsewhere. For most names only one of the two forms exists
@@ -91,11 +130,14 @@ pub fn resolve_qualified<'a, T>(
     if let Some(v) = table.get(&qualify(name, module)) {
         return Some(v);
     }
-    if let Some(v) = table.get(name) {
+    if let Some(origin) = import_origins
+        .get(module)
+        .and_then(|origins| origins.get(name))
+        && let Some(v) = table.get(&qualify(name, origin))
+    {
         return Some(v);
     }
-    let origin = import_origins.get(module)?.get(name)?;
-    table.get(&qualify(name, origin))
+    table.get(name).filter(|v| bare_is_visible(v))
 }
 
 /// A parsed source file tagged with its module path.
@@ -513,6 +555,15 @@ impl Program {
             &self.import_renames,
             module,
             name,
+            |info| {
+                definition_is_visible(
+                    &self.import_origins,
+                    &self.prelude_modules,
+                    module,
+                    name,
+                    &info.module,
+                )
+            },
         )
     }
 
@@ -532,6 +583,15 @@ impl Program {
             &self.import_renames,
             module,
             name,
+            |alias| {
+                definition_is_visible(
+                    &self.import_origins,
+                    &self.prelude_modules,
+                    module,
+                    name,
+                    &alias.module,
+                )
+            },
         )?;
         match &alias.ty {
             Type::Record(n) | Type::Sum(n) => self.type_by_id(n.id),
@@ -612,6 +672,15 @@ impl Program {
             &self.import_renames,
             module,
             name,
+            |info| {
+                definition_is_visible(
+                    &self.import_origins,
+                    &self.prelude_modules,
+                    module,
+                    name,
+                    &info.module,
+                )
+            },
         )
     }
 

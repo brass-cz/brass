@@ -2541,8 +2541,11 @@ impl<'a> Checker<'a> {
                 return;
             }
         };
-        // The loop variable is substituted textually into every copy, so a
-        // rebinding inside the body would silently change meaning.
+        // Shadowing the loop variable is a language rule, not an expansion
+        // limitation: the descriptor decays to a different field constant per
+        // copy, so a same-named binding in the body reads as one variable while
+        // meaning two. Expansion itself is shadow-aware as a defensive layer,
+        // but user programs are rejected up front.
         if block_rebinds(body, var) {
             self.errors.push(TypeError {
                 message: format!(

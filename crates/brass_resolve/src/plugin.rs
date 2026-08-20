@@ -10,7 +10,7 @@
 //! front end -- type checking, visibility, hover, completion -- treats plugin
 //! functions exactly like `.cz` functions.
 
-use fxhash::FxHashSet as HashSet;
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::path::{Path, PathBuf};
 
 use brass_plugin_host::ValueType;
@@ -59,16 +59,31 @@ pub fn synthesize_source(
         if let Some(doc) = &f.doc {
             src.push_str(&format!("/**\n{}\n*/\n", sanitize_doc(doc)));
         }
+        let mut parameter_names: HashMap<String, String> = HashMap::default();
+        let mut safe_params = Vec::with_capacity(f.params.len());
+        for (name, _) in &f.params {
+            let safe = safe_param(name);
+            if let Some(previous) = parameter_names.insert(safe.clone(), name.clone()) {
+                return Err(format!(
+                    "plugin `{logical_id}`, function `{}`: parameters `{previous}` and `{name}` \
+                     both map to the Brass name `{safe}`",
+                    f.name
+                ));
+            }
+            safe_params.push(safe);
+        }
         let params = f
             .params
             .iter()
-            .map(|(n, t)| format!("{}: {}", safe_param(n), brass_type(t)))
+            .zip(&safe_params)
+            .map(|((_, t), name)| format!("{name}: {}", brass_type(t)))
             .collect::<Vec<_>>()
             .join(", ");
         let args = f
             .params
             .iter()
-            .map(|(n, _)| format!(", {}", safe_param(n)))
+            .zip(&safe_params)
+            .map(|(_, name)| format!(", {name}"))
             .collect::<String>();
         let sig = sig_string(f);
         // Fallible functions return the builtin's `Result` whole, so the

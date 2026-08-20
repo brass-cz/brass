@@ -8,8 +8,14 @@
 
 use crate::lexer::{Token, TokenKind};
 
+static EOF: TokenKind = TokenKind::Eof;
+
 fn kind_at(tokens: &[Token], i: usize) -> &TokenKind {
-    &tokens[i.min(tokens.len() - 1)].kind
+    tokens
+        .get(i)
+        .or_else(|| tokens.last())
+        .map(|token| &token.kind)
+        .unwrap_or(&EOF)
 }
 
 /// Index of the first non-newline token at or after `pos`.
@@ -54,4 +60,19 @@ pub fn closure_ahead(tokens: &[Token], pos: usize) -> bool {
     }
     let i = next_significant(tokens, i);
     matches!(kind_at(tokens, i), TokenKind::Arrow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_token_lookahead_is_safe() {
+        // Public lookahead helpers also serve editor callers with an incomplete
+        // token buffer, so an empty slice behaves like end-of-file.
+        let tokens = Vec::new();
+        assert_eq!(next_significant(&tokens, 0), 0);
+        assert!(!newline_then(&tokens, 0, &TokenKind::Dot));
+        assert!(!closure_ahead(&tokens, 0));
+    }
 }

@@ -49,6 +49,22 @@ fn valid_cross_module_import_succeeds() {
 }
 
 #[test]
+fn bare_core_module_import_supports_qualified_calls() {
+    // The source spelling `io` aliases the embedded `core.io` module rather
+    // than a nonexistent one-segment loaded-module path.
+    let main = setup(
+        "qualified_core_import",
+        &[(
+            "main.cz",
+            "import io\nfun main() { io.println(\"qualified core import\") }\n",
+        )],
+    );
+    let (ok, out) = run(&main);
+    assert!(ok, "expected success, got: {out}");
+    assert_eq!(out.trim(), "qualified core import", "{out}");
+}
+
+#[test]
 fn import_is_relative_to_the_importing_file() {
     // `modules/a.cz` and `modules/b.cz` are siblings; `a.cz` imports `b.cz` as
     // `import b`, resolved relative to a.cz's own directory rather than the main
@@ -588,7 +604,7 @@ fn bare_prelude_import_still_resolves() {
     let (ok, out) = check(&bad);
     assert!(!ok, "expected failure, got: {out}");
     assert!(
-        out.contains("module `conv` has no exported name `no_such_export`"),
+        out.contains("module `core.conv` has no exported name `no_such_export`"),
         "{out}"
     );
 }

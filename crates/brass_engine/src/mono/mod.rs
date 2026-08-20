@@ -2259,6 +2259,11 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         let info = self
             .program
             .resolve_type(module, ty)
+            // MIR may carry the canonical storage symbol of a generated,
+            // already-validated type whose source module differs from the
+            // specialization template. Scoped lookup stays first so a local
+            // shadow still wins.
+            .or_else(|| self.program.types.get(ty))
             .ok_or_else(|| format!("unknown type `{ty}`"))?;
         let type_symbol = info.symbol.clone();
         let method = *self
@@ -2626,6 +2631,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         let info = self
             .program
             .resolve_type(module, ty)
+            .or_else(|| self.program.types.get(ty))
             .ok_or_else(|| format!("unknown type `{ty}`"))?;
         let TypeKind::Record { fields: decl, .. } = &info.kind else {
             return Err(format!("`{ty}` is not a record type"));
@@ -2683,6 +2689,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         let info = self
             .program
             .resolve_type(module, ty)
+            .or_else(|| self.program.types.get(ty))
             .ok_or_else(|| format!("unknown type `{ty}`"))?;
         let TypeKind::Sum { variants } = &info.kind else {
             return Err(format!("`{ty}` is not a sum type"));
