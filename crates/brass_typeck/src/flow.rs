@@ -228,22 +228,64 @@ fn stmt_diverges(program: &Program, stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Return(..) => true,
         Stmt::Expr(e) => expr_diverges(program, e),
-        Stmt::While { cond, body, .. } => is_infinite_loop(cond, body),
-        // A `for` loop may iterate zero times; `let`/`assign` never return;
+        Stmt::Let {
+            value: Some(value), ..
+        } => expr_diverges(program, value),
+        Stmt::Let { value: None, .. } => false,
+        Stmt::Assign { target, value, .. } => {
+            expr_diverges(program, value) || expr_diverges(program, target)
+        }
+        Stmt::While { cond, body, .. } => {
+            expr_diverges(program, cond) || is_infinite_loop(cond, body)
+        }
+        // A `for` loop may iterate zero times, but its iterand is always
+        // evaluated before that decision.
+        Stmt::For { iter, .. } => expr_diverges(program, iter),
         // `break`/`continue` leave a loop, not the function.
-        _ => false,
+        Stmt::Break(_) | Stmt::Continue(_) => false,
     }
 }
 
 fn expr_diverges(program: &Program, expr: &Expr) -> bool {
     match expr {
-        // An `if` returns on every path only when it has an `else` and both
-        // sides return.
-        Expr::If(_, then, Some(els), _) => {
-            block_returns(program, then) && expr_diverges(program, els)
+        Expr::Unary(_, inner, _)
+        | Expr::ErrorProp(inner, _)
+        | Expr::Field(inner, _, _)
+        | Expr::TypeTest(inner, _, _) => expr_diverges(program, inner),
+        Expr::Binary(op, left, right, _) => {
+            expr_diverges(program, left)
+                || binary_rhs_is_unconditional(*op, left) && expr_diverges(program, right)
         }
-        Expr::IfLet(_, _, then, Some(els), _) => {
-            block_returns(program, then) && expr_diverges(program, els)
+        Expr::Index(base, index, _) | Expr::Range(base, index, _) => {
+            expr_diverges(program, base) || expr_diverges(program, index)
+        }
+        Expr::Call(callee, args, _) => {
+            expr_diverges(program, callee)
+                || args.iter().any(|arg| expr_diverges(program, &arg.expr))
+        }
+        // Constructing a closure does not evaluate its body.
+        Expr::Closure(..) => false,
+        Expr::Array(items, _) => items.iter().any(|item| expr_diverges(program, item)),
+        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => fields
+            .iter()
+            .any(|(_, value)| expr_diverges(program, value)),
+        Expr::Str(segments, _) => segments.iter().any(|segment| match segment {
+            StrSeg::Expr(inner) => expr_diverges(program, inner),
+            StrSeg::Lit(_) => false,
+        }),
+        // An `if` returns on every path only when it has an `else` and both
+        // sides return. Its condition is evaluated on every path first.
+        Expr::If(cond, then, els, _) => {
+            expr_diverges(program, cond)
+                || els
+                    .as_deref()
+                    .is_some_and(|els| block_returns(program, then) && expr_diverges(program, els))
+        }
+        Expr::IfLet(_, scrutinee, then, els, _) => {
+            expr_diverges(program, scrutinee)
+                || els
+                    .as_deref()
+                    .is_some_and(|els| block_returns(program, then) && expr_diverges(program, els))
         }
         // A `match` returns when every arm returns AND an arm is guaranteed to
         // run: a catch-all (irrefutable) arm, or arms naming a sum's variants
@@ -251,13 +293,29 @@ fn expr_diverges(program: &Program, expr: &Expr) -> bool {
         // that guarantee -- e.g. a match over integer literals with no wildcard
         // -- control can fall through every arm at runtime, so the match must
         // not be treated as diverging.
-        Expr::Match(_, arms, _) => {
-            !arms.is_empty()
-                && arms.iter().all(|arm| expr_diverges(program, &arm.body))
-                && match_coverage_is_checked(program, arms)
+        Expr::Match(scrutinee, arms, _) => {
+            expr_diverges(program, scrutinee)
+                || !arms.is_empty()
+                    && arms.iter().all(|arm| expr_diverges(program, &arm.body))
+                    && match_coverage_is_checked(program, arms)
         }
         Expr::Block(block, _) => block_returns(program, block),
-        _ => false,
+        Expr::Int(..)
+        | Expr::Float(..)
+        | Expr::Bool(..)
+        | Expr::Null(_)
+        | Expr::Ident(..)
+        | Expr::SelfExpr(_) => false,
+    }
+}
+
+/// Logical RHS operands are short-circuited unless the literal LHS forces
+/// their evaluation; every other binary operator evaluates both operands.
+fn binary_rhs_is_unconditional(op: BinOp, left: &Expr) -> bool {
+    match op {
+        BinOp::And => matches!(left, Expr::Bool(true, _)),
+        BinOp::Or => matches!(left, Expr::Bool(false, _)),
+        _ => true,
     }
 }
 

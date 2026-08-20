@@ -104,6 +104,7 @@ impl ChannelDelta {
             && self.type_tests.is_empty()
             && self.type_tests_removed.is_empty()
             && self.errors.is_empty()
+            && self.instance_returns.is_empty()
             && self.keyed_calls.is_empty()
     }
 }
@@ -640,6 +641,21 @@ mod tests {
         }]);
         assert!(lerr.is_empty(), "lower: {lerr:?}");
         program
+    }
+
+    #[test]
+    fn instance_return_makes_a_delta_nonempty() {
+        // Lazy consumers must receive a return-only delta instead of dropping
+        // the concrete contract as empty bookkeeping.
+        let delta = ChannelDelta {
+            instance_returns: vec![(
+                "answer".to_string(),
+                Vec::new(),
+                Type::Int(brass_hir::IntKind::I32),
+            )],
+            ..ChannelDelta::default()
+        };
+        assert!(!delta.is_empty());
     }
 
     /// The consumer-side channel state after replaying a delta stream: what

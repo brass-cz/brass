@@ -102,9 +102,8 @@ fn is_shared_heap(ty: &Type) -> bool {
 
 impl ConstChecker<'_> {
     fn check_program(&mut self, modules: crate::AnalysisModules<'_>) {
-        // Top-level consts are in scope for every body in the file, so function
-        // and method bodies start from the module's global const bindings.
-        let globals = self.global_consts();
+        // Bodies see only the globals their defining module can resolve.
+        let global_defs = self.global_bindings();
         for f in self.program.functions.values() {
             if !modules.checks(&f.module) {
                 continue;
@@ -116,6 +115,7 @@ impl ConstChecker<'_> {
             let params = param_scope(&f.signature.params, false);
             self.current_module = f.module.clone();
             self.check_param_mutability(&f.signature.params, &f.decl.body);
+            let globals = self.globals_visible_from(&f.module, &global_defs, true);
             self.check_block(&f.decl.body, &mut vec![globals.clone(), params]);
         }
         for t in self.program.types.values() {
@@ -140,6 +140,7 @@ impl ConstChecker<'_> {
                 let params = param_scope(&m.signature.params, true);
                 self.current_module = t.module.clone();
                 self.check_param_mutability(&m.signature.params, body);
+                let globals = self.globals_visible_from(&t.module, &global_defs, true);
                 self.check_block(body, &mut vec![globals.clone(), params]);
             }
         }
@@ -150,41 +151,88 @@ impl ConstChecker<'_> {
                 continue;
             }
             self.current_module = init.path.clone();
-            let mut scopes = vec![HashMap::default()];
+            // Imported and implicit-prelude globals are already initialized;
+            // this module's own globals enter scope in statement order below.
+            let mut scopes = vec![self.globals_visible_from(&init.path, &global_defs, false)];
             for stmt in &init.stmts {
                 self.check_stmt(stmt, &mut scopes);
             }
         }
     }
 
-    /// The top-level `const` bindings visible to every body in the file.
-    /// A later top-level `let` that reuses a name shadows
-    /// an earlier const, matching the order-sensitive init scope.
-    fn global_consts(&self) -> HashMap<String, Binding> {
-        let mut consts = HashMap::default();
+    /// The final binding state of every module's globals. Mutable entries are
+    /// retained because they shadow imported or implicit-prelude consts.
+    fn global_bindings(&self) -> HashMap<Vec<String>, HashMap<String, Binding>> {
+        let mut modules: HashMap<Vec<String>, HashMap<String, Binding>> = HashMap::default();
         for init in &self.program.inits {
+            let bindings = modules.entry(init.path.clone()).or_default();
             for stmt in &init.stmts {
                 let Stmt::Let {
                     pat: Pattern::Binding(name, _),
                     ty,
-                    value: Some(value),
+                    value,
                     is_const,
                     ..
                 } = stmt
                 else {
                     continue;
                 };
-                if *is_const {
-                    consts.insert(
+                if *is_const && let Some(value) = value {
+                    bindings.insert(
                         name.clone(),
                         Binding::Const(self.binding_const_type(&init.path, ty, value)),
                     );
                 } else {
-                    consts.remove(name);
+                    bindings.insert(name.clone(), Binding::Mutable);
                 }
             }
         }
-        consts
+        modules
+    }
+
+    /// Globals visible from `module`, under their local names. Prelude globals
+    /// are implicit, explicit imports honor renames, and the module's own
+    /// declarations take precedence when `include_own` is true.
+    fn globals_visible_from(
+        &self,
+        module: &[String],
+        defs: &HashMap<Vec<String>, HashMap<String, Binding>>,
+        include_own: bool,
+    ) -> HashMap<String, Binding> {
+        let mut out = HashMap::default();
+        let mut prelude_paths: Vec<_> = self.program.prelude_modules.iter().collect();
+        prelude_paths.sort();
+        for path in prelude_paths {
+            if let Some(bindings) = defs.get(path) {
+                for (name, binding) in bindings {
+                    out.entry(name.clone()).or_insert_with(|| binding.clone());
+                }
+            }
+        }
+        if let Some(imports) = self.program.module_imports.get(module) {
+            let origins = self.program.import_origins.get(module);
+            let renames = self.program.import_renames.get(module);
+            for local in imports {
+                let Some(origin) = origins.and_then(|items| items.get(local)) else {
+                    continue;
+                };
+                let remote = renames
+                    .and_then(|items| items.get(local))
+                    .map(String::as_str)
+                    .unwrap_or(local);
+                if let Some(binding) = defs.get(origin).and_then(|items| items.get(remote)) {
+                    out.insert(local.clone(), binding.clone());
+                }
+            }
+        }
+        if include_own && let Some(bindings) = defs.get(module) {
+            out.extend(
+                bindings
+                    .iter()
+                    .map(|(name, binding)| (name.clone(), binding.clone())),
+            );
+        }
+        out
     }
 
     fn check_block(&mut self, block: &Block, scopes: &mut ConstScopes) {
@@ -238,7 +286,13 @@ impl ConstChecker<'_> {
                     }
                 }
             }
-            Stmt::Assign { target, span, .. } => {
+            Stmt::Assign {
+                target,
+                value,
+                span,
+                ..
+            } => {
+                self.check_expr(value, scopes);
                 self.check_expr(target, scopes);
                 if let Some(root) = root_ident(target)
                     && matches!(self.const_binding(scopes, root), Some(Binding::Const(_)))
@@ -308,7 +362,15 @@ impl ConstChecker<'_> {
                 self.check_expr(base, scopes);
                 self.check_expr(idx, scopes);
             }
-            Expr::Closure(_, body, _) => self.check_expr(body, scopes),
+            Expr::Closure(params, body, _) => {
+                let frame = params
+                    .iter()
+                    .map(|param| (param.name.clone(), Binding::Mutable))
+                    .collect();
+                scopes.push(frame);
+                self.check_expr(body, scopes);
+                scopes.pop();
+            }
             Expr::Array(items, _) => {
                 for item in items {
                     self.check_expr(item, scopes);
@@ -319,6 +381,13 @@ impl ConstChecker<'_> {
                     self.check_expr(value, scopes);
                 }
             }
+            Expr::Str(segments, _) => {
+                for segment in segments {
+                    if let StrSeg::Expr(inner) = segment {
+                        self.check_expr(inner, scopes);
+                    }
+                }
+            }
             Expr::If(cond, then, els, _) => {
                 self.check_expr(cond, scopes);
                 self.check_block(then, scopes);
@@ -326,9 +395,12 @@ impl ConstChecker<'_> {
                     self.check_expr(els, scopes);
                 }
             }
-            Expr::IfLet(_, scrutinee, then, els, _) => {
+            Expr::IfLet(pat, scrutinee, then, els, _) => {
                 self.check_expr(scrutinee, scopes);
+                let frame = self.pattern_scope(pat, scrutinee, scopes);
+                scopes.push(frame);
                 self.check_block(then, scopes);
+                scopes.pop();
                 if let Some(els) = els {
                     self.check_expr(els, scopes);
                 }
@@ -336,18 +408,43 @@ impl ConstChecker<'_> {
             Expr::Match(scrutinee, arms, _) => {
                 self.check_expr(scrutinee, scopes);
                 for arm in arms {
+                    let frame = self.pattern_scope(&arm.pattern, scrutinee, scopes);
+                    scopes.push(frame);
                     self.check_expr(&arm.body, scopes);
+                    scopes.pop();
                 }
             }
             Expr::Block(block, _) => self.check_block(block, scopes),
             Expr::Int(..)
             | Expr::Float(..)
-            | Expr::Str(..)
             | Expr::Bool(..)
             | Expr::Null(_)
             | Expr::Ident(..)
             | Expr::SelfExpr(_) => {}
         }
+    }
+
+    /// Bind names introduced by a refutable pattern in the arm where it
+    /// matched. Destructured pieces of a const scrutinee remain immutable,
+    /// while a whole-binding pattern can retain the scrutinee's known type.
+    fn pattern_scope(
+        &self,
+        pat: &Pattern,
+        scrutinee: &Expr,
+        scopes: &ConstScopes,
+    ) -> HashMap<String, Binding> {
+        let binding = if self.const_root(scrutinee, scopes).is_some() {
+            let ty = matches!(pat, Pattern::Binding(..))
+                .then(|| self.const_place_type(scrutinee, scopes))
+                .flatten();
+            Binding::Const(ty)
+        } else {
+            Binding::Mutable
+        };
+        pat.bound_names()
+            .into_iter()
+            .map(|name| (name.to_string(), binding.clone()))
+            .collect()
     }
 
     fn check_mutating_const_call(
@@ -736,39 +833,109 @@ fn param_permits_mutation(p: &ParamInfo) -> bool {
 /// Whether `block` (or any nested statement block) REBINDS `name` with a bare
 /// `name = value` assignment. Distinct from `mutates_root`: a rebind of a
 /// private copy never reaches the caller, so it forces no copy -- but a
-/// read-only (`infer`) binding forbids it all the same. Shadowing `let`s are
-/// not rebinding and closures rebind their own capture, so neither is counted.
+/// read-only (`infer`) binding forbids it all the same. Lexical bindings in
+/// blocks, patterns, and closure parameter lists hide the outer parameter.
 fn rebinds(block: &Block, name: &str) -> bool {
-    fn in_stmt(stmt: &Stmt, name: &str) -> bool {
+    fn pat_binds(pat: &Pattern, name: &str) -> bool {
+        pat.bound_names().contains(&name)
+    }
+
+    fn in_block(block: &Block, name: &str, mut shadowed: bool) -> bool {
+        for stmt in &block.stmts {
+            if in_stmt(stmt, name, shadowed) {
+                return true;
+            }
+            if let Stmt::Let { pat, .. } = stmt
+                && pat_binds(pat, name)
+            {
+                shadowed = true;
+            }
+        }
+        false
+    }
+
+    fn in_stmt(stmt: &Stmt, name: &str, shadowed: bool) -> bool {
         match stmt {
             Stmt::Assign {
                 target: Expr::Ident(n, _),
                 ..
-            } if n == name => true,
-            Stmt::While { body, .. } | Stmt::For { body, .. } => {
-                body.stmts.iter().any(|s| in_stmt(s, name))
+            } if !shadowed && n == name => true,
+            Stmt::Assign { target, value, .. } => {
+                in_expr(value, name, shadowed) || in_expr(target, name, shadowed)
             }
-            Stmt::Expr(e) | Stmt::Return(Some(e), _) | Stmt::Assign { value: e, .. } => {
-                in_expr(e, name)
+            Stmt::While { cond, body, .. } => {
+                in_expr(cond, name, shadowed) || in_block(body, name, shadowed)
             }
-            Stmt::Let { value, .. } => value.as_ref().is_some_and(|v| in_expr(v, name)),
-            _ => false,
+            Stmt::For {
+                pat, iter, body, ..
+            } => {
+                in_expr(iter, name, shadowed)
+                    || in_block(body, name, shadowed || pat_binds(pat, name))
+            }
+            Stmt::Expr(e) | Stmt::Return(Some(e), _) => in_expr(e, name, shadowed),
+            Stmt::Let { value, .. } => value
+                .as_ref()
+                .is_some_and(|value| in_expr(value, name, shadowed)),
+            Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => false,
         }
     }
-    fn in_expr(e: &Expr, name: &str) -> bool {
+
+    fn in_expr(e: &Expr, name: &str, shadowed: bool) -> bool {
         match e {
-            Expr::If(_, then, els, _) => {
-                then.stmts.iter().any(|s| in_stmt(s, name))
-                    || els.as_deref().is_some_and(|e| in_expr(e, name))
+            Expr::Unary(_, inner, _)
+            | Expr::ErrorProp(inner, _)
+            | Expr::Field(inner, _, _)
+            | Expr::TypeTest(inner, _, _) => in_expr(inner, name, shadowed),
+            Expr::Binary(_, left, right, _)
+            | Expr::Index(left, right, _)
+            | Expr::Range(left, right, _) => {
+                in_expr(left, name, shadowed) || in_expr(right, name, shadowed)
             }
-            Expr::IfLet(_, _, then, els, _) => {
-                then.stmts.iter().any(|s| in_stmt(s, name))
-                    || els.as_deref().is_some_and(|e| in_expr(e, name))
+            Expr::Call(callee, args, _) => {
+                in_expr(callee, name, shadowed)
+                    || args.iter().any(|arg| in_expr(&arg.expr, name, shadowed))
             }
-            Expr::Match(_, arms, _) => arms.iter().any(|a| in_expr(&a.body, name)),
-            Expr::Block(b, _) => b.stmts.iter().any(|s| in_stmt(s, name)),
-            _ => false,
+            Expr::Closure(params, body, _) => {
+                let shadowed = shadowed || params.iter().any(|param| param.name == name);
+                in_expr(body, name, shadowed)
+            }
+            Expr::Array(items, _) => items.iter().any(|item| in_expr(item, name, shadowed)),
+            Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => fields
+                .iter()
+                .any(|(_, value)| in_expr(value, name, shadowed)),
+            Expr::Str(segments, _) => segments.iter().any(|segment| match segment {
+                StrSeg::Expr(inner) => in_expr(inner, name, shadowed),
+                StrSeg::Lit(_) => false,
+            }),
+            Expr::If(cond, then, els, _) => {
+                in_expr(cond, name, shadowed)
+                    || in_block(then, name, shadowed)
+                    || els
+                        .as_deref()
+                        .is_some_and(|els| in_expr(els, name, shadowed))
+            }
+            Expr::IfLet(pat, scrutinee, then, els, _) => {
+                in_expr(scrutinee, name, shadowed)
+                    || in_block(then, name, shadowed || pat_binds(pat, name))
+                    || els
+                        .as_deref()
+                        .is_some_and(|els| in_expr(els, name, shadowed))
+            }
+            Expr::Match(scrutinee, arms, _) => {
+                in_expr(scrutinee, name, shadowed)
+                    || arms.iter().any(|arm| {
+                        in_expr(&arm.body, name, shadowed || pat_binds(&arm.pattern, name))
+                    })
+            }
+            Expr::Block(block, _) => in_block(block, name, shadowed),
+            Expr::Int(..)
+            | Expr::Float(..)
+            | Expr::Bool(..)
+            | Expr::Null(_)
+            | Expr::Ident(..)
+            | Expr::SelfExpr(_) => false,
         }
     }
-    block.stmts.iter().any(|s| in_stmt(s, name))
+
+    in_block(block, name, false)
 }

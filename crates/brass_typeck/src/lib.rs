@@ -382,19 +382,20 @@ fn check_result_shadows(program: &Program, modules: AnalysisModules<'_>) -> Vec<
 
 fn check_reserved_names(program: &Program, modules: AnalysisModules<'_>) -> Vec<TypeError> {
     let mut errors = Vec::new();
-    for name in brass_hir::RESERVED_FUNCTION_NAMES {
-        if let Some(info) = program.functions.get(*name) {
-            // The prelude itself provides some of these (`error` is an
-            // ordinary core/error.cz function); only a user
-            // redefinition is rejected.
-            if program.prelude_modules.contains(&info.module) || !modules.checks(&info.module) {
-                continue;
-            }
-            errors.push(TypeError {
-                message: format!("`{name}` is a builtin and cannot be redefined"),
-                span: info.signature.span,
-            });
+    for info in program.functions.values() {
+        let name = info.signature.name.as_str();
+        if !brass_hir::RESERVED_FUNCTION_NAMES.contains(&name) {
+            continue;
         }
+        // The prelude itself provides some of these (`error` is an ordinary
+        // core/error.cz function); only a user redefinition is rejected.
+        if program.prelude_modules.contains(&info.module) || !modules.checks(&info.module) {
+            continue;
+        }
+        errors.push(TypeError {
+            message: format!("`{name}` is a builtin and cannot be redefined"),
+            span: info.signature.span,
+        });
     }
     errors
 }
@@ -1862,6 +1863,93 @@ mod tests {
     }
 
     #[test]
+    fn const_mutations_in_assignment_values_and_interpolation_are_reported() {
+        // Both positions evaluate their embedded call and therefore enforce the
+        // same receiver immutability as a standalone call.
+        let e = errs(
+            "type Counter = { n: int32 }\nfun Counter.bump(self) -> int32 { self.n += 1\n return self.n }\nfun main() {\n const c = Counter { n: 0 }\n let n = 0\n n = c.bump()\n let text = \"{c.bump()}\"\n}\n",
+        );
+        let mutations = e
+            .iter()
+            .filter(|message| message.contains("mutating method `bump` on const value `c`"))
+            .count();
+        assert_eq!(mutations, 2, "{e:?}");
+    }
+
+    #[test]
+    fn closure_and_pattern_bindings_shadow_outer_consts() {
+        // Each binding is lexical and fresh; none resolves to the same-named
+        // global const while its body is checked.
+        let e = errs(
+            "const value = 1\nfun main() {\n let closure = (value) -> { value = 2 }\n if let value = 2 { value = 3 }\n match 2 { value => { value = 4 } }\n}\n",
+        );
+        assert!(
+            !e.iter()
+                .any(|message| message.contains("const value `value`")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn pattern_binding_from_a_const_scrutinee_is_const() {
+        // A matched aggregate aliases the const scrutinee instead of becoming a
+        // mutable route to the same storage.
+        let e =
+            errs("const source = [1]\nfun main() {\n if let item = source { item[0] = 2 }\n}\n");
+        assert!(
+            e.iter()
+                .any(|message| message.contains("cannot assign to const value `item`")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn global_const_resolution_is_module_local() {
+        // Same-named globals in unrelated modules cannot change the constness a
+        // function observes in its own module.
+        let e = module_errs(&[
+            (
+                &["a"],
+                "const shared = [1]\nfun mutate_shared() { shared.push(2) }\n",
+            ),
+            (&["b"], "let shared = [1]\n"),
+            (
+                &["c"],
+                "let other = [1]\nfun mutate_other() { other.push(2) }\n",
+            ),
+            (&["d"], "const other = [1]\n"),
+        ]);
+        assert!(
+            e.iter()
+                .any(|message| message.contains("const value `shared`")),
+            "{e:?}"
+        );
+        assert!(
+            !e.iter()
+                .any(|message| message.contains("const value `other`")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn imported_global_const_uses_its_local_name() {
+        // Import renames participate in const lookup just like function and
+        // type resolution.
+        let e = module_errs(&[
+            (&["values"], "const source = [1]\n"),
+            (
+                &["main"],
+                "import values.{ source as local }\nfun main() { local.push(2) }\n",
+            ),
+        ]);
+        assert!(
+            e.iter()
+                .any(|message| message.contains("const value `local`")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
     fn top_level_const_assignment_is_reported() {
         let e = errs("const a = 4\na += 1\n");
         assert!(e.iter().any(|m| m.contains("const")), "{e:?}");
@@ -2068,6 +2156,30 @@ mod tests {
     }
 
     #[test]
+    fn infer_parameter_rebinding_is_found_in_nested_expression_positions() {
+        // The assignment is inside a call argument's block expression, beyond
+        // the statement positions the old partial traversal covered.
+        let e = errs("fun f(x: infer) { println({ x = 2\n x }) }\n");
+        assert!(
+            e.iter()
+                .any(|message| message.contains("cannot mutate parameter `x`")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn nested_shadow_does_not_rebind_an_infer_parameter() {
+        // A lexical let hides the parameter for all later statements in the
+        // block expression.
+        let e = errs("fun f(x: infer) { println({ let x = 1\n x = 2\n x }) }\n");
+        assert!(
+            !e.iter()
+                .any(|message| message.contains("cannot mutate parameter `x`")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
     fn mutating_an_unannotated_parameter_is_allowed() {
         // An unannotated parameter the body mutates is inferred as a private `mut`
         // copy, so mutating it is fine (the caller is unaffected at runtime).
@@ -2218,6 +2330,92 @@ mod tests {
     }
 
     #[test]
+    fn branch_local_tracking_does_not_escape_its_scope() {
+        // Rewinding an if branch must discard both the branch-local descriptor
+        // and its state slot before later locals receive ids.
+        let e = errs(
+            "fun main(flag: bool) {\n if flag {\n  let branch: int32\n  branch = 1\n  println(branch)\n }\n let later: int32\n later = 2\n println(later)\n}\n",
+        );
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn indexed_store_requires_an_initialized_aggregate() {
+        // An element store projects through the aggregate and cannot construct
+        // an ordinary uninitialized binding wholesale.
+        let e = errs("fun main() {\n let values: int32[]\n values[0] = 1\n}\n");
+        assert!(
+            e.iter()
+                .any(|message| message.contains("`values` is used before it is fully initialized")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn fields_loop_exits_do_not_prove_full_initialization() {
+        // Break reaches the code after the loop without visiting later fields;
+        // continue can skip the current field. Both remain live uninitialized paths.
+        let e = errs(
+            "type Pair = { left: int32, right: int32 }\nfun with_break(stop: bool) {\n let pair: Pair\n for field in fields(pair) {\n  if stop { break }\n  pair[field] = 1\n }\n println(pair)\n}\nfun with_continue(skip: bool) {\n let pair: Pair\n for field in fields(pair) {\n  if skip { continue }\n  pair[field] = 1\n }\n println(pair)\n}\n",
+        );
+        let uses = e
+            .iter()
+            .filter(|message| message.contains("`pair` is used before it is fully initialized"))
+            .count();
+        assert_eq!(uses, 2, "{e:?}");
+    }
+
+    #[test]
+    fn returning_fields_loop_paths_do_not_reach_the_summary() {
+        // A return path needs no initialized post-loop value; every path that
+        // does reach the final return has assigned the current field.
+        let e = errs(
+            "type Pair = { left: int32, right: int32 }\nfun build(stop: bool) -> Pair {\n let pair: Pair\n for field in fields(pair) {\n  if stop { return Pair { left: 0, right: 0 } }\n  pair[field] = 1\n }\n return pair\n}\n",
+        );
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn closure_body_checks_its_own_uninitialized_locals() {
+        // Closure-local storage has its own definite-assignment analysis even
+        // though constructing the closure does not execute the body.
+        let e = errs(
+            "fun main() {\n let closure = () -> {\n  let local: int32\n  println(local)\n }\n}\n",
+        );
+        assert!(
+            e.iter()
+                .any(|message| message.contains("`local` is used before it is fully initialized")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn closure_parameter_is_not_an_outer_capture() {
+        // The parameter shadows the not-yet-initialized outer binding, so the
+        // closure captures no `value` from its surrounding function.
+        let e = errs(
+            "fun main() {\n let value: int32\n let closure = (value: int32) -> value + 1\n value = 2\n println(closure(value))\n}\n",
+        );
+        assert!(
+            !e.iter()
+                .any(|message| message.contains("captured by a closure")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn module_initializer_uses_definite_assignment() {
+        // Top-level statement sequences obey the same uninitialized-let rule as
+        // callable bodies.
+        let e = errs("let value: int32\nprintln(value)\n");
+        assert!(
+            e.iter()
+                .any(|message| message.contains("`value` is used before it is fully initialized")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
     fn top_level_annotation_is_resolved() {
         let e = errs("let value: Nope = 1\n");
         assert!(e.iter().any(|m| m.contains("unknown type `Nope`")), "{e:?}");
@@ -2244,6 +2442,35 @@ mod tests {
         let e = errs("fun f(b: bool) -> int32 {\n    if b { return 1 }\n}\n");
         assert!(
             e.iter().any(|m| m.contains("without returning a value")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn divergence_in_evaluated_subexpressions_satisfies_return_flow() {
+        // Each function returns from a position that is unconditionally
+        // evaluated before its enclosing statement could fall through.
+        let e = errs(
+            "fun consume(value: int32) {}\nfun from_initializer() -> int32 {\n let value = { return 1 }\n}\nfun from_assignment() -> int32 {\n let value = 0\n value = { return 2 }\n}\nfun from_condition() -> int32 {\n if { return 3 } {}\n}\nfun from_operand() -> int32 {\n let value = 1 + { return 4 }\n}\nfun from_argument() -> int32 {\n consume({ return 5 })\n}\n",
+        );
+        assert!(
+            !e.iter()
+                .any(|message| message.contains("may finish without returning")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn module_qualified_reserved_functions_are_rejected() {
+        // Duplicate bare names force qualified HIR symbols, but the declaration
+        // name remains reserved in every user module.
+        let e = module_errs(&[
+            (&["a"], "fun len(value) { return value }\n"),
+            (&["b"], "fun len(value) { return value }\n"),
+        ]);
+        assert!(
+            e.iter()
+                .any(|message| message.contains("`len` is a builtin and cannot be redefined")),
             "{e:?}"
         );
     }
