@@ -1509,6 +1509,52 @@ fn same_global_name_in_two_modules_keeps_its_own_type() {
     assert_eq!(out, "7\nseven\n", "{out}");
 }
 
+/// Keyed specializations retain the receiver's canonical symbol, so two
+/// modules may specialize same-named methods at the same result key without
+/// one module arbitrarily borrowing or suppressing the other's template.
+#[test]
+fn keyed_specialization_distinguishes_same_named_receivers() {
+    let main = setup(
+        "same_named_keyed_receivers",
+        &[
+            (
+                "lib/a.cz",
+                "type Decoder = | Value { first: string }\n\
+                 fun Decoder.into(self) -> infer! {\n\
+                   match self {\n\
+                     Decoder.Value { first } => { return infer.from(first) }\n\
+                   }\n\
+                 }\n\
+                 fun make_a() -> Decoder { return Decoder.Value { first: \"alpha\" } }\n",
+            ),
+            (
+                "lib/b.cz",
+                "type Decoder = | Value { second: string }\n\
+                 fun Decoder.into(self) -> infer! {\n\
+                   match self {\n\
+                     Decoder.Value { second } => { return infer.from(second) }\n\
+                   }\n\
+                 }\n\
+                 fun make_b() -> Decoder { return Decoder.Value { second: \"beta\" } }\n",
+            ),
+            (
+                "main.cz",
+                "import lib.a.{ make_a }\n\
+                 import lib.b.{ make_b }\n\
+                 fun main() {\n\
+                   const a: string = make_a().into()!\n\
+                   const b: string = make_b().into()!\n\
+                   println(a)\n\
+                   println(b)\n\
+                 }\n",
+            ),
+        ],
+    );
+    let (ok, out) = run(&main);
+    assert!(ok, "expected success, got: {out}");
+    assert_eq!(out, "alpha\nbeta\n", "{out}");
+}
+
 /// A static call on a type whose NAME another module also declares (here: an
 /// alias of that very type, `serv`'s `type HttpServer = Server` next to
 /// `serve`'s nominal). The duplicate name qualifies both symbols, and every

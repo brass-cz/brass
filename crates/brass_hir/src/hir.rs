@@ -567,17 +567,11 @@ impl Program {
         )
     }
 
-    /// [`Self::resolve_type`], additionally seeing through a `type Alias =
-    /// <nominal>` binding: an alias is not a nominal of its own and declares no
-    /// methods, so a use that needs the underlying declaration -- a static
-    /// method call's receiver, MIR call dispatch -- follows the alias to its
-    /// target record/sum. A non-nominal alias target (e.g. `type Ints =
-    /// int32[]`) yields `None`.
-    pub fn resolve_type_or_alias(&self, module: &[String], name: &str) -> Option<&TypeInfo> {
-        if let Some(v) = self.resolve_type(module, name) {
-            return Some(v);
-        }
-        let alias = resolve_qualified(
+    /// Resolve a type alias as seen from `module`, preserving the alias's full
+    /// target instance. Consumers that need a refinement's field substitution
+    /// must use this instead of following only its nominal declaration.
+    pub fn resolve_type_alias(&self, module: &[String], name: &str) -> Option<&TypeAlias> {
+        resolve_qualified(
             &self.type_aliases,
             &self.import_origins,
             &self.import_renames,
@@ -592,7 +586,20 @@ impl Program {
                     &alias.module,
                 )
             },
-        )?;
+        )
+    }
+
+    /// [`Self::resolve_type`], additionally seeing through a `type Alias =
+    /// <nominal>` binding: an alias is not a nominal of its own and declares no
+    /// methods, so a use that needs the underlying declaration -- a static
+    /// method call's receiver, MIR call dispatch -- follows the alias to its
+    /// target record/sum. A non-nominal alias target (e.g. `type Ints =
+    /// int32[]`) yields `None`.
+    pub fn resolve_type_or_alias(&self, module: &[String], name: &str) -> Option<&TypeInfo> {
+        if let Some(v) = self.resolve_type(module, name) {
+            return Some(v);
+        }
+        let alias = self.resolve_type_alias(module, name)?;
         match &alias.ty {
             Type::Record(n) | Type::Sum(n) => self.type_by_id(n.id),
             _ => None,

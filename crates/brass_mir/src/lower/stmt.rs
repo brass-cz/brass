@@ -301,9 +301,22 @@ impl FnLower<'_, '_> {
             // The checker rejects uninitialized wildcard/destructuring lets.
             return;
         };
-        // Nominal annotations (records, sums) are not "simple" types; resolve
-        // them against the program's types for the slot type and, for records,
-        // the skeleton's field list.
+        // A concrete refinement alias must keep its instance substitution for
+        // the skeleton; resolving only its base declaration would recover the
+        // open field types the alias concretized.
+        if let Some(slot_ty @ Type::Record(_)) = ty.and_then(|ty| self.slot_type(ty)) {
+            let local = self
+                .b
+                .fresh_local_typed(Some(name.clone()), slot_ty.clone());
+            if let Some(op) = self.default_operand(&slot_ty, &mut Vec::new()) {
+                self.b.push(MirStmt::Assign(local, Rvalue::Use(op)));
+            }
+            self.bind(name, local);
+            return;
+        }
+        // Other nominal annotations are not "simple" types; resolve them
+        // against the program's types for the slot type and, for records, the
+        // skeleton's field list.
         if let Some(TypeExpr::Named(type_name, _)) = ty {
             let info = brass_hir::generated_type_id(type_name)
                 .and_then(|id| self.ctx.type_info_by_id(id))
@@ -387,7 +400,7 @@ impl FnLower<'_, '_> {
                 // the field's width instead of the literal's default kind.
                 let mut subst = brass_hir::Substitution::empty();
                 for f in &field_infos {
-                    let ft = f.resolved_ty.as_ref()?;
+                    let ft = n.substitution.get(&f.name).or(f.resolved_ty.as_ref())?;
                     fields.push((f.name.clone(), self.default_operand(ft, visiting)?));
                     subst.insert(f.name.clone(), ft.clone());
                 }

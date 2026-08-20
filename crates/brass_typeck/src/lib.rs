@@ -72,7 +72,7 @@ pub struct Analysis {
     /// lowering replaces each call with the string constant.
     pub type_names: fxhash::FxHashMap<Span, String>,
     /// Reflective (`-> infer!`) method calls keyed by expectation: call span ->
-    /// (receiver type, method, target key). The driver specializes each and
+    /// (canonical receiver type symbol, method, target key). The driver specializes each and
     /// rewrites the call to the concrete method.
     pub keyed_calls: fxhash::FxHashMap<Span, (String, String, brass_hir::Type)>,
     /// Resolved binding types of `typeof`-bearing local annotations, keyed by

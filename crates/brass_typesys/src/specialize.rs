@@ -30,12 +30,6 @@ use brass_parser::ast::*;
 
 use brass_hir::{Program, Type, TypeKind};
 
-/// The width of each specialization's span band, in `SPAN_SHIFT_UNIT`s. Wider
-/// than any record's field count, so a fields-loop unroll inside one
-/// specialization (which shifts each copy by `(i+1) * SPAN_SHIFT_UNIT`) stays
-/// within that specialization's band.
-const SPAN_BAND: usize = 4096;
-
 /// A pure span-shift of a block by `delta` (a multiple of `SPAN_SHIFT_UNIT`):
 /// reuses the fields-loop expander with a variable that matches nothing, so it
 /// rewrites spans without substituting anything.
@@ -47,8 +41,124 @@ fn shift_spans(b: &Block, delta: usize) -> Block {
     brass_hir::expand_fields_body(b, "\u{0}shift", "", iteration.saturating_sub(1))
 }
 
-/// A requested specialization: method `method` on receiver type `recv`,
-/// targeting result type `key`.
+/// The largest synthetic offset and absolute high coordinate in a generated
+/// block. Field-loop expansion may already have shifted nested copies before a
+/// specialization receives its own band.
+fn span_metrics(b: &Block) -> (usize, usize) {
+    fn observe(span: brass_hir::Span, max_shift: &mut usize, max_hi: &mut usize) {
+        let source = span.source_span();
+        *max_shift = (*max_shift).max(
+            span.lo
+                .saturating_sub(source.lo)
+                .max(span.hi.saturating_sub(source.hi)),
+        );
+        *max_hi = (*max_hi).max(span.hi);
+    }
+
+    fn expr(e: &Expr, max_shift: &mut usize, max_hi: &mut usize) {
+        observe(e.span(), max_shift, max_hi);
+        match e {
+            Expr::Unary(_, inner, _)
+            | Expr::ErrorProp(inner, _)
+            | Expr::Field(inner, _, _)
+            | Expr::TypeTest(inner, _, _) => expr(inner, max_shift, max_hi),
+            Expr::Binary(_, left, right, _)
+            | Expr::Index(left, right, _)
+            | Expr::Range(left, right, _) => {
+                expr(left, max_shift, max_hi);
+                expr(right, max_shift, max_hi);
+            }
+            Expr::Call(callee, args, _) => {
+                expr(callee, max_shift, max_hi);
+                for arg in args {
+                    expr(&arg.expr, max_shift, max_hi);
+                }
+            }
+            Expr::Str(segments, _) => {
+                for segment in segments {
+                    if let StrSeg::Expr(inner) = segment {
+                        expr(inner, max_shift, max_hi);
+                    }
+                }
+            }
+            Expr::Closure(_, body, _) => expr(body, max_shift, max_hi),
+            Expr::Array(items, _) => {
+                for item in items {
+                    expr(item, max_shift, max_hi);
+                }
+            }
+            Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => {
+                for (_, value) in fields {
+                    expr(value, max_shift, max_hi);
+                }
+            }
+            Expr::If(cond, then, els, _) => {
+                expr(cond, max_shift, max_hi);
+                block(then, max_shift, max_hi);
+                if let Some(els) = els {
+                    expr(els, max_shift, max_hi);
+                }
+            }
+            Expr::IfLet(_, scrutinee, then, els, _) => {
+                expr(scrutinee, max_shift, max_hi);
+                block(then, max_shift, max_hi);
+                if let Some(els) = els {
+                    expr(els, max_shift, max_hi);
+                }
+            }
+            Expr::Match(scrutinee, arms, _) => {
+                expr(scrutinee, max_shift, max_hi);
+                for arm in arms {
+                    observe(arm.span, max_shift, max_hi);
+                    expr(&arm.body, max_shift, max_hi);
+                }
+            }
+            Expr::Block(inner, _) => block(inner, max_shift, max_hi),
+            Expr::Int(..)
+            | Expr::Float(..)
+            | Expr::Bool(..)
+            | Expr::Null(_)
+            | Expr::Ident(..)
+            | Expr::SelfExpr(_) => {}
+        }
+    }
+
+    fn block(b: &Block, max_shift: &mut usize, max_hi: &mut usize) {
+        observe(b.span, max_shift, max_hi);
+        for stmt in &b.stmts {
+            observe(stmt.span(), max_shift, max_hi);
+            match stmt {
+                Stmt::Let {
+                    value: Some(value), ..
+                } => expr(value, max_shift, max_hi),
+                Stmt::Let { value: None, .. } => {}
+                Stmt::Assign { target, value, .. } => {
+                    expr(target, max_shift, max_hi);
+                    expr(value, max_shift, max_hi);
+                }
+                Stmt::Expr(value) | Stmt::Return(Some(value), _) => expr(value, max_shift, max_hi),
+                Stmt::While { cond, body, .. } => {
+                    expr(cond, max_shift, max_hi);
+                    block(body, max_shift, max_hi);
+                }
+                Stmt::For { iter, body, .. } => {
+                    expr(iter, max_shift, max_hi);
+                    block(body, max_shift, max_hi);
+                }
+                Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => {}
+            }
+        }
+    }
+
+    let mut max_shift = 0;
+    let mut max_hi = 0;
+    block(b, &mut max_shift, &mut max_hi);
+    (max_shift, max_hi)
+}
+
+/// A requested specialization: method `method` on the receiver's canonical HIR
+/// symbol `recv`, targeting result type `key`. The symbol, unlike the source
+/// display name, is unique when modules declare same-named types.
 #[derive(Clone)]
 pub struct KeyedNeed {
     pub recv: String,
@@ -74,6 +184,10 @@ pub fn specialize_all(program: &Program, roots: &[KeyedNeed]) -> Result<Vec<Gene
     let mut out = Vec::new();
     let mut done: fxhash::FxHashSet<String> = fxhash::FxHashSet::default();
     let mut work: Vec<KeyedNeed> = roots.to_vec();
+    // One shift unit separates an unexpanded body from its first fields-loop
+    // copy. Each generated body reserves only the lanes it actually used, so
+    // the first specialization remains representable on 32-bit targets.
+    let mut next_span_base = brass_hir::SPAN_SHIFT_UNIT;
     // Bounded by the distinct (recv, method, key) triples the program's type
     // graph can reach -- finite -- so the worklist drains.
     while let Some(need) = work.pop() {
@@ -87,17 +201,36 @@ pub fn specialize_all(program: &Program, roots: &[KeyedNeed]) -> Result<Vec<Gene
             continue;
         }
         let (mut decl, module) = specialize_one(program, &need, &mut work)?;
-        // Every specialization is a clone of one template, so their statements
-        // share the template's source spans. Span-keyed inference state (literal
-        // kinds, expr types) would then collide across specializations. Shift
-        // each into its own span band, wide enough to also clear the fields-loop
-        // unroll's own per-field shifts inside it; a diagnostic maps back with
-        // `unshift_span` through the source coordinates retained by `Span`.
-        let base = (out.len() + 1) * SPAN_BAND * brass_hir::SPAN_SHIFT_UNIT;
+        // Every specialization cloned from one template retains the same source
+        // provenance, so it still needs a distinct synthetic coordinate band.
+        // Provenance itself separates different templates; within a template,
+        // reserve the exact field-expansion extent instead of assuming a fixed
+        // record-size ceiling or a 64-bit `usize`.
+        let (inner_shift, max_hi) = span_metrics(&decl.body);
+        if !inner_shift.is_multiple_of(brass_hir::SPAN_SHIFT_UNIT) {
+            return Err("reflective specialization produced a misaligned synthetic span".into());
+        }
+        let extent = inner_shift
+            .checked_add(brass_hir::SPAN_SHIFT_UNIT)
+            .ok_or_else(|| {
+                "reflective specialization exhausted synthetic span space".to_string()
+            })?;
+        let base = next_span_base;
+        max_hi.checked_add(base).ok_or_else(|| {
+            "reflective specialization exhausted synthetic span space".to_string()
+        })?;
+        next_span_base = next_span_base.checked_add(extent).ok_or_else(|| {
+            "reflective specialization exhausted synthetic span space".to_string()
+        })?;
         decl.body = shift_spans(&decl.body, base);
         out.push(Generated {
             module,
-            receiver: need.recv.clone(),
+            receiver: program
+                .types
+                .get(&need.recv)
+                .expect("specialization receiver was resolved above")
+                .name
+                .clone(),
             template: need.method.clone(),
             decl,
             key: need.key.clone(),
@@ -113,14 +246,13 @@ fn specialize_one(
 ) -> Result<(FunDecl, Vec<String>), String> {
     let info = program
         .types
-        .values()
-        .find(|i| i.name == need.recv)
+        .get(&need.recv)
         .ok_or_else(|| format!("unknown receiver type `{}`", need.recv))?;
     let method = match &info.kind {
         TypeKind::Record { methods, .. } => methods.get(&need.method),
         TypeKind::Sum { variants } => variants.iter().find_map(|v| v.methods.get(&need.method)),
     }
-    .ok_or_else(|| format!("`{}` has no method `{}`", need.recv, need.method))?;
+    .ok_or_else(|| format!("`{}` has no method `{}`", info.name, need.method))?;
     let src = &method.decl;
     let mut cx = Specializer {
         program,
@@ -133,7 +265,7 @@ fn specialize_one(
     let body = cx.block(&src.body.clone().ok_or("keyed method has no body")?);
     let decl = FunDecl {
         name: mangled_name(&need.method, &need.key),
-        recv: Some(TypeExpr::Named(need.recv.clone(), src.span)),
+        recv: Some(TypeExpr::Named(info.name.clone(), src.span)),
         params: src.params.clone(),
         // The concrete result: `key!` (a fallible decode).
         ret: Some(TypeExpr::Fallible(
@@ -191,7 +323,7 @@ impl Specializer<'_> {
                 span,
             } => vec![Stmt::Let {
                 pat: pat.clone(),
-                ty: ty.as_ref().map(|t| self.subst_type(t)),
+                ty: ty.as_ref().map(|t| self.subst_type(t, binds)),
                 value: value.as_ref().map(|v| self.expr(v, binds)),
                 is_const: *is_const,
                 span: *span,
@@ -221,7 +353,12 @@ impl Specializer<'_> {
                 };
                 let mut out = Vec::new();
                 for (i, f) in fields.iter().enumerate() {
-                    let fty = f.resolved_ty.clone().unwrap_or(Type::Void);
+                    let fty = n
+                        .substitution
+                        .get(&f.name)
+                        .cloned()
+                        .or_else(|| f.resolved_ty.clone())
+                        .unwrap_or(Type::Void);
                     // Reuse the fields-loop expansion (field name decay + v[f]
                     // projection), then rewrite the recursive keyed call to the
                     // field's specialization.
@@ -319,7 +456,7 @@ impl Specializer<'_> {
             Expr::Block(b, span) => Expr::Block(self.block_in(b, binds), *span),
             Expr::TypeTest(subject, te, span) => Expr::TypeTest(
                 Box::new(self.expr(subject, binds)),
-                self.subst_type(te),
+                self.subst_type(te, binds),
                 *span,
             ),
             Expr::If(c, t, els, span) => Expr::If(
@@ -470,16 +607,55 @@ impl Specializer<'_> {
         }
     }
 
-    fn subst_type(&self, t: &TypeExpr) -> TypeExpr {
+    fn subst_type(&mut self, t: &TypeExpr, binds: &Bindings) -> TypeExpr {
         match t {
             TypeExpr::Named(n, span) if n == "infer" => type_to_expr(self.key, *span),
             TypeExpr::Named(..) => t.clone(),
             TypeExpr::Array(i, len, span) => {
-                TypeExpr::Array(Box::new(self.subst_type(i)), *len, *span)
+                TypeExpr::Array(Box::new(self.subst_type(i, binds)), *len, *span)
             }
-            TypeExpr::Nullable(i, span) => TypeExpr::Nullable(Box::new(self.subst_type(i)), *span),
-            TypeExpr::Fallible(i, span) => TypeExpr::Fallible(Box::new(self.subst_type(i)), *span),
-            other => other.clone(),
+            TypeExpr::Fun(params, ret, span) => TypeExpr::Fun(
+                params
+                    .iter()
+                    .map(|param| self.subst_type(param, binds))
+                    .collect(),
+                Box::new(self.subst_type(ret, binds)),
+                *span,
+            ),
+            TypeExpr::Nullable(i, span) => {
+                TypeExpr::Nullable(Box::new(self.subst_type(i, binds)), *span)
+            }
+            TypeExpr::Fallible(i, span) => {
+                TypeExpr::Fallible(Box::new(self.subst_type(i, binds)), *span)
+            }
+            TypeExpr::Tuple(items, span) => TypeExpr::Tuple(
+                items
+                    .iter()
+                    .map(|item| self.subst_type(item, binds))
+                    .collect(),
+                *span,
+            ),
+            TypeExpr::Anonymous(fields, span) => TypeExpr::Anonymous(
+                fields
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), self.subst_type(ty, binds)))
+                    .collect(),
+                *span,
+            ),
+            TypeExpr::Mut(i, span) => TypeExpr::Mut(Box::new(self.subst_type(i, binds)), *span),
+            TypeExpr::Ref(i, span) => TypeExpr::Ref(Box::new(self.subst_type(i, binds)), *span),
+            TypeExpr::TypeOf(expr, span) => {
+                TypeExpr::TypeOf(Box::new(self.expr(expr, binds)), *span)
+            }
+            TypeExpr::Refine(base, fields, span) => TypeExpr::Refine(
+                Box::new(self.subst_type(base, binds)),
+                fields
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), self.subst_type(ty, binds)))
+                    .collect(),
+                *span,
+            ),
+            TypeExpr::TypeSlot(_) | TypeExpr::SelfField(..) => t.clone(),
         }
     }
 
@@ -515,13 +691,21 @@ impl Specializer<'_> {
     }
 }
 
-/// A minimal AST walk that renames `recv.<method>()` calls to `recv.<mangled>()`.
+/// A recursive AST walk that renames `recv.<method>()` calls to
+/// `recv.<mangled>()` wherever an expanded fields-loop body may contain them.
 struct RewriteInto<'a> {
     method: &'a str,
     mangled: &'a str,
 }
 
 impl RewriteInto<'_> {
+    fn block(&self, b: &Block) -> Block {
+        Block {
+            stmts: b.stmts.iter().map(|stmt| self.stmt(stmt)).collect(),
+            span: b.span,
+        }
+    }
+
     fn stmt(&self, s: &Stmt) -> Stmt {
         match s {
             Stmt::Assign {
@@ -536,6 +720,7 @@ impl RewriteInto<'_> {
                 span: *span,
             },
             Stmt::Return(Some(e), span) => Stmt::Return(Some(self.expr(e)), *span),
+            Stmt::Return(None, span) => Stmt::Return(None, *span),
             Stmt::Expr(e) => Stmt::Expr(self.expr(e)),
             Stmt::Let {
                 pat,
@@ -544,24 +729,41 @@ impl RewriteInto<'_> {
                 is_const,
                 span,
             } => Stmt::Let {
-                pat: pat.clone(),
-                ty: ty.clone(),
+                pat: self.pattern(pat),
+                ty: ty.as_ref().map(|ty| self.type_expr(ty)),
                 value: value.as_ref().map(|v| self.expr(v)),
                 is_const: *is_const,
                 span: *span,
             },
-            other => other.clone(),
+            Stmt::While { cond, body, span } => Stmt::While {
+                cond: self.expr(cond),
+                body: self.block(body),
+                span: *span,
+            },
+            Stmt::For {
+                pat,
+                iter,
+                body,
+                span,
+            } => Stmt::For {
+                pat: self.pattern(pat),
+                iter: self.expr(iter),
+                body: self.block(body),
+                span: *span,
+            },
+            Stmt::Break(span) => Stmt::Break(*span),
+            Stmt::Continue(span) => Stmt::Continue(*span),
         }
     }
 
     fn expr(&self, e: &Expr) -> Expr {
         match e {
             Expr::Call(callee, args, span) => {
-                let new_callee = match &**callee {
+                let new_callee = match self.expr(callee) {
                     Expr::Field(base, m, fspan) if m == self.method => {
-                        Expr::Field(Box::new(self.expr(base)), self.mangled.to_string(), *fspan)
+                        Expr::Field(base, self.mangled.to_string(), fspan)
                     }
-                    other => self.expr(other),
+                    other => other,
                 };
                 Expr::Call(
                     Box::new(new_callee),
@@ -573,6 +775,23 @@ impl RewriteInto<'_> {
                     *span,
                 )
             }
+            Expr::Int(value, span) => Expr::Int(*value, *span),
+            Expr::Float(value, span) => Expr::Float(*value, *span),
+            Expr::Bool(value, span) => Expr::Bool(*value, *span),
+            Expr::Null(span) => Expr::Null(*span),
+            Expr::Ident(name, span) => Expr::Ident(name.clone(), *span),
+            Expr::SelfExpr(span) => Expr::SelfExpr(*span),
+            Expr::Str(segments, span) => Expr::Str(
+                segments
+                    .iter()
+                    .map(|segment| match segment {
+                        StrSeg::Lit(value) => StrSeg::Lit(value.clone()),
+                        StrSeg::Expr(expr) => StrSeg::Expr(Box::new(self.expr(expr))),
+                    })
+                    .collect(),
+                *span,
+            ),
+            Expr::Unary(op, inner, span) => Expr::Unary(*op, Box::new(self.expr(inner)), *span),
             Expr::ErrorProp(i, span) => Expr::ErrorProp(Box::new(self.expr(i)), *span),
             Expr::Field(b, n, span) => Expr::Field(Box::new(self.expr(b)), n.clone(), *span),
             Expr::Index(b, i, span) => {
@@ -581,7 +800,141 @@ impl RewriteInto<'_> {
             Expr::Binary(op, l, r, span) => {
                 Expr::Binary(*op, Box::new(self.expr(l)), Box::new(self.expr(r)), *span)
             }
-            other => other.clone(),
+            Expr::Closure(params, body, span) => Expr::Closure(
+                params.iter().map(|param| self.param(param)).collect(),
+                Box::new(self.expr(body)),
+                *span,
+            ),
+            Expr::Array(items, span) => {
+                Expr::Array(items.iter().map(|item| self.expr(item)).collect(), *span)
+            }
+            Expr::Range(lo, hi, span) => {
+                Expr::Range(Box::new(self.expr(lo)), Box::new(self.expr(hi)), *span)
+            }
+            Expr::TypeLit(name, fields, span) => Expr::TypeLit(
+                name.clone(),
+                fields
+                    .iter()
+                    .map(|(name, value)| (name.clone(), self.expr(value)))
+                    .collect(),
+                *span,
+            ),
+            Expr::VariantLit(ty, variant, fields, span) => Expr::VariantLit(
+                ty.clone(),
+                variant.clone(),
+                fields
+                    .iter()
+                    .map(|(name, value)| (name.clone(), self.expr(value)))
+                    .collect(),
+                *span,
+            ),
+            Expr::If(cond, then, els, span) => Expr::If(
+                Box::new(self.expr(cond)),
+                self.block(then),
+                els.as_ref().map(|els| Box::new(self.expr(els))),
+                *span,
+            ),
+            Expr::IfLet(pattern, scrutinee, then, els, span) => Expr::IfLet(
+                self.pattern(pattern),
+                Box::new(self.expr(scrutinee)),
+                self.block(then),
+                els.as_ref().map(|els| Box::new(self.expr(els))),
+                *span,
+            ),
+            Expr::TypeTest(subject, ty, span) => {
+                Expr::TypeTest(Box::new(self.expr(subject)), self.type_expr(ty), *span)
+            }
+            Expr::Match(scrutinee, arms, span) => Expr::Match(
+                Box::new(self.expr(scrutinee)),
+                arms.iter()
+                    .map(|arm| MatchArm {
+                        pattern: self.pattern(&arm.pattern),
+                        body: self.expr(&arm.body),
+                        span: arm.span,
+                    })
+                    .collect(),
+                *span,
+            ),
+            Expr::Block(block, span) => Expr::Block(self.block(block), *span),
+        }
+    }
+
+    fn pattern(&self, pattern: &Pattern) -> Pattern {
+        match pattern {
+            Pattern::Wildcard(span) => Pattern::Wildcard(*span),
+            Pattern::Binding(name, span) => Pattern::Binding(name.clone(), *span),
+            Pattern::Literal(expr, span) => Pattern::Literal(Box::new(self.expr(expr)), *span),
+            Pattern::Record(name, fields, span) => Pattern::Record(
+                name.clone(),
+                fields
+                    .iter()
+                    .map(|field| FieldPat {
+                        name: field.name.clone(),
+                        pat: field.pat.as_ref().map(|pat| self.pattern(pat)),
+                        span: field.span,
+                    })
+                    .collect(),
+                *span,
+            ),
+            Pattern::Array(patterns, span) => Pattern::Array(
+                patterns
+                    .iter()
+                    .map(|pattern| self.pattern(pattern))
+                    .collect(),
+                *span,
+            ),
+        }
+    }
+
+    fn param(&self, param: &Param) -> Param {
+        Param {
+            name: param.name.clone(),
+            ty: param.ty.as_ref().map(|ty| self.type_expr(ty)),
+            span: param.span,
+        }
+    }
+
+    fn type_expr(&self, ty: &TypeExpr) -> TypeExpr {
+        match ty {
+            TypeExpr::Named(name, span) => TypeExpr::Named(name.clone(), *span),
+            TypeExpr::Array(inner, len, span) => {
+                TypeExpr::Array(Box::new(self.type_expr(inner)), *len, *span)
+            }
+            TypeExpr::Fun(params, ret, span) => TypeExpr::Fun(
+                params.iter().map(|param| self.type_expr(param)).collect(),
+                Box::new(self.type_expr(ret)),
+                *span,
+            ),
+            TypeExpr::Nullable(inner, span) => {
+                TypeExpr::Nullable(Box::new(self.type_expr(inner)), *span)
+            }
+            TypeExpr::Fallible(inner, span) => {
+                TypeExpr::Fallible(Box::new(self.type_expr(inner)), *span)
+            }
+            TypeExpr::Tuple(items, span) => TypeExpr::Tuple(
+                items.iter().map(|item| self.type_expr(item)).collect(),
+                *span,
+            ),
+            TypeExpr::Anonymous(fields, span) => TypeExpr::Anonymous(
+                fields
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), self.type_expr(ty)))
+                    .collect(),
+                *span,
+            ),
+            TypeExpr::Mut(inner, span) => TypeExpr::Mut(Box::new(self.type_expr(inner)), *span),
+            TypeExpr::Ref(inner, span) => TypeExpr::Ref(Box::new(self.type_expr(inner)), *span),
+            TypeExpr::TypeOf(expr, span) => TypeExpr::TypeOf(Box::new(self.expr(expr)), *span),
+            TypeExpr::TypeSlot(span) => TypeExpr::TypeSlot(*span),
+            TypeExpr::SelfField(name, span) => TypeExpr::SelfField(name.clone(), *span),
+            TypeExpr::Refine(base, fields, span) => TypeExpr::Refine(
+                Box::new(self.type_expr(base)),
+                fields
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), self.type_expr(ty)))
+                    .collect(),
+                *span,
+            ),
         }
     }
 }
@@ -614,5 +967,431 @@ pub fn type_to_expr(t: &Type, span: brass_hir::Span) -> TypeExpr {
         Type::Array(i, k) => TypeExpr::Array(Box::new(type_to_expr(i, span)), Some(*k), span),
         Type::ConstOf(i) | Type::Mut(i) | Type::Ref(i) => type_to_expr(i, span),
         _ => TypeExpr::Named(t.type_name(), span),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use brass_hir::{LoadedModule, NominalType, Substitution};
+
+    use super::*;
+
+    fn lower(src: &str) -> Program {
+        let ast = brass_parser::parse(src).expect("parse");
+        let modules = [LoadedModule {
+            path: vec!["main".into()],
+            ast,
+            is_prelude: false,
+        }];
+        let (program, errors) = brass_hir::lower(&modules);
+        assert!(errors.is_empty(), "lower errors: {errors:?}");
+        program
+    }
+
+    fn receiver_symbol(program: &Program, name: &str) -> String {
+        program
+            .types
+            .values()
+            .find(|info| info.name == name)
+            .expect("receiver")
+            .symbol
+            .clone()
+    }
+
+    fn keyed_need(program: &Program, receiver: &str, key: Type) -> KeyedNeed {
+        KeyedNeed {
+            recv: receiver_symbol(program, receiver),
+            method: "into".into(),
+            key,
+        }
+    }
+
+    #[test]
+    fn specialization_spans_reserve_only_the_lanes_the_body_uses() {
+        // Two leaf specializations need two lanes, not the former fixed 4096
+        // lanes whose very first base exceeded a 32-bit `usize`.
+        let program = lower(
+            "type Decoder = { value: int64 }\n\
+             fun Decoder.into(self) -> infer! {\n\
+               return infer.from(self.value)\n\
+             }\n",
+        );
+        let generated = specialize_all(
+            &program,
+            &[
+                keyed_need(&program, "Decoder", Type::Str),
+                keyed_need(&program, "Decoder", Type::Bool),
+            ],
+        )
+        .expect("specialize");
+        assert_eq!(generated.len(), 2);
+        let shifts: Vec<_> = generated
+            .iter()
+            .map(|generated| {
+                let span = generated.decl.body.span;
+                span.lo - span.source_span().lo
+            })
+            .collect();
+        assert_ne!(shifts[0], shifts[1]);
+        assert!(
+            shifts
+                .iter()
+                .all(|shift| *shift <= 2 * brass_hir::SPAN_SHIFT_UNIT)
+        );
+    }
+
+    #[test]
+    fn fields_loop_uses_the_concrete_record_field_substitution() {
+        // The declaration's open `value` field must specialize recursively at
+        // the concrete instance's `string`, not at the shared declaration hole.
+        let program = lower(
+            "type Target = { value }\n\
+             type Decoder = { marker: int32 }\n\
+             fun Decoder.into(self) -> infer! {\n\
+               let ret: infer\n\
+               for field in fields(ret) {\n\
+                 ret[field] = self.into()!\n\
+               }\n\
+               return ret\n\
+             }\n",
+        );
+        let target = program
+            .types
+            .values()
+            .find(|info| info.name == "Target")
+            .expect("Target");
+        let mut substitution = Substitution::empty();
+        substitution.insert("value", Type::Str);
+        let key = Type::Record(NominalType::with_substitution(
+            target.id,
+            target.name.clone(),
+            substitution,
+        ));
+        let generated = specialize_all(&program, &[keyed_need(&program, "Decoder", key.clone())])
+            .expect("specialize");
+        assert!(generated.iter().any(|decl| decl.key == Type::Str));
+        let root = generated
+            .iter()
+            .find(|decl| decl.key == key)
+            .expect("root specialization");
+        assert_eq!(
+            count_method_calls(&root.decl.body, &mangled_name("into", &Type::Str)),
+            1
+        );
+    }
+
+    #[test]
+    fn infer_substitution_reaches_every_composite_type_expression() {
+        // The shape includes function, tuple, anonymous, mut/ref, typeof, and
+        // refinement nesting so no composite can strand an `infer` annotation.
+        let span = brass_hir::Span::new(1, 2);
+        let infer = || TypeExpr::Named("infer".into(), span);
+        let ty = TypeExpr::Fun(
+            vec![
+                TypeExpr::Tuple(
+                    vec![
+                        TypeExpr::Array(Box::new(infer()), Some(2), span),
+                        TypeExpr::Nullable(
+                            Box::new(TypeExpr::Fallible(Box::new(infer()), span)),
+                            span,
+                        ),
+                    ],
+                    span,
+                ),
+                TypeExpr::Anonymous(
+                    vec![(
+                        "value".into(),
+                        TypeExpr::Mut(Box::new(TypeExpr::Ref(Box::new(infer()), span)), span),
+                    )],
+                    span,
+                ),
+                TypeExpr::TypeOf(
+                    Box::new(Expr::TypeTest(
+                        Box::new(Expr::Ident("x".into(), span)),
+                        infer(),
+                        span,
+                    )),
+                    span,
+                ),
+            ],
+            Box::new(TypeExpr::Refine(
+                Box::new(TypeExpr::Named("Base".into(), span)),
+                vec![(
+                    "slot".into(),
+                    TypeExpr::Fun(vec![infer()], Box::new(infer()), span),
+                )],
+                span,
+            )),
+            span,
+        );
+        let program = Program::empty();
+        let mut work = Vec::new();
+        let mut specializer = Specializer {
+            program: &program,
+            recv: "Receiver",
+            method: "into",
+            key: &Type::Str,
+            scrutinee: Type::Void,
+            work: &mut work,
+        };
+        let substituted = specializer.subst_type(&ty, &HashMap::default());
+        assert_eq!(count_infer_types(&substituted), 0);
+    }
+
+    #[test]
+    fn recursive_call_rewrite_walks_nested_control_flow_and_values() {
+        // These are the nodes the former shallow walker cloned wholesale:
+        // loops, blocks, conditionals, matches, closures, arrays, and unary ops.
+        let span = brass_hir::Span::new(1, 2);
+        let call = || {
+            Expr::Call(
+                Box::new(Expr::Field(
+                    Box::new(Expr::Ident("x".into(), span)),
+                    "into".into(),
+                    span,
+                )),
+                Vec::new(),
+                span,
+            )
+        };
+        let nested = Block {
+            stmts: vec![
+                Stmt::While {
+                    cond: call(),
+                    body: Block {
+                        stmts: vec![Stmt::Expr(Expr::If(
+                            Box::new(call()),
+                            Block {
+                                stmts: vec![Stmt::Expr(Expr::Match(
+                                    Box::new(call()),
+                                    vec![MatchArm {
+                                        pattern: Pattern::Wildcard(span),
+                                        body: call(),
+                                        span,
+                                    }],
+                                    span,
+                                ))],
+                                span,
+                            },
+                            Some(Box::new(Expr::Block(
+                                Block {
+                                    stmts: vec![Stmt::Expr(call())],
+                                    span,
+                                },
+                                span,
+                            ))),
+                            span,
+                        ))],
+                        span,
+                    },
+                    span,
+                },
+                Stmt::For {
+                    pat: Pattern::Binding("item".into(), span),
+                    iter: Expr::Array(vec![call()], span),
+                    body: Block {
+                        stmts: vec![Stmt::Let {
+                            pat: Pattern::Binding("f".into(), span),
+                            ty: Some(TypeExpr::TypeOf(Box::new(call()), span)),
+                            value: Some(Expr::Closure(
+                                Vec::new(),
+                                Box::new(Expr::Array(
+                                    vec![Expr::Unary(UnaryOp::Not, Box::new(call()), span)],
+                                    span,
+                                )),
+                                span,
+                            )),
+                            is_const: false,
+                            span,
+                        }],
+                        span,
+                    },
+                    span,
+                },
+            ],
+            span,
+        };
+        let original = count_method_calls(&nested, "into");
+        assert!(original >= 8);
+        let rewritten = RewriteInto {
+            method: "into",
+            mangled: "into__string",
+        }
+        .block(&nested);
+        assert_eq!(count_method_calls(&rewritten, "into"), 0);
+        assert_eq!(count_method_calls(&rewritten, "into__string"), original);
+    }
+
+    fn count_infer_types(ty: &TypeExpr) -> usize {
+        match ty {
+            TypeExpr::Named(name, _) => usize::from(name == "infer"),
+            TypeExpr::Array(inner, _, _)
+            | TypeExpr::Nullable(inner, _)
+            | TypeExpr::Fallible(inner, _)
+            | TypeExpr::Mut(inner, _)
+            | TypeExpr::Ref(inner, _) => count_infer_types(inner),
+            TypeExpr::Fun(params, ret, _) => {
+                params.iter().map(count_infer_types).sum::<usize>() + count_infer_types(ret)
+            }
+            TypeExpr::Tuple(items, _) => items.iter().map(count_infer_types).sum(),
+            TypeExpr::Anonymous(fields, _) => {
+                fields.iter().map(|(_, ty)| count_infer_types(ty)).sum()
+            }
+            TypeExpr::TypeOf(expr, _) => count_infer_expr(expr),
+            TypeExpr::Refine(base, fields, _) => {
+                count_infer_types(base)
+                    + fields
+                        .iter()
+                        .map(|(_, ty)| count_infer_types(ty))
+                        .sum::<usize>()
+            }
+            TypeExpr::TypeSlot(_) | TypeExpr::SelfField(..) => 0,
+        }
+    }
+
+    fn count_infer_expr(expr: &Expr) -> usize {
+        match expr {
+            Expr::TypeTest(subject, ty, _) => count_infer_expr(subject) + count_infer_types(ty),
+            _ => 0,
+        }
+    }
+
+    fn count_method_calls(block: &Block, method: &str) -> usize {
+        block
+            .stmts
+            .iter()
+            .map(|stmt| match stmt {
+                Stmt::Let { ty, value, .. } => {
+                    ty.as_ref().map_or(0, |ty| count_type_calls(ty, method))
+                        + value
+                            .as_ref()
+                            .map_or(0, |value| count_expr_calls(value, method))
+                }
+                Stmt::Assign { target, value, .. } => {
+                    count_expr_calls(target, method) + count_expr_calls(value, method)
+                }
+                Stmt::Expr(expr) | Stmt::Return(Some(expr), _) => count_expr_calls(expr, method),
+                Stmt::While { cond, body, .. } => {
+                    count_expr_calls(cond, method) + count_method_calls(body, method)
+                }
+                Stmt::For { iter, body, .. } => {
+                    count_expr_calls(iter, method) + count_method_calls(body, method)
+                }
+                Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => 0,
+            })
+            .sum()
+    }
+
+    fn count_type_calls(ty: &TypeExpr, method: &str) -> usize {
+        match ty {
+            TypeExpr::Array(inner, _, _)
+            | TypeExpr::Nullable(inner, _)
+            | TypeExpr::Fallible(inner, _)
+            | TypeExpr::Mut(inner, _)
+            | TypeExpr::Ref(inner, _) => count_type_calls(inner, method),
+            TypeExpr::Fun(params, ret, _) => {
+                params
+                    .iter()
+                    .map(|param| count_type_calls(param, method))
+                    .sum::<usize>()
+                    + count_type_calls(ret, method)
+            }
+            TypeExpr::Tuple(items, _) => items
+                .iter()
+                .map(|item| count_type_calls(item, method))
+                .sum(),
+            TypeExpr::Anonymous(fields, _) => fields
+                .iter()
+                .map(|(_, ty)| count_type_calls(ty, method))
+                .sum(),
+            TypeExpr::TypeOf(expr, _) => count_expr_calls(expr, method),
+            TypeExpr::Refine(base, fields, _) => {
+                count_type_calls(base, method)
+                    + fields
+                        .iter()
+                        .map(|(_, ty)| count_type_calls(ty, method))
+                        .sum::<usize>()
+            }
+            TypeExpr::Named(..) | TypeExpr::TypeSlot(_) | TypeExpr::SelfField(..) => 0,
+        }
+    }
+
+    fn count_expr_calls(expr: &Expr, method: &str) -> usize {
+        let own = usize::from(matches!(
+            expr,
+            Expr::Call(callee, _, _)
+                if matches!(&**callee, Expr::Field(_, name, _) if name == method)
+        ));
+        own + match expr {
+            Expr::Unary(_, inner, _) | Expr::ErrorProp(inner, _) | Expr::Field(inner, _, _) => {
+                count_expr_calls(inner, method)
+            }
+            Expr::TypeTest(subject, ty, _) => {
+                count_expr_calls(subject, method) + count_type_calls(ty, method)
+            }
+            Expr::Binary(_, left, right, _)
+            | Expr::Index(left, right, _)
+            | Expr::Range(left, right, _) => {
+                count_expr_calls(left, method) + count_expr_calls(right, method)
+            }
+            Expr::Call(callee, args, _) => {
+                count_expr_calls(callee, method)
+                    + args
+                        .iter()
+                        .map(|arg| count_expr_calls(&arg.expr, method))
+                        .sum::<usize>()
+            }
+            Expr::Str(segments, _) => segments
+                .iter()
+                .map(|segment| match segment {
+                    StrSeg::Lit(_) => 0,
+                    StrSeg::Expr(expr) => count_expr_calls(expr, method),
+                })
+                .sum(),
+            Expr::Closure(params, body, _) => {
+                params
+                    .iter()
+                    .map(|param| {
+                        param
+                            .ty
+                            .as_ref()
+                            .map_or(0, |ty| count_type_calls(ty, method))
+                    })
+                    .sum::<usize>()
+                    + count_expr_calls(body, method)
+            }
+            Expr::Array(items, _) => items
+                .iter()
+                .map(|item| count_expr_calls(item, method))
+                .sum(),
+            Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => fields
+                .iter()
+                .map(|(_, value)| count_expr_calls(value, method))
+                .sum(),
+            Expr::If(cond, then, els, _) => {
+                count_expr_calls(cond, method)
+                    + count_method_calls(then, method)
+                    + els.as_ref().map_or(0, |els| count_expr_calls(els, method))
+            }
+            Expr::IfLet(_, scrutinee, then, els, _) => {
+                count_expr_calls(scrutinee, method)
+                    + count_method_calls(then, method)
+                    + els.as_ref().map_or(0, |els| count_expr_calls(els, method))
+            }
+            Expr::Match(scrutinee, arms, _) => {
+                count_expr_calls(scrutinee, method)
+                    + arms
+                        .iter()
+                        .map(|arm| count_expr_calls(&arm.body, method))
+                        .sum::<usize>()
+            }
+            Expr::Block(block, _) => count_method_calls(block, method),
+            Expr::Int(..)
+            | Expr::Float(..)
+            | Expr::Bool(..)
+            | Expr::Null(_)
+            | Expr::Ident(..)
+            | Expr::SelfExpr(_) => 0,
+        }
     }
 }

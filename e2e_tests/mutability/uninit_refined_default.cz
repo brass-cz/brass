@@ -1,0 +1,11 @@
+// A refinement alias supplies the concrete defaultable type of the base
+// record's open field, so field-wise initialization can allocate its skeleton.
+type Open = { value }
+type Payload = { count: int64 }
+type Concrete = Open { value: Payload }
+
+fun main() {
+    let item: Concrete
+    item.value = Payload { count: 7 }
+    println(item.value.count)
+}

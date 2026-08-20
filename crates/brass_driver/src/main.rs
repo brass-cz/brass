@@ -3466,7 +3466,8 @@ fn specialize_keyed(
             .into_iter()
             .filter(|generated| {
                 generated_symbols.insert(format!(
-                    "{}.{}:{}",
+                    "{}.{}.{}:{}",
+                    generated.module.join("."),
                     generated.receiver,
                     generated.template,
                     brass_hir::type_key(&generated.key)

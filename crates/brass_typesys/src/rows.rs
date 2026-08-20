@@ -436,6 +436,31 @@ struct ParamScan<'p> {
     out: LocalScan,
 }
 
+/// Presence tests in a condition are distinct from fields that the condition
+/// proves present in one arm. In particular, both operands of `a || b` tolerate
+/// absence while neither operand is necessarily present when the result is true.
+#[derive(Default)]
+struct GuardSubjects {
+    tested: Vec<String>,
+    then_present: Vec<String>,
+    else_present: Vec<String>,
+}
+
+fn union_fields(mut left: Vec<String>, right: Vec<String>) -> Vec<String> {
+    for field in right {
+        if !left.contains(&field) {
+            left.push(field);
+        }
+    }
+    left
+}
+
+fn intersect_fields(left: Vec<String>, right: &[String]) -> Vec<String> {
+    left.into_iter()
+        .filter(|field| right.contains(field))
+        .collect()
+}
+
 impl ParamScan<'_> {
     fn ineligible(&mut self) {
         self.out.eligible = false;
@@ -779,12 +804,13 @@ impl ParamScan<'_> {
     /// Walk `cond` recording its bare `p.f` truthiness subjects as Guarded
     /// accesses, then run `then` with those fields added to the guard set.
     fn walk_guarding_cond(&mut self, cond: &Expr, active: bool, then: impl FnOnce(&mut Self)) {
-        let (then_guards, _else_guards) = self.guard_subjects(cond, active);
-        for f in &then_guards {
+        let subjects = self.guard_subjects(cond, active);
+        for f in &subjects.tested {
             self.access(f, Presence::Guarded, None);
         }
         self.walk_cond_rest(cond, active);
-        let added: Vec<String> = then_guards
+        let added: Vec<String> = subjects
+            .then_present
             .into_iter()
             .filter(|f| self.guarded.insert(f.clone()))
             .collect();
@@ -797,11 +823,9 @@ impl ParamScan<'_> {
     /// Walk an `if`'s else arm: a negated test (`if !p.f { .. } else { .. }`)
     /// proves the field present in the else arm.
     fn walk_else(&mut self, cond: &Expr, active: bool, els: &Expr) {
-        let (_then_guards, else_guards) = self.guard_subjects(cond, active);
-        for f in &else_guards {
-            self.access(f, Presence::Guarded, None);
-        }
-        let added: Vec<String> = else_guards
+        let added: Vec<String> = self
+            .guard_subjects(cond, active)
+            .else_present
             .into_iter()
             .filter(|f| self.guarded.insert(f.clone()))
             .collect();
@@ -811,26 +835,46 @@ impl ParamScan<'_> {
         }
     }
 
-    /// The parameter fields a condition tests for truthiness, split by which
-    /// arm the test proves them present in: `p.f` proves `f` in the then arm,
-    /// `!p.f` in the else arm, `a && b` proves both sides' then-fields. `||`
-    /// proves nothing (either side may have failed).
-    fn guard_subjects(&self, cond: &Expr, active: bool) -> (Vec<String>, Vec<String>) {
+    /// The parameter fields tested for truthiness and the fields proven present
+    /// in each arm. `&&` unions then-proofs, while `||` only retains proofs shared
+    /// by both alternatives; every bare operand remains a tolerant presence test.
+    fn guard_subjects(&self, cond: &Expr, active: bool) -> GuardSubjects {
         match cond {
             Expr::Field(..) => match self.param_field(cond, active) {
-                Some(f) => (vec![f.to_string()], Vec::new()),
-                None => (Vec::new(), Vec::new()),
+                Some(f) => GuardSubjects {
+                    tested: vec![f.to_string()],
+                    then_present: vec![f.to_string()],
+                    else_present: Vec::new(),
+                },
+                None => GuardSubjects::default(),
             },
             Expr::Unary(brass_parser::ast::UnaryOp::Not, inner, _) => {
-                let (t, e) = self.guard_subjects(inner, active);
-                (e, t)
+                let subjects = self.guard_subjects(inner, active);
+                GuardSubjects {
+                    tested: subjects.tested,
+                    then_present: subjects.else_present,
+                    else_present: subjects.then_present,
+                }
             }
             Expr::Binary(brass_parser::ast::BinOp::And, a, b, _) => {
-                let (ta, _) = self.guard_subjects(a, active);
-                let (tb, _) = self.guard_subjects(b, active);
-                (ta.into_iter().chain(tb).collect(), Vec::new())
+                let left = self.guard_subjects(a, active);
+                let right = self.guard_subjects(b, active);
+                GuardSubjects {
+                    tested: union_fields(left.tested, right.tested),
+                    then_present: union_fields(left.then_present, right.then_present),
+                    else_present: intersect_fields(left.else_present, &right.else_present),
+                }
             }
-            _ => (Vec::new(), Vec::new()),
+            Expr::Binary(brass_parser::ast::BinOp::Or, a, b, _) => {
+                let left = self.guard_subjects(a, active);
+                let right = self.guard_subjects(b, active);
+                GuardSubjects {
+                    tested: union_fields(left.tested, right.tested),
+                    then_present: intersect_fields(left.then_present, &right.then_present),
+                    else_present: union_fields(left.else_present, right.else_present),
+                }
+            }
+            _ => GuardSubjects::default(),
         }
     }
 
@@ -844,7 +888,7 @@ impl ParamScan<'_> {
             Expr::Unary(brass_parser::ast::UnaryOp::Not, inner, _) => {
                 self.walk_cond_rest(inner, active)
             }
-            Expr::Binary(brass_parser::ast::BinOp::And, a, b, _) => {
+            Expr::Binary(brass_parser::ast::BinOp::And | brass_parser::ast::BinOp::Or, a, b, _) => {
                 self.walk_cond_rest(a, active);
                 self.walk_cond_rest(b, active);
             }

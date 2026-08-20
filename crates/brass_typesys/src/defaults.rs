@@ -35,8 +35,9 @@ fn constructible(program: &Program, ty: &Type, visiting: &mut Vec<i32>) -> bool 
                 .find(|i| i.id == n.id)
                 .is_some_and(|info| match &info.kind {
                     TypeKind::Record { fields, .. } => fields.iter().all(|f| {
-                        f.resolved_ty
-                            .as_ref()
+                        n.substitution
+                            .get(&f.name)
+                            .or(f.resolved_ty.as_ref())
                             .is_some_and(|ft| constructible(program, ft, visiting))
                     }),
                     _ => false,
@@ -45,5 +46,50 @@ fn constructible(program: &Program, ty: &Type, visiting: &mut Vec<i32>) -> bool 
             ok
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use brass_hir::{LoadedModule, NominalType, Substitution};
+
+    use super::*;
+
+    #[test]
+    fn refined_record_fields_use_the_instance_substitution() {
+        // The open declaration has no default on its own, while this concrete
+        // instance pins the field to a recursively default-constructible record.
+        let ast = brass_parser::parse(
+            "type Open = { value }\n\
+             type Payload = { count: int64 }\n",
+        )
+        .expect("parse");
+        let modules = [LoadedModule {
+            path: vec!["main".into()],
+            ast,
+            is_prelude: false,
+        }];
+        let (program, errors) = brass_hir::lower(&modules);
+        assert!(errors.is_empty(), "lower errors: {errors:?}");
+        let open = program
+            .types
+            .values()
+            .find(|info| info.name == "Open")
+            .expect("Open");
+        let payload = program
+            .types
+            .values()
+            .find(|info| info.name == "Payload")
+            .expect("Payload");
+        assert!(!default_constructible(&program, &open.type_ref()));
+
+        let mut substitution = Substitution::empty();
+        substitution.insert("value", payload.type_ref());
+        let refined = Type::Record(NominalType::with_substitution(
+            open.id,
+            open.name.clone(),
+            substitution,
+        ));
+        assert!(default_constructible(&program, &refined));
     }
 }

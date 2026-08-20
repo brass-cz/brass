@@ -27,18 +27,31 @@ fn flow_sides(solver: &Solver, a: &Type, b: &Type) -> (Type, Type) {
     )
 }
 
+/// Whether indexing reaches a growable slice through the same passing-mode
+/// wrappers that [`index_element`] sees through.
+fn is_slice_indexable(ty: &Type) -> bool {
+    match ty {
+        Type::Slice(_) => true,
+        Type::Ref(inner) | Type::Mut(inner) | Type::ConstOf(inner) => is_slice_indexable(inner),
+        _ => false,
+    }
+}
+
 /// Unify with Brass's value-flow leniency, returning whether it succeeded.
 /// A top-level nullable is stripped from each side (see [`strip_nullable`]),
-/// and array-like types reconcile by element type -- a `[1,2,3]` literal,
-/// inferred as a slice, matches an `int32[3]` annotation, seen through
-/// `ref`/`mut`/`const` wrappers the same way indexing is.
+/// and a slice reconciles with another indexable type by element type -- a
+/// `[1,2,3]` literal inferred as a slice matches an `int32[3]` annotation,
+/// seen through `ref`/`mut`/`const` wrappers the same way indexing is. Two
+/// fixed arrays retain their lengths as part of unification.
 ///
 /// Succeeding commits the unification's bindings; failing commits nothing (the
 /// attempt is rolled back), so a caller can try further fallbacks -- numeric
 /// conversion, structural subtyping -- against unpolluted state.
 pub fn flow_unify(solver: &mut Solver, a: &Type, b: &Type) -> bool {
     let (a, b) = flow_sides(solver, a, b);
-    if let (Some(x), Some(y)) = (index_element(&a), index_element(&b)) {
+    if (is_slice_indexable(&a) || is_slice_indexable(&b))
+        && let (Some(x), Some(y)) = (index_element(&a), index_element(&b))
+    {
         return flow_unify(solver, &x, &y);
     }
     let snapshot = solver.snapshot();
@@ -91,6 +104,24 @@ mod tests {
             &mut solver,
             &Type::Ref(Box::new(arr)),
             &Type::Ref(Box::new(fixed))
+        ));
+    }
+
+    /// Fixed-array lengths are part of their storage type; element-only
+    /// reconciliation is reserved for flows where one side is a slice.
+    #[test]
+    fn fixed_arrays_require_equal_lengths() {
+        let mut solver = Solver::new();
+        let int = Type::Int(IntKind::I32);
+        assert!(!flow_unify(
+            &mut solver,
+            &Type::Array(Box::new(int.clone()), 3),
+            &Type::Array(Box::new(int.clone()), 4),
+        ));
+        assert!(flow_unify(
+            &mut solver,
+            &Type::Slice(Box::new(int.clone())),
+            &Type::Array(Box::new(int), 4),
         ));
     }
 

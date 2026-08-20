@@ -45,6 +45,22 @@ fn truthiness_guard_makes_the_field_guarded_with_the_forced_type() {
 }
 
 #[test]
+fn disjunctive_presence_tests_are_guarded_but_prove_neither_operand() {
+    // Both sides of `||` tolerate an absent field. The second function also
+    // pins that the true arm does not prove either alternative present.
+    let src = "fun any(p) {\n  if p.a || p.b {\n    return\n  }\n}\n\
+               fun read_after_any(p) {\n  if p.a || p.b {\n    println(p.a)\n    println(p.b)\n  }\n}\n";
+    let (_p, rows) = analyze(src);
+    let any = rows.function_param("any", 0).expect("row");
+    assert_eq!(any.row.fields["a"].presence, Presence::Guarded);
+    assert_eq!(any.row.fields["b"].presence, Presence::Guarded);
+
+    let read = rows.function_param("read_after_any", 0).expect("row");
+    assert_eq!(read.row.fields["a"].presence, Presence::Required);
+    assert_eq!(read.row.fields["b"].presence, Presence::Required);
+}
+
+#[test]
 fn forwarding_unions_the_callee_row() {
     // `display` never touches `last_name` itself; forwarding `obj` into
     // `helper` must pull helper's requirement into display's row (C.2.2).

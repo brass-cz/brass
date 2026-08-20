@@ -406,7 +406,7 @@ pub struct Inference {
     /// lowering replaces each such call with this string constant.
     pub type_names: HashMap<Span, String>,
     /// Reflective (`-> infer!`) method calls keyed by the caller's expectation:
-    /// call span -> (receiver type name, method, target key). The driver
+    /// call span -> (canonical receiver type symbol, method, target key). The driver
     /// generates a concrete specialization per (receiver, method, key) and
     /// rewrites the call to it.
     pub keyed_calls: HashMap<Span, (String, String, Type)>,

@@ -620,11 +620,16 @@ impl<'a> Checker<'a> {
                 return self.fresh_unknown();
             }
         };
-        let recv_name = match brass_hir::peel_modes(&self.resolve(recv_ty)) {
-            Type::Record(n) | Type::Sum(n) => n.name.clone(),
+        let recv_symbol = match brass_hir::peel_modes(&self.resolve(recv_ty)) {
+            Type::Record(n) | Type::Sum(n) => self
+                .program
+                .type_by_id(n.id)
+                .expect("a resolved keyed method receiver has nominal metadata")
+                .symbol
+                .clone(),
             other => other.type_name(),
         };
-        self.record_keyed_call(span, recv_name, method.to_string(), key.clone());
+        self.record_keyed_call(span, recv_symbol, method.to_string(), key.clone());
         // The specialization's failures come from `error(..)`, whose payload
         // is the prelude `Error` wrapping the message string.
         let err = crate::lift_err_payload(self.program, Type::Str);

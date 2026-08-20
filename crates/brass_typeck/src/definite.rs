@@ -31,7 +31,7 @@ pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -
         if !modules.checks(&f.module) {
             continue;
         }
-        check_body(program, None, &f.decl.body, &mut errors);
+        check_body(program, &f.module, None, &f.decl.body, &mut errors);
     }
     for info in program.types.values() {
         if !modules.checks(&info.module) {
@@ -44,7 +44,7 @@ pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -
                         continue;
                     }
                     if let Some(body) = m.decl.body.as_ref() {
-                        check_body(program, Some(info), body, &mut errors);
+                        check_body(program, &info.module, Some(info), body, &mut errors);
                     }
                 }
             }
@@ -55,7 +55,7 @@ pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -
                             continue;
                         }
                         if let Some(body) = m.decl.body.as_ref() {
-                            check_body(program, Some(info), body, &mut errors);
+                            check_body(program, &info.module, Some(info), body, &mut errors);
                         }
                     }
                 }
@@ -66,28 +66,31 @@ pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -
         if !modules.checks(&init.path) {
             continue;
         }
-        check_statements(program, None, &init.stmts, &mut errors);
+        check_statements(program, &init.path, None, &init.stmts, &mut errors);
     }
     errors
 }
 
 fn check_body(
     program: &Program,
+    module: &[String],
     self_info: Option<&TypeInfo>,
     body: &Block,
     errors: &mut Vec<TypeError>,
 ) {
-    check_statements(program, self_info, &body.stmts, errors);
+    check_statements(program, module, self_info, &body.stmts, errors);
 }
 
 fn check_statements(
     program: &Program,
+    module: &[String],
     self_info: Option<&TypeInfo>,
     statements: &[Stmt],
     errors: &mut Vec<TypeError>,
 ) {
     let mut w = Walker {
         program,
+        module,
         self_info,
         tracked: Vec::new(),
         scopes: Vec::new(),
@@ -181,6 +184,7 @@ fn finish_fields_path(
 
 struct Walker<'p, 'e> {
     program: &'p Program,
+    module: &'p [String],
     self_info: Option<&'p TypeInfo>,
     tracked: Vec<Tracked>,
     /// Innermost-last scopes: `Some(id)` is a tracked binding, `None` shadows
@@ -222,18 +226,26 @@ impl<'p, 'e> Walker<'p, 'e> {
         }
     }
 
-    /// The record type named by an uninitialized let's annotation, if any.
-    fn named_type(&self, te: &TypeExpr) -> Option<&'p TypeInfo> {
+    /// The nominal declaration and full instance named by an uninitialized
+    /// let's annotation. A refinement alias keeps its substitution here rather
+    /// than decaying to the base declaration's open fields.
+    fn named_type(&self, te: &TypeExpr) -> Option<(&'p TypeInfo, brass_hir::Type)> {
         let TypeExpr::Named(name, _) = te else {
             return None;
         };
         if name == "Self" {
-            return self.self_info;
+            let info = self.self_info?;
+            return Some((info, info.type_ref()));
         }
-        self.program
-            .types
-            .get(name)
-            .or_else(|| self.program.types.values().find(|i| &i.name == name))
+        if let Some(alias) = self.program.resolve_type_alias(self.module, name) {
+            let nominal = match &alias.ty {
+                brass_hir::Type::Record(n) | brass_hir::Type::Sum(n) => n,
+                _ => return None,
+            };
+            return Some((self.program.type_by_id(nominal.id)?, alias.ty.clone()));
+        }
+        let info = self.program.resolve_type(self.module, name)?;
+        Some((info, info.type_ref()))
     }
 
     fn walk_block(&mut self, b: &Block) {
@@ -266,10 +278,9 @@ impl<'p, 'e> Walker<'p, 'e> {
                     return; // rejected by the infer pass
                 };
                 let (fields, block_reason) = match ty.as_ref().and_then(|te| self.named_type(te)) {
-                    Some(info) => match &info.kind {
+                    Some((info, instance)) => match &info.kind {
                         TypeKind::Record { fields, .. } => {
-                            if brass_typesys::default_constructible(self.program, &info.type_ref())
-                            {
+                            if brass_typesys::default_constructible(self.program, &instance) {
                                 (
                                     Some(fields.iter().map(|f| f.name.clone()).collect()),
                                     String::new(),
@@ -683,6 +694,7 @@ impl<'p, 'e> Walker<'p, 'e> {
                 frame.extend(params.iter().map(|param| (param.name.clone(), None)));
                 let mut nested = Walker {
                     program: self.program,
+                    module: self.module,
                     self_info: self.self_info,
                     tracked: Vec::new(),
                     scopes: vec![frame],
