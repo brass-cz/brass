@@ -20,7 +20,7 @@ fn sorted(mut v: Vec<(String, Span)>) -> Vec<(String, Span)> {
 }
 
 fn full_analysis(src: &str) -> FullAnalysis {
-    DocAnalyzer::new(path()).analyze_full(src).unwrap()
+    DocAnalyzer::new(path()).analyze_full(src)
 }
 
 fn position(src: &str, needle: &str, last: bool) -> (Document, Position) {
@@ -79,6 +79,62 @@ fn whitespace_edit_preserves_diagnostics() {
     );
     // The incremental result matches a fresh from-scratch check.
     assert_eq!(sorted(d2), sorted(DocAnalyzer::new(path()).diagnostics(v2)));
+}
+
+/// An import rename can change an unchanged function body's meaning, so import
+/// fingerprints must prevent its old per-item diagnostic from being carried.
+#[test]
+fn incremental_rechecks_unchanged_items_after_import_change() {
+    let root = std::env::temp_dir().join(format!(
+        "brass_lsp_import_fingerprint_test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("create import test directory");
+    std::fs::write(
+        root.join("values.cz"),
+        "fun number() -> int32 { return 1 }\nfun text() -> string { return \"ok\" }\n",
+    )
+    .expect("write imported module");
+    let main = root.join("main.cz");
+    let body = "fun main() {\n    let value: string = chosen()\n}\n";
+    let v1 = format!("import values.{{ number as chosen }}\n{body}");
+    let v2 = format!("import values.{{ text as chosen }}\n{body}");
+    let mut analyzer = DocAnalyzer::new(main);
+    assert!(!analyzer.diagnostics(&v1).is_empty());
+    assert!(
+        analyzer.diagnostics(&v2).is_empty(),
+        "the new import returns the declared string type"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Dependency contents are analysis context even when the active buffer and
+/// all of its item hashes are byte-identical.
+#[test]
+fn incremental_rechecks_unchanged_items_after_dependency_change() {
+    let root = std::env::temp_dir().join(format!(
+        "brass_lsp_context_fingerprint_test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("create dependency test directory");
+    let dependency = root.join("values.cz");
+    std::fs::write(&dependency, "fun selected() -> int32 { return 1 }\n")
+        .expect("write first dependency version");
+    let src = concat!(
+        "import values.{ selected }\n",
+        "fun main() {\n",
+        "    let value: string = selected()\n",
+        "}\n",
+    );
+    let mut analyzer = DocAnalyzer::new(root.join("main.cz"));
+    assert!(!analyzer.diagnostics(src).is_empty());
+    std::fs::write(dependency, "fun selected() -> string { return \"ok\" }\n")
+        .expect("write second dependency version");
+    assert!(
+        analyzer.diagnostics(src).is_empty(),
+        "the dependency's new return type must clear the cached error"
+    );
+    let _ = std::fs::remove_dir_all(root);
 }
 
 fn hover_text(h: &tower_lsp_server::ls_types::Hover) -> String {
@@ -585,6 +641,37 @@ fn hover_method_call_shows_method_signature() {
     );
 }
 
+/// A member used as an argument is not the containing call's callee, so that
+/// outer call's return type must not specialize the member hover signature.
+#[test]
+fn hover_member_reference_ignores_containing_call_inference() {
+    let src = concat!(
+        "type Box = {\n",
+        "}\n",
+        "fun Box.pick(self, value) {\n",
+        "    return value\n",
+        "}\n",
+        "fun Box.make(value) {\n",
+        "    return value\n",
+        "}\n",
+        "fun consume(callback) -> string {\n",
+        "    return \"done\"\n",
+        "}\n",
+        "fun main() {\n",
+        "    let box = Box { }\n",
+        "    consume(box.pick)\n",
+        "    consume(Box.make)\n",
+        "}\n",
+    );
+    let full = full_analysis(src);
+    for needle in ["pick)", "make)"] {
+        let (doc, pos) = position(src, needle, false);
+        let text = hover_text(&hover::hover(&doc, &full, pos).expect("member hover"));
+        assert!(text.contains("fun "), "{needle}: {text}");
+        assert!(!text.contains("-> string"), "{needle}: {text}");
+    }
+}
+
 /// A method with unannotated parameters (`HashMap.set(self, key, value)`) shows
 /// the concrete parameter types at the call site -- resolved from the receiver's
 /// key/value via the call arguments -- rather than bare `unknown_N`.
@@ -839,6 +926,64 @@ fn definition_jumps_to_local_binding() {
     assert_eq!(loc.range.start.line, 1, "binding is on line 1");
 }
 
+/// Bindings in a completed sibling block or closure do not shadow the outer
+/// binding at a later use.
+#[test]
+fn definition_ignores_bindings_from_closed_scopes() {
+    let src = concat!(
+        "fun main() {\n",
+        "    let target = 1\n",
+        "    if true {\n",
+        "        let target = 2\n",
+        "        println(target)\n",
+        "    }\n",
+        "    let callback = (target) -> target\n",
+        "    println(target)\n",
+        "}\n",
+    );
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "target)", true);
+    let loc = definition::definition(&doc, &full, pos).expect("outer target definition");
+    assert_eq!(loc.range.start.line, 1);
+}
+
+/// Same-named bindings in match arms resolve only within their own arm.
+#[test]
+fn definition_resolves_binding_in_the_active_match_arm() {
+    let src = concat!(
+        "type Value = | Number { value: int32 } | Text { value: string }\n",
+        "fun show(input: Value) {\n",
+        "    match input {\n",
+        "        Number { value } => println(value)\n",
+        "        Text { value } => println(value)\n",
+        "    }\n",
+        "}\n",
+    );
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "value)", true);
+    let loc = definition::definition(&doc, &full, pos).expect("second arm binding");
+    assert_eq!(loc.range.start.line, 4);
+}
+
+/// Parameter hover borrows type evidence only from uses resolving to that
+/// parameter, not from a same-named binding in a nested block.
+#[test]
+fn hover_parameter_type_uses_its_lexical_binding() {
+    let src = concat!(
+        "fun show(value: string) {\n",
+        "    if true {\n",
+        "        let value = 1\n",
+        "        println(value)\n",
+        "    }\n",
+        "    println(value)\n",
+        "}\n",
+    );
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "value: string", false);
+    let text = hover_text(&hover::hover(&doc, &full, pos).expect("parameter hover"));
+    assert!(text.contains("value: string"), "{text}");
+}
+
 /// Semantic tokens classify the leading `fun` as a keyword and produce output.
 #[test]
 fn semantic_tokens_classify_keyword() {
@@ -877,6 +1022,95 @@ fn completion_offers_types_and_functions() {
     );
 }
 
+/// Type aliases participate in ordinary symbol completion and retain their
+/// own definition target instead of disappearing behind the nominal base.
+#[test]
+fn type_alias_completes_and_navigates_to_its_declaration() {
+    let src = concat!(
+        "type Counts = HashMap { key: string, value: int64 }\n",
+        "fun main() {\n",
+        "    let map: Counts = Counts.new()\n",
+        "    Cou\n",
+        "}\n",
+    );
+    let analyzer = DocAnalyzer::new(path());
+    let doc = Document::new(src.to_string(), 1);
+    let off = src.find("Cou\n").expect("completion probe") + 3;
+    let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(off));
+    assert!(labels(&items).contains(&"Counts".to_string()));
+
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "Counts =", true);
+    let location = definition::definition(&doc, &full, pos).expect("alias definition");
+    assert_eq!(location.range.start.line, 0);
+}
+
+/// A nominal refinement alias exposes the static methods of its target while
+/// keeping the alias's pinned substitution for signature details.
+#[test]
+fn completion_offers_static_members_after_type_alias() {
+    let src = concat!(
+        "type Counts = HashMap { key: string, value: int64 }\n",
+        "fun main() {\n",
+        "    Counts.\n",
+        "}\n",
+    );
+    let analyzer = DocAnalyzer::new(path());
+    let doc = Document::new(src.to_string(), 1);
+    let off = src.find("Counts.\n").expect("alias member probe") + "Counts.".len();
+    let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(off));
+    let labels = labels(&items);
+    assert!(labels.contains(&"new".to_string()), "{labels:?}");
+    assert!(
+        !labels.contains(&"get".to_string()),
+        "instance method: {labels:?}"
+    );
+}
+
+/// Export completion lists aliases, and a renamed import uses the local alias
+/// for ordinary completion while definition navigation reaches the remote span.
+#[test]
+fn imported_type_alias_completes_with_rename_and_definition() {
+    let root = std::env::temp_dir().join(format!(
+        "brass_lsp_alias_completion_test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("create alias module directory");
+    std::fs::write(
+        root.join("aliases.cz"),
+        "type Counts = HashMap { key: string, value: int64 }\n",
+    )
+    .expect("write alias module");
+    let main = root.join("main.cz");
+    let analyzer = DocAnalyzer::new(main.clone());
+
+    let import_src = "import aliases.{ ";
+    let doc = Document::new(import_src.to_string(), 1);
+    let exports = completion::completion(&doc, &analyzer, &main, doc.position_at(import_src.len()));
+    assert!(labels(&exports).contains(&"Counts".to_string()));
+
+    let src = concat!(
+        "import aliases.{ Counts as Totals }\n",
+        "fun main() {\n",
+        "    let map: Totals\n",
+        "    Tot\n",
+        "}\n",
+    );
+    let doc = Document::new(src.to_string(), 1);
+    let off = src.find("Tot\n").expect("renamed completion probe") + 3;
+    let items = completion::completion(&doc, &analyzer, &main, doc.position_at(off));
+    let visible = labels(&items);
+    assert!(visible.contains(&"Totals".to_string()), "{visible:?}");
+    assert!(!visible.contains(&"Counts".to_string()), "{visible:?}");
+
+    let full = analyzer.analyze_full(src);
+    let (doc, pos) = position(src, "Totals", false);
+    let location = definition::definition(&doc, &full, pos).expect("remote alias definition");
+    assert!(location.uri.as_str().ends_with("/aliases.cz"));
+    assert_eq!(location.range.start.line, 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// A native plugin module surfaces through the LSP like a `.cz` module:
 /// hover on an imported plugin function shows its annotated signature and the
 /// Rust doc comment, and the import brace list offers the dylib's exposed
@@ -898,9 +1132,7 @@ fn plugin_functions_hover_and_complete() {
     // Hover carries the synthesized signature and the plugin's Rust doc.
     let src =
         "import plugins.mathx.{ add }\nfun main() {\n    let v = add(1, 2)\n    println(v)\n}\n";
-    let full = DocAnalyzer::new(main.clone())
-        .analyze_full(src)
-        .expect("analyze a program importing a plugin");
+    let full = DocAnalyzer::new(main.clone()).analyze_full(src);
     let (doc, pos) = position(src, "add(1", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the plugin function"));
     assert!(
@@ -1201,6 +1433,39 @@ fn completion_offers_array_members() {
     assert!(
         !labels.contains(&"abs".to_string()),
         "no free functions as members: {labels:?}"
+    );
+}
+
+/// Literal endings are valid receiver boundaries; the probe analysis, not a
+/// byte whitelist, decides whether their member access parses and types.
+#[test]
+fn completion_accepts_string_and_record_literal_receivers() {
+    let string_src = "fun main() {\n    \"a,b\".\n}\n";
+    let analyzer = DocAnalyzer::new(path());
+    let doc = Document::new(string_src.to_string(), 1);
+    let off = string_src.find("\".\n").expect("string receiver") + 2;
+    let string_items = completion::completion(&doc, &analyzer, &path(), doc.position_at(off));
+    let string_labels = labels(&string_items);
+    assert!(
+        string_labels.contains(&"split".to_string()),
+        "{string_labels:?}"
+    );
+
+    let record_src = concat!(
+        "type Point = {\n",
+        "    x: int32\n",
+        "}\n",
+        "fun main() {\n",
+        "    let x = Point { x: 1 }.\n",
+        "}\n",
+    );
+    let doc = Document::new(record_src.to_string(), 1);
+    let off = record_src.find("}.\n").expect("record receiver") + 2;
+    let record_items = completion::completion(&doc, &analyzer, &path(), doc.position_at(off));
+    let record_labels = labels(&record_items);
+    assert!(
+        record_labels.contains(&"x".to_string()),
+        "{record_labels:?}"
     );
 }
 
@@ -1721,9 +1986,7 @@ fn syntax_errors_are_all_reported_at_their_tokens() {
 #[test]
 fn hover_survives_a_syntax_error_elsewhere() {
     let src = "fun ok(a: int32) -> int32 {\n    return a\n}\nfun broken() {\n    let x = )\n}\n";
-    let analysis = DocAnalyzer::new(path())
-        .analyze_full(src)
-        .expect("recovered AST should still analyze");
+    let analysis = DocAnalyzer::new(path()).analyze_full(src);
     let (doc, pos) = position(src, "ok", false);
     let h = hover::hover(&doc, &analysis, pos);
     assert!(

@@ -60,6 +60,12 @@ pub struct Item {
 #[derive(Clone, Default)]
 pub struct ItemCache {
     pub items: Vec<Item>,
+    /// Hash of the active module's import declarations. Imports live outside
+    /// top-level item spans, so item hashes alone cannot notice their edits.
+    pub import_fingerprint: u64,
+    /// Hash of every source that supplies the active module's analysis
+    /// context. A dependency edit can change an unchanged item's meaning.
+    pub context_fingerprint: u64,
 }
 
 /// Split a parsed module into items, hashing each from `main_src` (the document
@@ -198,7 +204,12 @@ pub struct Diff {
 pub type Carry = (usize, i64, Vec<Diag>);
 
 /// Compute the incremental diff between `prev` (last cache) and `new_items`.
-pub fn diff(prev: &ItemCache, new_items: &[Item]) -> Diff {
+pub fn diff(
+    prev: &ItemCache,
+    new_items: &[Item],
+    import_fingerprint: u64,
+    context_fingerprint: u64,
+) -> Diff {
     let new_by_name = index_by_name(new_items);
     let names_unique = new_by_name.len() == new_items.len();
     let prev_by_name = index_by_name(&prev.items);
@@ -208,7 +219,11 @@ pub fn diff(prev: &ItemCache, new_items: &[Item]) -> Diff {
         && new_by_name.len() == prev_by_name.len()
         && new_by_name.keys().all(|k| prev_by_name.contains_key(k));
 
-    if prev.items.is_empty() || !same_name_set {
+    if prev.items.is_empty()
+        || !same_name_set
+        || prev.import_fingerprint != import_fingerprint
+        || prev.context_fingerprint != context_fingerprint
+    {
         // From-scratch check: everything is affected, the reduced set is all.
         let all: HashSet<usize> = (0..new_items.len()).collect();
         return Diff {
@@ -219,32 +234,33 @@ pub fn diff(prev: &ItemCache, new_items: &[Item]) -> Diff {
         };
     }
 
-    // Changed = source hash differs from the same-named previous item. Collect the
-    // names those changed items *define* (an item's own name, or the globals of a
-    // changed `<init>`), so a user of a changed global is re-checked too.
-    let mut changed_names: HashSet<&str> = HashSet::default();
-    let mut changed_defs: HashSet<&str> = HashSet::default();
+    // Changed = source hash differs from the same-named previous item. Seed
+    // reverse invalidation with both versions' definitions: a changed `<init>`
+    // may have removed or renamed a global that its unchanged users still name.
+    let mut affected: HashSet<usize> = HashSet::default();
+    let mut changed_defs: HashSet<String> = HashSet::default();
     for (name, &i) in &new_by_name {
         let pi = prev_by_name[name];
         if new_items[i].hash != prev.items[pi].hash {
-            changed_names.insert(name);
-            for d in &new_items[i].defines {
-                changed_defs.insert(d);
-            }
+            affected.insert(i);
+            changed_defs.extend(prev.items[pi].defines.iter().cloned());
+            changed_defs.extend(new_items[i].defines.iter().cloned());
         }
     }
 
-    // Affected = changed items plus every item that references a name *defined* by a
-    // changed item.
-    let mut affected: HashSet<usize> = HashSet::default();
-    for (name, &i) in &new_by_name {
-        let is_changed = changed_names.contains(name.as_str());
-        let uses_changed = new_items[i]
-            .refs
-            .iter()
-            .any(|r| changed_defs.contains(r.as_str()));
-        if is_changed || uses_changed {
-            affected.insert(i);
+    // Follow reverse dependencies to closure. When a user becomes affected,
+    // its own definitions become invalidation seeds so users of that item are
+    // refreshed transitively rather than only one level deep.
+    let mut work: Vec<String> = changed_defs.iter().cloned().collect();
+    while let Some(definition) = work.pop() {
+        for (i, item) in new_items.iter().enumerate() {
+            if item.refs.contains(&definition) && affected.insert(i) {
+                for defined in &item.defines {
+                    if changed_defs.insert(defined.clone()) {
+                        work.push(defined.clone());
+                    }
+                }
+            }
         }
     }
 
@@ -328,7 +344,7 @@ fn refs_type_decl(t: &TypeDecl, out: &mut HashSet<String>) {
         out.insert(i.clone());
     }
     let members = match &t.body {
-        TypeBody::Record(members) => members.clone(),
+        TypeBody::Record(members) => members,
         TypeBody::Sum(variants) => {
             for v in variants {
                 for m in &v.members {
@@ -342,7 +358,7 @@ fn refs_type_decl(t: &TypeDecl, out: &mut HashSet<String>) {
             return;
         }
     };
-    for m in &members {
+    for m in members {
         refs_member(m, out);
     }
 }
@@ -560,6 +576,15 @@ mod tests {
         split(&parse(src).expect("parse"), src, 0)
     }
 
+    fn unchanged_context_diff(prev: &ItemCache, new_items: &[Item]) -> Diff {
+        diff(
+            prev,
+            new_items,
+            prev.import_fingerprint,
+            prev.context_fingerprint,
+        )
+    }
+
     /// Editing a function that references a module-level global must pull the
     /// `<init>` item (which declares the global) into the reduced re-check set, so
     /// the function is not re-checked with the global out of scope -- which used to
@@ -570,9 +595,10 @@ mod tests {
         let v2 = "const LIMIT = 100\nfun use_it() {\n    return LIMIT + 0\n}\n";
         let prev = ItemCache {
             items: items_of(v1),
+            ..ItemCache::default()
         };
         let new_items = items_of(v2);
-        let d = diff(&prev, &new_items);
+        let d = unchanged_context_diff(&prev, &new_items);
         assert!(
             !d.full,
             "a single-body edit is incremental, not from-scratch"
@@ -595,9 +621,10 @@ mod tests {
         let v2 = "const LIMIT = 200\nfun use_it() {\n    return LIMIT\n}\n";
         let prev = ItemCache {
             items: items_of(v1),
+            ..ItemCache::default()
         };
         let new_items = items_of(v2);
-        let d = diff(&prev, &new_items);
+        let d = unchanged_context_diff(&prev, &new_items);
         let use_idx = new_items
             .iter()
             .position(|it| it.name == "use_it")
@@ -606,5 +633,65 @@ mod tests {
             d.affected.contains(&use_idx),
             "a user of the changed global must be re-checked"
         );
+    }
+
+    /// Reverse invalidation must reach users of users, because their cached
+    /// diagnostics can depend on a changed definition through the call chain.
+    #[test]
+    fn changed_definition_affects_transitive_users() {
+        let v1 = concat!(
+            "fun source() { return 1 }\n",
+            "fun middle() { return source() }\n",
+            "fun outer() { return middle() }\n",
+        );
+        let v2 = concat!(
+            "fun source() { return \"changed\" }\n",
+            "fun middle() { return source() }\n",
+            "fun outer() { return middle() }\n",
+        );
+        let prev = ItemCache {
+            items: items_of(v1),
+            ..ItemCache::default()
+        };
+        let new_items = items_of(v2);
+        let d = unchanged_context_diff(&prev, &new_items);
+        let outer = new_items
+            .iter()
+            .position(|item| item.name == "outer")
+            .expect("outer item");
+        assert!(d.affected.contains(&outer));
+    }
+
+    /// The old definition set seeds invalidation so removing a global still
+    /// refreshes unchanged code that refers to its former name.
+    #[test]
+    fn removed_global_affects_its_users() {
+        let v1 = "const OLD = 1\nfun use_it() { return OLD }\n";
+        let v2 = "const NEW = 1\nfun use_it() { return OLD }\n";
+        let prev = ItemCache {
+            items: items_of(v1),
+            ..ItemCache::default()
+        };
+        let new_items = items_of(v2);
+        let d = unchanged_context_diff(&prev, &new_items);
+        let user = new_items
+            .iter()
+            .position(|item| item.name == "use_it")
+            .expect("use_it item");
+        assert!(d.affected.contains(&user));
+    }
+
+    /// Imports and dependency sources are not covered by item hashes, so a
+    /// fingerprint change must reject every carried diagnostic.
+    #[test]
+    fn changed_external_fingerprint_forces_full_diff() {
+        let src = "fun stable() { return imported() }\n";
+        let prev = ItemCache {
+            items: items_of(src),
+            import_fingerprint: 10,
+            context_fingerprint: 20,
+        };
+        assert!(diff(&prev, &items_of(src), 11, 20).full);
+        assert!(diff(&prev, &items_of(src), 10, 21).full);
     }
 }

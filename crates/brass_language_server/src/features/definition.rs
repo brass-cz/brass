@@ -7,8 +7,6 @@
 //! symbol tables so a local shadowing a function jumps to the local.
 
 use brass_hir::Type;
-use brass_parser::Span;
-use brass_parser::ast::{Block, Expr, FieldPat, Pattern, Stmt, StrSeg};
 use tower_lsp_server::ls_types::{Location, Position};
 
 use crate::analysis::FullAnalysis;
@@ -33,14 +31,17 @@ pub fn definition(doc: &Document, full: &FullAnalysis, pos: Position) -> Option<
     let (name, _) = nav::ident_at(&doc.text, local)?;
 
     // A local binding in the enclosing function shadows everything else.
-    if let Some(span) = local_binding(full, global, &name) {
-        return nav::locate(full, span);
+    if let Some(binding) = nav::local_binding(&full.main_ast, global, &name) {
+        return nav::locate(full, binding.span);
     }
     if let Some(f) = full.program.resolve_function(&module, &name) {
         return nav::locate(full, f.signature.span);
     }
     if let Some(t) = full.program.resolve_type(&module, &name) {
         return nav::locate(full, t.span);
+    }
+    if let Some(alias) = full.program.resolve_type_alias(&module, &name) {
+        return nav::locate(full, alias.span);
     }
     None
 }
@@ -113,148 +114,5 @@ fn has_field(info: &brass_hir::TypeInfo, name: &str) -> bool {
         brass_hir::TypeKind::Sum { variants } => variants
             .iter()
             .any(|v| v.fields.iter().any(|f| f.name == name)),
-    }
-}
-
-/// Find the nearest binding of `name` visible at `global_off` within the
-/// enclosing function. Approximates lexical scope by the nearest preceding
-/// binding in the function, which is correct in the absence of inner-block
-/// shadowing after the use.
-fn local_binding(full: &FullAnalysis, global_off: usize, name: &str) -> Option<Span> {
-    let (params, body) = nav::enclosing(&full.main_ast, global_off)?;
-    let mut found: Option<Span> = None;
-    let mut consider = |bname: &str, span: Span| {
-        if bname == name && span.lo <= global_off && found.map(|f| span.lo > f.lo).unwrap_or(true) {
-            found = Some(span);
-        }
-    };
-    for p in params {
-        consider(&p.name, p.span);
-    }
-    collect_block_bindings(body, &mut consider);
-    found
-}
-
-/// Walk a block collecting every binding it introduces (let patterns, for-loop
-/// variables, closure parameters), invoking `f(name, span)` for each.
-fn collect_block_bindings(block: &Block, f: &mut impl FnMut(&str, Span)) {
-    for s in &block.stmts {
-        collect_stmt_bindings(s, f);
-    }
-}
-
-fn collect_stmt_bindings(s: &Stmt, f: &mut impl FnMut(&str, Span)) {
-    match s {
-        Stmt::Let { pat, value, .. } => {
-            collect_pattern_bindings(pat, f);
-            if let Some(value) = value {
-                collect_expr_bindings(value, f);
-            }
-        }
-        Stmt::Assign { value, .. } => collect_expr_bindings(value, f),
-        Stmt::Expr(e) => collect_expr_bindings(e, f),
-        Stmt::While { body, .. } => collect_block_bindings(body, f),
-        Stmt::For {
-            pat,
-            iter,
-            body,
-            span,
-        } => {
-            // A loop variable has no standalone span; attribute every name the
-            // pattern binds to the loop header so they precede uses in the body.
-            for n in pat.bound_names() {
-                f(n, Span::new(span.lo, span.lo));
-            }
-            collect_expr_bindings(iter, f);
-            collect_block_bindings(body, f);
-        }
-        Stmt::Return(Some(e), _) => collect_expr_bindings(e, f),
-        Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => {}
-    }
-}
-
-fn collect_pattern_bindings(p: &Pattern, f: &mut impl FnMut(&str, Span)) {
-    match p {
-        Pattern::Binding(name, span) => f(name, *span),
-        Pattern::Record(_, fields, _) => {
-            for FieldPat { name, pat, span } in fields {
-                match pat {
-                    Some(p) => collect_pattern_bindings(p, f),
-                    None => f(name, *span),
-                }
-            }
-        }
-        Pattern::Array(pats, _) => {
-            for p in pats {
-                collect_pattern_bindings(p, f);
-            }
-        }
-        Pattern::Wildcard(_) | Pattern::Literal(_, _) => {}
-    }
-}
-
-/// Closures introduce bindings too; recurse into expressions to reach them.
-fn collect_expr_bindings(e: &Expr, f: &mut impl FnMut(&str, Span)) {
-    match e {
-        Expr::Closure(params, body, _) => {
-            for p in params {
-                f(&p.name, p.span);
-            }
-            collect_expr_bindings(body, f);
-        }
-        Expr::Block(b, _) => collect_block_bindings(b, f),
-        Expr::Unary(_, e, _) | Expr::ErrorProp(e, _) => collect_expr_bindings(e, f),
-        Expr::Binary(_, a, b, _) | Expr::Index(a, b, _) => {
-            collect_expr_bindings(a, f);
-            collect_expr_bindings(b, f);
-        }
-        Expr::Call(callee, args, _) => {
-            collect_expr_bindings(callee, f);
-            for arg in args {
-                collect_expr_bindings(&arg.expr, f);
-            }
-        }
-        Expr::Field(recv, _, _) => collect_expr_bindings(recv, f),
-        Expr::Array(elems, _) => {
-            for e in elems {
-                collect_expr_bindings(e, f);
-            }
-        }
-        Expr::Str(segs, _) => {
-            for seg in segs {
-                if let StrSeg::Expr(e) = seg {
-                    collect_expr_bindings(e, f);
-                }
-            }
-        }
-        Expr::If(cond, then, els, _) => {
-            collect_expr_bindings(cond, f);
-            collect_block_bindings(then, f);
-            if let Some(e) = els {
-                collect_expr_bindings(e, f);
-            }
-        }
-        Expr::IfLet(pat, scrut, then, els, _) => {
-            collect_pattern_bindings(pat, f);
-            collect_expr_bindings(scrut, f);
-            collect_block_bindings(then, f);
-            if let Some(e) = els {
-                collect_expr_bindings(e, f);
-            }
-        }
-        Expr::Match(scrut, arms, _) => {
-            collect_expr_bindings(scrut, f);
-            for arm in arms {
-                collect_pattern_bindings(&arm.pattern, f);
-                collect_expr_bindings(&arm.body, f);
-            }
-        }
-        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => {
-            for (_, v) in fields {
-                collect_expr_bindings(v, f);
-            }
-        }
-        Expr::TypeTest(subject, _, _) => collect_expr_bindings(subject, f),
-        _ => {}
     }
 }

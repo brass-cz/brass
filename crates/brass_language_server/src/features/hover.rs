@@ -43,7 +43,7 @@ pub fn hover(doc: &Document, full: &FullAnalysis, pos: Position) -> Option<Hover
     // The cursor on a method name in `recv.method(...)` shows the *method's* type
     // (its signature), not the call's result type. (A method called through UFCS is
     // a free function and is handled by the `resolve_function` path below.)
-    if let Some(h) = method_hover(doc, full, local, global) {
+    if let Some(h) = method_hover(doc, full, local) {
         return Some(h);
     }
 
@@ -61,7 +61,7 @@ pub fn hover(doc: &Document, full: &FullAnalysis, pos: Position) -> Option<Hover
     // `method_hover` finds no receiver expression there and the position used to
     // fall through to the enclosing call -- showing the call's RESULT type
     // instead of the method's own signature.
-    if let Some(h) = type_method_hover(doc, full, local, global) {
+    if let Some(h) = type_method_hover(doc, full, local) {
         return Some(h);
     }
 
@@ -152,22 +152,7 @@ fn resolve_type_alias<'a>(
     module: &[String],
     name: &str,
 ) -> Option<&'a brass_hir::TypeAlias> {
-    brass_hir::resolve_qualified(
-        &full.program.type_aliases,
-        &full.program.import_origins,
-        &full.program.import_renames,
-        module,
-        name,
-        |alias| {
-            brass_hir::definition_is_visible(
-                &full.program.import_origins,
-                &full.program.prelude_modules,
-                module,
-                name,
-                &alias.module,
-            )
-        },
-    )
+    full.program.resolve_type_alias(module, name)
 }
 
 /// Hover for a type-alias name. An alias of a nominal record (usually a
@@ -289,7 +274,7 @@ fn value_hover(full: &FullAnalysis, name: &str, ty: &Type, range: Option<Range>)
 /// general hover paths. The return slot is filled from the enclosing call's
 /// inferred result type when present, so an unannotated method return shows its
 /// concrete type rather than a bare `unknown_N`.
-fn method_hover(doc: &Document, full: &FullAnalysis, local: usize, global: usize) -> Option<Hover> {
+fn method_hover(doc: &Document, full: &FullAnalysis, local: usize) -> Option<Hover> {
     let (name, span) = nav::ident_at(&doc.text, local)?;
     // A member access: a `.` immediately before the name. The receiver expression
     // ends exactly at that `.`.
@@ -303,7 +288,8 @@ fn method_hover(doc: &Document, full: &FullAnalysis, local: usize, global: usize
     // receiver is the call's first argument, aligned with `self`, so `map.get(1)`
     // can pin a parameter the scheme leaves open (a key compared with `==` does
     // not unify onto the scheme's parameter).
-    let (call_span, ret) = enclosing_call(full, global)
+    let member_span = Span::new(full.main_base + span.lo, full.main_base + span.hi);
+    let (call_span, ret) = callee_call(full, member_span)
         .map(|e| (Some(e.span), Some(e.ty.clone())))
         .unwrap_or((None, None));
     let call_args = call_span.and_then(|s| nav::call_args_at_span(full, s));
@@ -358,12 +344,7 @@ fn method_decl_hover(
 /// parenthesized receiver is a value, already served by [`method_hover`]. An
 /// alias receiver resolves methods against the concrete instance the alias
 /// names, so its pinned slot types show in the parameters and return.
-fn type_method_hover(
-    doc: &Document,
-    full: &FullAnalysis,
-    local: usize,
-    global: usize,
-) -> Option<Hover> {
+fn type_method_hover(doc: &Document, full: &FullAnalysis, local: usize) -> Option<Hover> {
     let (name, span) = nav::ident_at(&doc.text, local)?;
     let bytes = doc.text.as_bytes();
     if span.lo == 0 || bytes.get(span.lo - 1) != Some(&b'.') {
@@ -393,7 +374,8 @@ fn type_method_hover(
     // Specialize from the enclosing call when the cursor sits in one: its
     // inferred result fills a return the scheme leaves open (a constructor's
     // `new()` shows the instance it builds here).
-    let (call_span, ret) = enclosing_call(full, global)
+    let member_span = Span::new(full.main_base + span.lo, full.main_base + span.hi);
+    let (call_span, ret) = callee_call(full, member_span)
         .map(|e| (Some(e.span), Some(e.ty.clone())))
         .unwrap_or((None, None));
     let call_args = call_span.and_then(|s| nav::call_args_at_span(full, s));
@@ -812,15 +794,28 @@ fn primitive_method<'a>(
     full.program.functions.get(symbol).map(|f| &f.signature)
 }
 
-/// The innermost call expression covering `global` (the method call the cursor
-/// sits in): its span locates the call's arguments and its type is the method's
-/// inferred return.
-fn enclosing_call(full: &FullAnalysis, global: usize) -> Option<&brass_hir::TypedExpr> {
+/// The typed call whose AST callee is the member ending at `member_span`.
+/// Merely containing the cursor is insufficient: `take(value.method)` contains
+/// the member but its return and arguments belong to `take`, not `method`.
+fn callee_call(full: &FullAnalysis, member_span: Span) -> Option<&brass_hir::TypedExpr> {
+    let mut call_span = None;
+    let mut visit = |expr: &brass_parser::ast::Expr| {
+        if let brass_parser::ast::Expr::Call(callee, _, span) = expr {
+            let callee_span = callee.span();
+            if callee_span.hi == member_span.hi
+                && callee_span.lo <= member_span.lo
+                && call_span.is_none_or(|current: Span| span.hi - span.lo < current.hi - current.lo)
+            {
+                call_span = Some(*span);
+            }
+        }
+    };
+    nav::walk_exprs(&full.main_ast, &mut visit);
+    let call_span = call_span?;
     full.typed
         .expressions
         .iter()
-        .filter(|e| matches!(e.kind, TypedExprKind::Call) && nav::contains(e.span, global))
-        .min_by_key(|e| e.span.hi - e.span.lo)
+        .find(|expr| expr.span == call_span && matches!(expr.kind, TypedExprKind::Call))
 }
 
 /// Hover for a free function: its generic signature plus, when the cursor is on

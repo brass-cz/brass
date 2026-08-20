@@ -4,8 +4,8 @@
 //! every token is classified from its kind, and identifiers are refined with a
 //! small amount of syntactic context (the previous and next significant token)
 //! plus the set of declared type and function names gathered from a best-effort
-//! parse of the document. Line comments -- which the lexer discards -- are
-//! recovered by a direct scan so they highlight too.
+//! parse of the document. Comments -- which the lexer discards -- are recovered
+//! by a lexer-equivalent scan so they highlight too.
 
 use fxhash::FxHashSet as HashSet;
 
@@ -76,6 +76,7 @@ pub fn tokens(text: &str) -> Vec<SemanticToken> {
     };
     let names = DeclaredNames::collect(text);
     let line_starts = line_starts(text);
+    let comments = comment_spans(text);
 
     // Absolute tokens (line, start char in UTF-16, length, type, modifiers),
     // gathered then delta-encoded.
@@ -102,12 +103,16 @@ pub fn tokens(text: &str) -> Vec<SemanticToken> {
         let next = sig.get(sig_pos + 1).map(|&j| &toks[j].kind);
 
         if let Some((ty, modifiers)) = classify(&tok.kind, prev, next, &names) {
-            push_span(&mut out, text, &line_starts, tok.span, ty, modifiers);
+            if ty == T_STRING {
+                push_span_excluding(&mut out, text, &line_starts, tok.span, &comments);
+            } else {
+                push_span(&mut out, text, &line_starts, tok.span, ty, modifiers);
+            }
         }
     }
 
-    // Line comments, recovered separately since the lexer drops them.
-    for span in comment_spans(text) {
+    // Comments are recovered separately since the lexer drops them.
+    for span in comments {
         push_span(&mut out, text, &line_starts, span, T_COMMENT, 0);
     }
 
@@ -283,6 +288,12 @@ fn push_span(
             .find('\n')
             .map(|n| seg_start + n)
             .unwrap_or(seg_end);
+        let content_end =
+            if content_end > seg_start && text.as_bytes().get(content_end - 1) == Some(&b'\r') {
+                content_end - 1
+            } else {
+                content_end
+            };
         if content_end > seg_start {
             let line_start = line_starts[line];
             let start = utf16_len(&text[line_start..seg_start]);
@@ -297,6 +308,45 @@ fn push_span(
         }
         seg_start = seg_end;
         line += 1;
+    }
+}
+
+/// Push the portions of `span` not occupied by recovered comments. String
+/// tokens cover their interpolation source as one lexer token, so carving out
+/// interpolation comments prevents overlapping semantic tokens.
+fn push_span_excluding(
+    out: &mut Vec<Abs>,
+    text: &str,
+    line_starts: &[usize],
+    span: Span,
+    excluded: &[Span],
+) {
+    let mut start = span.lo;
+    for exclusion in excluded
+        .iter()
+        .filter(|exclusion| exclusion.lo < span.hi && exclusion.hi > span.lo)
+    {
+        if exclusion.lo > start {
+            push_span(
+                out,
+                text,
+                line_starts,
+                Span::new(start, exclusion.lo.min(span.hi)),
+                T_STRING,
+                0,
+            );
+        }
+        start = start.max(exclusion.hi);
+    }
+    if start < span.hi {
+        push_span(
+            out,
+            text,
+            line_starts,
+            Span::new(start, span.hi),
+            T_STRING,
+            0,
+        );
     }
 }
 
@@ -325,40 +375,84 @@ fn encode(abs: Vec<Abs>) -> Vec<SemanticToken> {
     out
 }
 
-/// Byte offsets of every `//` line comment, to its line end. Tracks string
-/// state coarsely so a `//` inside a string literal is not mistaken for a
-/// comment.
+/// Byte offsets of comments in source code and interpolation expressions.
+/// String and interpolation recursion mirrors the lexer so braces, quotes, or
+/// comment markers in any nested state cannot desynchronize the scan.
 fn comment_spans(text: &str) -> Vec<Span> {
-    let bytes = text.as_bytes();
-    let mut spans = Vec::new();
-    let mut i = 0;
-    let mut in_string = false;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_string {
-            match b {
-                b'\\' => i += 1, // skip the escaped byte
-                b'"' => in_string = false,
-                _ => {}
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                let start = i;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
+    let mut scanner = CommentScanner {
+        bytes: text.as_bytes(),
+        spans: Vec::new(),
+    };
+    scanner.scan_code(0, false);
+    scanner.spans
+}
+
+struct CommentScanner<'a> {
+    bytes: &'a [u8],
+    spans: Vec<Span>,
+}
+
+impl CommentScanner<'_> {
+    /// Scan code until EOF or the `}` closing a recursive interpolation/brace.
+    fn scan_code(&mut self, mut i: usize, stop_at_brace: bool) -> usize {
+        while i < self.bytes.len() {
+            match self.bytes[i] {
+                b'"' => i = self.skip_string(i),
+                b'/' if self.bytes.get(i + 1) == Some(&b'/') => {
+                    i = self.line_comment(i);
                 }
-                spans.push(Span::new(start, i));
-                continue;
+                b'#' => i = self.line_comment(i),
+                b'/' if self.bytes.get(i + 1) == Some(&b'*') => {
+                    i = self.block_comment(i);
+                }
+                b'{' if stop_at_brace => i = self.scan_code(i + 1, true),
+                b'}' if stop_at_brace => return i + 1,
+                _ => i += 1,
             }
-            _ => {}
         }
-        i += 1;
+        i
     }
-    spans
+
+    fn skip_string(&mut self, mut i: usize) -> usize {
+        i += 1;
+        while i < self.bytes.len() {
+            match self.bytes[i] {
+                b'\\' => i = (i + 2).min(self.bytes.len()),
+                b'"' => return i + 1,
+                b'{' => i = self.scan_code(i + 1, true),
+                _ => i += 1,
+            }
+        }
+        i
+    }
+
+    fn line_comment(&mut self, mut i: usize) -> usize {
+        let start = i;
+        while i < self.bytes.len() && self.bytes[i] != b'\n' {
+            i += 1;
+        }
+        self.spans.push(Span::new(start, i));
+        i
+    }
+
+    fn block_comment(&mut self, mut i: usize) -> usize {
+        let start = i;
+        i += 2;
+        let mut depth = 1;
+        while i < self.bytes.len() && depth > 0 {
+            if self.bytes[i] == b'/' && self.bytes.get(i + 1) == Some(&b'*') {
+                depth += 1;
+                i += 2;
+            } else if self.bytes[i] == b'*' && self.bytes.get(i + 1) == Some(&b'/') {
+                depth -= 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        self.spans.push(Span::new(start, i.min(self.bytes.len())));
+        i
+    }
 }
 
 fn utf16_len(s: &str) -> u32 {
@@ -373,4 +467,33 @@ fn line_starts(text: &str) -> Vec<usize> {
         }
     }
     starts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crlf_is_not_part_of_multiline_token_lengths() {
+        let lengths: Vec<u32> = tokens("\"a\r\nb\"")
+            .into_iter()
+            .filter(|token| token.token_type == T_STRING)
+            .map(|token| token.length)
+            .collect();
+        assert_eq!(lengths, vec![2, 2]);
+    }
+
+    /// Nested interpolation comments may contain unmatched braces and quotes;
+    /// each remains a comment without hiding the real comment after the string.
+    #[test]
+    fn comments_follow_nested_string_and_interpolation_states() {
+        let src = r#""literal // text { value // }
+            + "nested { inner # }
+            }" /* } */ }" // real"#;
+        let found: Vec<&str> = comment_spans(src)
+            .iter()
+            .map(|span| &src[span.lo..span.hi])
+            .collect();
+        assert_eq!(found, vec!["// }", "# }", "/* } */", "// real"]);
+    }
 }

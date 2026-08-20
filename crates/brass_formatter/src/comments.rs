@@ -100,22 +100,38 @@ fn skip_interpolation(b: &[u8], mut i: usize) -> usize {
                 depth -= 1;
                 i += 1;
             }
-            b'"' => i = skip_nested_string(b, i),
+            // A nested string can itself interpolate, so use the same
+            // recursive string state as the outer literal.
+            b'"' => i = skip_string(b, i),
+            b'/' if b.get(i + 1) == Some(&b'/') => i = skip_line_comment(b, i),
+            b'#' => i = skip_line_comment(b, i),
+            b'/' if b.get(i + 1) == Some(&b'*') => i = skip_block_comment(b, i),
             _ => i += 1,
         }
     }
     i
 }
 
-/// Skip a string nested inside an interpolation (escapes honored, no further
-/// interpolation recursion needed for brace balancing beyond quotes).
-fn skip_nested_string(b: &[u8], mut i: usize) -> usize {
-    i += 1;
-    while i < b.len() {
-        match b[i] {
-            b'\\' => i += 2,
-            b'"' => return i + 1,
-            _ => i += 1,
+fn skip_line_comment(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && b[i] != b'\n' {
+        i += 1;
+    }
+    i
+}
+
+/// Skip one nested block comment using the lexer's nesting rule.
+fn skip_block_comment(b: &[u8], mut i: usize) -> usize {
+    i += 2;
+    let mut depth = 1;
+    while i < b.len() && depth > 0 {
+        if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+            depth += 1;
+            i += 2;
+        } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+            depth -= 1;
+            i += 2;
+        } else {
+            i += 1;
         }
     }
     i
@@ -157,5 +173,17 @@ mod tests {
         let s = spans(src);
         assert_eq!(s.len(), 1);
         assert_eq!(&src[s[0].0..s[0].1], "/* a /* b */ c */");
+    }
+
+    /// Comments and strings nested recursively inside interpolation must not
+    /// consume the real source comment that follows the outer literal.
+    #[test]
+    fn interpolation_comments_do_not_desynchronize_the_scan() {
+        let src = r#"let s = "literal { value // }
+            + "nested { inner # }
+            }" /* } /* { */ */ }" // real
+        let x = 1 /* after */"#;
+        let found: Vec<&str> = spans(src).iter().map(|(lo, hi)| &src[*lo..*hi]).collect();
+        assert_eq!(found, vec!["// real", "/* after */"]);
     }
 }

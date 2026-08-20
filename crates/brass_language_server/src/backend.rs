@@ -11,8 +11,10 @@
 //! errors are the ones worth reporting mid-edit anyway.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use tower_lsp_server::ls_types::{
     CompletionOptions, CompletionParams, CompletionResponse, Diagnostic,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
@@ -40,13 +42,17 @@ use crate::features::{self, semantic_tokens};
 struct DocState {
     document: Document,
     analyzer: DocAnalyzer,
+    /// Identifies one open/close lifetime independently of LSP versions, which
+    /// clients may restart when a document is reopened.
+    generation: u64,
 }
 
 impl DocState {
-    fn new(uri: &Uri, text: String, version: i32) -> Self {
+    fn new(uri: &Uri, text: String, version: i32, generation: u64) -> Self {
         DocState {
             document: Document::new(text, version),
             analyzer: DocAnalyzer::new(uri_to_path(uri)),
+            generation,
         }
     }
 }
@@ -54,6 +60,9 @@ impl DocState {
 pub struct Backend {
     client: Client,
     docs: DashMap<Uri, DocState>,
+    /// Monotonic document-lifetime ids keep stale close/change handlers from
+    /// mutating a later open of the same URI.
+    next_generation: AtomicU64,
     /// Serializes diagnostic notifications. Document analysis remains
     /// concurrent; only publication is ordered so an older check cannot arrive
     /// after a newer version or after the document was closed.
@@ -65,29 +74,31 @@ impl Backend {
         Backend {
             client,
             docs: DashMap::new(),
+            next_generation: AtomicU64::new(1),
             diagnostic_publish: tokio::sync::Mutex::new(()),
         }
     }
 
-    /// Store a document's new text and publish its diagnostics. `check` decides
-    /// whether the full analysis runs or only the parse. The analysis runs under
-    /// the map entry; the entry is dropped before the async publish.
-    async fn refresh(&self, uri: Uri, text: String, version: i32, check: Check) {
-        let diags = {
-            let mut entry = self
-                .docs
-                .entry(uri.clone())
-                .or_insert_with(|| DocState::new(&uri, String::new(), version));
-            entry.document.update(text, version);
-            match check {
-                Check::Full => analyze(&mut entry),
-                Check::SyntaxOnly => {
-                    let raw = entry.analyzer.syntax_diagnostics(&entry.document.text);
-                    features::diagnostics::to_lsp(&raw, &entry.document)
-                }
-            }
+    /// Install a freshly opened document and publish its full diagnostics.
+    async fn open(&self, uri: Uri, text: String, version: i32) {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let Some(diags) = open_document(&self.docs, &uri, text, version, generation, analyze)
+        else {
+            return;
         };
-        self.publish_current(uri, diags, version).await;
+        self.publish_current(uri, diags, version, generation).await;
+    }
+
+    /// Store a document's new text and publish its syntax diagnostics. The
+    /// analysis runs under the map entry; the entry is dropped before publish.
+    async fn refresh(&self, uri: Uri, text: String, version: i32, generation: u64) {
+        let Some(diags) = update_document(&self.docs, &uri, text, version, generation, |entry| {
+            let raw = entry.analyzer.syntax_diagnostics(&entry.document.text);
+            features::diagnostics::to_lsp(&raw, &entry.document)
+        }) else {
+            return;
+        };
+        self.publish_current(uri, diags, version, generation).await;
     }
 
     /// Re-publish the current document's full diagnostics, without a new text.
@@ -95,11 +106,12 @@ impl Backend {
     async fn recheck(&self, uri: Uri) {
         let Some(diags) = self.docs.get_mut(&uri).map(|mut entry| {
             let version = entry.document.version;
-            (analyze(&mut entry), version)
+            let generation = entry.generation;
+            (analyze(&mut entry), version, generation)
         }) else {
             return;
         };
-        self.publish_current(uri, diags.0, diags.1).await;
+        self.publish_current(uri, diags.0, diags.1, diags.2).await;
     }
 
     /// Diagnostics for an already-open document, for the pull
@@ -111,12 +123,18 @@ impl Backend {
         }
     }
 
-    async fn publish_current(&self, uri: Uri, diags: Vec<Diagnostic>, version: i32) {
+    async fn publish_current(
+        &self,
+        uri: Uri,
+        diags: Vec<Diagnostic>,
+        version: i32,
+        generation: u64,
+    ) {
         let _publish = self.diagnostic_publish.lock().await;
         if self
             .docs
             .get(&uri)
-            .is_none_or(|entry| entry.document.version != version)
+            .is_none_or(|entry| entry.generation != generation || entry.document.version != version)
         {
             return;
         }
@@ -210,8 +228,7 @@ impl LanguageServer for Backend {
     /// the user has touched (and saved) anything.
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let doc = params.text_document;
-        self.refresh(doc.uri, doc.text, doc.version, Check::Full)
-            .await;
+        self.open(doc.uri, doc.text, doc.version).await;
     }
 
     /// An edit re-parses only. The type diagnostics of the last checked version
@@ -220,12 +237,14 @@ impl LanguageServer for Backend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
+        let Some(generation) = self.docs.get(&uri).map(|entry| entry.generation) else {
+            return;
+        };
         // FULL sync: the single content change carries the whole new text.
         let Some(change) = params.content_changes.into_iter().next() else {
             return;
         };
-        self.refresh(uri, change.text, version, Check::SyntaxOnly)
-            .await;
+        self.refresh(uri, change.text, version, generation).await;
     }
 
     /// Saving runs the type check.
@@ -234,9 +253,15 @@ impl LanguageServer for Backend {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.docs.remove(&params.text_document.uri);
+        let uri = params.text_document.uri;
+        let Some(generation) = self.docs.get(&uri).map(|entry| entry.generation) else {
+            return;
+        };
+        if !close_document(&self.docs, &uri, generation) {
+            return;
+        }
         // Clear diagnostics for the closed file.
-        self.clear_closed(params.text_document.uri.clone()).await;
+        self.clear_closed(uri).await;
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -247,9 +272,7 @@ impl LanguageServer for Backend {
         };
         // The full analysis holds `Rc` data (`!Send`); it stays a local here and
         // is dropped before this handler ever awaits, so the future stays `Send`.
-        let Some(full) = entry.analyzer.analyze_full(&entry.document.text) else {
-            return Ok(None);
-        };
+        let full = entry.analyzer.analyze_full(&entry.document.text);
         Ok(features::hover::hover(&entry.document, &full, pos))
     }
 
@@ -262,9 +285,7 @@ impl LanguageServer for Backend {
         let Some(entry) = self.docs.get(&uri) else {
             return Ok(None);
         };
-        let Some(full) = entry.analyzer.analyze_full(&entry.document.text) else {
-            return Ok(None);
-        };
+        let full = entry.analyzer.analyze_full(&entry.document.text);
         Ok(
             features::definition::definition(&entry.document, &full, pos)
                 .map(GotoDefinitionResponse::Scalar),
@@ -347,13 +368,55 @@ impl LanguageServer for Backend {
     }
 }
 
-/// How much analysis a document update triggers.
-#[derive(Clone, Copy)]
-enum Check {
-    /// Parse, lower, and type-check the whole module graph.
-    Full,
-    /// Parse the document alone.
-    SyntaxOnly,
+/// Replace the document only when this open belongs to a newer lifetime. The
+/// callback runs while the map entry is locked, so a change cannot observe a
+/// half-installed analyzer/document pair.
+fn open_document<R>(
+    docs: &DashMap<Uri, DocState>,
+    uri: &Uri,
+    text: String,
+    version: i32,
+    generation: u64,
+    use_state: impl FnOnce(&mut DocState) -> R,
+) -> Option<R> {
+    match docs.entry(uri.clone()) {
+        Entry::Occupied(mut entry) => {
+            if entry.get().generation >= generation {
+                return None;
+            }
+            entry.insert(DocState::new(uri, text, version, generation));
+            Some(use_state(entry.get_mut()))
+        }
+        Entry::Vacant(entry) => {
+            let mut state = entry.insert(DocState::new(uri, text, version, generation));
+            Some(use_state(&mut state))
+        }
+    }
+}
+
+/// Apply a change only to the lifetime it was received for and only when its
+/// LSP version advances the installed text.
+fn update_document<R>(
+    docs: &DashMap<Uri, DocState>,
+    uri: &Uri,
+    text: String,
+    version: i32,
+    generation: u64,
+    use_state: impl FnOnce(&mut DocState) -> R,
+) -> Option<R> {
+    let mut state = docs.get_mut(uri)?;
+    if state.generation != generation || version <= state.document.version {
+        return None;
+    }
+    state.document.update(text, version);
+    Some(use_state(&mut state))
+}
+
+/// Remove only the open lifetime observed by the close handler. A reopen that
+/// wins the race carries a different generation and remains installed.
+fn close_document(docs: &DashMap<Uri, DocState>, uri: &Uri, generation: u64) -> bool {
+    docs.remove_if(uri, |_, state| state.generation == generation)
+        .is_some()
 }
 
 /// Run the incremental analyzer over a document's current text and lower the
@@ -370,4 +433,31 @@ fn uri_to_path(uri: &Uri) -> PathBuf {
     uri.to_file_path()
         .map(|p| p.into_owned())
         .unwrap_or_else(|| PathBuf::from(uri.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uri() -> Uri {
+        "file:///tmp/concurrent.cz".parse().expect("file URI")
+    }
+
+    /// Version and generation checks make deliberately reordered operations
+    /// leave the newest open lifetime and its newest text installed.
+    #[test]
+    fn stale_document_operations_are_rejected() {
+        let docs = DashMap::new();
+        let uri = uri();
+        assert!(open_document(&docs, &uri, "new".into(), 1, 2, |_| ()).is_some());
+        assert!(open_document(&docs, &uri, "old open".into(), 8, 1, |_| ()).is_none());
+        assert!(update_document(&docs, &uri, "version 3".into(), 3, 2, |_| ()).is_some());
+        assert!(update_document(&docs, &uri, "version 2".into(), 2, 2, |_| ()).is_none());
+        assert!(update_document(&docs, &uri, "old lifetime".into(), 99, 1, |_| ()).is_none());
+        assert!(!close_document(&docs, &uri, 1));
+        let state = docs.get(&uri).expect("new lifetime remains open");
+        assert_eq!(state.document.text, "version 3");
+        drop(state);
+        assert!(close_document(&docs, &uri, 2));
+    }
 }

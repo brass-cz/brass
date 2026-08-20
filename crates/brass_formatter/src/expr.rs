@@ -19,8 +19,8 @@
 //! that a bare `Name { ... }` literal in an `if`/`while`/`for`/`match` head
 //! must be parenthesized to not be read as the statement's block.
 
-use brass_parser::Span;
 use brass_parser::ast::*;
+use brass_parser::{Span, TokenKind, lex};
 
 use crate::printer::Printer;
 
@@ -667,11 +667,20 @@ impl<'a> Printer<'a> {
     /// The AST does not record a record pattern's trailing `..`; recover it
     /// from the source: the last tokens before the pattern's closing brace.
     fn has_rest(&self, span: Span) -> bool {
-        let s = self.slice(span).trim_end();
-        let Some(s) = s.strip_suffix('}') else {
+        let Ok(tokens) = lex(self.slice(span)) else {
             return false;
         };
-        s.trim_end().ends_with("..")
+        let mut significant = tokens
+            .iter()
+            .rev()
+            .filter(|token| !matches!(token.kind, TokenKind::Newline | TokenKind::Eof));
+        matches!(
+            significant.next().map(|token| &token.kind),
+            Some(TokenKind::RBrace)
+        ) && matches!(
+            significant.next().map(|token| &token.kind),
+            Some(TokenKind::DotDot)
+        )
     }
 
     // ----- types -----

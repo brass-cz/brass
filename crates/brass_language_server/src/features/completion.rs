@@ -28,7 +28,7 @@ use std::path::Path;
 
 use brass_hir::{Type, TypeInfo, TypeKind};
 use brass_parser::ast::{TopLevel, TypeBody};
-use brass_parser::parse;
+use brass_parser::{TokenKind, lex, parse};
 use brass_resolve::SearchPaths;
 use tower_lsp_server::ls_types::{CompletionItem, CompletionItemKind};
 
@@ -257,9 +257,7 @@ fn analyzed_module_exports(module: &[String], analyzer: &DocAnalyzer) -> Vec<Com
         return Vec::new();
     }
     let probe = format!("import {}\n", module.join("."));
-    let Some(full) = analyzer.analyze_full(&probe) else {
-        return Vec::new();
-    };
+    let full = analyzer.analyze_full(&probe);
     // The probe's import path was canonicalized by the loader; a bare core
     // module (`import math`) keeps its written path but is stored under
     // `core.<name>`.
@@ -296,6 +294,14 @@ fn analyzed_module_exports(module: &[String], analyzer: &DocAnalyzer) -> Vec<Com
                 Some(format!("type {}", t.name)),
                 t.doc.as_deref(),
             ));
+        }
+    }
+    for (symbol, alias) in &full.program.type_aliases {
+        if alias.module == target {
+            let name = symbol_name(symbol);
+            if brass_resolve::is_public(name) {
+                items.push(alias_item(name, alias));
+            }
         }
     }
     items
@@ -392,15 +398,15 @@ fn member_completion(
     while word_start > 0 && is_ident_byte(bytes[word_start - 1]) {
         word_start -= 1;
     }
-    // A `.` must sit immediately before the name, and the receiver before that
-    // `.` must look like the end of an expression (not e.g. a float `3.`).
+    // A `.` must sit immediately before the name. Receiver validity comes from
+    // the probe analysis; only a numeric literal is excluded here because its
+    // trailing dot is an incomplete number, not member access.
     if word_start == 0 || bytes[word_start - 1] != b'.' {
         return None;
     }
     let dot = word_start - 1;
-    match dot.checked_sub(1).map(|i| bytes[i]) {
-        Some(b) if is_ident_byte(b) || b == b')' || b == b']' => {}
-        _ => return None,
+    if numeric_literal_before_dot(&doc.text, dot) {
+        return None;
     }
     let partial = &doc.text[word_start..cursor];
     // `_`-prefixed members are implementation details, hidden unless the user
@@ -411,9 +417,9 @@ fn member_completion(
     // already parses as a field access.
     let full = if partial.is_empty() {
         let patched = format!("{}{PROBE}{}", &doc.text[..cursor], &doc.text[cursor..]);
-        analyzer.analyze_full(&patched)?
+        analyzer.analyze_full(&patched)
     } else {
-        analyzer.analyze_full(&doc.text)?
+        analyzer.analyze_full(&doc.text)
     };
 
     // A bare type name receiver (`Shape.`) offers that type's variants/methods.
@@ -616,7 +622,17 @@ fn type_qualified_items(
         }
     }
     let name = &text[start..dot];
-    let info = full.program.resolve_type(&["main".to_string()], name)?;
+    let module = ["main".to_string()];
+    let (info, substitution) = if let Some(info) = full.program.resolve_type(&module, name) {
+        (info, brass_hir::Substitution::empty())
+    } else {
+        let alias = full.program.resolve_type_alias(&module, name)?;
+        let nominal = match strip(&alias.ty) {
+            Type::Record(n) | Type::Sum(n) => n,
+            _ => return None,
+        };
+        (full.program.type_by_id(nominal.id)?, nominal.substitution)
+    };
     let mut items = Vec::new();
     if let TypeKind::Sum { variants } = &info.kind {
         for v in variants {
@@ -626,13 +642,10 @@ fn type_qualified_items(
             items.push(item(v.name.clone(), CompletionItemKind::ENUM_MEMBER, None));
         }
     }
-    // The declaration view: no instance, so an empty substitution shows signatures
-    // over the declaration's own slots (`Self.<slot>`).
-    let empty = brass_hir::Substitution::empty();
     items.extend(type_method_items(
         full,
         info,
-        &empty,
+        &substitution,
         include_private,
         MethodKind::Static,
     ));
@@ -654,6 +667,20 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// A numeric token immediately ending at `dot` owns the trailing period while
+/// the user is entering a float. Identifiers ending in digits remain valid
+/// receivers because the lexer reports them as `Ident`, not `Int`/`Float`.
+fn numeric_literal_before_dot(text: &str, dot: usize) -> bool {
+    lex(&text[..dot]).is_ok_and(|tokens| {
+        tokens.iter().rev().any(|token| {
+            if matches!(token.kind, TokenKind::Eof | TokenKind::Newline) {
+                return false;
+            }
+            token.span.hi == dot && matches!(token.kind, TokenKind::Int(_) | TokenKind::Float(_))
+        })
+    })
+}
+
 fn filter_prefix(items: Vec<CompletionItem>, prefix: &str) -> Vec<CompletionItem> {
     if prefix.is_empty() {
         return items;
@@ -673,13 +700,10 @@ fn dedup_by_label(mut items: Vec<CompletionItem>) -> Vec<CompletionItem> {
 // ===== type / function completion =====
 
 /// Types and functions visible from the document, plus the built-in types and
-/// intrinsic functions. From the analyzed program when available, else a
-/// best-effort set parsed from the document and prelude.
-fn symbol_items(analyzer: &DocAnalyzer, doc: &Document, doc_path: &Path) -> Vec<CompletionItem> {
-    let mut items = match analyzer.analyze_full(&doc.text) {
-        Some(f) => program_symbols(&f),
-        None => fallback_symbols(doc, doc_path),
-    };
+/// intrinsic functions.
+fn symbol_items(analyzer: &DocAnalyzer, doc: &Document, _doc_path: &Path) -> Vec<CompletionItem> {
+    let full = analyzer.analyze_full(&doc.text);
+    let mut items = program_symbols(&full);
     for ty in BUILTIN_TYPES {
         items.push(item((*ty).to_string(), CompletionItemKind::STRUCT, None));
     }
@@ -735,53 +759,45 @@ fn program_symbols(full: &FullAnalysis) -> Vec<CompletionItem> {
             ));
         }
     }
-    items
-}
-
-/// Best-effort symbols when the document does not parse: its own top-level
-/// declarations (if it parses) and every prelude module's public names.
-fn fallback_symbols(doc: &Document, _doc_path: &Path) -> Vec<CompletionItem> {
-    let mut items = Vec::new();
-    if let Ok(parsed) = parse(&doc.text) {
-        for top in &parsed.items {
-            match top {
-                TopLevel::Fun(f) => {
-                    items.push(item(f.name.clone(), CompletionItemKind::FUNCTION, None));
-                }
-                TopLevel::Type(t) => {
-                    items.push(item(t.name.clone(), type_decl_kind(&t.body), None));
-                }
-                _ => {}
-            }
-        }
-    }
-    for name in prelude_module_names() {
-        if let Some(src) = prelude_source(name) {
-            for (n, kind) in module_public_symbols_from_src(src) {
-                items.push(item(n, kind, None));
-            }
+    let mut alias_names: HashSet<String> = full
+        .program
+        .type_aliases
+        .iter()
+        .filter(|(_, alias)| {
+            alias.module.is_empty()
+                || alias.module == main_module
+                || full.program.prelude_modules.contains(&alias.module)
+        })
+        .map(|(symbol, _)| symbol_name(symbol).to_string())
+        .collect();
+    alias_names.extend(imported.iter().filter_map(|name| {
+        full.program
+            .resolve_type_alias(&main_module, name)
+            .map(|_| name.clone())
+    }));
+    for name in alias_names {
+        if let Some(alias) = full.program.resolve_type_alias(&main_module, &name) {
+            items.push(alias_item(&name, alias));
         }
     }
     items
 }
 
-fn module_public_symbols_from_src(src: &str) -> Vec<(String, CompletionItemKind)> {
-    let Ok(parsed) = parse(src) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for top in &parsed.items {
-        match top {
-            TopLevel::Fun(f) if brass_resolve::is_public(&f.name) => {
-                out.push((f.name.clone(), CompletionItemKind::FUNCTION));
-            }
-            TopLevel::Type(t) if brass_resolve::is_public(&t.name) => {
-                out.push((t.name.clone(), type_decl_kind(&t.body)));
-            }
-            _ => {}
-        }
-    }
-    out
+fn symbol_name(symbol: &str) -> &str {
+    symbol.split_once('@').map_or(symbol, |(name, _)| name)
+}
+
+fn alias_item(name: &str, alias: &brass_hir::TypeAlias) -> CompletionItem {
+    let mut namer = UnknownNamer::default();
+    doc_item(
+        name.to_string(),
+        CompletionItemKind::STRUCT,
+        Some(format!(
+            "type {name} = {}",
+            render_type(&alias.ty, &mut namer)
+        )),
+        None,
+    )
 }
 
 fn type_decl_kind(body: &TypeBody) -> CompletionItemKind {

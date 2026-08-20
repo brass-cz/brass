@@ -201,6 +201,31 @@ mod tests {
         assert!(out.contains("Circle { radius, .. }"), "{out}");
     }
 
+    /// A trailing comment is insignificant to the pattern grammar and must not
+    /// hide the AST-less rest marker from the formatter.
+    #[test]
+    fn rest_pattern_before_comment_is_preserved() {
+        let src = "fun f(s) {\n    if let Circle { radius, .. /* remaining fields */ } = s {\n        return radius\n    }\n}\n";
+        let out = roundtrip(src);
+        assert!(out.contains("Circle { radius, .. }"), "{out}");
+        assert!(out.contains("/* remaining fields */"), "{out}");
+    }
+
+    /// Comments after a recursively interpolated string survive both format
+    /// passes even when interpolation comments contain unmatched delimiters.
+    #[test]
+    fn comments_after_nested_interpolation_are_idempotent() {
+        let src = r#"fun main() {
+    let text = "outer { value + // }
+        "nested { inner # }
+        }" /* } */ }" // keep
+    println(text)
+}
+"#;
+        let out = roundtrip(src);
+        assert!(out.contains("// keep"), "{out}");
+    }
+
     #[test]
     fn sum_type_layout() {
         // Short sums inline; long ones get one leading-pipe line per variant.

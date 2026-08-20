@@ -134,9 +134,19 @@ impl LineIndex {
 
 fn line_starts(text: &str) -> Vec<usize> {
     let mut starts = vec![0];
-    for (i, b) in text.bytes().enumerate() {
-        if b == b'\n' {
-            starts.push(i + 1);
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' if bytes.get(i + 1) == Some(&b'\n') => {
+                starts.push(i + 2);
+                i += 2;
+            }
+            b'\r' | b'\n' => {
+                starts.push(i + 1);
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
     starts
@@ -149,7 +159,8 @@ fn char_boundary_at_or_before(text: &str, mut offset: usize) -> usize {
     offset
 }
 
-/// Exclude a line's `\n` or `\r\n` terminator from its LSP column space.
+/// Exclude a line's `\n`, `\r\n`, or lone `\r` terminator from its LSP column
+/// space.
 fn line_content_end(text: &str, line_start: usize, offset: usize) -> usize {
     let bytes = text.as_bytes();
     let mut end = offset;
@@ -184,5 +195,16 @@ mod tests {
     fn interior_utf8_offsets_round_down() {
         let doc = Document::new("a😀b".to_string(), 1);
         assert_eq!(doc.position_at(2), Position::new(0, 1));
+    }
+
+    /// A lone carriage return is a line boundary of its own, so the byte after
+    /// it cannot collapse onto the terminator's position on the previous line.
+    #[test]
+    fn lone_cr_offsets_start_a_distinct_line() {
+        let doc = Document::new("first\rsecond\rthird".to_string(), 1);
+        assert_eq!(doc.position_at("first".len()), Position::new(0, 5));
+        assert_eq!(doc.position_at("first\r".len()), Position::new(1, 0));
+        assert_eq!(doc.offset_at(Position::new(1, 3)), "first\rsec".len());
+        assert_eq!(doc.offset_at(Position::new(2, 0)), "first\rsecond\r".len());
     }
 }

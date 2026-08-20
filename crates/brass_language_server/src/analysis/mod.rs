@@ -5,13 +5,14 @@
 //! the changed items and their users are re-checked (see [`items`]), against a
 //! module graph reduced to the affected items plus the definitions they depend
 //! on. Hover and go-to-definition need type information for the whole document,
-//! so they use a separately cached full analysis, recomputed at most once per
-//! document version and only when such a request actually arrives.
+//! so they request a whole-program analysis when the feature needs it.
 
 pub mod items;
 pub mod world;
 
 use fxhash::FxHashSet as HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use brass_hir::{LoadedModule, Program, TypedProgram, lower};
@@ -181,7 +182,14 @@ impl DocAnalyzer {
         }
 
         let mut new_items = items::split(&world.main_ast, text, world.main_base);
-        let d = items::diff(&self.cache, &new_items);
+        let import_fingerprint = import_fingerprint(&world.main_ast);
+        let context_fingerprint = context_fingerprint(&world);
+        let d = items::diff(
+            &self.cache,
+            &new_items,
+            import_fingerprint,
+            context_fingerprint,
+        );
 
         // Run the front end on the reduced module graph (the whole document on a
         // from-scratch check). Its diagnostics are authoritative for the
@@ -214,7 +222,11 @@ impl DocAnalyzer {
             }
         }
 
-        self.cache = ItemCache { items: new_items };
+        self.cache = ItemCache {
+            items: new_items,
+            import_fingerprint,
+            context_fingerprint,
+        };
 
         // Assemble: every item's diagnostics, the global bucket, and the
         // module-graph load errors (recomputed each run). The cache keeps global
@@ -235,12 +247,12 @@ impl DocAnalyzer {
     /// in the shared document map; the caller uses it synchronously and drops it.
     /// A document with syntax errors is analyzed from its recovered AST, so
     /// hover/definition keep working on the parts that parse.
-    pub fn analyze_full(&self, text: &str) -> Option<FullAnalysis> {
+    pub fn analyze_full(&self, text: &str) -> FullAnalysis {
         let world = world::build(&self.path, text);
         let main = world.main_ast.clone();
         let (program, typed, schemes, function_returns, method_returns, _diags) =
             run_pipeline(&world.context_modules, main, context_seed_for(&world));
-        Some(FullAnalysis {
+        FullAnalysis {
             program,
             typed,
             schemes,
@@ -249,8 +261,42 @@ impl DocAnalyzer {
             sources: world.sources,
             main_base: world.main_base,
             main_ast: world.main_ast,
-        })
+        }
     }
+}
+
+/// Hash the import declarations independently of their spans. Import text is
+/// outside every incremental item, while its resolved names affect all items.
+fn import_fingerprint(module: &Module) -> u64 {
+    let mut hash = DefaultHasher::new();
+    for import in &module.imports {
+        import.path.hash(&mut hash);
+        import.bare.hash(&mut hash);
+        import.alias.hash(&mut hash);
+        import.explicit_alias.hash(&mut hash);
+        for name in &import.names {
+            name.remote.hash(&mut hash);
+            name.local.hash(&mut hash);
+        }
+    }
+    hash.finish()
+}
+
+/// Hash the loaded context's identities and source bytes. Source offsets are
+/// intentionally excluded because an active-buffer length change can move
+/// bases without changing any dependency.
+fn context_fingerprint(world: &world::World) -> u64 {
+    let mut hash = DefaultHasher::new();
+    world
+        .context_modules
+        .iter()
+        .for_each(|module| module.path.hash(&mut hash));
+    world
+        .sources
+        .entries()
+        .filter(|(base, _)| *base != world.main_base)
+        .for_each(|(_, source)| source.hash(&mut hash));
+    hash.finish()
 }
 
 /// Run lex/parse-fed lowering, import resolution, and type checking on

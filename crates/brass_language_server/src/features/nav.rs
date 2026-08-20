@@ -84,78 +84,340 @@ pub fn enclosing(main_ast: &Module, global_off: usize) -> Option<(Vec<&Param>, &
     None
 }
 
+/// One lexical binding visible at a cursor. `value_span` is present only for a
+/// direct `let name = value`, whose initializer supplies the declaration hover
+/// type even when the binding is unused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalBinding {
+    pub span: Span,
+    value_span: Option<Span>,
+}
+
+/// Resolve `name` along the lexical scope path containing `global_off`.
+/// Bindings from closed sibling blocks, other match arms, and completed
+/// closures are never added to the path.
+pub fn local_binding(main_ast: &Module, global_off: usize, name: &str) -> Option<LocalBinding> {
+    let (params, body) = enclosing(main_ast, global_off)?;
+    let mut visible: Vec<(String, LocalBinding)> = params
+        .into_iter()
+        .map(|param| {
+            (
+                param.name.clone(),
+                LocalBinding {
+                    span: param.span,
+                    value_span: None,
+                },
+            )
+        })
+        .collect();
+    resolve_block_binding(body, global_off, name, &mut visible)
+}
+
+fn current_binding(visible: &[(String, LocalBinding)], name: &str) -> Option<LocalBinding> {
+    visible
+        .iter()
+        .rev()
+        .find_map(|(binding_name, binding)| (binding_name == name).then_some(*binding))
+}
+
+fn resolve_block_binding(
+    block: &Block,
+    off: usize,
+    name: &str,
+    visible: &mut Vec<(String, LocalBinding)>,
+) -> Option<LocalBinding> {
+    for stmt in &block.stmts {
+        if contains(stmt.span(), off) {
+            return resolve_stmt_binding(stmt, off, name, visible);
+        }
+        if stmt.span().hi <= off
+            && let Stmt::Let { pat, value, .. } = stmt
+        {
+            let direct_value = match pat {
+                Pattern::Binding(_, _) => value.as_ref().map(Expr::span),
+                _ => None,
+            };
+            push_pattern_bindings(pat, direct_value, visible);
+        }
+    }
+    current_binding(visible, name)
+}
+
+fn resolve_stmt_binding(
+    stmt: &Stmt,
+    off: usize,
+    name: &str,
+    visible: &[(String, LocalBinding)],
+) -> Option<LocalBinding> {
+    match stmt {
+        Stmt::Let { pat, value, .. } => {
+            let direct_value = match pat {
+                Pattern::Binding(_, _) => value.as_ref().map(Expr::span),
+                _ => None,
+            };
+            binding_in_pattern(pat, off, name, direct_value).or_else(|| {
+                value
+                    .as_ref()
+                    .filter(|expr| contains(expr.span(), off))
+                    .and_then(|expr| resolve_expr_binding(expr, off, name, visible))
+                    .or_else(|| current_binding(visible, name))
+            })
+        }
+        Stmt::Assign { target, value, .. } => [target, value]
+            .into_iter()
+            .find(|expr| contains(expr.span(), off))
+            .and_then(|expr| resolve_expr_binding(expr, off, name, visible))
+            .or_else(|| current_binding(visible, name)),
+        Stmt::Expr(expr) | Stmt::Return(Some(expr), _) => {
+            resolve_expr_binding(expr, off, name, visible)
+        }
+        Stmt::While { cond, body, .. } => {
+            if contains(cond.span(), off) {
+                resolve_expr_binding(cond, off, name, visible)
+            } else if contains(body.span, off) {
+                let mut nested = visible.to_vec();
+                resolve_block_binding(body, off, name, &mut nested)
+            } else {
+                current_binding(visible, name)
+            }
+        }
+        Stmt::For {
+            pat, iter, body, ..
+        } => {
+            if let Some(binding) = binding_in_pattern(pat, off, name, None) {
+                return Some(binding);
+            }
+            if contains(iter.span(), off) {
+                return resolve_expr_binding(iter, off, name, visible);
+            }
+            if contains(body.span, off) {
+                let mut nested = visible.to_vec();
+                push_pattern_bindings(pat, None, &mut nested);
+                return resolve_block_binding(body, off, name, &mut nested);
+            }
+            current_binding(visible, name)
+        }
+        Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => {
+            current_binding(visible, name)
+        }
+    }
+}
+
+fn resolve_expr_binding(
+    expr: &Expr,
+    off: usize,
+    name: &str,
+    visible: &[(String, LocalBinding)],
+) -> Option<LocalBinding> {
+    let child = |expr: &Expr| {
+        contains(expr.span(), off).then(|| resolve_expr_binding(expr, off, name, visible))
+    };
+    match expr {
+        Expr::Closure(params, body, _) => {
+            if let Some(param) = params
+                .iter()
+                .find(|param| param.name == name && contains(param.span, off))
+            {
+                return Some(LocalBinding {
+                    span: param.span,
+                    value_span: None,
+                });
+            }
+            if contains(body.span(), off) {
+                let mut nested = visible.to_vec();
+                nested.extend(params.iter().map(|param| {
+                    (
+                        param.name.clone(),
+                        LocalBinding {
+                            span: param.span,
+                            value_span: None,
+                        },
+                    )
+                }));
+                resolve_expr_binding(body, off, name, &nested)
+            } else {
+                current_binding(visible, name)
+            }
+        }
+        Expr::Block(block, _) => {
+            let mut nested = visible.to_vec();
+            resolve_block_binding(block, off, name, &mut nested)
+        }
+        Expr::Unary(_, inner, _) | Expr::ErrorProp(inner, _) => child(inner).flatten(),
+        Expr::Binary(_, left, right, _)
+        | Expr::Index(left, right, _)
+        | Expr::Range(left, right, _) => child(left)
+            .or_else(|| child(right))
+            .flatten()
+            .or_else(|| current_binding(visible, name)),
+        Expr::Call(callee, args, _) => child(callee)
+            .or_else(|| {
+                args.iter()
+                    .find(|arg| contains(arg.expr.span(), off))
+                    .map(|arg| resolve_expr_binding(&arg.expr, off, name, visible))
+            })
+            .flatten()
+            .or_else(|| current_binding(visible, name)),
+        Expr::Field(receiver, _, _) | Expr::TypeTest(receiver, _, _) => child(receiver)
+            .flatten()
+            .or_else(|| current_binding(visible, name)),
+        Expr::Array(elements, _) => elements
+            .iter()
+            .find(|element| contains(element.span(), off))
+            .and_then(|element| resolve_expr_binding(element, off, name, visible))
+            .or_else(|| current_binding(visible, name)),
+        Expr::Str(segments, _) => segments
+            .iter()
+            .filter_map(|segment| match segment {
+                StrSeg::Expr(expr) if contains(expr.span(), off) => Some(expr.as_ref()),
+                _ => None,
+            })
+            .find_map(|expr| resolve_expr_binding(expr, off, name, visible))
+            .or_else(|| current_binding(visible, name)),
+        Expr::If(cond, then, alternative, _) => {
+            if contains(cond.span(), off) {
+                return resolve_expr_binding(cond, off, name, visible);
+            }
+            if contains(then.span, off) {
+                let mut nested = visible.to_vec();
+                return resolve_block_binding(then, off, name, &mut nested);
+            }
+            alternative
+                .as_ref()
+                .filter(|expr| contains(expr.span(), off))
+                .and_then(|expr| resolve_expr_binding(expr, off, name, visible))
+                .or_else(|| current_binding(visible, name))
+        }
+        Expr::IfLet(pat, scrutinee, then, alternative, _) => {
+            if let Some(binding) = binding_in_pattern(pat, off, name, None) {
+                return Some(binding);
+            }
+            if contains(scrutinee.span(), off) {
+                return resolve_expr_binding(scrutinee, off, name, visible);
+            }
+            if contains(then.span, off) {
+                let mut nested = visible.to_vec();
+                push_pattern_bindings(pat, None, &mut nested);
+                return resolve_block_binding(then, off, name, &mut nested);
+            }
+            alternative
+                .as_ref()
+                .filter(|expr| contains(expr.span(), off))
+                .and_then(|expr| resolve_expr_binding(expr, off, name, visible))
+                .or_else(|| current_binding(visible, name))
+        }
+        Expr::Match(scrutinee, arms, _) => {
+            if contains(scrutinee.span(), off) {
+                return resolve_expr_binding(scrutinee, off, name, visible);
+            }
+            let Some(arm) = arms.iter().find(|arm| contains(arm.span, off)) else {
+                return current_binding(visible, name);
+            };
+            if let Some(binding) = binding_in_pattern(&arm.pattern, off, name, None) {
+                return Some(binding);
+            }
+            let mut nested = visible.to_vec();
+            push_pattern_bindings(&arm.pattern, None, &mut nested);
+            resolve_expr_binding(&arm.body, off, name, &nested)
+        }
+        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => fields
+            .iter()
+            .find(|(_, value)| contains(value.span(), off))
+            .and_then(|(_, value)| resolve_expr_binding(value, off, name, visible))
+            .or_else(|| current_binding(visible, name)),
+        Expr::Ident(_, _)
+        | Expr::Int(_, _)
+        | Expr::Float(_, _)
+        | Expr::Bool(_, _)
+        | Expr::Null(_)
+        | Expr::SelfExpr(_) => current_binding(visible, name),
+    }
+}
+
+fn binding_in_pattern(
+    pattern: &Pattern,
+    off: usize,
+    name: &str,
+    value_span: Option<Span>,
+) -> Option<LocalBinding> {
+    match pattern {
+        Pattern::Binding(binding_name, span) => (binding_name == name && contains(*span, off))
+            .then_some(LocalBinding {
+                span: *span,
+                value_span,
+            }),
+        Pattern::Record(_, fields, _) => fields.iter().find_map(|field| match &field.pat {
+            Some(pattern) => binding_in_pattern(pattern, off, name, None),
+            None => (field.name == name && contains(field.span, off)).then_some(LocalBinding {
+                span: field.span,
+                value_span: None,
+            }),
+        }),
+        Pattern::Array(patterns, _) => patterns
+            .iter()
+            .find_map(|pattern| binding_in_pattern(pattern, off, name, None)),
+        Pattern::Wildcard(_) | Pattern::Literal(_, _) => None,
+    }
+}
+
+fn push_pattern_bindings(
+    pattern: &Pattern,
+    value_span: Option<Span>,
+    visible: &mut Vec<(String, LocalBinding)>,
+) {
+    match pattern {
+        Pattern::Binding(name, span) => visible.push((
+            name.clone(),
+            LocalBinding {
+                span: *span,
+                value_span,
+            },
+        )),
+        Pattern::Record(_, fields, _) => fields.iter().for_each(|field| match &field.pat {
+            Some(pattern) => push_pattern_bindings(pattern, None, visible),
+            None => visible.push((
+                field.name.clone(),
+                LocalBinding {
+                    span: field.span,
+                    value_span: None,
+                },
+            )),
+        }),
+        Pattern::Array(patterns, _) => patterns
+            .iter()
+            .for_each(|pattern| push_pattern_bindings(pattern, None, visible)),
+        Pattern::Wildcard(_) | Pattern::Literal(_, _) => {}
+    }
+}
+
 /// The inferred type of the local variable `name` whose declaration or use is at
 /// `global_off`. The type checker records expression nodes (variable *uses*) but
 /// not binding sites, so a hover on a `let`, parameter, for-loop, or pattern
 /// binding finds nothing under the cursor directly; this recovers the type from
 /// the bound value, or from a use of the variable in the same function.
 pub fn local_var_type(full: &FullAnalysis, global_off: usize, name: &str) -> Option<Type> {
-    let (_, body) = enclosing(&full.main_ast, global_off)?;
-    // Precise: the cursor is on a `let name = value` binding -> the value's type.
-    if let Some(value_span) = let_value_span(body, global_off, name)
+    let binding = local_binding(&full.main_ast, global_off, name)?;
+    if let Some(value_span) = binding.value_span
         && let Some(e) = source_expr_at(full, value_span)
     {
         return Some(e.ty.clone());
     }
-    // Otherwise borrow the type from a use of the name in this function -- the
-    // case for parameters, for-loop variables, and pattern bindings, which have
-    // no bound value expression. Prefer the nearest use at or after the cursor,
-    // so hovering a pattern binding picks the use in that same match arm rather
-    // than a same-named binding in another arm.
+    // Binding sites are absent from the typed sidecar. Borrow a use only when
+    // resolving that use through the AST reaches this exact binding, excluding
+    // same-named bindings in sibling scopes and later closures.
     let mut uses: Vec<&TypedExpr> = full
         .typed
         .expressions
         .iter()
         .filter(|e| {
-            matches!(&e.kind, TypedExprKind::Ident(n) if n == name) && within(body.span, e.span)
+            matches!(&e.kind, TypedExprKind::Ident(n) if n == name)
+                && local_binding(&full.main_ast, e.span.lo, name)
+                    .is_some_and(|candidate| candidate.span == binding.span)
         })
         .collect();
     uses.sort_by_key(|e| e.span.lo);
     let after = uses.iter().find(|e| e.span.lo >= global_off);
     after.or_else(|| uses.last()).map(|e| e.ty.clone())
-}
-
-/// Span of the value expression of a `let name = value` whose binding identifier
-/// contains `off`, searching nested blocks (loop/if/match/closure bodies).
-fn let_value_span(block: &Block, off: usize, name: &str) -> Option<Span> {
-    block
-        .stmts
-        .iter()
-        .find_map(|s| let_value_in_stmt(s, off, name))
-}
-
-fn let_value_in_stmt(s: &Stmt, off: usize, name: &str) -> Option<Span> {
-    match s {
-        Stmt::Let { pat, value, .. } => {
-            let value = value.as_ref()?;
-            if let Pattern::Binding(n, bspan) = pat
-                && n == name
-                && contains(*bspan, off)
-            {
-                return Some(value.span());
-            }
-            let_value_in_expr(value, off, name)
-        }
-        Stmt::Assign { value, .. } => let_value_in_expr(value, off, name),
-        Stmt::Expr(e) | Stmt::Return(Some(e), _) => let_value_in_expr(e, off, name),
-        Stmt::While { body, .. } | Stmt::For { body, .. } => let_value_span(body, off, name),
-        _ => None,
-    }
-}
-
-fn let_value_in_expr(e: &Expr, off: usize, name: &str) -> Option<Span> {
-    match e {
-        Expr::Block(b, _) => let_value_span(b, off, name),
-        Expr::If(_, then, els, _) | Expr::IfLet(_, _, then, els, _) => {
-            let_value_span(then, off, name)
-                .or_else(|| els.as_ref().and_then(|e| let_value_in_expr(e, off, name)))
-        }
-        Expr::Match(_, arms, _) => arms
-            .iter()
-            .find_map(|a| let_value_in_expr(&a.body, off, name)),
-        Expr::Closure(_, body, _) => let_value_in_expr(body, off, name),
-        _ => None,
-    }
 }
 
 /// The inferred return type of a free function whose return is unannotated.
