@@ -1681,7 +1681,6 @@ fn czcache_survives_relocation() {
         err.contains("front/cache-hit"),
         "the moved project must reuse its cache: {err}"
     );
-
     // An edit at the NEW location misses -- content, not location, is the key.
     fs::write(
         moved.join("libs/util.cz"),
@@ -2077,9 +2076,9 @@ fn czcache_misses_when_package_names_change() {
     );
 }
 
-/// `_PATH` is the one thing a relocated cache must NOT replay: it IS the
-/// module's location. A hit after the project moves re-anchors it while the
-/// analysis itself stays cached.
+/// `_PATH` is the one thing relocated analysis and native caches must NOT
+/// replay: it IS the module's location. Warming the native cache before each
+/// move pins the combination that previously escaped a single suite run.
 #[test]
 fn czcache_reanchors_module_path_on_relocation() {
     let main = setup(
@@ -2096,10 +2095,13 @@ fn czcache_reanchors_module_path_on_relocation() {
         ],
     );
     let root = main.parent().unwrap().to_path_buf();
+    let user_cache = root.with_file_name("czcache_path_reanchor_user_cache");
+    let _ = fs::remove_dir_all(&user_cache);
     let run_at = |root: &PathBuf| {
         let out = Command::new(env!("CARGO_BIN_EXE_brass"))
             .arg(root.join("main.cz"))
             .env("BRASS_LOG", "brass::perf=debug")
+            .env("XDG_CACHE_HOME", &user_cache)
             .output()
             .expect("spawn brass");
         (
@@ -2112,6 +2114,9 @@ fn czcache_reanchors_module_path_on_relocation() {
     let (ok, out, err) = run_at(&root);
     assert!(ok, "cold run: {out} {err}");
     assert!(out.contains("whereami.cz"), "{out}");
+    let (ok, out, err) = run_at(&root);
+    assert!(ok, "warm run: {out} {err}");
+    assert!(root.join("main.o0.czobj").is_file());
 
     let moved = root.with_file_name("czcache_path_reanchor_moved");
     let _ = fs::remove_dir_all(&moved);
@@ -2122,10 +2127,32 @@ fn czcache_reanchors_module_path_on_relocation() {
         err.contains("front/cache-hit"),
         "the moved project must reuse its cache: {err}"
     );
+    assert!(
+        err.contains("object cache: _PATH binding mismatch"),
+        "the moved native pack must reject its path-bound group: {err}"
+    );
     let moved_canon = moved.canonicalize().unwrap();
     assert!(
         out.contains(&moved_canon.display().to_string()),
         "_PATH must point at the module's NEW location, got: {out}"
+    );
+
+    // Copying the rewritten pack through another relocation ensures a stale
+    // path-bound group is replaced without sacrificing the rest of the pack.
+    let moved_again = root.with_file_name("czcache_path_reanchor_moved_again");
+    let _ = fs::remove_dir_all(&moved_again);
+    copy_tree(&moved, &moved_again);
+    let (ok, out, err) = run_at(&moved_again);
+    assert!(ok, "second relocated run: {err}");
+    assert!(err.contains("front/cache-hit"), "{err}");
+    assert!(
+        err.contains("object cache: _PATH binding mismatch"),
+        "{err}"
+    );
+    let moved_again_canon = moved_again.canonicalize().unwrap();
+    assert!(
+        out.contains(&moved_again_canon.display().to_string()),
+        "_PATH must follow every relocation, got: {out}"
     );
 }
 

@@ -20,7 +20,9 @@ use brass_hir::{FloatKind, IntKind, NominalType, Program, Type, TypeKind};
 use brass_mir::{BlockId, ClosureId, LocalId};
 use brass_parser::ast::*;
 
-use crate::jit::objcache::{CapturedObject, ObjectCacheSession, ValidatedObjects};
+use crate::jit::objcache::{
+    CapturedObject, GroupMetadata, ModulePathBinding, ObjectCacheSession, ValidatedObjects,
+};
 use crate::jit::orc::{OptTier, OrcContext, OrcJit, OrcModule, lazy_implementation_symbol};
 use crate::layout::Abi;
 use crate::monomorph::*;
@@ -121,6 +123,9 @@ struct MirState<'ctx> {
     /// Exact ordered public symbols for every lazy group, used to bind captured
     /// objects to the group shape persisted in the native packfile.
     lazy_group_symbols: HashMap<String, Vec<String>>,
+    /// Module `_PATH` constants embedded by each lazy group. Most groups carry
+    /// none and therefore remain reusable after the project moves.
+    lazy_group_path_bindings: HashMap<String, Vec<ModulePathBinding>>,
     /// The warm lazy-run ORC session. Cold deferred-monomorphization runs keep
     /// using MCJIT until their mutable lowering service is migrated as well.
     orc: Option<OrcJit>,
@@ -2132,11 +2137,15 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             HashMap::with_capacity_and_hasher(program.functions.len(), Default::default());
         let mut group_symbols =
             HashMap::with_capacity_and_hasher(program.functions.len(), Default::default());
+        let mut group_path_bindings =
+            HashMap::with_capacity_and_hasher(program.functions.len(), Default::default());
+        let module_paths = crate::jit::objcache::module_path_bindings(program.hir);
         let mut registrations = Vec::new();
         let mut perf = brass_utils::PerfLog::start("back/codegen-fn");
         for chunk in program.functions.chunks(group_size) {
             let key = mangle_fn(&chunk[0].symbol);
             let publics: Vec<String> = chunk.iter().map(|f| mangle_fn(&f.symbol)).collect();
+            let path_bindings = crate::jit::objcache::group_path_bindings(chunk, &module_paths);
             let object = cached_objects
                 .and_then(|objects| objects.matching_object(&key, &publics))
                 .map(<[u8]>::to_vec);
@@ -2153,13 +2162,15 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
                 }
                 pending.insert(key.clone(), module);
             }
-            group_symbols.insert(key, publics.clone());
+            group_symbols.insert(key.clone(), publics.clone());
+            group_path_bindings.insert(key, path_bindings);
             registrations.push((publics, object));
         }
         perf.report();
         self.mir.lazy_modules = pending;
         self.mir.lazy_groups = groups;
         self.mir.lazy_group_symbols = group_symbols;
+        self.mir.lazy_group_path_bindings = group_path_bindings;
         self.mir.lazy_has_main = program.lookup("main").is_some();
         self.mir.lazy_precompile = brass_engine::spawn_precompile(program)
             .unwrap_or_default()
@@ -2217,9 +2228,11 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             .into_iter()
             .filter_map(|(group_key, object)| {
                 let symbols = self.mir.lazy_group_symbols.get(&group_key)?.clone();
+                let path_bindings = self.mir.lazy_group_path_bindings.get(&group_key)?.clone();
                 Some(CapturedObject {
                     group_key,
                     symbols,
+                    path_bindings,
                     object,
                 })
             })
@@ -2230,13 +2243,27 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     /// functions may terminate the process without unwinding back through the
     /// driver, so the ORC transform publishes each captured group immediately.
     pub(crate) fn install_object_cache_writer(&mut self, cache: &ObjectCacheSession) {
-        let symbols = self
+        let metadata = self
             .mir
             .lazy_group_symbols
             .iter()
-            .map(|(key, symbols)| (key.clone(), symbols.clone()))
+            .map(|(key, symbols)| {
+                let path_bindings = self
+                    .mir
+                    .lazy_group_path_bindings
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_default();
+                (
+                    key.clone(),
+                    GroupMetadata {
+                        symbols: symbols.clone(),
+                        path_bindings,
+                    },
+                )
+            })
             .collect();
-        let Some(writer) = cache.writer(symbols) else {
+        let Some(writer) = cache.writer(metadata) else {
             return;
         };
         if let Some(jit) = self.mir.orc.as_mut() {

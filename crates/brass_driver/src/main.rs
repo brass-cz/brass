@@ -645,6 +645,7 @@ fn drive(mode: Mode, file: &str) -> Result<(), u8> {
                 brass_jit_llvm::jit::objcache::ObjectCacheSession::load(
                     main_path.clone(),
                     analysis_hash,
+                    &checked.program,
                 )
             });
             #[cfg(not(jit_backend))]
@@ -2772,6 +2773,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
             let cache = brass_jit_llvm::jit::objcache::ObjectCacheSession::load(
                 entry_path.clone(),
                 analysis_hash,
+                &checked.program,
             );
             let result =
                 brass_jit_llvm::run_lazy_cached(&checked.program, &checked.channels(), cache);
