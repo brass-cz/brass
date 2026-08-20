@@ -170,15 +170,12 @@ fn protocol_satisfied_by_methods(program: &Program, have: &Type, sup: &NominalTy
 /// by a METHOD rather than a stored field:
 /// - the built-in `debug` -- every type renders itself, so a one-parameter
 ///   `debug` returning `string` is always satisfied;
-/// - a method the nominal declares, with the same parameter count and a
-///   compatible return;
+/// - a method the nominal declares, with contravariantly compatible parameters
+///   (including matching passing modes) and a compatible return;
 /// - a core primitive/array method on `have`'s class (`fun string.display`).
 pub fn member_provided_by_method(program: &Program, have: &Type, name: &str, want: &Type) -> bool {
     let Type::Fun(params, ret) = want else {
         return false;
-    };
-    let ret_compatible = |have_annotated: bool, have_ret: Option<&Type>| {
-        annotated_type_satisfies(program, have_annotated, have_ret, true, Some(ret))
     };
     // A nullable narrows before any method call, and a closure has no
     // rendering; neither carries the built-in `debug`.
@@ -193,6 +190,31 @@ pub fn member_provided_by_method(program: &Program, have: &Type, name: &str, wan
     {
         return true;
     }
+    let params: Vec<Type> = params
+        .iter()
+        .map(|param| substitute_member_self(param, have))
+        .collect();
+    let ret = substitute_member_self(ret, have);
+    let ret_compatible = |have_annotated: bool, have_ret: Option<&Type>| {
+        let have_ret = have_ret.map(|ty| substitute_member_self(ty, have));
+        annotated_type_satisfies(program, have_annotated, have_ret.as_ref(), true, Some(&ret))
+    };
+    let params_compatible = |have_params: &[ParamInfo]| {
+        have_params.len() == params.len()
+            && have_params
+                .iter()
+                .zip(&params)
+                .all(|(have_param, want_param)| {
+                    have_param.resolved_ty.as_ref().is_none_or(|have_param| {
+                        let have_param = substitute_member_self(have_param, have);
+                        // A provider must accept every value admitted by the
+                        // protocol member, so parameter assignability is reversed.
+                        // `function_part_compatible` also keeps the caller-visible
+                        // passing convention invariant.
+                        function_part_compatible(program, want_param, &have_param)
+                    })
+                })
+    };
     if let Type::Record(n) | Type::Sum(n) = have
         && let Some(info) = program.type_by_id(n.id)
     {
@@ -201,7 +223,7 @@ pub fn member_provided_by_method(program: &Program, have: &Type, name: &str, wan
             TypeKind::Sum { variants } => variants.iter().find_map(|v| v.methods.get(name)),
         };
         if let Some(m) = found {
-            return m.signature.params.len() == params.len()
+            return params_compatible(&m.signature.params)
                 && ret_compatible(m.signature.ret.is_some(), m.signature.ret_ty.as_ref());
         }
     }
@@ -211,10 +233,33 @@ pub fn member_provided_by_method(program: &Program, have: &Type, name: &str, wan
             .get(&(class.to_string(), name.to_string()))
         && let Some(f) = program.functions.get(sym)
     {
-        return f.signature.params.len() == params.len()
+        return params_compatible(&f.signature.params)
             && ret_compatible(f.signature.ret.is_some(), f.signature.ret_ty.as_ref());
     }
     false
+}
+
+/// Replace the protocol declaration's abstract `Self` with the concrete type
+/// whose method is being considered. The replacement applies recursively so a
+/// receiver nested in another function or container has the same meaning as a
+/// top-level receiver parameter.
+fn substitute_member_self(ty: &Type, replacement: &Type) -> Type {
+    let substitute = |ty| substitute_member_self(ty, replacement);
+    match ty {
+        Type::SelfType => replacement.clone(),
+        Type::Array(element, len) => Type::Array(Box::new(substitute(element)), *len),
+        Type::Slice(element) => Type::Slice(Box::new(substitute(element))),
+        Type::Tuple(elements) => Type::Tuple(elements.iter().map(substitute).collect()),
+        Type::Fun(params, ret) => Type::Fun(
+            params.iter().map(substitute).collect(),
+            Box::new(substitute(ret)),
+        ),
+        Type::Nullable(inner) => Type::Nullable(Box::new(substitute(inner))),
+        Type::ConstOf(inner) => Type::ConstOf(Box::new(substitute(inner))),
+        Type::Mut(inner) => Type::Mut(Box::new(substitute(inner))),
+        Type::Ref(inner) => Type::Ref(Box::new(substitute(inner))),
+        other => other.clone(),
+    }
 }
 
 /// Function subtyping may reverse the value-type direction of a parameter, but

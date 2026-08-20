@@ -1612,6 +1612,45 @@ mod tests {
     }
 
     #[test]
+    fn function_typed_interface_member_rejects_incompatible_method_parameter() {
+        // Same arity is insufficient: the implementing method must accept the
+        // parameter type promised by the function-typed protocol member.
+        let e = errs(
+            "type Parser = {\n    parse: (Self, string) -> string\n}\ntype IntParser: Parser = {\n}\nfun IntParser.parse(self, value: int32) -> string {\n    return \"parsed\"\n}\n",
+        );
+        assert!(
+            e.iter().any(|m| m.contains(
+                "`IntParser` does not satisfy `Parser`: missing field `parse`"
+            )),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn function_typed_interface_member_accepts_compatible_method_parameter() {
+        // A method with the protocol's receiver, parameter, and return types
+        // provides the function-typed member without a stored closure field.
+        let e = errs(
+            "type Parser = {\n    parse: (Self, string) -> string\n}\ntype StringParser: Parser = {\n}\nfun StringParser.parse(self, value: string) -> string {\n    return value\n}\n",
+        );
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn function_typed_interface_member_rejects_method_passing_mode_change() {
+        // Function-member substitution cannot turn a copied parameter into a
+        // mutable reference that aliases caller-owned state.
+        let e = errs(
+            "type Applier = {\n    apply: (Self, int32[]) -> void\n}\ntype BorrowingApplier: Applier = {\n}\nfun BorrowingApplier.apply(self, values: ref(mut(int32[]))) -> void {\n}\n",
+        );
+        assert!(
+            e.iter().any(|m| m
+                .contains("`BorrowingApplier` does not satisfy `Applier`: missing field `apply`")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
     fn builtin_debug_types_as_string() {
         // Every type satisfies `Debug`: a record without a user `debug` gets
         // the built-in renderer, typed `string` (the mismatch against int32

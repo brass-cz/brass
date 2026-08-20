@@ -5,6 +5,7 @@
 use fxhash::FxHashMap as HashMap;
 
 use brass_hir::{FieldInfo, MethodInfo, Program, TypeKind};
+use brass_typesys::structural::member_provided_by_method;
 
 use crate::TypeError;
 
@@ -18,6 +19,7 @@ pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -
         if !modules.checks(&info.module) {
             continue;
         }
+        let have_ty = info.type_ref();
         // Two interfaces a type implements may declare the same field name with
         // incompatible types. Each parent is otherwise checked independently
         // against the implementer, so this conflict between the parents
@@ -82,6 +84,7 @@ pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -
                         &v.methods,
                         &iv.fields,
                         &HashMap::default(),
+                        &have_ty,
                         program,
                         info.span,
                         true,
@@ -124,6 +127,7 @@ pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -
                         methods,
                         ifields,
                         imethods,
+                        &have_ty,
                         program,
                         info.span,
                         true,
@@ -140,6 +144,7 @@ pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -
                             &v.methods,
                             ifields,
                             imethods,
+                            &have_ty,
                             program,
                             info.span,
                             true,
@@ -211,6 +216,7 @@ fn report(
     methods: &HashMap<String, MethodInfo>,
     ifields: &[FieldInfo],
     imethods: &HashMap<String, MethodInfo>,
+    have_ty: &brass_hir::Type,
     program: &Program,
     span: brass_parser::Span,
     report_missing: bool,
@@ -221,17 +227,11 @@ fn report(
             None if report_missing => {
                 // A function-typed interface member may be provided by a
                 // METHOD instead of a stored field: the built-in `debug`
-                // (every type renders itself) or a declared method of the
-                // same arity. `type A: Debug` holds for any record.
-                let provided = match ifld.resolved_ty.as_ref() {
-                    Some(brass_hir::Type::Fun(params, _)) => {
-                        (ifld.name == "debug" && params.len() == 1)
-                            || methods
-                                .get(&ifld.name)
-                                .is_some_and(|m| m.signature.params.len() == params.len())
-                    }
-                    _ => false,
-                };
+                // (every type renders itself) or a signature-compatible
+                // declared method. `type A: Debug` holds for any record.
+                let provided = ifld.resolved_ty.as_ref().is_some_and(|want| {
+                    member_provided_by_method(program, have_ty, &ifld.name, want)
+                });
                 if !provided {
                     errors.push(TypeError {
                         message: format!(
