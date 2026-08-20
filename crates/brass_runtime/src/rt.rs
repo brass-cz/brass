@@ -24,9 +24,11 @@ pub const TAG_F64: i64 = 17;
 // ----- object kinds -----
 
 pub const KIND_STRING: u8 = 1;
+/// A typed growable array whose element buffer is stored separately at offset 32.
+pub const KIND_ARRAY: u8 = 2;
 /// A typed monomorphized heap object laid out by the typed back end itself: its
-/// fields are concrete typed values, so nothing traverses them. Strings, arrays,
-/// Result cells, and nullable cells the runtime hands back all carry this kind.
+/// fields are concrete typed values, so nothing traverses them. Result cells,
+/// nullable cells, and other runtime-created typed objects carry this kind.
 pub const KIND_TYPED: u8 = 8;
 
 // ----- owner classes -----
@@ -95,7 +97,7 @@ pub struct Header {
     pub nchild: i32,
 }
 
-// The bump allocator lives in crate::mem.
+// The counted allocator lives in crate::mem.
 pub use crate::mem::pp_obj_alloc;
 
 /// Mask an integer to the width/signedness implied by its tag. Used by the typed

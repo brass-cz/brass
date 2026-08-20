@@ -40,7 +40,7 @@ import std.path.{ Path }
  */
 type File = {
     _fd: int64
-    _path: string
+    _path: string _borrowed: bool
 }
 
 /**
@@ -50,7 +50,7 @@ type File = {
  * `File` owns the descriptor from here: closing the `File` closes it.
  */
 fun File.from_fd(fd: int64) -> File {
-    return File { _fd: fd, _path: "" }
+    return File { _fd: fd, _path: "", _borrowed: false }
 }
 
 /**
@@ -61,22 +61,22 @@ fun File.open(path, mode: string) -> File! {
     // The text is kept as well as the descriptor: `size` stats by name (see
     // below), so the `File` has to remember the name it was opened under.
     const text = _as_text(path)!
-    return File { _fd: fd_open(text, mode)!, _path: text }
+    return File { _fd: fd_open(text, mode)!, _path: text, _borrowed: false }
 }
 
 /** Standard input as a `File` (never closed by `close`). */
 fun File.stdin() -> File {
-    return File { _fd: 0, _path: "" }
+    return File { _fd: 0, _path: "", _borrowed: true }
 }
 
 /** Standard output as a `File` (never closed by `close`). */
 fun File.stdout() -> File {
-    return File { _fd: 1, _path: "" }
+    return File { _fd: 1, _path: "", _borrowed: true }
 }
 
 /** Standard error as a `File` (never closed by `close`). */
 fun File.stderr() -> File {
-    return File { _fd: 2, _path: "" }
+    return File { _fd: 2, _path: "", _borrowed: true }
 }
 
 /** Block for data and read up to non-negative `max` bytes (fewer on a short read; empty at end-of-file). */
@@ -107,15 +107,15 @@ fun File.size(self) -> int64! {
 }
 
 /**
- * Close the file. The standard streams are left open, and the stored
- * descriptor is forgotten on close so a second `close()` cannot re-close a
- * descriptor the OS may have reassigned to a later `open` (it is a no-op),
- * and reads/writes after close fail instead of hitting an unrelated file.
+ * Close an owned file. Borrowed standard streams are left open; every other
+ * descriptor is closed regardless of its numeric value. An owned descriptor
+ * is forgotten so a second close cannot affect a descriptor the OS reassigned;
+ * explicit ownership, not the descriptor number, controls closure.
  */
 fun File.close(self) {
-    if self._fd > 2 {
-        fd_close(self._fd)!
-        self._fd = -1
+    if self._fd >= 0 {
+        fd_close(self._fd, self._borrowed)!
+        if !self._borrowed { self._fd = -1 }
     }
 }
 

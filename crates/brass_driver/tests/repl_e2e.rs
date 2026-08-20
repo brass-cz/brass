@@ -169,3 +169,27 @@ fn interactive_repl_executes_statements_and_echoes_expressions() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(stdout, "42\n25\n42\n", "interactive REPL stdout");
 }
+
+#[test]
+fn interactive_repl_does_not_repeat_prior_input_effects() {
+    // The first statement consumes one following line. Checking and executing
+    // the next statement must not run that input operation again.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_brass"))
+        .env("BRASS_CACHE", "off")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn brass repl");
+
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(b"println(input()!)\nfirst\nprintln(\"done\")\n")
+            .unwrap();
+    }
+
+    let out = child.wait_with_output().expect("wait for brass repl");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout, "first\ndone\n", "interactive REPL stdout");
+}

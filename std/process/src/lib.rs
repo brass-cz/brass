@@ -2,9 +2,9 @@
 //!
 //! `std/process.cz` builds the `Command`/`Stdio`/`Child` surface on
 //! these primitives. A spawned child sits in a process-wide table keyed by an
-//! `i64` handle; a piped standard stream leaves as a raw descriptor, which the
-//! Brass side adopts as a `File` so the ordinary read/write/close methods
-//! drive it.
+//! `i64` handle; on Unix, a piped standard stream leaves as a raw descriptor,
+//! which the Brass side adopts as a `File` so the ordinary read/write/close
+//! methods drive it. Taking raw child streams is unsupported elsewhere.
 //!
 //! Stdio modes are the small integers `process.cz` translates its `Stdio`
 //! variants to: 0 = inherit, 1 = pipe, 2 = null. Stream selectors are
@@ -210,10 +210,18 @@ export! {
     }
 
     /// Take the child's piped standard stream `which` (0 = stdin, 1 = stdout,
-    /// 2 = stderr) and return its raw descriptor. Available once, and only
-    /// when that stream was configured as a pipe -- but also after `wait`,
-    /// because the pipe still holds what the child wrote before exiting.
+    /// 2 = stderr) and return its Unix raw descriptor. Available once, and
+    /// only when that stream was configured as a pipe -- but also after
+    /// `wait`, because the pipe still holds what the child wrote before
+    /// exiting. Non-Unix targets report this operation as unsupported.
     fn process_stream(child: i64, which: i64) -> Result<i64, String> {
+        #[cfg(not(unix))]
+        {
+            let _ = (child, which);
+            return Err("taking raw child streams is supported only on Unix".to_string());
+        }
+        #[cfg(unix)]
+        {
         let entry = entry(child)?;
         let mut e = lock(&entry)?;
         let fd = {
@@ -227,6 +235,7 @@ export! {
         };
         release_if_spent(&mut e);
         fd.ok_or_else(|| "stream is not piped or already taken".to_string())
+        }
     }
 
     /// Block until the child exits, returning its exit code (the signal
@@ -314,11 +323,6 @@ fn join_reader(handle: Reader) -> Result<Vec<u8>, String> {
 #[cfg(unix)]
 fn into_fd(stream: impl std::os::fd::IntoRawFd) -> i64 {
     i64::from(stream.into_raw_fd())
-}
-
-#[cfg(windows)]
-fn into_fd(stream: impl std::os::windows::io::IntoRawHandle) -> i64 {
-    stream.into_raw_handle() as i64
 }
 
 struct ProcessLib;

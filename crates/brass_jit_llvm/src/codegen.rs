@@ -1568,30 +1568,41 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             .unwrap_basic()
     }
 
-    /// The `(int64 value, is_float flag, f64 value)` triple a `*.from(x)`
-    /// conversion passes to the runtime, from an int or float argument.
+    /// The `(int64 value, is_float flag, f64 value, integer signedness)` values a
+    /// `*.from(x)` conversion passes to the runtime.
     fn conv_from_args(
         &mut self,
         arg: BasicValueEnum<'ctx>,
         arg_ty: &Type,
-    ) -> (IntValue<'ctx>, IntValue<'ctx>, FloatValue<'ctx>) {
+    ) -> (
+        IntValue<'ctx>,
+        IntValue<'ctx>,
+        FloatValue<'ctx>,
+        IntValue<'ctx>,
+    ) {
         match arg_ty {
-            Type::Int(_) => {
+            Type::Int(kind) => {
                 let xi = self
                     .coerce(arg, arg_ty, &Type::Int(IntKind::I64))
                     .into_int_value();
-                (xi, self.i64c(0), self.ctx.f64_type().const_float(0.0))
+                (
+                    xi,
+                    self.i64c(0),
+                    self.ctx.f64_type().const_float(0.0),
+                    self.i64c(i64::from(kind.is_signed())),
+                )
             }
             Type::Float(_) => {
                 let xf = self
                     .coerce(arg, arg_ty, &Type::Float(FloatKind::F64))
                     .into_float_value();
-                (self.i64c(0), self.i64c(1), xf)
+                (self.i64c(0), self.i64c(1), xf, self.i64c(1))
             }
             _ => (
                 self.i64c(0),
                 self.i64c(0),
                 self.ctx.f64_type().const_float(0.0),
+                self.i64c(1),
             ),
         }
     }
@@ -3250,7 +3261,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
                     let f = self.abi.runtime_fn(&self.module, "pp_conv_int_parse", ty);
                     self.call_basic(f, &[arg.into(), tag.into()])
                 } else {
-                    let (xi, is_float, xf) = self.conv_from_args(arg, arg_ty);
+                    let (xi, is_float, xf, _) = self.conv_from_args(arg, arg_ty);
                     let ty = self.abi.ptr().fn_type(
                         &[
                             self.abi.i64t().into(),
@@ -3274,19 +3285,28 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
                     let f = self.abi.runtime_fn(&self.module, "pp_conv_float_parse", ty);
                     self.call_basic(f, &[arg.into(), tag.into()])
                 } else {
-                    let (xi, is_float, xf) = self.conv_from_args(arg, arg_ty);
+                    let (xi, is_float, xf, source_signed) = self.conv_from_args(arg, arg_ty);
                     let ty = self.ctx.f64_type().fn_type(
                         &[
                             self.abi.i64t().into(),
                             self.abi.i64t().into(),
                             self.ctx.f64_type().into(),
                             self.abi.i64t().into(),
+                            self.abi.i64t().into(),
                         ],
                         false,
                     );
                     let f = self.abi.runtime_fn(&self.module, "pp_conv_float_from", ty);
-                    let wide =
-                        self.call_basic(f, &[xi.into(), is_float.into(), xf.into(), tag.into()]);
+                    let wide = self.call_basic(
+                        f,
+                        &[
+                            xi.into(),
+                            is_float.into(),
+                            xf.into(),
+                            source_signed.into(),
+                            tag.into(),
+                        ],
+                    );
                     // `pp_conv_float_from` returns an f64; a `float32` target must
                     // truncate it to f32 before it is stored into the 4-byte slot.
                     // The value is already f32-rounded in the runtime, so the

@@ -769,17 +769,13 @@ impl<'p, 'm> Interp<'p, 'm> {
             // so interactive `input()` works on the interpreter.
             "_print_str" | "_println_str" => {
                 let s = self.eval_operand(f, frame, &args[0], &Type::Str)?;
-                if name == "_println_str" {
-                    let _ = writeln!(self.out, "{}", s.as_str());
-                } else {
-                    let _ = write!(self.out, "{}", s.as_str());
-                }
+                write_output(self.out, s.as_str(), name == "_println_str")?;
                 Ok(Value::Void)
             }
             // Push buffered output out before something that is not a normal
             // return ends the program or reads the terminal.
             "_flush" => {
-                let _ = self.out.flush();
+                self.out.flush().map_err(|e| e.to_string())?;
                 Ok(Value::Void)
             }
             // The program's argument vector, published by the driver (empty in
@@ -906,13 +902,9 @@ impl<'p, 'm> Interp<'p, 'm> {
                 Ok(convert(&target, "parse", &Type::Str, &s))
             }
             "_int_to_float" => {
-                let x = self.eval_operand(f, frame, &args[0], &Type::Int(IntKind::I64))?;
-                Ok(convert(
-                    &Type::Float(FloatKind::F64),
-                    "from",
-                    &Type::Int(IntKind::I64),
-                    &x,
-                ))
+                let source = operand_type_of(&args[0], &f.local_types);
+                let x = self.eval_operand(f, frame, &args[0], &source)?;
+                Ok(convert(&Type::Float(FloatKind::F64), "from", &source, &x))
             }
             "_float_to_int" => {
                 let x = self.eval_operand(f, frame, &args[0], &Type::Float(FloatKind::F64))?;
@@ -1003,11 +995,7 @@ impl<'p, 'm> Interp<'p, 'm> {
                 }
             }
         };
-        if newline {
-            let _ = writeln!(self.out, "{s}");
-        } else {
-            let _ = write!(self.out, "{s}");
-        }
+        write_output(self.out, &s, newline)?;
         Ok(Value::Void)
     }
 }
@@ -1246,7 +1234,7 @@ fn coerce(v: Value, from: &Type, to: &Type) -> Value {
         }
         // An integer implicitly converts to a float (e.g. `int * float`).
         (Value::Int(x), Type::Float(fk)) => {
-            let f = *x as f64;
+            let f = int_to_float(*x, int_kind(from));
             Value::Float(if matches!(fk, FloatKind::F32) {
                 (f as f32) as f64
             } else {
@@ -1303,7 +1291,13 @@ fn convert(target: &Type, method: &str, arg_ty: &Type, v: &Value) -> Value {
         },
         Type::Float(k) => match method {
             // `float.from(int)` is infallible; it yields the float value directly.
-            "from" => Value::Float(round_f32_if(*k, v.as_float())),
+            "from" => {
+                let value = match arg_ty {
+                    Type::Int(source) => int_to_float(v.as_int(), *source),
+                    _ => v.as_float(),
+                };
+                Value::Float(round_f32_if(*k, value))
+            }
             "parse" => match v.as_str().trim().parse::<f64>() {
                 Ok(x) => result_ok(Value::Float(round_f32_if(*k, x))),
                 Err(_) => result_err(&format!("cannot parse `{}` as float", v.as_str())),
@@ -1327,14 +1321,15 @@ fn float_to_int(fx: f64, k: IntKind) -> Value {
     }
     let truncated = fx.trunc();
     let (min, max) = int_range(k.bits(), k.is_signed());
-    if truncated < min as f64 || truncated > max as f64 {
+    let integral = truncated as i128;
+    if integral < min || integral > max {
         return result_err(&format!(
             "float value {} is out of range for {} ({min}..={max})",
             float_str(fx),
             k.name()
         ));
     }
-    result_ok(Value::Int(norm_int(truncated as i64, k)))
+    result_ok(Value::Int(norm_int(integral as i64, k)))
 }
 
 /// `Result.Ok { value }` when `x` fits integer kind `k`, else `Result.Err`, with
@@ -1496,6 +1491,25 @@ fn round_f32_if(fk: FloatKind, x: f64) -> f64 {
     }
 }
 
+/// Convert the bits carried in an `i64` according to their source integer kind.
+fn int_to_float(value: i64, kind: IntKind) -> f64 {
+    if kind.is_signed() {
+        value as f64
+    } else {
+        (value as u64) as f64
+    }
+}
+
+/// Write one interpreter output item and preserve the sink's failure as a
+/// runtime error.
+fn write_output(out: &mut dyn Write, text: &str, newline: bool) -> Result<(), String> {
+    if newline {
+        writeln!(out, "{text}").map_err(|e| e.to_string())
+    } else {
+        write!(out, "{text}").map_err(|e| e.to_string())
+    }
+}
+
 /// The integer kind of a type, defaulting to `int32` for a non-integer (the
 /// operand type of `Neg`/`BitNot` is always an integer in valid programs).
 fn int_kind(ty: &Type) -> IntKind {
@@ -1520,4 +1534,55 @@ fn is_result_ty(ty: &Type) -> bool {
 /// `head`; a plain `head` is unchanged).
 fn field_key(field: &str) -> &str {
     field.rsplit('.').next().unwrap_or(field)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn variant_name(value: &Value) -> Option<&str> {
+        match value {
+            Value::Variant(value) => Some(&value.variant),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn float_integer_bounds_are_checked_before_carrier_conversion() {
+        // Rounded endpoint values are judged in the wider integral domain.
+        assert_eq!(
+            variant_name(&float_to_int(2f64.powi(63), IntKind::I64)),
+            Some("Err")
+        );
+        assert_eq!(
+            variant_name(&float_to_int(2f64.powi(64), IntKind::U64)),
+            Some("Err")
+        );
+    }
+
+    #[test]
+    fn unsigned_integer_to_float_uses_the_full_carrier_bits() {
+        // The all-ones carrier denotes uint64::MAX for an unsigned source.
+        assert_eq!(int_to_float(-1, IntKind::U64), u64::MAX as f64);
+        assert_eq!(int_to_float(-1, IntKind::I64), -1.0);
+    }
+
+    #[test]
+    fn output_sink_failures_are_returned() {
+        // Both primitive and high-level print paths share this fallible writer.
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("closed output"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("closed output"))
+            }
+        }
+
+        let mut out = FailingWriter;
+        assert!(write_output(&mut out, "text", false).is_err());
+        assert!(out.flush().is_err());
+    }
 }

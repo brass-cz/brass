@@ -208,8 +208,21 @@ pub extern "C-unwind" fn pp_int_narrow(
 }
 
 /// Typed `floatN.from(x)` (infallible widening/narrowing): returns the float.
-pub extern "C-unwind" fn pp_conv_float_from(xi: i64, is_float: i64, xf: f64, tag: i64) -> f64 {
-    let f = if is_float != 0 { xf } else { xi as f64 };
+/// `source_signed` describes the integer carrier when `is_float == 0`.
+pub extern "C-unwind" fn pp_conv_float_from(
+    xi: i64,
+    is_float: i64,
+    xf: f64,
+    source_signed: i64,
+    tag: i64,
+) -> f64 {
+    let f = if is_float != 0 {
+        xf
+    } else if source_signed != 0 {
+        xi as f64
+    } else {
+        (xi as u64) as f64
+    };
     if tag == TAG_F32 { (f as f32) as f64 } else { f }
 }
 
@@ -323,5 +336,12 @@ mod tests {
         assert!(checked_int_i64(-1, TAG_INT_U8).is_err());
         assert_eq!(checked_int_i64(127, TAG_INT_I8), Ok(127));
         assert!(checked_int_i64(128, TAG_INT_I8).is_err());
+    }
+
+    #[test]
+    fn float_from_preserves_unsigned_carrier_bits() {
+        // The source signedness selects how the shared i64 carrier is interpreted.
+        assert_eq!(pp_conv_float_from(-1, 0, 0.0, 0, TAG_F64), u64::MAX as f64);
+        assert_eq!(pp_conv_float_from(-1, 0, 0.0, 1, TAG_F64), -1.0);
     }
 }

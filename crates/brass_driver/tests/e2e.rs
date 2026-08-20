@@ -36,6 +36,13 @@ fn collect_cases(dir: &Path, out: &mut Vec<PathBuf>) {
     entries.sort();
     for path in entries {
         if path.is_dir() {
+            if path.file_name().is_some_and(|name| name == "net")
+                && std::env::var_os("BRASS_E2E_SKIP_NET").is_some()
+            {
+                // Restricted test sandboxes may deny even loopback sockets;
+                // keep the remainder of the default-feature suite runnable.
+                continue;
+            }
             if !cfg!(feature = "jit")
                 && path.file_name().is_some_and(|n| {
                     n == "concurrency"

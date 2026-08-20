@@ -1924,9 +1924,9 @@ pub trait Codegen {
             // `_int_to_float(x, float_bits)` widens an integer to float; the bits
             // operand selects the float width but the typed value is f64-carried.
             "_int_to_float" => {
-                let i64t = Type::Int(brass_hir::IntKind::I64);
-                let x = self.codegen_operand(program, f, &args[0], &i64t);
-                self.convert(&Type::Float(brass_hir::FloatKind::F64), "from", &i64t, x)
+                let source = operand_type_of(&args[0], &f.local_types);
+                let x = self.codegen_operand(program, f, &args[0], &source);
+                self.convert(&Type::Float(brass_hir::FloatKind::F64), "from", &source, x)
             }
             // `_float_to_int(x, int_bits, signed)` truncates a float to an integer,
             // range-checked: a typed `Result<int64, string>`.

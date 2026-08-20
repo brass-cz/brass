@@ -24,14 +24,14 @@ use crate::rt::{Header, OWNER_BRIDGE, OWNER_CONTAINED, OWNER_IMMUTABLE, OWNER_LO
 /// Per-region metadata. `lrc` includes the bridge's own external owner, so it
 /// starts at 1 and a region is closed at `lrc == 1` (no other reference in).
 /// `parent` is the id of the enclosing region, or 0 at the top level. `bridge` and
-/// `prev_owner` record the bridge object and the owner class it had before the
-/// region re-tagged it `BRIDGE`, so close can restore it -- otherwise a cown stays
-/// `BRIDGE` after its first `with` and is no longer recognised as shared.
+/// `prev_owner` and `prev_region` record the bridge metadata that close restores
+/// after temporarily tagging it as this region's bridge.
 struct RegionMeta {
     lrc: i64,
     parent: i64,
     bridge: usize,
     prev_owner: u8,
+    prev_region: i32,
 }
 
 /// Live regions by id, plus the next id to hand out. A region is inserted on
@@ -77,6 +77,11 @@ pub unsafe extern "C-unwind" fn pp_region_open_nested(bridge: *mut Header, paren
         } else {
             (*bridge).owner
         };
+        let prev_region = if bridge.is_null() {
+            0
+        } else {
+            (*bridge).nchild
+        };
         let mut table = REGIONS.lock().unwrap();
         let id = table.next_id;
         table.next_id += 1;
@@ -87,6 +92,7 @@ pub unsafe extern "C-unwind" fn pp_region_open_nested(bridge: *mut Header, paren
                 parent,
                 bridge: bridge as usize,
                 prev_owner,
+                prev_region,
             },
         );
         if !bridge.is_null() {
@@ -372,6 +378,7 @@ pub extern "C-unwind" fn pp_region_close(id: i64) -> bool {
     if meta.bridge != 0 {
         unsafe {
             (*(meta.bridge as *mut Header)).owner = meta.prev_owner;
+            (*(meta.bridge as *mut Header)).nchild = meta.prev_region;
         }
     }
     meta.lrc == 1
@@ -401,6 +408,25 @@ mod tests {
     /// (gc, conc) never observe this module's allocations mid-flight.
     fn serial_region() -> MutexGuard<'static, ()> {
         crate::serial_heap_test()
+    }
+
+    #[test]
+    fn nested_bridge_close_restores_the_enclosing_region() {
+        // Reusing a bridge for a nested scope restores both pieces of its prior
+        // region metadata when the inner scope closes.
+        let _serial = serial_region();
+        unsafe {
+            let bridge = pp_typed_alloc(32);
+            let outer = pp_region_open(bridge);
+            let inner = pp_region_open_nested(bridge, outer);
+            assert_eq!((*bridge).nchild, inner as i32);
+            assert!(pp_region_close(inner));
+            assert_eq!((*bridge).nchild, outer as i32);
+            assert_eq!((*bridge).owner, OWNER_BRIDGE);
+            assert!(pp_region_close(outer));
+            assert_eq!((*bridge).nchild, 0);
+            assert_eq!((*bridge).owner, OWNER_LOCAL);
+        }
     }
 
     /// A region with no escape stays closed; an external reference into it (the

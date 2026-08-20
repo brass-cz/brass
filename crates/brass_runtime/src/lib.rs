@@ -1,10 +1,9 @@
 //! Brass runtime: the C-ABI primitives that the typed (unboxed) JIT back end
 //! links against. The back end emits monomorphized LLVM that operates on
-//! concrete typed values, so the runtime only provides the heap object model
-//! (a bump allocator over `Header`-prefixed objects in `crate::mem`), the typed
-//! string/array/conversion entry points, and the panic path. There is no boxed
-//! value representation and no garbage collector: heap is bump-allocated and the
-//! process exits on a runtime error.
+//! concrete typed values, so the runtime provides the counted heap object model,
+//! typed string/array/conversion entry points, region and concurrency primitives,
+//! cycle collection for registered aggregates, and the panic path. There is no
+//! boxed value representation; the process exits on a runtime error.
 
 pub mod alloc;
 pub mod builtins;

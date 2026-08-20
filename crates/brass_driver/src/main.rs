@@ -1114,6 +1114,22 @@ impl CheckerPause {
     }
 }
 
+/// Ensures every exit after checker startup requests termination and wakes a
+/// checker that is waiting for another priority request.
+#[cfg(jit_backend)]
+struct CheckerCleanup {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    paused: std::sync::Arc<CheckerPause>,
+}
+
+#[cfg(jit_backend)]
+impl Drop for CheckerCleanup {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.paused.resume();
+    }
+}
+
 #[cfg(jit_backend)]
 struct ThreadScheduler {
     events: tokio::sync::mpsc::UnboundedSender<brass_typeck::stream::CheckEvent>,
@@ -2070,6 +2086,7 @@ fn resolve_deferred(
                 // more of the check has landed; a failure against the final
                 // state is real.
                 if !lazy.closed {
+                    lazy.resume_background();
                     lazy.pump_blocking();
                     lazy.pump_pending();
                     if !lazy.needs_eager {
@@ -2189,6 +2206,10 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
             check_front(&label, front, &search, Some(&mut sched), resume)
         }
     });
+    let _checker_cleanup = CheckerCleanup {
+        stop: stop.clone(),
+        paused: paused.clone(),
+    };
 
     // Front-pass diagnostics (qualified uses, spawn ownership) are not
     // rendered here: the checker reports them with the rest, eager-identical.
@@ -2289,6 +2310,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
             // Reclaimability: the paused checker thread must exit before `rt`
             // drops (it joins blocking tasks), and this path abandons it.
             lazy.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            lazy.resume_background();
             return run_fresh_eager(&label, &src, &root);
         }
         return finish_eagerly(
@@ -2438,6 +2460,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                             // Reclaimability: the paused checker thread must exit before `rt`
                             // drops (it joins blocking tasks), and this path abandons it.
                             lazy.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                            lazy.resume_background();
                             return run_fresh_eager(&label, &src, &root);
                         }
                     } else {
@@ -2700,6 +2723,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                         // Reclaimability: the paused checker thread must exit before `rt`
                         // drops (it joins blocking tasks), and this path abandons it.
                         lazy.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        lazy.resume_background();
                         return run_fresh_eager(&label, &src, &root);
                     }
                     // A rejection against the checker's final state: held
@@ -3018,6 +3042,7 @@ fn stop_checker(
     lazy: &mut LazyState,
 ) {
     lazy.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    lazy.resume_background();
     while !lazy.closed {
         lazy.pump_blocking();
     }
@@ -3260,7 +3285,7 @@ fn check_front(
             (Vec::new(), HashMap::default())
         } else {
             let t = std::time::Instant::now();
-            match specialize_keyed(&mut program, &mut analysis, &sources) {
+            match specialize_keyed(&mut program, &mut analysis) {
                 Ok((generated, keyed_dispatch)) => {
                     phase("front/keyed-continuation", t);
                     if let Some(s) = sched.as_deref_mut() {
@@ -3411,41 +3436,16 @@ type KeyedSpecializationResult = (Vec<brass_hir::GeneratedDecl>, HashMap<Span, S
 fn specialize_keyed(
     program: &mut Program,
     analysis: &mut brass_typeck::Analysis,
-    sources: &brass_resolve::SourceMap,
 ) -> Result<KeyedSpecializationResult, (String, Span)> {
     let seed = analysis.context_tables.clone();
     let mut pending = analysis.keyed_calls.clone();
     let keyed_spans: HashSet<Span> = pending.keys().copied().collect();
-    let keyed_statements = keyed_statement_spans(program, &keyed_spans);
-    let keyed_lines: HashSet<(String, usize)> = keyed_spans
-        .iter()
-        .filter_map(|span| {
-            let loc = sources.locate(span.lo)?;
-            let line = loc.src.as_bytes()[..loc.local]
-                .iter()
-                .filter(|byte| **byte == b'\n')
-                .count();
-            Some((loc.label.to_string(), line))
-        })
-        .collect();
+    let provisional_spans = keyed_provisional_spans(program, &keyed_spans);
     // A keyed call is initially elaborated against the generic template, so
     // constraints from a second key can leave a provisional error at that
     // call span. The generated-body continuation is the verdict for those
     // sites; discovery errors that prevented recording a key are unaffected.
-    analysis.errors.retain(|error| {
-        let keyed_line = sources.locate(error.span.lo).is_some_and(|loc| {
-            let line = loc.src.as_bytes()[..loc.local]
-                .iter()
-                .filter(|byte| **byte == b'\n')
-                .count();
-            keyed_lines.contains(&(loc.label.to_string(), line))
-        });
-        !keyed_line
-            && !keyed_spans.contains(&error.span)
-            && !keyed_statements
-                .iter()
-                .any(|span| span.lo <= error.span.lo && error.span.lo < span.hi)
-    });
+    remove_provisional_keyed_diagnostics(&mut analysis.errors, &provisional_spans);
     let mut generated_all = Vec::new();
     let mut generated_symbols = fxhash::FxHashSet::default();
     let mut keyed_dispatch = HashMap::default();
@@ -3540,17 +3540,15 @@ fn specialize_keyed(
     ))
 }
 
-/// Source statements containing a keyed call. First-pass inference errors on
-/// these statements are provisional because the template is shared across
-/// keys; static discovery errors do not record a keyed call and stay outside
-/// this set.
-fn keyed_statement_spans(program: &Program, keyed: &HashSet<Span>) -> Vec<Span> {
-    let mut owners = Vec::new();
+/// Source spans at which first-pass keyed result-flow diagnostics can land: the
+/// call itself or its owning statement's required-type check.
+fn keyed_provisional_spans(program: &Program, keyed: &HashSet<Span>) -> HashSet<Span> {
+    let mut spans = keyed.clone();
     let mut inspect = |stmt: &Stmt| {
         let mut calls = Vec::new();
         collect_call_spans_stmt(stmt, &mut calls);
         if calls.iter().any(|span| keyed.contains(span)) {
-            owners.push(stmt.span());
+            spans.insert(stmt.span());
         }
     };
     for function in program.functions.values() {
@@ -3574,7 +3572,22 @@ fn keyed_statement_spans(program: &Program, keyed: &HashSet<Span>) -> Vec<Span> 
                 .for_each(&mut inspect),
         }
     }
-    owners
+    spans
+}
+
+/// Remove only required-type mismatches emitted by the keyed call's provisional
+/// first-pass result. Other diagnostics at the same span remain actionable.
+fn remove_provisional_keyed_diagnostics(
+    errors: &mut Vec<brass_typeck::TypeError>,
+    provisional_spans: &HashSet<Span>,
+) {
+    errors.retain(|error| {
+        let provisional_flow = (error.message.starts_with("cannot use `")
+            && error.message.contains("` where `")
+            && error.message.ends_with("` is required"))
+            || error.message.starts_with("cannot implicitly convert `");
+        !provisional_flow || !provisional_spans.contains(&error.span)
+    });
 }
 
 /// Every call expression's span mapped to its source position (diagnostic
@@ -3797,10 +3810,10 @@ fn render_diagnostics(
 // ===== interactive REPL =====
 
 /// Run an interactive REPL session. Top-level definitions (functions, types,
-/// imports) accumulate; statements and expressions execute in an implicit `main`
-/// whose history re-runs each turn so earlier bindings stay visible. Because the
-/// program is deterministic and history-prefixed, only the new output suffix is
-/// shown. A bare expression is echoed by wrapping it in `println`.
+/// imports) and statements accumulate for static checking. Each accepted input
+/// executes once; prior bindings with side-effect-free initializers are replayed
+/// only to provide values required by the new statement. A bare expression is
+/// echoed by wrapping it in `println`.
 fn repl_interactive() -> ExitCode {
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let stdin = io::stdin();
@@ -3808,7 +3821,6 @@ fn repl_interactive() -> ExitCode {
 
     let mut defs: Vec<String> = Vec::new();
     let mut body: Vec<String> = Vec::new();
-    let mut last_output = String::new();
 
     loop {
         eprint!("> ");
@@ -3824,7 +3836,7 @@ fn repl_interactive() -> ExitCode {
 
         if is_definition(&item) {
             defs.push(item);
-            match run_capture(&defs, &body, &root) {
+            match check_capture(&defs, &body, &root) {
                 Ok(_) => {}
                 Err(e) => {
                     defs.pop();
@@ -3844,19 +3856,46 @@ fn repl_interactive() -> ExitCode {
         let mut committed = false;
         let mut last_err = String::new();
         for cand in candidates {
-            body.push(cand);
-            match run_capture(&defs, &body, &root) {
+            body.push(cand.clone());
+            if let Err(e) = check_capture(&defs, &body, &root) {
+                body.pop();
+                last_err = e;
+                continue;
+            }
+
+            let mut execution: Vec<String> = body[..body.len() - 1]
+                .iter()
+                .filter(|prior| is_replay_safe_binding(prior))
+                .cloned()
+                .collect();
+            execution.push(cand);
+            let execution = match check_capture(&defs, &execution, &root) {
+                Ok(checked) => checked,
+                Err(e) => {
+                    body.pop();
+                    last_err = e;
+                    continue;
+                }
+            };
+            if let Err(e) = brass_repl::validate(&execution.program, &execution.channels()) {
+                body.pop();
+                last_err = e;
+                continue;
+            }
+            match run_checked_capture(&execution) {
                 Ok(out) => {
-                    print_new_output(&out, &last_output);
-                    last_output = out;
+                    print!("{out}");
+                    let _ = io::stdout().flush();
                     committed = true;
-                    break;
                 }
                 Err(e) => {
                     body.pop();
                     last_err = e;
                 }
             }
+            // Once a statically valid candidate has run, trying another form
+            // could execute the entered expression a second time.
+            break;
         }
         if !committed {
             eprintln!("{last_err}");
@@ -3865,23 +3904,64 @@ fn repl_interactive() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Print the portion of `out` past the already-shown `prev` prefix (history
-/// re-runs, so `out` extends `prev`); fall back to the whole output if the prefix
-/// no longer matches.
-fn print_new_output(out: &str, prev: &str) {
-    let suffix = out.strip_prefix(prev).unwrap_or(out);
-    print!("{suffix}");
-    let _ = io::stdout().flush();
-}
-
-/// Assemble the accumulated definitions and `main` body, check, and interpret it,
-/// capturing `print`/`println` output. Returns the captured output or the error.
-fn run_capture(defs: &[String], body: &[String], root: &Path) -> Result<String, String> {
-    let src = assemble(defs, body);
-    let checked = analyze("<repl>", &src, root).map_err(|d| d.join("\n"))?;
+/// Interpret one already checked and runtime-supported candidate, capturing
+/// `print`/`println` output.
+fn run_checked_capture(checked: &Checked) -> Result<String, String> {
     let mut buf: Vec<u8> = Vec::new();
     brass_repl::run(&checked.program, &checked.channels(), &mut buf)?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Check an accumulated REPL program without evaluating it.
+fn check_capture(defs: &[String], body: &[String], root: &Path) -> Result<Checked, String> {
+    let src = assemble(defs, body);
+    analyze("<repl>", &src, root).map_err(|d| d.join("\n"))
+}
+
+/// Whether replaying an earlier binding can only reconstruct local values.
+fn is_replay_safe_binding(item: &str) -> bool {
+    let Ok(module) = parse(item) else {
+        return false;
+    };
+    let [TopLevel::Stmt(Stmt::Let { value, .. })] = module.items.as_slice() else {
+        return false;
+    };
+    value.as_ref().is_none_or(replay_safe_expr)
+}
+
+/// Recognize the conservative expression subset whose evaluation performs no
+/// calls or control-flow effects.
+fn replay_safe_expr(expr: &brass_parser::ast::Expr) -> bool {
+    use brass_parser::ast::{Expr, StrSeg};
+
+    match expr {
+        Expr::Int(..)
+        | Expr::Float(..)
+        | Expr::Bool(..)
+        | Expr::Null(..)
+        | Expr::Ident(..)
+        | Expr::SelfExpr(..)
+        | Expr::Closure(..) => true,
+        Expr::Str(segments, _) => segments
+            .iter()
+            .all(|segment| matches!(segment, StrSeg::Lit(_))),
+        Expr::Array(items, _) => items.iter().all(replay_safe_expr),
+        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => {
+            fields.iter().all(|(_, value)| replay_safe_expr(value))
+        }
+        Expr::Unary(..)
+        | Expr::Binary(..)
+        | Expr::Call(..)
+        | Expr::Field(..)
+        | Expr::Index(..)
+        | Expr::ErrorProp(..)
+        | Expr::Range(..)
+        | Expr::If(..)
+        | Expr::IfLet(..)
+        | Expr::TypeTest(..)
+        | Expr::Match(..)
+        | Expr::Block(..) => false,
+    }
 }
 
 /// Build a single source unit from accumulated top-level definitions and an
@@ -3906,10 +3986,14 @@ fn assemble(defs: &[String], body: &[String]) -> String {
 fn is_definition(item: &str) -> bool {
     match parse(item) {
         Ok(m) => {
-            !m.imports.is_empty()
+            let has_definition = !m.imports.is_empty()
                 || m.items
                     .iter()
-                    .any(|i| matches!(i, TopLevel::Fun(_) | TopLevel::Type(_)))
+                    .any(|i| matches!(i, TopLevel::Fun(_) | TopLevel::Type(_)));
+            has_definition
+                && m.items
+                    .iter()
+                    .all(|i| matches!(i, TopLevel::Fun(_) | TopLevel::Type(_)))
         }
         Err(_) => false,
     }
@@ -3969,11 +4053,12 @@ fn brace_balanced(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::is_replay_safe_binding;
     #[cfg(jit_backend)]
-    use super::demand_loop_progress;
+    use super::{CheckerCleanup, CheckerPause, demand_loop_progress};
     use super::{
         context_identity, context_module_hashes, module_path_at, program_file_index,
-        retain_diagnostic_free_context,
+        remove_provisional_keyed_diagnostics, retain_diagnostic_free_context,
     };
     use brass_hir::LoadedModule;
     use brass_parser::Span;
@@ -4008,6 +4093,61 @@ mod tests {
         // the driver neither queued, settled, nor lowered anything before retry.
         let error = demand_loop_progress(0, 0, 0).expect_err("stuck retry must abort");
         assert!(error.contains("demand loop made no progress"));
+    }
+
+    #[cfg(jit_backend)]
+    #[test]
+    fn checker_cleanup_wakes_a_paused_checker() {
+        // Every post-startup return must make the request wait observable.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (requests, mut receiver) = tokio::sync::mpsc::unbounded_channel::<
+            Option<Vec<brass_typeck::stream::BodyRequest>>,
+        >();
+        let paused = std::sync::Arc::new(CheckerPause {
+            paused: std::sync::atomic::AtomicBool::new(true),
+            requests,
+        });
+        drop(CheckerCleanup {
+            stop: stop.clone(),
+            paused,
+        });
+
+        assert!(stop.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(matches!(receiver.try_recv(), Ok(None)));
+    }
+
+    #[test]
+    fn keyed_cleanup_preserves_nearby_diagnostics() {
+        // Only the diagnostic emitted at the provisional call span is removed.
+        let keyed = Span::new(10, 15);
+        let nearby = Span::new(17, 22);
+        let mut errors = vec![
+            brass_typeck::TypeError {
+                message: "cannot use `int64` where `string` is required".into(),
+                span: keyed,
+            },
+            brass_typeck::TypeError {
+                message: "independent error".into(),
+                span: keyed,
+            },
+            brass_typeck::TypeError {
+                message: "independent".into(),
+                span: nearby,
+            },
+        ];
+        remove_provisional_keyed_diagnostics(&mut errors, &fxhash::FxHashSet::from_iter([keyed]));
+
+        assert_eq!(errors.len(), 2);
+        assert!(errors.iter().any(|error| error.span == keyed));
+        assert!(errors.iter().any(|error| error.span == nearby));
+    }
+
+    #[test]
+    fn repl_replays_only_inert_bindings() {
+        // Literal bindings remain available, while calls are never repeated.
+        assert!(is_replay_safe_binding("let answer = 42"));
+        assert!(!is_replay_safe_binding("let line = input()!"));
+        assert!(!is_replay_safe_binding("println(42)"));
     }
 
     #[test]

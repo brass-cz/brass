@@ -3,11 +3,10 @@
 //!
 //! Loading is process-global. The front end registers each plugin's stable
 //! logical import identity with the absolute library path it resolved, and the
-//! runtime uses that identity to find the library. The `dlopen` cache remains
-//! keyed by library path, so the front end and runtime share one handle without
-//! embedding a machine-specific path in generated code. A loaded plugin stays
-//! loaded for the life of the process (unloading a library whose code may still
-//! be referenced is never safe), including one a rebuild superseded.
+//! runtime uses that identity to find the library. Separate front-end and
+//! runtime caches are keyed by library path, so manifest refreshes cannot alter
+//! a mapping already pinned by a running program. A loaded plugin stays loaded
+//! for the life of the process, including one a rebuild superseded.
 //!
 //! The two roles treat the cache differently, deliberately:
 //!
@@ -192,6 +191,7 @@ fn contains_void(ty: &ValueType) -> bool {
 #[cfg(not(target_family = "wasm"))]
 mod imp {
     use std::collections::HashMap;
+    use std::hash::{Hash, Hasher};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -207,18 +207,23 @@ mod imp {
     type CallFn = unsafe extern "C" fn(u32, *const RawValue, usize, *mut RawValue) -> i32;
     type ReleaseFn = unsafe extern "C" fn(RawValue);
 
-    /// What a library file looked like when it was loaded. A rebuild that keeps
-    /// both is indistinguishable, which is why only the front end revalidates.
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    /// What a library file looked like when it was loaded. Only the front end
+    /// revalidates this fingerprint; runtime mappings remain pinned.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct Stamp {
         modified: Option<std::time::SystemTime>,
         len: u64,
+        contents: u64,
     }
 
     fn stamp_of(path: &Path) -> Option<Stamp> {
+        let bytes = std::fs::read(path).ok()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
         std::fs::metadata(path).ok().map(|m| Stamp {
             modified: m.modified().ok(),
             len: m.len(),
+            contents: hasher.finish(),
         })
     }
 
@@ -230,15 +235,17 @@ mod imp {
         /// Resolved once: a `dlsym` per call would be pure overhead, and the
         /// library outlives every `Loaded` that names it.
         call: CallFn,
-        release: Option<ReleaseFn>,
+        release: ReleaseFn,
         stamp: Option<Stamp>,
     }
 
     #[derive(Default)]
     struct Cache {
-        /// Keyed by the path as the caller wrote it AND by its canonical form,
-        /// so a repeat call needs no filesystem syscall.
-        by_path: HashMap<PathBuf, Arc<Loaded>>,
+        /// Revalidated manifests, keyed by canonical path.
+        fresh_by_path: HashMap<PathBuf, Arc<Loaded>>,
+        /// Runtime mappings, keyed by the caller's path and canonical path so
+        /// repeat calls never touch the filesystem.
+        pinned_by_path: HashMap<PathBuf, Arc<Loaded>>,
         /// Entries a `load_manifest` revalidation replaced. Held forever: the
         /// module never unloads a library whose code may still be referenced.
         /// Bounded by the number of rebuilds in one session.
@@ -257,23 +264,29 @@ mod imp {
     /// even if the `.so` is deleted or rebuilt underneath it. Only the first
     /// load of a path canonicalizes.
     pub(crate) fn load_pinned(path: &Path) -> Result<Arc<Loaded>, String> {
-        if let Some(loaded) = cache().lock().unwrap().by_path.get(path) {
+        if let Some(loaded) = cache().lock().unwrap().pinned_by_path.get(path) {
             return Ok(loaded.clone());
         }
         let canonical = path
             .canonicalize()
             .map_err(|e| format!("cannot load plugin `{}`: {e}", path.display()))?;
         let mut cache = cache().lock().unwrap();
-        let loaded = match cache.by_path.get(&canonical) {
+        let loaded = match cache.pinned_by_path.get(&canonical) {
             Some(loaded) => loaded.clone(),
-            None => {
-                let loaded = Arc::new(load_uncached(&canonical, false)?);
-                cache.by_path.insert(canonical.clone(), loaded.clone());
-                loaded
-            }
+            None => cache
+                .fresh_by_path
+                .get(&canonical)
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| load_uncached(&canonical, false).map(Arc::new))?,
         };
+        cache
+            .pinned_by_path
+            .insert(canonical.clone(), loaded.clone());
         if canonical != path {
-            cache.by_path.insert(path.to_path_buf(), loaded.clone());
+            cache
+                .pinned_by_path
+                .insert(path.to_path_buf(), loaded.clone());
         }
         Ok(loaded)
     }
@@ -282,9 +295,9 @@ mod imp {
     ///
     /// An editor session or a REPL outlives many rebuilds of the plugin it is
     /// analyzing, and a manifest that predates the current binary reports the
-    /// wrong functions. A changed size or mtime therefore reloads, retiring the
-    /// old entry (never unloading it) and dropping every path that named it, so
-    /// a subsequent [`load_pinned`] pins the new code rather than the old.
+    /// wrong functions. A changed content fingerprint therefore reloads and
+    /// publishes only after the replacement has opened successfully. Runtime
+    /// mappings stay in the separate pinned cache.
     pub(crate) fn load_fresh(path: &Path) -> Result<Arc<Loaded>, String> {
         let canonical = path
             .canonicalize()
@@ -292,17 +305,17 @@ mod imp {
         let stamp = stamp_of(&canonical);
         let mut cache = cache().lock().unwrap();
         let mut superseded = false;
-        if let Some(loaded) = cache.by_path.get(&canonical) {
+        if let Some(loaded) = cache.fresh_by_path.get(&canonical) {
             if loaded.stamp == stamp {
                 return Ok(loaded.clone());
             }
-            let stale = loaded.clone();
-            cache.by_path.retain(|_, l| !Arc::ptr_eq(l, &stale));
-            cache.retired.push(stale);
             superseded = true;
         }
+        superseded |= cache.pinned_by_path.contains_key(&canonical);
         let loaded = Arc::new(load_uncached(&canonical, superseded)?);
-        cache.by_path.insert(canonical, loaded.clone());
+        if let Some(stale) = cache.fresh_by_path.insert(canonical, loaded.clone()) {
+            cache.retired.push(stale);
+        }
         Ok(loaded)
     }
 
@@ -374,8 +387,14 @@ mod imp {
                     path.display()
                 )
             })?;
-            let release = lib.get::<ReleaseFn>(b"brass_release\0").ok();
-            (*call, release.map(|r| *r))
+            let release: libloading::Symbol<ReleaseFn> =
+                lib.get(b"brass_release\0").map_err(|e| {
+                    format!(
+                        "`{}` is not a Brass ABI v{ABI_VERSION} plugin (no `brass_release`): {e}",
+                        path.display()
+                    )
+                })?;
+            (*call, *release)
         };
         let by_name = manifest
             .functions
@@ -557,9 +576,7 @@ mod imp {
             CALL_OK | CALL_ERR => {
                 // Copy the plugin-owned result, then hand its buffer back.
                 let value = unsafe { Value::from_raw(&out) };
-                if let Some(release) = loaded.release {
-                    unsafe { release(out) };
-                }
+                unsafe { (loaded.release)(out) };
                 let value = value.map_err(CallFailure::Host)?;
                 if status == CALL_OK {
                     Ok(value)
@@ -581,9 +598,11 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
+        use std::fs::{self, FileTimes};
+
         use brass_plugin::raw::{RawFunction, RawManifest, RawStr};
 
-        use super::decode_manifest;
+        use super::{decode_manifest, stamp_of};
 
         fn raw_str(s: &'static str) -> RawStr {
             RawStr {
@@ -670,6 +689,34 @@ mod imp {
                     "{names}: {err}"
                 );
             }
+        }
+
+        #[test]
+        fn freshness_fingerprint_detects_same_metadata_content_change() {
+            // Front-end revalidation must notice an equal-length replacement
+            // even when its modification time is preserved.
+            let path =
+                std::env::temp_dir().join(format!("brass-plugin-stamp-{}", std::process::id()));
+            fs::write(&path, b"aaaa").expect("write initial fingerprint fixture");
+            let modified = fs::metadata(&path)
+                .expect("fixture metadata")
+                .modified()
+                .expect("fixture modification time");
+            let before = stamp_of(&path).expect("initial stamp");
+
+            fs::write(&path, b"bbbb").expect("replace fingerprint fixture");
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open fingerprint fixture")
+                .set_times(FileTimes::new().set_modified(modified))
+                .expect("restore fixture modification time");
+            let after = stamp_of(&path).expect("replacement stamp");
+            let _ = fs::remove_file(&path);
+
+            assert_eq!(before.modified, after.modified);
+            assert_eq!(before.len, after.len);
+            assert_ne!(before.contents, after.contents);
         }
     }
 }

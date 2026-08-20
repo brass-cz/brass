@@ -111,8 +111,8 @@ fn registry() -> &'static Mutex<HashMap<usize, usize>> {
     R.get_or_init(|| Mutex::new(HashMap::default()))
 }
 
-/// Objects to free after a collection pass, gathered so freeing never happens while
-/// the cycle is still being traversed (which would be a use-after-free).
+/// Objects to free after a collection pass, gathered so every trace traversal
+/// finishes before reclamation begins.
 fn pending_free() -> &'static Mutex<Vec<usize>> {
     static F: OnceLock<Mutex<Vec<usize>>> = OnceLock::new();
     F.get_or_init(|| Mutex::new(Vec::new()))
@@ -325,14 +325,17 @@ fn collect_once() {
     for addr in to_free {
         let h = addr as *mut Header;
         unregister(h);
-        unsafe { crate::mem::pp_obj_free(h as *mut c_void) };
+        unsafe {
+            crate::alloc::free_auxiliary_storage(h);
+            crate::mem::pp_obj_free(h as *mut c_void);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alloc::{pp_release, pp_typed_alloc};
+    use crate::alloc::{pp_arr_new, pp_release, pp_typed_alloc};
     use crate::mem::pp_live_blocks;
     use std::sync::MutexGuard;
 
@@ -369,6 +372,34 @@ mod tests {
         unsafe {
             *((obj as *mut u8).add(16) as *mut *mut Header) = child;
             (*child).rc += 1; // the field now references `child`
+        }
+    }
+
+    extern "C-unwind" fn trace_array(obj: *mut Header, visit: extern "C-unwind" fn(*mut Header)) {
+        unsafe {
+            let len = *((obj as *mut u8).add(16) as *const i64);
+            let data = *((obj as *mut u8).add(32) as *const *mut *mut Header);
+            for index in 0..len {
+                visit(*data.offset(index as isize));
+            }
+        }
+    }
+
+    #[test]
+    fn collecting_an_array_cycle_releases_its_buffer() {
+        // The array header and its separately owned buffer are reclaimed together.
+        let _serial = serial_gc();
+        unsafe {
+            let base = pp_live_blocks();
+            let array = pp_arr_new(8, 1);
+            let data = *((array as *mut u8).add(32) as *mut *mut *mut Header);
+            *data = array;
+            (*array).rc += 1;
+            pp_gc_register(array, trace_array as *const () as usize);
+            (*array).rc -= 1;
+
+            pp_gc_collect();
+            assert_eq!(pp_live_blocks(), base);
         }
     }
 

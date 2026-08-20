@@ -58,7 +58,7 @@ const MAGIC: &[u8; 8] = b"PPCACHE\0";
 /// the stamp can be re-anchored on another machine or after the project moves.
 /// Relative components are stored `/`-joined, so a cache written on one
 /// platform reads on another.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum StampOrigin {
     /// Relative to the entry file's directory (the project's own sources).
     Entry(String),
@@ -86,9 +86,9 @@ pub enum StampOrigin {
 /// format the release uses -- so an mtime key would reject a distributed cache
 /// on every machine. Content also makes the stamp exact rather than merely
 /// conservative: rewriting a file with the same bytes (a checkout, a formatter
-/// that changed nothing) no longer forces a re-check. And content is what makes
-/// the ORIGIN sound: whichever file a root resolves the reference to, equal
-/// bytes mean the identical program, so no path needs to be part of the key.
+/// that changed nothing) no longer forces a re-check. Origin remains part of
+/// the entry identity even when two candidate entry files contain the same
+/// bytes.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct FileStamp {
     pub origin: StampOrigin,
@@ -360,7 +360,8 @@ pub fn cache_path(entry: &Path) -> PathBuf {
 /// whose rewrite passes shape the cached ASTs (the JIT driver auto-acquires
 /// `spawn` bodies; a REPL-only driver does not), so two differently-configured
 /// binaries of the same compiler never accept each other's caches -- plus, for
-/// a working-tree build ONLY, the running executable's modification time.
+/// a working-tree build ONLY, the running executable's modification time and
+/// length.
 ///
 /// A released compiler (a channel the release workflow stamped) is fully
 /// identified by its channel and commit, so its tag is the same on every machine
@@ -372,24 +373,33 @@ pub fn cache_path(entry: &Path) -> PathBuf {
 /// `nightly` is the channel of a build with no release stamp, i.e. one built
 /// from a working tree, and such a build is NOT identified by its commit -- the
 /// source changes while the commit does not. A cache written by an earlier build
-/// of the same commit must not survive the recompile, and the executable's mtime
-/// is what rules it out. The mtime, rather than the executable's contents,
-/// because it must be read on every cache hit and the compiler is tens of
-/// megabytes; a local rebuild always moves it. A nightly build whose own mtime
-/// cannot be determined gets NO tag at all -- caching is skipped rather than
-/// letting two such builds silently share one.
+/// of the same commit must not survive the recompile. Modification time plus
+/// file length distinguishes size-changing rebuilds even when a build tool
+/// preserves the timestamp, while keeping a cache hit to one metadata read
+/// instead of hashing an executable that may be tens of megabytes. A nightly
+/// build whose own metadata cannot be determined gets NO tag at all -- caching
+/// is skipped rather than letting unidentified builds silently share one.
 pub fn cache_tag(flavor: &str) -> Option<String> {
     let tag = format!("{}/{}/{flavor}", compiler_tag(), FORMAT_VERSION);
     if brass_metadata::build_channel() != BuildChannel::Nightly {
         return Some(tag);
     }
-    Some(format!("{tag}/{}", exe_mtime_nanos()?))
+    let (mtime, len) = exe_fingerprint()?;
+    Some(nightly_cache_tag(&tag, mtime, len))
 }
 
-fn exe_mtime_nanos() -> Option<u128> {
+fn exe_fingerprint() -> Option<(u128, u64)> {
     let exe = std::env::current_exe().ok()?;
-    let mtime = std::fs::metadata(exe).ok()?.modified().ok()?;
-    Some(mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos())
+    let metadata = std::fs::metadata(exe).ok()?;
+    let mtime = metadata.modified().ok()?;
+    Some((
+        mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos(),
+        metadata.len(),
+    ))
+}
+
+fn nightly_cache_tag(base: &str, mtime: u128, len: u64) -> String {
+    format!("{base}/{mtime}-{len}")
 }
 
 /// Whether caching is enabled at all (`BRASS_CACHE=off`/`0` disables it,
@@ -491,11 +501,10 @@ pub fn load(
     let bytes = std::fs::read(&path).ok()?;
     let body = decode_file(&bytes, &cache_tag(flavor)?)?;
     let payload: Payload = postcard::from_bytes(body).ok()?;
-    // The first dep must BE the file the user named: same length, same hash.
-    // `still_valid` alone would only prove the recorded file exists somewhere.
-    let entry_bytes = std::fs::read(entry).ok()?;
+    // The first dep must BE the file the user named, including its recorded
+    // origin. `still_valid` alone only proves that origin still exists.
     let first = payload.deps.first()?;
-    if first.len != entry_bytes.len() as u64 || first.sha1 != sha1(&entry_bytes) {
+    if !entry_matches(first, entry, &roots) {
         tracing::debug!(target: "brass::perf", "cache: entry is not the recorded one, ignoring {}", path.display());
         return None;
     }
@@ -550,9 +559,8 @@ pub fn load_partial(
     let bytes = std::fs::read(&path).ok()?;
     let body = decode_file(&bytes, &cache_tag(flavor)?)?;
     let payload: PartialPayload = postcard::from_bytes(body).ok()?;
-    let entry_bytes = std::fs::read(entry).ok()?;
     let first = payload.deps.first()?;
-    if first.len != entry_bytes.len() as u64 || first.sha1 != sha1(&entry_bytes) {
+    if !entry_matches(first, entry, &roots) {
         return None;
     }
     if payload.packages != package_names(search) {
@@ -572,6 +580,16 @@ pub fn load_partial(
     }
     tracing::debug!(target: "brass::perf", "partial cache: resuming from {}", path.display());
     Some(payload.snapshot)
+}
+
+/// Whether the requested entry is the recorded entry, not merely a file with
+/// identical contents that maps to the same cache path.
+fn entry_matches(first: &FileStamp, entry: &Path, roots: &StampRoots) -> bool {
+    FileStamp::of(entry, roots).is_some_and(|current| same_entry_stamp(first, &current))
+}
+
+fn same_entry_stamp(first: &FileStamp, current: &FileStamp) -> bool {
+    current.origin == first.origin && current.len == first.len && current.sha1 == first.sha1
 }
 
 /// [`save`] for a partial payload (its own flavor tag, same file).
@@ -735,7 +753,10 @@ pub fn save_context_bundle(id: &[u8; 20], bundle: &ContextBundle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{FORMAT_VERSION, cache_tag, decode_file, encode_file, shipped_context_dir_for};
+    use super::{
+        FORMAT_VERSION, FileStamp, StampOrigin, cache_tag, decode_file, encode_file,
+        nightly_cache_tag, same_entry_stamp, shipped_context_dir_for,
+    };
     use std::path::{Path, PathBuf};
 
     /// Framing accepts an intact body and rejects same-size corruption before
@@ -779,6 +800,33 @@ mod tests {
         let obsolete = format!("obsolete-compiler/{FORMAT_VERSION}/jit");
         let encoded = encode_file(&obsolete, b"old serialized wrapper AST");
         assert_eq!(decode_file(&encoded, &current), None);
+    }
+
+    #[test]
+    fn nightly_tag_includes_executable_length() {
+        // Equal timestamps from different-sized local builds must not share a tag.
+        assert_ne!(
+            nightly_cache_tag("nightly", 123, 10),
+            nightly_cache_tag("nightly", 123, 11)
+        );
+    }
+
+    #[test]
+    fn entry_identity_includes_origin() {
+        // Extensionless and `.cz` entries can share contents and a cache path.
+        let contents = [7; 20];
+        let extensionless = FileStamp {
+            origin: StampOrigin::Entry("app".into()),
+            len: 4,
+            sha1: contents,
+        };
+        let source = FileStamp {
+            origin: StampOrigin::Entry("app.cz".into()),
+            len: 4,
+            sha1: contents,
+        };
+
+        assert!(!same_entry_stamp(&extensionless, &source));
     }
 
     /// A distributed `bin/brass` resolves seeds from the sibling top-level

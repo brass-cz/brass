@@ -33,6 +33,28 @@ pub fn run(
     let mir = brass_mir::lower_program_with_types(program, channels);
     let mono = brass_engine::monomorphize(&mir, program)
         .map_err(|e| format!("typed lowering failed: {e}"))?;
+    validate_monomorphized(program, &mono)?;
+    let mut interp = Interp::new(&mono, program, out);
+    interp.run()
+}
+
+/// Lower and monomorphize a checked program without evaluating it. Interactive
+/// callers use this to reject an unsupported candidate before any of its
+/// operations can run.
+pub fn validate(
+    program: &Program,
+    channels: &brass_mir::CheckerChannels<'_>,
+) -> Result<(), String> {
+    let mir = brass_mir::lower_program_with_types(program, channels);
+    let mono = brass_engine::monomorphize(&mir, program)
+        .map_err(|e| format!("typed lowering failed: {e}"))?;
+    validate_monomorphized(program, &mono)
+}
+
+fn validate_monomorphized(
+    program: &Program,
+    mono: &brass_engine::MonoProgram<'_>,
+) -> Result<(), String> {
     if program.functions.contains_key("main") && mono.lookup("main").is_none() {
         // `main_skip` is the first construct that made `main` untypeable --
         // the diagnostic the user needs, same as the JIT engine's error path.
@@ -45,6 +67,5 @@ pub fn run(
             }
         });
     }
-    let mut interp = Interp::new(&mono, program, out);
-    interp.run()
+    Ok(())
 }

@@ -9,9 +9,9 @@
 //! when mutated), so transferring the closure pointer across threads is sound.
 
 use fxhash::FxHashMap as HashMap;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,8 @@ thread_local! {
     /// non-recursive spinlock. Reentrancy is inherently per-thread, so a
     /// thread-local needs no synchronization and adds no cross-thread contention.
     static LOCK_DEPTH: RefCell<HashMap<usize, u32>> = RefCell::new(HashMap::default());
+    /// True only while this thread is executing a closure started by [`pp_spawn`].
+    static IN_SPAWN: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The current thread's reentrancy depth for `obj`.
@@ -45,20 +47,21 @@ fn push_lock_depth(obj: *mut Header) -> u32 {
     })
 }
 
-/// Record that this thread has left `obj`'s lock once, returning the remaining
-/// depth (0 when the outermost acquisition is being released).
-fn pop_lock_depth(obj: *mut Header) -> u32 {
+/// Record that this thread has left `obj`'s lock once. `None` means this thread
+/// has no matching acquisition; `Some(0)` is the outermost release.
+fn pop_lock_depth(obj: *mut Header) -> Option<u32> {
     LOCK_DEPTH.with(|d| {
         let mut d = d.borrow_mut();
         match d.get_mut(&(obj as usize)) {
             Some(n) if *n > 1 => {
                 *n -= 1;
-                *n
+                Some(*n)
             }
-            _ => {
+            Some(_) => {
                 d.remove(&(obj as usize));
-                0
+                Some(0)
             }
+            None => None,
         }
     })
 }
@@ -86,6 +89,21 @@ unsafe impl Send for SendPtr {}
 fn threads() -> &'static Mutex<Vec<JoinHandle<()>>> {
     static THREADS: OnceLock<Mutex<Vec<JoinHandle<()>>>> = OnceLock::new();
     THREADS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Serializes ownership of spawned-thread handles. Worker threads never take a
+/// handle; the coordinator drains them after worker-side synchronization has
+/// completed.
+fn join_coordinator() -> &'static Mutex<()> {
+    static COORDINATOR: Mutex<()> = Mutex::new(());
+    &COORDINATOR
+}
+
+/// Number of spawned workers currently waiting at `sync`, paired with the
+/// notification used when a worker finishes or reaches/leaves the wait set.
+fn spawn_waiters() -> &'static (Mutex<usize>, Condvar) {
+    static WAITERS: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+    WAITERS.get_or_init(|| (Mutex::new(0), Condvar::new()))
 }
 
 /// Promote `obj` to a cown so its reference count is maintained atomically (the
@@ -221,7 +239,7 @@ pub unsafe extern "C-unwind" fn pp_unlock(obj: *mut Header) {
     if obj.is_null() {
         return;
     }
-    if pop_lock_depth(obj) == 0 {
+    if pop_lock_depth(obj) == Some(0) {
         unsafe { lock_byte(obj) }.store(0, Ordering::Release);
     }
 }
@@ -327,6 +345,7 @@ pub unsafe extern "C-unwind" fn pp_spawn(closure: *mut Header) {
     // thread's last heap operation, so the cycle collector defers while it runs.
     ACTIVE_SPAWNS.fetch_add(1, Ordering::SeqCst);
     let handle = std::thread::spawn(move || {
+        IN_SPAWN.set(true);
         // Balance the counter on *every* exit path of the thread body. The body
         // is not supposed to unwind in a real program (runtime errors exit the
         // process), but a test/embedding diagnostic can panic through it; a lost
@@ -336,6 +355,7 @@ pub unsafe extern "C-unwind" fn pp_spawn(closure: *mut Header) {
         impl Drop for SpawnDone {
             fn drop(&mut self) {
                 ACTIVE_SPAWNS.fetch_sub(1, Ordering::SeqCst);
+                spawn_waiters().1.notify_all();
             }
         }
         let _done = SpawnDone;
@@ -375,30 +395,34 @@ pub unsafe extern "C-unwind" fn pp_spawn(closure: *mut Header) {
 /// re-raised on the joining thread so a failed spawned task surfaces instead of
 /// being lost.
 pub extern "C-unwind" fn pp_join_all() {
-    // A spawned task may itself call `sync()`, and the global registry then
-    // contains the *calling thread's own* handle. Joining it would be a self-join
-    // -- pthread_join(self) fails with EDEADLK and the std join panics, aborting
-    // the program -- so the caller's handle is set aside and handed back to the
-    // registry for an enclosing join (ultimately main's epilogue) to drain.
-    let me = std::thread::current().id();
+    if IN_SPAWN.get() {
+        // A worker waits until every active spawn is either finished or waiting
+        // at the same synchronization point. Handles remain with the coordinator.
+        let (waiters, changed) = spawn_waiters();
+        let mut waiting = waiters.lock().unwrap();
+        *waiting += 1;
+        changed.notify_all();
+        while ACTIVE_SPAWNS.load(Ordering::SeqCst) > *waiting {
+            waiting = changed.wait(waiting).unwrap();
+        }
+        *waiting -= 1;
+        changed.notify_all();
+        return;
+    }
+
+    let coordinator = join_coordinator()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut failure: Option<Box<dyn std::any::Any + Send>> = None;
     // A spawned thread may itself spawn (a nested/late spawn), pushing a new handle
-    // after this drain started. Loop until the registry holds nothing but the
-    // caller's own handle: each round joins the threads taken so far, during which
-    // any of them may have pushed more. Without this, a nested spawn is never
-    // joined -- its work is lost and it runs into process teardown, a
-    // use-after-free of runtime state.
+    // after this drain started. Loop until the registry is empty: each round joins
+    // the threads taken so far, during which any of them may have pushed more.
     loop {
         let taken: Vec<_> = std::mem::take(&mut *threads().lock().unwrap());
-        let (own, others): (Vec<_>, Vec<_>) =
-            taken.into_iter().partition(|h| h.thread().id() == me);
-        if !own.is_empty() {
-            threads().lock().unwrap().extend(own);
-        }
-        if others.is_empty() {
+        if taken.is_empty() {
             break;
         }
-        for h in others {
+        for h in taken {
             if let Err(payload) = h.join() {
                 // Keep joining the remaining threads (so none leak into process
                 // teardown), then surface the first failure below.
@@ -406,6 +430,7 @@ pub extern "C-unwind" fn pp_join_all() {
             }
         }
     }
+    drop(coordinator);
     if let Some(payload) = failure {
         std::panic::resume_unwind(payload);
     }
@@ -513,6 +538,22 @@ mod tests {
             0,
             "the outermost release frees the lock"
         );
+    }
+
+    #[test]
+    fn unmatched_unlock_does_not_release_another_threads_lock() {
+        // Only the thread that recorded an acquisition may release the lock byte.
+        let _serial = serial_spawn();
+        let obj = alloc_counter();
+        unsafe { pp_lock(obj) };
+
+        let addr = obj as usize;
+        std::thread::spawn(move || unsafe { pp_unlock(addr as *mut Header) })
+            .join()
+            .expect("unmatched unlock returns normally");
+        assert_eq!(unsafe { lock_byte(obj) }.load(Ordering::Relaxed), 1);
+        unsafe { pp_unlock(obj) };
+        assert_eq!(unsafe { lock_byte(obj) }.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -678,12 +719,9 @@ mod tests {
     }
 
     #[test]
-    fn join_all_from_a_spawned_task_skips_its_own_handle() {
-        // A spawned task that calls `sync()` (pp_join_all) finds its *own* handle
-        // in the global registry. It must be skipped, not joined: a self-join
-        // fails with EDEADLK and the std join panics, which aborted the whole
-        // program. After the fix the task's sync returns (joining only siblings)
-        // and main's outer join still reaps the task itself.
+    fn join_all_from_a_spawned_task_waits_for_its_sibling() {
+        // Worker-side synchronization observes sibling completion while handle
+        // ownership remains with the outer coordinator.
         let _serial = serial_spawn();
         static RAN: AtomicI64 = AtomicI64::new(0);
         RAN.store(0, Ordering::SeqCst);
@@ -692,13 +730,12 @@ mod tests {
             RAN.fetch_add(1, Ordering::SeqCst);
         }
         extern "C" fn syncer(_env: *mut Header) {
-            // Spawn a sibling and join it from inside this spawned thread; the
-            // registry also holds this thread's own handle at this point.
+            // Spawn a sibling and synchronize from inside this worker.
             let clo = unsafe { pp_obj_alloc(32) as *mut Header };
             unsafe { *((clo as *mut u8).add(16) as *mut usize) = sibling as *const () as usize };
             unsafe { pp_spawn(clo) };
             pp_join_all();
-            // The sibling's effect is visible after the inner join.
+            // The sibling's effect is visible after worker synchronization.
             assert_eq!(RAN.load(Ordering::SeqCst), 1);
             RAN.fetch_add(1, Ordering::SeqCst);
         }
@@ -712,6 +749,31 @@ mod tests {
             2,
             "both the sibling and the syncing task ran to completion"
         );
+    }
+
+    #[test]
+    fn simultaneous_worker_syncs_complete_without_cross_joining() {
+        // Both workers reach the synchronization point before either can finish;
+        // the coordinator retains their handles while the wait set releases them.
+        let _serial = serial_spawn();
+        static GATE: OnceLock<std::sync::Barrier> = OnceLock::new();
+        static RAN: AtomicI64 = AtomicI64::new(0);
+        GATE.get_or_init(|| std::sync::Barrier::new(2));
+        RAN.store(0, Ordering::SeqCst);
+
+        extern "C" fn syncer(_env: *mut Header) {
+            GATE.get().unwrap().wait();
+            pp_join_all();
+            RAN.fetch_add(1, Ordering::SeqCst);
+        }
+
+        for _ in 0..2 {
+            let clo = unsafe { pp_obj_alloc(32) as *mut Header };
+            unsafe { *((clo as *mut u8).add(16) as *mut usize) = syncer as *const () as usize };
+            unsafe { pp_spawn(clo) };
+        }
+        pp_join_all();
+        assert_eq!(RAN.load(Ordering::SeqCst), 2);
     }
 
     #[test]

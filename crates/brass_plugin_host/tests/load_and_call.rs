@@ -158,14 +158,18 @@ fn calls_survive_the_library_file_disappearing() {
 
 /// The front end revalidates: a language server or REPL that outlives a plugin
 /// rebuild must see the new manifest, not the one it read at startup. A
-/// manifest already handed out keeps describing the build it came from (it is
-/// host-owned data), and a later call reaches the new code.
+/// manifest already handed out keeps describing the build it came from, while
+/// a runtime mapping pinned before the rebuild stays on that build.
 #[test]
 fn load_manifest_sees_a_rebuilt_library() {
     let lib = private_copy(&fixture::build_testlib(), "revalidated_plugin");
     let before = load_manifest(&lib).expect("initial manifest");
     assert!(before.function("add").is_some());
     assert!(before.function("extra").is_none());
+    assert_eq!(
+        call(&lib, "add", &[Value::Int(40), Value::Int(2)]).expect("pin initial runtime"),
+        Value::Int(42)
+    );
 
     // An unchanged file is not reloaded: the same manifest object comes back.
     let cached = load_manifest(&lib).expect("cached manifest");
@@ -188,9 +192,34 @@ fn load_manifest_sees_a_rebuilt_library() {
     // The old manifest is still readable, and still describes the old build.
     assert!(before.function("extra").is_none());
 
-    // Calls now reach the new code (the stale entry was purged, not just the
-    // canonical key), and the superseded library was retired, not unloaded.
-    assert_eq!(call(&lib, "extra", &[]).expect("extra"), Value::Int(7));
+    // The front end sees the replacement, but the running program remains on
+    // its separately pinned function table.
+    match call(&lib, "extra", &[]) {
+        Err(CallFailure::Host(message)) => assert!(message.contains("no function"), "{message}"),
+        other => panic!("expected the pinned manifest, got {other:?}"),
+    }
+}
+
+#[test]
+fn failed_manifest_reload_preserves_runtime_pin() {
+    // A replacement is published only after it loads successfully.
+    let lib = private_copy(&fixture::build_testlib(), "failed_reload_plugin");
+    assert_eq!(
+        call(&lib, "add", &[Value::Int(20), Value::Int(22)]).expect("pin initial runtime"),
+        Value::Int(42)
+    );
+
+    let staged = lib.with_extension("invalid");
+    fs::write(&staged, b"not a dynamic library").expect("stage invalid replacement");
+    fs::rename(&staged, &lib).expect("install invalid replacement");
+    assert!(
+        load_manifest(&lib).is_err(),
+        "invalid replacement must fail"
+    );
+    assert_eq!(
+        call(&lib, "add", &[Value::Int(1), Value::Int(2)]).expect("call pinned runtime"),
+        Value::Int(3)
+    );
 }
 
 /// A plugin whose registration panics is a load error, not a process abort:

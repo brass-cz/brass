@@ -1,7 +1,7 @@
-//! Heap allocation of the typed back end's objects. Everything
-//! is bump-allocated through `crate::mem`; objects are never individually freed.
-//! These are the typed string, array, and conversion-helper entry points the
-//! unboxed code generator calls: their values are concrete unboxed typed data.
+//! Heap allocation and reference-counting entry points for the typed back end.
+//! Object blocks are individually reclaimed; growable arrays additionally own a
+//! separately allocated element buffer. Cycle-capable aggregates participate in
+//! the runtime collector through `crate::gc`.
 
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -106,12 +106,11 @@ pub extern "C-unwind" fn pp_typed_alloc(size: i64) -> *mut Header {
 // separately-allocated element buffer of `cap * elem_size` bytes. Elements are
 // concrete typed values, not boxed `Value`.
 
-/// `count * elem_size` as a byte length, trapping on a negative operand or i64
-/// overflow. Generated code supplies these, so a bad length must fail closed
-/// rather than wrap into an undersized allocation that later element writes
-/// overrun. `pp_panic_str` exits the process (no unwind across the C-ABI).
+/// `count * elem_size` as a byte length, accepting only positive element widths
+/// and a product representable by the allocator ABI. `pp_panic_str` exits the
+/// process without unwinding across the C-ABI.
 fn checked_bytes(count: i64, elem_size: i64) -> i64 {
-    if count < 0 || elem_size < 0 {
+    if count < 0 || elem_size <= 0 {
         crate::builtins::pp_panic_str("negative array allocation size");
     }
     match count.checked_mul(elem_size) {
@@ -128,14 +127,27 @@ fn grow_cap(cap: i64) -> i64 {
     }
 }
 
+/// Validate a new array's logical shape and compute its initial capacity and
+/// byte length before any object state is created.
+fn initial_array_layout(elem_size: i64, len: i64) -> Result<(i64, i64), &'static str> {
+    if len < 0 || elem_size <= 0 {
+        return Err("invalid array shape");
+    }
+    let cap = len.max(4);
+    cap.checked_mul(elem_size)
+        .map(|bytes| (cap, bytes))
+        .ok_or("array allocation size overflow")
+}
+
 /// A growable array holding `len` elements with spare capacity.
 pub extern "C-unwind" fn pp_arr_new(elem_size: i64, len: i64) -> *mut Header {
+    let (cap, bytes) = initial_array_layout(elem_size, len)
+        .unwrap_or_else(|message| crate::builtins::pp_panic_str(message));
     unsafe {
-        let cap = len.max(4);
-        let h = pp_typed_alloc(40);
+        let h = init_header(pp_obj_alloc(40), KIND_ARRAY, 0);
         *((h as *mut u8).offset(16) as *mut i64) = len;
         *((h as *mut u8).offset(24) as *mut i64) = cap;
-        let data = pp_obj_alloc(checked_bytes(cap, elem_size.max(1))) as *mut u8;
+        let data = pp_obj_alloc(bytes) as *mut u8;
         *((h as *mut u8).offset(32) as *mut *mut u8) = data;
         h
     }
@@ -212,6 +224,8 @@ pub unsafe extern "C-unwind" fn pp_arr_deep_copy(
 /// `elem_size` readable bytes.
 pub unsafe extern "C-unwind" fn pp_arr_push(arr: *mut Header, elem: *const u8, elem_size: i64) {
     unsafe {
+        // Preserve the input bytes before the owned buffer can move.
+        let elem = std::slice::from_raw_parts(elem, elem_size as usize).to_vec();
         let len_p = (arr as *mut u8).offset(16) as *mut i64;
         let cap_p = (arr as *mut u8).offset(24) as *mut i64;
         let data_pp = (arr as *mut u8).offset(32) as *mut *mut u8;
@@ -229,7 +243,7 @@ pub unsafe extern "C-unwind" fn pp_arr_push(arr: *mut Header, elem: *const u8, e
             crate::mem::pp_obj_free(old as *mut c_void);
         }
         let dst = (*data_pp).offset((len * elem_size) as isize);
-        std::ptr::copy_nonoverlapping(elem, dst, elem_size as usize);
+        std::ptr::copy_nonoverlapping(elem.as_ptr(), dst, elem_size as usize);
         *len_p = len + 1;
     }
 }
@@ -248,6 +262,8 @@ pub unsafe extern "C-unwind" fn pp_arr_insert(
     elem_size: i64,
 ) {
     unsafe {
+        // Preserve the input bytes before growth or the overlapping tail shift.
+        let elem = std::slice::from_raw_parts(elem, elem_size as usize).to_vec();
         let len_p = (arr as *mut u8).offset(16) as *mut i64;
         let cap_p = (arr as *mut u8).offset(24) as *mut i64;
         let data_pp = (arr as *mut u8).offset(32) as *mut *mut u8;
@@ -267,8 +283,20 @@ pub unsafe extern "C-unwind" fn pp_arr_insert(
         let src = base.offset((at * elem_size) as isize);
         let dst = base.offset(((at + 1) * elem_size) as isize);
         std::ptr::copy(src, dst, ((len - at) * elem_size) as usize);
-        std::ptr::copy_nonoverlapping(elem, src, elem_size as usize);
+        std::ptr::copy_nonoverlapping(elem.as_ptr(), src, elem_size as usize);
         *len_p = len + 1;
+    }
+}
+
+/// Release storage owned by an object's runtime-defined layout while leaving
+/// traced child references unchanged. Cycle collection calls this before freeing
+/// an object whose generated destructor is intentionally bypassed.
+pub(crate) unsafe fn free_auxiliary_storage(h: *mut Header) {
+    unsafe {
+        if (*h).kind == KIND_ARRAY {
+            let data = *((h as *mut u8).offset(32) as *mut *mut u8);
+            crate::mem::pp_obj_free(data as *mut c_void);
+        }
     }
 }
 
@@ -679,6 +707,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn array_layout_rejects_invalid_dimensions_before_allocation() {
+        // A valid layout always has a positive element width and logical length.
+        assert!(initial_array_layout(8, 0).is_ok());
+        assert!(initial_array_layout(0, 1).is_err());
+        assert!(initial_array_layout(-1, 1).is_err());
+        assert!(initial_array_layout(8, -1).is_err());
+        assert!(initial_array_layout(i64::MAX, 4).is_err());
+    }
+
     /// `pp_arr_insert` opens a hole at the index (shifting the tail right) and
     /// `pp_arr_remove` returns the element and closes the gap (shifting left).
     #[test]
@@ -715,6 +753,32 @@ mod tests {
             // out-of-range remove is a no-op returning 0
             assert_eq!(pp_arr_remove(arr, 99, 8), 0);
             assert_eq!(*((arr as *mut u8).offset(16) as *mut i64), 5);
+        }
+    }
+
+    #[test]
+    fn array_push_and_insert_snapshot_aliased_elements() {
+        // An element may be selected directly from the array being changed; its
+        // bytes stay stable across both buffer growth and an overlapping shift.
+        let _serial = serial();
+        unsafe {
+            let pushed = pp_arr_new(8, 4);
+            let pushed_data = *((pushed as *mut u8).offset(32) as *mut *mut i64);
+            for (slot, value) in [10i64, 20, 30, 40].into_iter().enumerate() {
+                *pushed_data.add(slot) = value;
+            }
+            pp_arr_push(pushed, pushed_data as *const u8, 8);
+            let grown = *((pushed as *mut u8).offset(32) as *mut *mut i64);
+            assert_eq!(*grown.add(4), 10);
+
+            let inserted = pp_arr_new(8, 3);
+            let inserted_data = *((inserted as *mut u8).offset(32) as *mut *mut i64);
+            for (slot, value) in [10i64, 20, 30].into_iter().enumerate() {
+                *inserted_data.add(slot) = value;
+            }
+            pp_arr_insert(inserted, 0, inserted_data.add(2) as *const u8, 8);
+            let view = std::slice::from_raw_parts(inserted_data, 4);
+            assert_eq!(view, [30, 10, 20, 30]);
         }
     }
 

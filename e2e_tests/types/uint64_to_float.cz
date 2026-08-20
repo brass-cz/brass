@@ -1,0 +1,6 @@
+// Explicit and primitive conversion preserve a uint64 carrier's unsigned bits.
+fun main() {
+    let value: uint64 = uint64.parse("18446744073709551615")!
+    println(float64.from(value) > 0.0)
+    println(_int_to_float(value, 64) > 0.0)
+}

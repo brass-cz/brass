@@ -1,25 +1,31 @@
 //! File descriptors and byte I/O, as a native Brass plugin.
 //!
 //! `std/fs.cz` builds the `File` surface on these primitives. A file
-//! crosses the boundary as its raw descriptor (an `i64`); everything that is
+//! crosses the boundary as its Unix raw descriptor (an `i64`); everything that is
 //! policy rather than I/O -- which descriptor a `File` holds, the double-close
 //! guard, size lookups (delegated to the path library, which stats by name) --
 //! lives on the Brass side. The descriptor is borrowed without ownership for
-//! reads/writes/seeks (so an operation does not close it); `fd_close` takes
-//! ownership and closes it.
+//! reads/writes/seeks (so an operation does not close it); `fd_close` closes
+//! only descriptors marked as owned by the Brass `File`. Raw-descriptor
+//! operations report unsupported on non-Unix targets.
 //!
 //! Directories are not descriptors: `dir_create`/`dir_remove` work by name, so
 //! they take a path and hand back nothing.
 
+#[cfg(unix)]
 use std::fs::{File, OpenOptions};
+#[cfg(unix)]
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::mem::ManuallyDrop;
+#[cfg(unix)]
 use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
 
 use brass_plugin::{BrassLib, Bytes, Registry, brass_lib, decl, export};
 
 /// Validate a live descriptor before narrowing the ABI's `i64` to the host's
 /// raw descriptor type. A closed `File` stores -1.
+#[cfg(unix)]
 fn live(fd: i64) -> Result<RawFd, String> {
     if fd < 0 {
         return Err("file is closed".to_string());
@@ -29,6 +35,7 @@ fn live(fd: i64) -> Result<RawFd, String> {
 
 /// Run `op` on the `File` for `fd` without taking ownership, so the borrow
 /// ending does not close the descriptor.
+#[cfg(unix)]
 fn borrow_fd<R>(fd: RawFd, op: impl FnOnce(&mut File) -> R) -> R {
     let mut file = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
     op(&mut file)
@@ -36,6 +43,7 @@ fn borrow_fd<R>(fd: RawFd, op: impl FnOnce(&mut File) -> R) -> R {
 
 /// Convert a byte count from the plugin ABI without turning a negative value
 /// into an empty read.
+#[cfg(any(unix, test))]
 fn byte_count(value: i64) -> Result<usize, String> {
     usize::try_from(value).map_err(|_| format!("byte count {value} must be non-negative"))
 }
@@ -46,6 +54,7 @@ fn byte_count(value: i64) -> Result<usize, String> {
 /// A symbolic link inside the tree is RECREATED as a link rather than followed.
 /// That is what POSIX's `cp -R` does, and it is also what keeps the walk finite:
 /// following a link that points at an ancestor would recurse forever.
+#[cfg(unix)]
 fn copy_tree(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(target)?;
     for entry in std::fs::read_dir(source)? {
@@ -66,6 +75,7 @@ fn copy_tree(source: &std::path::Path, target: &std::path::Path) -> std::io::Res
 
 /// Copy a tree and remove the newly-created target when any entry fails. The
 /// source remains untouched, so a failed copy can be retried immediately.
+#[cfg(unix)]
 fn copy_tree_clean(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
     if let Err(copy_error) = copy_tree(source, target) {
         match std::fs::remove_dir_all(target) {
@@ -80,6 +90,102 @@ fn copy_tree_clean(source: &std::path::Path, target: &std::path::Path) -> std::i
     } else {
         Ok(())
     }
+}
+
+#[cfg(not(unix))]
+fn copy_tree_clean(_source: &std::path::Path, _target: &std::path::Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "directory tree copy is supported only on Unix",
+    ))
+}
+
+#[cfg(not(unix))]
+const RAW_FD_UNSUPPORTED: &str = "raw file descriptor I/O is supported only on Unix";
+
+#[cfg(unix)]
+fn platform_fd_open(path: String, mode: String) -> Result<i64, String> {
+    let mut opts = OpenOptions::new();
+    match mode.as_str() {
+        "r" => opts.read(true),
+        "w" => opts.write(true).create(true).truncate(true),
+        "a" => opts.append(true).create(true),
+        other => return Err(format!("invalid open mode `{other}`")),
+    };
+    opts.open(&path)
+        .map(|file| i64::from(file.into_raw_fd()))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(unix))]
+fn platform_fd_open(_path: String, _mode: String) -> Result<i64, String> {
+    Err(RAW_FD_UNSUPPORTED.to_string())
+}
+
+#[cfg(unix)]
+fn platform_fd_read(fd: i64, n: i64) -> Result<Bytes, String> {
+    let fd = live(fd)?;
+    let mut buf = vec![0u8; byte_count(n)?];
+    match borrow_fd(fd, |file| file.read(&mut buf)) {
+        Ok(got) => {
+            buf.truncate(got);
+            Ok(Bytes(buf))
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(not(unix))]
+fn platform_fd_read(_fd: i64, _n: i64) -> Result<Bytes, String> {
+    Err(RAW_FD_UNSUPPORTED.to_string())
+}
+
+#[cfg(unix)]
+fn platform_fd_write(fd: i64, data: Bytes) -> Result<i64, String> {
+    let fd = live(fd)?;
+    match borrow_fd(fd, |file| file.write_all(&data.0)) {
+        Ok(()) => Ok(data.0.len() as i64),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(not(unix))]
+fn platform_fd_write(_fd: i64, _data: Bytes) -> Result<i64, String> {
+    Err(RAW_FD_UNSUPPORTED.to_string())
+}
+
+#[cfg(unix)]
+fn platform_fd_seek(fd: i64, pos: i64) -> Result<(), String> {
+    let fd = live(fd)?;
+    let pos =
+        u64::try_from(pos).map_err(|_| format!("seek position {pos} must be non-negative"))?;
+    borrow_fd(fd, |file| file.seek(SeekFrom::Start(pos)))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(unix))]
+fn platform_fd_seek(_fd: i64, _pos: i64) -> Result<(), String> {
+    Err(RAW_FD_UNSUPPORTED.to_string())
+}
+
+#[cfg(any(unix, test))]
+fn descriptor_is_owned(borrowed: bool) -> bool {
+    !borrowed
+}
+
+#[cfg(unix)]
+fn platform_fd_close(fd: i64, borrowed: bool) -> Result<(), String> {
+    let fd = live(fd)?;
+    if descriptor_is_owned(borrowed) {
+        drop(unsafe { File::from_raw_fd(fd) });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn platform_fd_close(_fd: i64, _borrowed: bool) -> Result<(), String> {
+    Err(RAW_FD_UNSUPPORTED.to_string())
 }
 
 /// Check the invariants both directory operations share, and answer the pair of
@@ -115,60 +221,30 @@ export! {
     /// `w` truncate+create write, `a` append+create. The Brass side owns
     /// the descriptor from here.
     fn fd_open(path: String, mode: String) -> Result<i64, String> {
-        let mut opts = OpenOptions::new();
-        match mode.as_str() {
-            "r" => opts.read(true),
-            "w" => opts.write(true).create(true).truncate(true),
-            "a" => opts.append(true).create(true),
-            other => return Err(format!("invalid open mode `{other}`")),
-        };
-        match opts.open(&path) {
-            Ok(f) => Ok(i64::from(f.into_raw_fd())),
-            Err(e) => Err(e.to_string()),
-        }
+        platform_fd_open(path, mode)
     }
 
     /// Up to `n` bytes from descriptor `fd` (fewer at end-of-file).
     fn fd_read(fd: i64, n: i64) -> Result<Bytes, String> {
-        let fd = live(fd)?;
-        let mut buf = vec![0u8; byte_count(n)?];
-        match borrow_fd(fd, |f| f.read(&mut buf)) {
-            Ok(got) => {
-                buf.truncate(got);
-                Ok(Bytes(buf))
-            }
-            Err(e) => Err(e.to_string()),
-        }
+        platform_fd_read(fd, n)
     }
 
     /// Write all of `data` to descriptor `fd`, returning its length.
     fn fd_write(fd: i64, data: Bytes) -> Result<i64, String> {
-        let fd = live(fd)?;
-        match borrow_fd(fd, |f| f.write_all(&data.0)) {
-            Ok(()) => Ok(data.0.len() as i64),
-            Err(e) => Err(e.to_string()),
-        }
+        platform_fd_write(fd, data)
     }
 
     /// Move descriptor `fd`'s read/write cursor to absolute byte offset `pos`
     /// from the start of the file.
     fn fd_seek(fd: i64, pos: i64) -> Result<(), String> {
-        let fd = live(fd)?;
-        let pos = u64::try_from(pos).map_err(|_| format!("seek position {pos} must be non-negative"))?;
-        borrow_fd(fd, |f| f.seek(SeekFrom::Start(pos)))
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        platform_fd_seek(fd, pos)
     }
 
-    /// Close descriptor `fd`. The standard streams 0/1/2 are left open (a
-    /// backstop under `File.close`'s own guard), as closing them would break
-    /// the process.
-    fn fd_close(fd: i64) -> Result<(), String> {
-        let fd = live(fd)?;
-        if fd > 2 {
-            drop(unsafe { File::from_raw_fd(fd) });
-        }
-        Ok(())
+    /// Close descriptor `fd` when it is owned. Borrowed standard streams stay
+    /// open even if their numeric descriptor is later reused elsewhere; the
+    /// explicit ownership flag, rather than the number, controls closure.
+    fn fd_close(fd: i64, borrowed: bool) -> Result<(), String> {
+        platform_fd_close(fd, borrowed)
     }
 
     /// Read a whole file while Rust owns the handle, so every success and
@@ -313,10 +389,19 @@ mod tests {
     fn descriptor_and_byte_count_ranges_are_checked() {
         // The ABI uses i64 even where Unix uses i32. Truncation could turn a
         // bogus handle into a different live descriptor, including stdout.
+        #[cfg(unix)]
         assert!(live(i64::from(i32::MAX) + 1).is_err());
         assert!(byte_count(-1).is_err());
     }
 
+    #[test]
+    fn descriptor_ownership_is_explicit() {
+        // Ownership, rather than a descriptor's current number, decides close.
+        assert!(descriptor_is_owned(false));
+        assert!(!descriptor_is_owned(true));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn failed_tree_copy_removes_its_partial_target() {
         // A regular file is not a readable tree: copy_tree creates the target
