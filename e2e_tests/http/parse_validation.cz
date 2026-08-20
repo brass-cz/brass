@@ -1,0 +1,42 @@
+import std.http.{ Header, HttpRequest, HttpResponse, fetch, request }
+
+fun show(label: string, value) {
+    match value {
+        Ok { value } => println("{label}: accepted"),
+        Err { error } => println("{label}: rejected"),
+    }
+}
+
+fun main() {
+const parsed_request = HttpRequest.parse("GET /a?b HTTP/1.1\r\nHost: example.test\r\nX-Test: yes\r\n\r\n")!
+println("{parsed_request.method} {parsed_request.path} {parsed_request.version}")
+show("extra request part", HttpRequest.parse("GET / HTTP/1.1 extra\r\n\r\n"))
+show("bad method", HttpRequest.parse("GE(T / HTTP/1.1\r\n\r\n"))
+show("bad header name", HttpRequest.parse("GET / HTTP/1.1\r\nBad Name: x\r\n\r\n"))
+show("bad status", HttpResponse.parse("HTTP/1.1 20 OK\r\n\r\n"))
+show("negative length", HttpResponse.parse("HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n"))
+show("conflicting length", HttpResponse.parse("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nxx"))
+
+const sliced = HttpResponse.parse("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nabcd")!
+println(sliced.body_text()!)
+const empty = HttpResponse.parse("HTTP/1.1 204 No Content\r\nContent-Length: 9\r\n\r\nunwanted")!
+println(empty.body.len())
+show("unsupported scheme", fetch("ftp://example.test/file"))
+
+const bad_host = HttpRequest {
+    method: "GET",
+    path: "/",
+    version: "HTTP/1.1",
+    headers: [Header { name: "Host", value: "[::1" }],
+    body: [],
+}
+show("malformed IPv6 host", request(bad_host))
+const bad_port = HttpRequest {
+    method: "GET",
+    path: "/",
+    version: "HTTP/1.1",
+    headers: [Header { name: "Host", value: "[::1]:70000" }],
+    body: [],
+}
+show("out-of-range port", request(bad_port))
+}

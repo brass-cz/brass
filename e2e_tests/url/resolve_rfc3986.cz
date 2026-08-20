@@ -39,6 +39,9 @@ fun main() {
     _show(base, "./g/.")
     _show(base, "g/./h")
     _show(base, "g/../h")
+    _show(base, "g//h")
+    _show(base, "g//./h")
+    _show(base, "g//../h")
 
     // A redirect may cross scheme and host, and a relative one is read against
     // the path it came from.

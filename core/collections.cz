@@ -233,6 +233,7 @@ fun HashMap.delete(self, key) -> bool {
     if idx < 0 {
         return false
     }
+    self._entries[idx] = null
     self._states[idx] = 2
     self._tombs += one
     self._count -= one
@@ -306,6 +307,7 @@ fun HashMap.clear(self) {
     let zero: int64 = 0
     let i: int64 = 0
     while i < self._cap {
+        self._entries[i] = null
         self._states[i] = 0
         i += 1
     }

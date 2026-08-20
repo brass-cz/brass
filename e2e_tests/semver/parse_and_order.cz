@@ -42,7 +42,12 @@ fun main() {
     const plain = Version.parse("1.4.2")!
     println("{plain.prerelease} {plain.build}")
     println(plain.is_prerelease())
-    println(Version.new(2, 3, 4).to_string())
+    println(Version.new(2, 3, 4)!.to_string())
+    show("9223372036854775808.0.0")
+    match Version.new(-1, 0, 0) {
+        Ok { value } => println("negative constructor accepted"),
+        Err { error } => println("negative constructor rejected"),
+    }
 
     // Precedence (§11), the spec's example, sorted back from reverse order.
     const order = [

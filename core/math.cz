@@ -2,7 +2,9 @@
 // supporting `<`/`-`; the float routines wrap runtime primitives. Part of the
 // implicit prelude.
 
-/** The absolute value of `x`, for any numeric type. */
+/** The absolute value of `x`, for any numeric type. Integer arithmetic follows
+ * Brass's wrapping rule, so the signed minimum (whose positive value is not
+ * representable) is returned unchanged. */
 // `x - x` yields a correctly typed zero so this works for any numeric type
 // without a typed literal.
 fun abs(x) {

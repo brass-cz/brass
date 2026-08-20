@@ -1,0 +1,6 @@
+import std.package_manager.fetch.{ download_and_extract_tarball }
+
+match download_and_extract_tarball("http://example.invalid/package.tar.gz", "../escape") {
+    Ok { value } => println("invalid hash accepted"),
+    Err { error } => println("invalid hash rejected before fetch"),
+}

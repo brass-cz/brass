@@ -3,6 +3,7 @@
 fun main() {
     println(abs(-5))
     println(abs(2.5 - 4.0))
+    println(abs(INT64_MIN))
     println(min(3, 7))
     println(max(3, 7))
     println(min(1.5, -2.5))

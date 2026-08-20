@@ -1,7 +1,7 @@
 import std.env
 import std.fs.{ create_dir, read_file, write_file }
 import std.path.Path
-import std.process.{ Command, exit }
+import std.process.{ Command, Stdio, exit }
 
 import manifest.{ Manifest, valid_package_name }
 import resolve.{ PACKAGE_FILE_NAME, ResolvedDependencies, resolve_deps }
@@ -77,7 +77,8 @@ fun main() {
     if cmd == "fmt" {
         // The recursive project walk is only needed by the per-file commands
         // (`fmt`, `check`); `run`/`lsp` must not pay for it on every start.
-        const files = list_files(Path.parse("."))!.filter(
+        const root = Path.parse(".").canonicalize()!
+        const files = list_files(root, root)!.filter(
             (v) -> v.to_string().ends_with(".cz"),
         )
         for path in files {
@@ -100,7 +101,8 @@ fun main() {
         // program run, and the program's exit status becomes czpm's.
         exec_brass([main_path.to_string()], deps)!
     } else if cmd == "check" {
-        const files = list_files(Path.parse("."))!.filter(
+        const root = Path.parse(".").canonicalize()!
+        const files = list_files(root, root)!.filter(
             (v) -> v.to_string().ends_with(".cz"),
         )
         let fail = false
@@ -177,7 +179,7 @@ fun init_dir(path: Path, name: string) {
 
     // Write the manifest and entry source only after both destinations have
     // been checked, so a failed initialization never overwrites either one.
-    write_file(
+    _write_new(
         manifest_path,
         "[package]
 name = \"{name}\"
@@ -191,16 +193,27 @@ license = \"MIT\"
 ",
     )!
 
-    write_file(source_path, "println(\"Hello, {name}!\")")!
+    _write_new(source_path, "println(\"Hello, {name}!\")")!
 
-    write_file(path.join(".gitignore"), "*.czcache")
+    const ignore_path = path.join(".gitignore")
+    if ignore_path.exists() {
+        let ignore = read_file(ignore_path)!
+        if !_has_line(ignore, "*.czcache") {
+            if len(ignore) > 0 && !ignore.ends_with("\n") {
+                ignore += "\n"
+            }
+            write_file(ignore_path, ignore + "*.czcache\n")!
+        }
+    } else {
+        _write_new(ignore_path, "*.czcache\n")!
+    }
 
     // Sub-modules live under the package's identifier-shaped directory.
     println("Package {name} created at {path.to_string()}!")
     exit(0)
 }
 
-fun list_files(dir: Path) {
+fun list_files(root: Path, dir: Path) {
     let result = []
     for entry in dir.entries()! {
         // Do not recurse through links: a link can escape the project or form a
@@ -208,18 +221,12 @@ fun list_files(dir: Path) {
         if entry.is_sym_link() {
             continue
         }
-        const components = entry
-            .components()
-            .filter((v) -> v != "." && v != "..")
-        if components.len() == 0 {
-            continue
-        }
-        let path = Path.parse(components[0])
-        for component in components.slice(1, components.len()) {
-            path = path.join(component)
+        const path = entry.canonicalize()!
+        if !path.starts_with(root) {
+            return error("project entry escapes the project root: {entry.to_string()}")
         }
         if path.is_dir() {
-            for path in list_files(path)! {
+            for path in list_files(root, path)! {
                 result.push(path)
             }
         } else {
@@ -227,6 +234,34 @@ fun list_files(dir: Path) {
         }
     }
     return result
+}
+
+// Create a file without replacing an existing destination. The shell's
+// noclobber redirection performs the existence check and creation atomically.
+fun _write_new(path: Path, content: string) {
+    let cmd = Command.new("sh")
+    cmd.args([
+        "-c",
+        "umask 077; set -C; printf '%s' \"$2\" > \"$1\"",
+        "czpm-create",
+        path.to_string(),
+        content,
+    ])
+    cmd.stdin(Stdio.Null)
+    const child = cmd.spawn()!
+    const code = child.wait()!
+    if code != 0 {
+        return error("cannot create {path.to_string()}: destination already exists")
+    }
+}
+
+fun _has_line(text: string, expected: string) -> bool {
+    for line in text.split("\n") {
+        if line.trim() == expected {
+            return true
+        }
+    }
+    return false
 }
 
 fun run_brass(args: string[], deps: string) {

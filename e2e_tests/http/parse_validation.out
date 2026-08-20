@@ -1,0 +1,12 @@
+GET /a?b HTTP/1.1
+extra request part: rejected
+bad method: rejected
+bad header name: rejected
+bad status: rejected
+negative length: rejected
+conflicting length: rejected
+ab
+0
+unsupported scheme: rejected
+malformed IPv6 host: rejected
+out-of-range port: rejected

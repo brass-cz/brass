@@ -183,10 +183,19 @@ fun _quote(s: string) -> string {
                 out = out + "\\\""
             } else if ch == "\\" {
                 out = out + "\\\\"
+            } else if ch == _byte_char(8) {
+                out = out + "\\b"
+            } else if ch == _byte_char(12) {
+                out = out + "\\f"
             } else if ch == "\n" {
                 out = out + "\\n"
             } else if ch == "\t" {
                 out = out + "\\t"
+            } else if ch == "\r" {
+                out = out + "\\r"
+            } else if _is_control(ch) {
+                const b = to_bytes(ch)[0]
+                out = out + "\\u00{_hex_digit(b / 16)}{_hex_digit(b % 16)}"
             } else {
                 out = out + ch
             }
@@ -338,7 +347,7 @@ fun _Cursor._string(self) -> string! {
     let out = ""
     while self.pos < len(self.text) {
         const c = self._peek()
-        self.pos = self.pos + 1
+        self.pos = self.pos + len(c)
         if c == "\"" {
             return out
         }
@@ -357,10 +366,19 @@ fun _Cursor._string(self) -> string! {
                 out = out + "\t"
             } else if esc == "r" {
                 out = out + "\r"
+            } else if esc == "b" {
+                out = out + _byte_char(8)
+            } else if esc == "f" {
+                out = out + _byte_char(12)
+            } else if esc == "u" {
+                out = out + self._unicode_escape()!
             } else {
                 return error("invalid escape in string at offset {self.pos}")
             }
         } else {
+            if _is_control(c) {
+                return error("raw control character in string at offset {self.pos}")
+            }
             out = out + c
         }
     }
@@ -369,20 +387,60 @@ fun _Cursor._string(self) -> string! {
 
 fun _Cursor._number(self) -> JsonValue! {
     const start = self.pos
-    while self.pos < len(self.text) {
-        const c = self._peek()
-        if !_is_number_char(c) {
-            break
-        }
-        self.pos = self.pos + 1
+    if self._peek() == "-" {
+        self.pos += 1
     }
-    return JsonValue.Number { value: float64.parse(_string_slice(self.text, start, self.pos))! }
+    if self._peek() == "0" {
+        self.pos += 1
+        if _is_digit(self._peek()) {
+            return error("leading zero in JSON number at offset {self.pos}")
+        }
+    } else {
+        if !_is_nonzero_digit(self._peek()) {
+            return error("invalid JSON number at offset {self.pos}")
+        }
+        while _is_digit(self._peek()) {
+            self.pos += 1
+        }
+    }
+    if self._peek() == "." {
+        self.pos += 1
+        if !_is_digit(self._peek()) {
+            return error("missing fraction digits at offset {self.pos}")
+        }
+        while _is_digit(self._peek()) {
+            self.pos += 1
+        }
+    }
+    const exponent = self._peek()
+    if exponent == "e" || exponent == "E" {
+        self.pos += 1
+        const sign = self._peek()
+        if sign == "+" || sign == "-" {
+            self.pos += 1
+        }
+        if !_is_digit(self._peek()) {
+            return error("missing exponent digits at offset {self.pos}")
+        }
+        while _is_digit(self._peek()) {
+            self.pos += 1
+        }
+    }
+    const raw = _string_slice(self.text, start, self.pos)
+    const value = float64.parse(raw)!
+    if value != value || value - value != 0.0 {
+        return error("JSON number is not finite: {raw}")
+    }
+    return JsonValue.Number { value: value }
 }
 
-fun _is_number_char(c: string) -> bool {
-    return c == "-" || c == "+" || c == "." || c == "e" || c == "E" ||
-        c == "0" || c == "1" || c == "2" || c == "3" || c == "4" ||
+fun _is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4" ||
         c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fun _is_nonzero_digit(c: string) -> bool {
+    return _is_digit(c) && c != "0"
 }
 
 fun _Cursor._bool(self) -> JsonValue! {
@@ -403,4 +461,110 @@ fun _Cursor._null(self) -> JsonValue! {
         return JsonValue.Null
     }
     return error("invalid literal at offset {self.pos}")
+}
+
+// Decode one JSON UTF-16 escape, combining a required low surrogate after a
+// high surrogate and rejecting lone surrogate code units.
+fun _Cursor._unicode_escape(self) -> string! {
+    let cp = self._hex4()!
+    if cp >= 55296 && cp <= 56319 {
+        if !self._starts_with_here("\\u") {
+            return error("high surrogate is not followed by a low surrogate")
+        }
+        self.pos += 2
+        const low = self._hex4()!
+        if low < 56320 || low > 57343 {
+            return error("invalid low surrogate in JSON string")
+        }
+        cp = 65536 + (cp - 55296) * 1024 + (low - 56320)
+    } else if cp >= 56320 && cp <= 57343 {
+        return error("lone low surrogate in JSON string")
+    }
+    return _encode_utf8(cp)!
+}
+
+fun _Cursor._hex4(self) -> int64! {
+    let value: int64 = 0
+    let i: int64 = 0
+    while i < 4 {
+        const digit = _hex_value(self._peek())
+        if digit < 0 {
+            return error("invalid unicode escape at offset {self.pos}")
+        }
+        value = value * 16 + digit
+        self.pos += 1
+        i += 1
+    }
+    return value
+}
+
+fun _hex_value(c: string) -> int64 {
+    const b = to_bytes(c)
+    if len(b) != 1 {
+        return -1
+    }
+    if b[0] >= 48 && b[0] <= 57 {
+        return b[0] - 48
+    }
+    if b[0] >= 65 && b[0] <= 70 {
+        return b[0] - 55
+    }
+    if b[0] >= 97 && b[0] <= 102 {
+        return b[0] - 87
+    }
+    return -1
+}
+
+fun _hex_digit(value: int64) -> string {
+    if value < 10 {
+        return string.from(value)
+    }
+    return ["A", "B", "C", "D", "E", "F"][value - 10]
+}
+
+fun _is_control(c: string) -> bool {
+    const bytes = to_bytes(c)
+    return len(bytes) == 1 && bytes[0] < 32
+}
+
+fun _u8(value: int64) -> uint8 {
+    match uint8.from(value) {
+        Ok { value } => { return value }
+        Err { error } => { return 0 }
+    }
+}
+
+fun _byte_char(value: int64) -> string {
+    let bytes: uint8[] = []
+    bytes.push(_u8(value))
+    match _string_from_bytes(bytes) {
+        Ok { value } => { return value }
+        Err { error } => { return "" }
+    }
+}
+
+fun _encode_utf8(cp: int64) -> string! {
+    let bytes: uint8[] = []
+    if cp < 128 {
+        bytes.push(_u8(cp))
+    } else if cp < 2048 {
+        bytes.push(_u8(192 + cp / 64))
+        bytes.push(_u8(128 + cp % 64))
+    } else if cp < 65536 {
+        bytes.push(_u8(224 + cp / 4096))
+        bytes.push(_u8(128 + (cp / 64) % 64))
+        bytes.push(_u8(128 + cp % 64))
+    } else if cp <= 1114111 {
+        bytes.push(_u8(240 + cp / 262144))
+        bytes.push(_u8(128 + (cp / 4096) % 64))
+        bytes.push(_u8(128 + (cp / 64) % 64))
+        bytes.push(_u8(128 + cp % 64))
+    } else {
+        return error("unicode code point out of range")
+    }
+    match _string_from_bytes(bytes) {
+        Ok { value } => { return value }
+        Err { error } => {}
+    }
+    return error("invalid UTF-8 encoding")
 }

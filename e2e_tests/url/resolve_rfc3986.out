@@ -23,6 +23,9 @@ g. -> http://a/b/c/g.
 ./g/. -> http://a/b/c/g/
 g/./h -> http://a/b/c/g/h
 g/../h -> http://a/b/c/h
+g//h -> http://a/b/c/g//h
+g//./h -> http://a/b/c/g//h
+g//../h -> http://a/b/c/g/h
 http://other.example/x -> http://other.example/x
 /top -> https://example.com/top
 ../guide/ -> https://example.com/docs/guide/

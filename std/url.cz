@@ -233,31 +233,26 @@ fun _remove_dot_segments(path: string) -> string {
     let absolute = path.starts_with("/")
     let parts = path.split("/")
     let kept: string[] = []
-    // A path ending in `/`, `.` or `..` names a directory, so it keeps a trailing
-    // slash even though the segment itself contributes nothing.
-    let directory = false
     let i: int64 = 0
+    if absolute { i = 1 }
     while i < len(parts) {
         let segment = parts[i]
+        const last = i + 1 == len(parts)
         i += 1
         if segment == "." {
-            directory = true
+            if last { kept.push("") }
         } else if segment == ".." {
             if len(kept) > 0 { kept = kept.slice(0, len(kept) - 1) }
-            directory = true
-        } else if len(segment) > 0 {
+            if last { kept.push("") }
+        } else {
+            // Empty interior and trailing segments are significant. Only the
+            // first empty segment of an absolute path was consumed as its root.
             kept.push(segment)
-            directory = false
-        } else if i == len(parts) {
-            // The empty segment a trailing `/` leaves behind. (A leading one --
-            // the `/` of an absolute path -- is carried by `absolute` instead.)
-            directory = true
         }
     }
     let joined = kept.join("/")
     let out = joined
     if absolute { out = "/{joined}" }
-    if directory && len(kept) > 0 { out = "{out}/" }
     return out
 }
 

@@ -33,7 +33,53 @@ type Display = {
 // debug form is quoted (`"a".debug() == "\"a\""`, `"a".display() == "a"`).
 
 fun string.debug(self) -> string {
-    return "\"{self}\""
+    let out = "\""
+    let i: int64 = 0
+    while i < len(self) {
+        if let c = _string_char_at(self, i) {
+            if c == "\"" {
+                out += "\\\""
+            } else if c == "\\" {
+                out += "\\\\"
+            } else if _debug_is_byte(c, 8) {
+                out += "\\b"
+            } else if _debug_is_byte(c, 12) {
+                out += "\\f"
+            } else if c == "\n" {
+                out += "\\n"
+            } else if c == "\r" {
+                out += "\\r"
+            } else if c == "\t" {
+                out += "\\t"
+            } else if _debug_is_control(c) {
+                const b = _string_bytes(c)[0]
+                out += "\\u00{_debug_hex(b / 16)}{_debug_hex(b % 16)}"
+            } else {
+                out += c
+            }
+            i += len(c)
+        } else {
+            i += 1
+        }
+    }
+    return out + "\""
+}
+
+fun _debug_is_byte(c: string, expected: int64) -> bool {
+    const bytes = _string_bytes(c)
+    return len(bytes) == 1 && bytes[0] == expected
+}
+
+fun _debug_is_control(c: string) -> bool {
+    const bytes = _string_bytes(c)
+    return len(bytes) == 1 && (bytes[0] < 32 || bytes[0] == 127)
+}
+
+fun _debug_hex(value: int64) -> string {
+    if value < 10 {
+        return string.from(value)
+    }
+    return ["A", "B", "C", "D", "E", "F"][value - 10]
 }
 
 fun string.display(self) -> string {

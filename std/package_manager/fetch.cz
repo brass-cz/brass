@@ -11,7 +11,7 @@
 // through the normal unhandled-error path and exits non-zero.
 
 import std.env
-import std.fs.{ create_dir, remove_dir }
+import std.fs.{ create_dir, move_dir, remove_dir }
 import std.hash.{ sha256, hex }
 import std.http.fetch
 import std.path.Path
@@ -25,13 +25,20 @@ fun _packages_dir() {
 }
 
 fun download_and_extract_tarball(url: string, hash: string) {
-    const path = _packages_dir()!.join("tarball").join(hash)
-    if path.is_dir() {
+    if !_valid_sha256(hash) {
+        return error("tarball hash must be exactly 64 lowercase hexadecimal characters")
+    }
+    const cache = _packages_dir()!.join("tarball")
+    if !cache.is_dir() {
+        create_dir(cache)!
+    }
+    const path = cache.join(hash)
+    if _complete(path) {
         return path
     }
-    // The cache directory appears only after the download verified: creating
-    // it first would leave an empty directory behind a failed fetch, and the
-    // next run would mistake that for an extracted package.
+    if path.is_dir() {
+        remove_dir(path)!
+    }
     const downloaded = fetch(url)!
     const downloaded_hash = hex(sha256(downloaded.body))
     if downloaded_hash != hash {
@@ -39,22 +46,79 @@ fun download_and_extract_tarball(url: string, hash: string) {
             "Downloaded tarball hash `{downloaded_hash}` is differ from expected one `{hash}`",
         )!
     }
-    create_dir(path)!
+    const staging = _staging_dir(cache, hash)!
+    const populated = _populate(staging, downloaded.body)
+    match populated {
+        Err { error } => {
+            remove_dir(staging)!
+        }
+        Ok { value } => {}
+    }
+    populated!
+    match move_dir(staging, path) {
+        Ok { value } => { return path }
+        Err { error } => {
+            remove_dir(staging)!
+            // Another process may have published the same verified package.
+            if _complete(path) {
+                return path
+            }
+            return error("failed to publish the extracted tarball")
+        }
+    }
+}
+
+fun _populate(path: Path, body: uint8[]) {
     let cmd = Command.new("tar")
     cmd.args(["xz", "-C", path.to_string()])
     cmd.stdin(Stdio.Pipe)
     const child = cmd.spawn()!
     let tar_in = child.stdin()!
-    tar_in.write(downloaded.body)!
+    tar_in.write(body)!
     tar_in.close()!
     const code = child.wait()!
     if code != 0 {
-        if path.is_dir() {
-            remove_dir(path)!
-        }
-        error("failed to extract downloaded tarball")!
+        return error("failed to extract downloaded tarball")
     }
-    return path
+    // A directory marker cannot be followed as a file symlink. Its presence in
+    // the final directory proves extraction reached the publication step.
+    create_dir(path.join(".czpm-complete"))!
+}
+
+fun _complete(path: Path) -> bool {
+    return path.is_dir() && path.join(".czpm-complete").is_dir()
+}
+
+fun _valid_sha256(hash: string) -> bool {
+    if len(hash) != 64 {
+        return false
+    }
+    for b in to_bytes(hash) {
+        if !((b >= 48 && b <= 57) || (b >= 97 && b <= 102)) {
+            return false
+        }
+    }
+    return true
+}
+
+// Use a short-lived shell's process id to reserve a sibling directory. mkdir
+// is the exclusive operation; a concurrent fetch therefore gets its own tree.
+fun _staging_dir(parent: Path, key: string) -> Path! {
+    let cmd = Command.new("sh")
+    cmd.args([
+        "-c",
+        "umask 077; stage=\"$1/.$2.$$\"; mkdir \"$stage\" && printf '%s' \"$stage\"",
+        "czpm-stage",
+        parent.to_string(),
+        key,
+    ])
+    cmd.stdout(Stdio.Pipe)
+    const child = cmd.spawn()!
+    const out = child.output()!
+    if out.code != 0 {
+        return error("failed to create a tarball staging directory")
+    }
+    return Path.parse(to_text(out.stdout)!)
 }
 
 // The entry `main` runs automatically; an explicit top-level call would run

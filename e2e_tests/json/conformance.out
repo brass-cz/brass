@@ -1,0 +1,11 @@
+7
+"\b\fA𝄞"
+"\u0001"
++1: rejected
+01: rejected
+1.: rejected
+.1: rejected
+1e999: rejected
+-0.25e+2: accepted
+raw control rejected
+lone surrogate rejected

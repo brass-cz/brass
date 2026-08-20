@@ -1,0 +1,42 @@
+import std.data.toml.{ TomlValue }
+
+fun show(label: string, text: string) {
+    match TomlValue.parse(text) {
+        Ok { value } => println("{label}: accepted"),
+        Err { error } => println("{label}: rejected"),
+    }
+}
+
+show("duplicate key", "a = 1\na = 2\n")
+show("reopened table", "[a]\nx = 1\n[a]\ny = 2\n")
+show("duplicate dotted key", "a.b = 1\na.b = 2\n")
+show("extended inline table", "a = \{ b = 1 \}\na.c = 2\n")
+show("duplicate inline key", "a = \{ b = 1, b = 2 \}\n")
+show("late parent table", "[a.b]\nx = 1\n[a]\ny = 2\n")
+
+show("leading zero", "v = 01\n")
+show("double underscore", "v = 1__0\n")
+show("edge underscore", "v = 1_\n")
+show("fraction underscore", "v = 1._0\n")
+show("radix overflow", "v = 0xffffffffffffffff\n")
+show("separated integer", "v = 1_000\n")
+
+show("bad month", "v = 1979-13-01\n")
+show("bad leap day", "v = 2023-02-29\n")
+show("bad hour", "v = 1979-05-27T25:00:00Z\n")
+show("bad offset", "v = 1979-05-27T07:32:00+24:00\n")
+show("valid leap day", "v = 2024-02-29\n")
+show("valid local time", "v = 07:32:00.123\n")
+
+println(TomlValue.parse("s = \"\\b\\f\"\n")!.get("s")!.stringify())
+println(TomlValue.parse("v = nan\n")!.get("v")!.stringify())
+println(TomlValue.parse("v = +inf\n")!.get("v")!.stringify())
+println(TomlValue.parse("v = -inf\n")!.get("v")!.stringify())
+
+let raw = to_bytes("s = \"")
+raw.push(uint8.from(1)!)
+raw.push(uint8.from(34)!)
+match TomlValue.parse(to_text(raw)!) {
+    Ok { value } => println("raw control accepted"),
+    Err { error } => println("raw control rejected"),
+}

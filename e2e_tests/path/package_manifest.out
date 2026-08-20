@@ -3,3 +3,6 @@ pinned: repo at abc
 local: ../local
 mixed source rejected
 registry source rejected
+stray source field rejected
+hyphenated package accepted
+underscore package accepted

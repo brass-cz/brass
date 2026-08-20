@@ -214,7 +214,16 @@ fun _inline(value: TomlValue) -> string {
     match value {
         TomlValue.String { value } => { return _quote(value) }
         TomlValue.Integer { value } => { return "{value}" }
-        TomlValue.Float { value } => { return "{value}" }
+        TomlValue.Float { value } => {
+            if value != value {
+                return "nan"
+            }
+            if value - value != 0.0 {
+                if value < 0.0 { return "-inf" }
+                return "inf"
+            }
+            return "{value}"
+        }
         TomlValue.Bool { value } => {
             if value { return "true" }
             return "false"
@@ -267,12 +276,19 @@ fun _quote(s: string) -> string {
                 out = out + "\\\""
             } else if ch == "\\" {
                 out = out + "\\\\"
+            } else if _is_byte(ch, 8) {
+                out = out + "\\b"
+            } else if _is_byte(ch, 12) {
+                out = out + "\\f"
             } else if ch == "\n" {
                 out = out + "\\n"
             } else if ch == "\t" {
                 out = out + "\\t"
             } else if ch == "\r" {
                 out = out + "\\r"
+            } else if _is_raw_control(ch, false) {
+                const b = _string_bytes(ch)[0]
+                out = out + "\\u00{_hex_digit(b / 16)}{_hex_digit(b % 16)}"
             } else {
                 out = out + ch
             }
@@ -298,6 +314,18 @@ type _Cursor = {
     pos: int64
 }
 
+type _PathSet = HashMap { key: string, value: bool }
+
+type _ParseState = {
+    declared: _PathSet
+    dotted: _PathSet
+    sealed: _PathSet
+    arrays: _PathSet
+    latest_keys: string[]
+    latest_values: string[]
+    serial: int64
+}
+
 /**
  * Parse `text` as a TOML document, returning its root as a `Table`. Errors on the
  * first malformed statement, naming the byte offset.
@@ -306,6 +334,20 @@ fun TomlValue.parse(text: string) -> TomlValue! {
     let cur = _Cursor { text: text, pos: 0 }
     let root: _TomlTable = HashMap.new()
     let current = root
+    let current_path = ""
+    let declared: _PathSet = HashMap.new()
+    let dotted: _PathSet = HashMap.new()
+    let sealed: _PathSet = HashMap.new()
+    let arrays: _PathSet = HashMap.new()
+    let state = _ParseState {
+        declared: declared,
+        dotted: dotted,
+        sealed: sealed,
+        arrays: arrays,
+        latest_keys: [],
+        latest_values: [],
+        serial: 0,
+    }
     while cur.pos < len(cur.text) {
         cur._skip_blank()
         if cur.pos >= len(cur.text) {
@@ -318,13 +360,19 @@ fun TomlValue.parse(text: string) -> TomlValue! {
                 // append a fresh table to the array there, make it current.
                 cur.pos += 2
                 let parent = root
+                let parent_path = ""
                 cur._skip_inline_ws()
                 let part = cur._key_part()!
                 cur._skip_inline_ws()
                 while cur._peek() == "." {
                     cur.pos += 1
                     cur._skip_inline_ws()
+                    const desired = _path_key(parent_path, part)
+                    if state.sealed.contains_key(desired) {
+                        return error("cannot extend inline table '{part}'")
+                    }
                     parent = _child(parent, part)!
+                    parent_path = _latest(state, desired)
                     part = cur._key_part()!
                     cur._skip_inline_ws()
                 }
@@ -332,38 +380,75 @@ fun TomlValue.parse(text: string) -> TomlValue! {
                     return error("expected ']]' to close an array-of-tables header at offset {cur.pos}")
                 }
                 cur.pos += 2
+                const array_path = _path_key(parent_path, part)
+                if state.sealed.contains_key(array_path) ||
+                   state.declared.contains_key(array_path) ||
+                   state.dotted.contains_key(array_path) {
+                    return error("key '{part}' was already defined as a table")
+                }
+                if parent.contains_key(part) && !state.arrays.contains_key(array_path) {
+                    return error("key '{part}' is not an array of tables")
+                }
                 current = _append_array_table(parent, part)!
+                state.arrays.set(array_path, true)
+                state.serial += 1
+                current_path = "{array_path}@{state.serial}"
+                _set_latest(state, array_path, current_path)
             } else {
                 // `[a.b.c]`: navigate/create the table at the dotted path from
                 // root and make it current.
                 cur.pos += 1
                 current = root
+                current_path = ""
                 cur._skip_inline_ws()
                 let part = cur._key_part()!
+                let desired = _path_key(current_path, part)
+                if state.sealed.contains_key(desired) {
+                    return error("cannot extend inline table '{part}'")
+                }
                 current = _child(current, part)!
+                current_path = _latest(state, desired)
                 cur._skip_inline_ws()
                 while cur._peek() == "." {
                     cur.pos += 1
                     cur._skip_inline_ws()
                     part = cur._key_part()!
+                    desired = _path_key(current_path, part)
+                    if state.sealed.contains_key(desired) {
+                        return error("cannot extend inline table '{part}'")
+                    }
                     current = _child(current, part)!
+                    current_path = _latest(state, desired)
                     cur._skip_inline_ws()
                 }
                 if cur._peek() != "]" {
                     return error("expected ']' to close a table header at offset {cur.pos}")
                 }
                 cur.pos += 1
+                if state.arrays.contains_key(desired) ||
+                   state.declared.contains_key(desired) ||
+                   state.dotted.contains_key(desired) {
+                    return error("table '{part}' was already defined")
+                }
+                state.declared.set(desired, true)
             }
         } else {
             // `key = value` (dotted key): navigate `current` to the table holding
             // the final key part, then store the value.
             let tbl = current
+            let tbl_path = current_path
             let key = cur._key_part()!
             cur._skip_inline_ws()
             while cur._peek() == "." {
                 cur.pos += 1
                 cur._skip_inline_ws()
+                const desired = _path_key(tbl_path, key)
+                if state.sealed.contains_key(desired) {
+                    return error("cannot extend inline table '{key}'")
+                }
                 tbl = _child(tbl, key)!
+                tbl_path = _latest(state, desired)
+                state.dotted.set(desired, true)
                 key = cur._key_part()!
                 cur._skip_inline_ws()
             }
@@ -372,8 +457,16 @@ fun TomlValue.parse(text: string) -> TomlValue! {
             }
             cur.pos += 1
             cur._skip_inline_ws()
+            const value_path = _path_key(tbl_path, key)
+            if tbl.contains_key(key) {
+                return error("duplicate key '{key}'")
+            }
             const value = cur._value()!
             tbl.set(key, value)
+            match value {
+                TomlValue.Table { values } => { state.sealed.set(value_path, true) }
+                _ => {}
+            }
         }
         // A statement must end at a line boundary: only whitespace and a comment
         // may follow it on the line.
@@ -384,6 +477,40 @@ fun TomlValue.parse(text: string) -> TomlValue! {
         }
     }
     return TomlValue.Table { values: root }
+}
+
+// Length-prefix each component so quoted keys containing separators cannot
+// collide in the parser's definition-tracking maps.
+fun _path_key(parent: string, key: string) -> string {
+    const component = "{len(key)}:{key}"
+    if len(parent) == 0 {
+        return component
+    }
+    return "{parent}/{component}"
+}
+
+fun _latest(state: _ParseState, path: string) -> string {
+    let i: int64 = 0
+    while i < len(state.latest_keys) {
+        if state.latest_keys[i] == path {
+            return state.latest_values[i]
+        }
+        i += 1
+    }
+    return path
+}
+
+fun _set_latest(state: _ParseState, path: string, value: string) {
+    let i: int64 = 0
+    while i < len(state.latest_keys) {
+        if state.latest_keys[i] == path {
+            state.latest_values[i] = value
+            return
+        }
+        i += 1
+    }
+    state.latest_keys.push(path)
+    state.latest_values.push(value)
 }
 
 // The child table at `key` of `parent`, creating an empty one when absent. When
@@ -518,6 +645,8 @@ fun _Cursor._array(self) -> TomlValue! {
 fun _Cursor._inline_table(self) -> TomlValue! {
     self.pos += 1
     let t: _TomlTable = HashMap.new()
+    let dotted: _PathSet = HashMap.new()
+    let sealed: _PathSet = HashMap.new()
     self._skip_inline_ws()
     if self._peek() == "\}" {
         self.pos += 1
@@ -526,12 +655,22 @@ fun _Cursor._inline_table(self) -> TomlValue! {
     while true {
         self._skip_inline_ws()
         let tbl = t
+        let tbl_path = ""
         let key = self._key_part()!
         self._skip_inline_ws()
         while self._peek() == "." {
             self.pos += 1
             self._skip_inline_ws()
+            const desired = _path_key(tbl_path, key)
+            if sealed.contains_key(desired) {
+                return error("cannot extend inline table '{key}'")
+            }
+            if tbl.contains_key(key) && !dotted.contains_key(desired) {
+                return error("duplicate key '{key}' in inline table")
+            }
             tbl = _child(tbl, key)!
+            tbl_path = desired
+            dotted.set(desired, true)
             key = self._key_part()!
             self._skip_inline_ws()
         }
@@ -540,8 +679,16 @@ fun _Cursor._inline_table(self) -> TomlValue! {
         }
         self.pos += 1
         self._skip_inline_ws()
+        const value_path = _path_key(tbl_path, key)
+        if tbl.contains_key(key) {
+            return error("duplicate key '{key}' in inline table")
+        }
         const v = self._value()!
         tbl.set(key, v)
+        match v {
+            TomlValue.Table { values } => { sealed.set(value_path, true) }
+            _ => {}
+        }
         self._skip_inline_ws()
         const sep = self._peek()
         self.pos += 1
@@ -562,12 +709,15 @@ fun _Cursor._basic_string(self) -> string! {
     let out = ""
     while self.pos < len(self.text) {
         const c = self._peek()
-        self.pos += 1
+        self.pos += len(c)
         if c == "\"" {
             return out
         }
         if c == "\n" {
             return error("newline in a single-line string at offset {self.pos}")
+        }
+        if _is_raw_control(c, false) {
+            return error("raw control character in basic string at offset {self.pos}")
         }
         if c == "\\" {
             out = out + self._escape()!
@@ -591,7 +741,7 @@ fun _Cursor._literal_string(self) -> string! {
         if c == "\n" {
             return error("newline in a single-line literal string at offset {self.pos}")
         }
-        self.pos += 1
+        self.pos += len(c)
     }
     return error("unterminated literal string")
 }
@@ -617,7 +767,10 @@ fun _Cursor._ml_basic_string(self) -> string! {
                 out = out + self._escape()!
             }
         } else {
-            self.pos += 1
+            self.pos += len(c)
+            if _is_raw_control(c, true) {
+                return error("raw control character in basic string at offset {self.pos}")
+            }
             out = out + c
         }
     }
@@ -634,7 +787,8 @@ fun _Cursor._ml_literal_string(self) -> string! {
             self.pos += 3
             return out
         }
-        self.pos += 1
+        const c = self._peek()
+        self.pos += len(c)
     }
     return error("unterminated multi-line literal string")
 }
@@ -710,7 +864,11 @@ fun _Cursor._number_or_datetime(self) -> TomlValue! {
                 self.pos += 1
             }
             const tpart = _string_slice(self.text, tstart, self.pos)
-            return TomlValue.Datetime { value: raw + " " + tpart }
+            const joined = raw + " " + tpart
+            if !_valid_datetime(joined) {
+                return error("invalid TOML date-time: {joined}")
+            }
+            return TomlValue.Datetime { value: joined }
         }
     }
     if _is_datetime_token(raw) {
@@ -722,15 +880,30 @@ fun _Cursor._number_or_datetime(self) -> TomlValue! {
 // Classify and parse a non-date-time numeric token into an `Integer` or `Float`.
 fun _parse_number(raw: string) -> TomlValue! {
     if raw.starts_with("0x") {
+        if !_valid_digit_run(_string_slice(raw, 2, len(raw)), 16) {
+            return error("invalid hexadecimal integer literal")
+        }
         return TomlValue.Integer { value: _parse_radix(_string_slice(raw, 2, len(raw)), 16)! }
     }
     if raw.starts_with("0o") {
+        if !_valid_digit_run(_string_slice(raw, 2, len(raw)), 8) {
+            return error("invalid octal integer literal")
+        }
         return TomlValue.Integer { value: _parse_radix(_string_slice(raw, 2, len(raw)), 8)! }
     }
     if raw.starts_with("0b") {
+        if !_valid_digit_run(_string_slice(raw, 2, len(raw)), 2) {
+            return error("invalid binary integer literal")
+        }
         return TomlValue.Integer { value: _parse_radix(_string_slice(raw, 2, len(raw)), 2)! }
     }
+    if !_valid_decimal_underscores(raw) {
+        return error("invalid underscore placement in number: {raw}")
+    }
     let cleaned = raw.replace("_", "")
+    if !_valid_decimal_number(cleaned) {
+        return error("invalid TOML number: {raw}")
+    }
     if _is_float_token(cleaned) {
         // `float64.parse` accepts a leading `+` and `inf`/`nan`; a leading `+` is
         // stripped defensively so `+inf` parses like `inf`.
@@ -755,6 +928,9 @@ fun _parse_radix(digits: string, base: int64) -> int64! {
             const d = _digit_value(c)
             if d < 0 || d >= base {
                 return error("invalid digit '{c}' in integer literal")
+            }
+            if acc > (INT64_MAX - d) / base {
+                return error("integer literal does not fit in int64")
             }
             acc = acc * base + d
         }
@@ -946,28 +1122,124 @@ fun _digit_value(c: string) -> int64 {
 // Whether `raw` is a bare TOML date (`YYYY-MM-DD` prefix), used to detect the
 // space that may join a date and a time.
 fun _is_date(raw: string) -> bool {
-    if len(raw) < 10 {
+    if len(raw) != 10 {
         return false
     }
-    if !_is_digit(_string_slice(raw, 0, 1)) {
+    if !_all_digits(raw, 0, 4) || !_all_digits(raw, 5, 2) ||
+       !_all_digits(raw, 8, 2) {
         return false
     }
-    return _string_char_at_eq(raw, 4, "-") && _string_char_at_eq(raw, 7, "-")
+    if !_string_char_at_eq(raw, 4, "-") || !_string_char_at_eq(raw, 7, "-") {
+        return false
+    }
+    const year = _digits_value(raw, 0, 4)
+    const month = _digits_value(raw, 5, 2)
+    const day = _digits_value(raw, 8, 2)
+    if month < 1 || month > 12 {
+        return false
+    }
+    let days: int64 = 31
+    if month == 4 || month == 6 || month == 9 || month == 11 {
+        days = 30
+    } else if month == 2 {
+        days = 28
+        if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+            days = 29
+        }
+    }
+    return day >= 1 && day <= days
 }
 
 // Whether `raw` should be read as a date/time: a digit-led token that carries a
 // time (`:`) or a full date (`YYYY-MM-DD`).
 fun _is_datetime_token(raw: string) -> bool {
-    if len(raw) == 0 {
-        return false
-    }
-    if !_is_digit(_string_slice(raw, 0, 1)) {
-        return false
-    }
-    if raw.find(":") != null {
+    return _valid_datetime(raw)
+}
+
+fun _valid_datetime(raw: string) -> bool {
+    if _is_date(raw) {
         return true
     }
-    return _is_date(raw)
+    if len(raw) >= 8 && _string_char_at_eq(raw, 2, ":") {
+        return _valid_time(raw, false)
+    }
+    if len(raw) < 19 || !_is_date(_string_slice(raw, 0, 10)) {
+        return false
+    }
+    const sep = _string_slice(raw, 10, 11)
+    if sep != "T" && sep != "t" && sep != " " {
+        return false
+    }
+    return _valid_time(_string_slice(raw, 11, len(raw)), true)
+}
+
+fun _valid_time(raw: string, allow_offset: bool) -> bool {
+    if len(raw) < 8 || !_string_char_at_eq(raw, 2, ":") ||
+       !_string_char_at_eq(raw, 5, ":") || !_all_digits(raw, 0, 2) ||
+       !_all_digits(raw, 3, 2) || !_all_digits(raw, 6, 2) {
+        return false
+    }
+    if _digits_value(raw, 0, 2) > 23 || _digits_value(raw, 3, 2) > 59 ||
+       _digits_value(raw, 6, 2) > 59 {
+        return false
+    }
+    let pos: int64 = 8
+    if pos < len(raw) && _string_char_at_eq(raw, pos, ".") {
+        pos += 1
+        const start = pos
+        while pos < len(raw) && _is_digit(_string_slice(raw, pos, pos + 1)) {
+            pos += 1
+        }
+        if pos == start {
+            return false
+        }
+    }
+    if pos == len(raw) {
+        return true
+    }
+    if !allow_offset {
+        return false
+    }
+    const marker = _string_slice(raw, pos, pos + 1)
+    if marker == "Z" || marker == "z" {
+        return pos + 1 == len(raw)
+    }
+    if marker != "+" && marker != "-" {
+        return false
+    }
+    if pos + 6 != len(raw) || !_string_char_at_eq(raw, pos + 3, ":") ||
+       !_all_digits(raw, pos + 1, 2) || !_all_digits(raw, pos + 4, 2) {
+        return false
+    }
+    return _digits_value(raw, pos + 1, 2) <= 23 &&
+        _digits_value(raw, pos + 4, 2) <= 59
+}
+
+fun _all_digits(s: string, start: int64, count: int64) -> bool {
+    if start < 0 || start + count > len(s) {
+        return false
+    }
+    let i = start
+    while i < start + count {
+        if !_is_digit(_string_slice(s, i, i + 1)) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+fun _digits_value(s: string, start: int64, count: int64) -> int64 {
+    if !_all_digits(s, start, count) {
+        return -1
+    }
+    let value: int64 = 0
+    let i = start
+    while i < start + count {
+        value = value * 10 + _digit_value(_string_slice(s, i, i + 1))
+        i += 1
+    }
+    return value
 }
 
 // Whether the token is a float rather than an integer: it carries a fractional
@@ -983,11 +1255,126 @@ fun _is_float_token(s: string) -> bool {
     return s.find("inf") != null || s.find("nan") != null
 }
 
+fun _valid_digit_run(s: string, base: int64) -> bool {
+    if len(s) == 0 || s.starts_with("_") || s.ends_with("_") {
+        return false
+    }
+    let i: int64 = 0
+    while i < len(s) {
+        const c = _string_slice(s, i, i + 1)
+        if c == "_" {
+            const before = _digit_value(_string_slice(s, i - 1, i))
+            const after = _digit_value(_string_slice(s, i + 1, i + 2))
+            if before < 0 || before >= base || after < 0 || after >= base {
+                return false
+            }
+        } else {
+            const digit = _digit_value(c)
+            if digit < 0 || digit >= base {
+                return false
+            }
+        }
+        i += 1
+    }
+    return true
+}
+
+fun _valid_decimal_underscores(s: string) -> bool {
+    if len(s) == 0 || s.starts_with("_") || s.ends_with("_") {
+        return false
+    }
+    let i: int64 = 0
+    while i < len(s) {
+        if _string_char_at_eq(s, i, "_") {
+            if i == 0 || i + 1 >= len(s) ||
+               !_is_digit(_string_slice(s, i - 1, i)) ||
+               !_is_digit(_string_slice(s, i + 1, i + 2)) {
+                return false
+            }
+        }
+        i += 1
+    }
+    return true
+}
+
+fun _valid_decimal_number(s: string) -> bool {
+    if s == "inf" || s == "+inf" || s == "-inf" ||
+       s == "nan" || s == "+nan" || s == "-nan" {
+        return true
+    }
+    let pos: int64 = 0
+    if _string_char_at_eq(s, pos, "+") || _string_char_at_eq(s, pos, "-") {
+        pos += 1
+    }
+    const integer_start = pos
+    while pos < len(s) && _is_digit(_string_slice(s, pos, pos + 1)) {
+        pos += 1
+    }
+    if pos == integer_start {
+        return false
+    }
+    if pos - integer_start > 1 && _string_char_at_eq(s, integer_start, "0") {
+        return false
+    }
+    let is_float = false
+    if pos < len(s) && _string_char_at_eq(s, pos, ".") {
+        is_float = true
+        pos += 1
+        const fraction_start = pos
+        while pos < len(s) && _is_digit(_string_slice(s, pos, pos + 1)) {
+            pos += 1
+        }
+        if pos == fraction_start {
+            return false
+        }
+    }
+    if pos < len(s) && (_string_char_at_eq(s, pos, "e") ||
+                       _string_char_at_eq(s, pos, "E")) {
+        is_float = true
+        pos += 1
+        if _string_char_at_eq(s, pos, "+") || _string_char_at_eq(s, pos, "-") {
+            pos += 1
+        }
+        const exponent_start = pos
+        while pos < len(s) && _is_digit(_string_slice(s, pos, pos + 1)) {
+            pos += 1
+        }
+        if pos == exponent_start {
+            return false
+        }
+    }
+    return pos == len(s)
+}
+
 fun _string_char_at_eq(s: string, i: int64, expect: string) -> bool {
     if let c = _string_char_at(s, i) {
         return c == expect
     }
     return false
+}
+
+fun _is_byte(c: string, expected: int64) -> bool {
+    const bytes = _string_bytes(c)
+    return len(bytes) == 1 && bytes[0] == expected
+}
+
+fun _is_raw_control(c: string, multiline: bool) -> bool {
+    const bytes = _string_bytes(c)
+    if len(bytes) != 1 {
+        return false
+    }
+    const b: int64 = bytes[0]
+    if b == 9 || (multiline && (b == 10 || b == 13)) {
+        return false
+    }
+    return b < 32 || b == 127
+}
+
+fun _hex_digit(value: int64) -> string {
+    if value < 10 {
+        return string.from(value)
+    }
+    return ["A", "B", "C", "D", "E", "F"][value - 10]
 }
 
 // ----- byte / UTF-8 helpers -----
@@ -1042,4 +1429,3 @@ fun _encode_utf8(cp: int64) -> string! {
     }
     return _bytes_to_string(bytes)!
 }
-

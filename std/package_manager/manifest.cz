@@ -49,6 +49,9 @@ fun Manifest.parse(s: string) -> Manifest! {
     // keyed call anywhere in the closure forces the driver's whole-program
     // eager pipeline, which costs czpm its lazy start-up path.
     const name: string = package_raw.get("name")!.as_string()!
+    if !valid_package_name(name)! {
+        return error("package name `{name}` is not a legal identifier")
+    }
     const authors: string[] = match package_raw.get("authors")! {
         String { value } => [value],
         Array { value } => {
@@ -85,13 +88,11 @@ fun Manifest.parse(s: string) -> Manifest! {
 }
 
 /**
- * Whether `name` is a legal name for a package itself. A package's own name
- * is never an import segment (a depender reaches it by its dependency key),
- * so hyphens are allowed: a letter first, letters/digits/`-`/`_` after, and
- * not ending in a separator.
+ * Whether `name` is a legal package name. Hyphens are accepted in package
+ * names and normalize to underscores when matched to an import identifier.
  */
 fun valid_package_name(name: string) {
-    const regex = Regex.new("^[a-zA-Z]([a-zA-Z0-9\\-_]*[a-zA-Z0-9])?$")!
+    const regex = Regex.new("^[a-zA-Z_]([a-zA-Z0-9\\-_]*[a-zA-Z0-9_])?$")!
     return regex.is_match(name)
 }
 
@@ -116,18 +117,18 @@ fun _dependency(entry: TomlValue) -> Dependency! {
     const has_git = _has(keys, "git")
     const has_path = _has(keys, "path")
     const has_tarball = _has(keys, "tarball") && _has(keys, "hash")
-    if has_git && !has_path && !has_tarball {
+    if has_git && _only(keys, ["git", "rev"]) {
         const rev = if _has(keys, "rev") {
             entry.get("rev")!.as_string()!
         } else {
             DEFAULT_REV
         }
         return Dependency.Git { git: entry.get("git")!.as_string()!, rev: rev }
-    } else if has_path && !has_git && !has_tarball {
+    } else if has_path && _only(keys, ["path"]) {
         return Dependency.Path {
             path: Path.parse(entry.get("path")!.as_string()!),
         }
-    } else if has_tarball && !has_git && !has_path {
+    } else if has_tarball && _only(keys, ["tarball", "hash"]) {
         return Dependency.Tarball {
             tarball: entry.get("tarball")!.as_string()!,
             hash: entry.get("hash")!.as_string()!,
@@ -135,6 +136,17 @@ fun _dependency(entry: TomlValue) -> Dependency! {
     } else {
         return error("invalid dependency format")
     }
+}
+
+// Whether every present key is allowed. Callers separately require their
+// source's mandatory keys, so this rejects both mixed sources and stray fields.
+fun _only(keys: string[], allowed: string[]) -> bool {
+    for key in keys {
+        if !_has(allowed, key) {
+            return false
+        }
+    }
+    return true
 }
 
 // `TomlValue.get` reports a missing key as an error rather than null, so an

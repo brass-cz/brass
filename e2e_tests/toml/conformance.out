@@ -1,0 +1,23 @@
+duplicate key: rejected
+reopened table: rejected
+duplicate dotted key: rejected
+extended inline table: rejected
+duplicate inline key: rejected
+late parent table: accepted
+leading zero: rejected
+double underscore: rejected
+edge underscore: rejected
+fraction underscore: rejected
+radix overflow: rejected
+separated integer: accepted
+bad month: rejected
+bad leap day: rejected
+bad hour: rejected
+bad offset: rejected
+valid leap day: accepted
+valid local time: accepted
+"\b\f"
+nan
+inf
+-inf
+raw control rejected

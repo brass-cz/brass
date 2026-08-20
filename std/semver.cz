@@ -12,7 +12,9 @@
 // needs no plugin beyond the regex one. Parsing uses the OFFICIAL pattern from
 // semver.org verbatim (see `_PATTERN`), which is what makes acceptance exactly
 // the spec's: no leading zeros in the numeric fields, a pre-release of
-// dot-separated identifiers, and optional build metadata.
+// dot-separated identifiers, and optional build metadata. This implementation
+// deliberately stores the three core components as int64, so it rejects a
+// syntactically valid component above INT64_MAX; SemVer itself sets no size cap.
 //
 //     BRASS_PACKAGES=std=/path/to/toolchain
 //     import std.semver.{ Version }
@@ -55,7 +57,8 @@ type Version = {
 /**
  * The version `text` denotes. Fails when `text` is not a semantic version in
  * its entirety (the official pattern is anchored): a leading `v`, a missing
- * field, a leading zero, or trailing text are all rejected.
+ * field, a leading zero, or trailing text are all rejected. Core components
+ * must also fit in a non-negative int64, an explicit implementation limit.
  */
 fun Version.parse(text: string) -> Version! {
     if let m = _VERSION.find(text) {
@@ -70,8 +73,12 @@ fun Version.parse(text: string) -> Version! {
     return error("not a semantic version: `{text}`")
 }
 
-/** The version `major.minor.patch`, with no pre-release and no build metadata. */
-fun Version.new(major: int64, minor: int64, patch: int64) -> Version {
+/** The version `major.minor.patch`, with no pre-release and no build metadata.
+ * Fails when any component is negative. */
+fun Version.new(major: int64, minor: int64, patch: int64) -> Version! {
+    if major < 0 || minor < 0 || patch < 0 {
+        return error("semantic version components must be non-negative")
+    }
     return Self {
         major: major,
         minor: minor,

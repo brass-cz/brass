@@ -1,6 +1,6 @@
 import std.process.{ Command, Stdio }
 import std.path.Path
-import std.fs.{ read_file, create_dir, remove_dir }
+import std.fs.{ read_file, create_dir, move_dir, remove_dir }
 import std.hash.{ sha256, hex }
 
 import manifest.{ Manifest, Dependency, Dependencies }
@@ -42,21 +42,22 @@ fun _resolve_deps(
             read_file(path.join(PACKAGE_FILE_NAME).to_string())!,
         )!
         const name = manifest.package.name
-        if name != declared_name {
+        const import_name = name.replace("-", "_")
+        if import_name != declared_name {
             return error(
                 "dependency `{declared_name}` contains package `{name}` at {path.to_string()}",
             )
         }
         const path_text = path.to_string()
-        if let previous = result.get(name) {
+        if let previous = result.get(declared_name) {
             if previous != path_text {
                 return error(
-                    "dependency `{name}` resolves to both {previous} and {path_text}",
+                    "dependency `{declared_name}` resolves to both {previous} and {path_text}",
                 )
             }
             continue
         }
-        result.set(name, path_text)
+        result.set(declared_name, path_text)
         _resolve_deps(manifest.dependencies, path, result)!
     }
     return
@@ -74,7 +75,7 @@ fun git_clone(repo: string, rev: string) {
     const key = hex(sha256(to_bytes("{repo}\n{rev}")))
     const path = pkgs.join(key)
     if path.is_dir() {
-        if path.join(".git").is_dir() {
+        if path.join(".git").is_dir() && _revision_matches(path, rev)! {
             return path
         }
         remove_dir(path)!
@@ -83,27 +84,101 @@ fun git_clone(repo: string, rev: string) {
         create_dir(pkgs)!
     }
 
+    const staging = _staging_dir(pkgs, key)!
+    const populated = _clone_checkout(staging, repo, rev)
+    match populated {
+        Err { error } => {
+            remove_dir(staging)!
+        }
+        Ok { value } => {}
+    }
+    populated!
+    match move_dir(staging, path) {
+        Ok { value } => { return path }
+        Err { error } => {
+            remove_dir(staging)!
+            if path.is_dir() && path.join(".git").is_dir() && _revision_matches(path, rev)! {
+                return path
+            }
+            return error("failed to publish the git checkout")
+        }
+    }
+}
+
+fun _clone_checkout(path: Path, repo: string, rev: string) {
     let cmd = Command.new("git")
     cmd.args(["clone", repo, path.to_string()])
     const child = cmd.spawn()!
     const code = child.wait()!
     if code != 0 {
-        if path.is_dir() {
-            remove_dir(path)!
-        }
         return error("failed to clone `{repo}`: exit code {code}")
     }
+    const commit = _resolved_commit(path, rev)!
     let cmd = Command.new("git")
-    cmd.args(["-C", path.to_string(), "checkout", "--detach", rev])
+    cmd.args(["-C", path.to_string(), "checkout", "--detach", commit])
     const child = cmd.spawn()!
     const code = child.wait()!
     if code != 0 {
-        remove_dir(path)!
         return error(
             "failed to check out `{rev}` from `{repo}`: exit code {code}",
         )
     }
-    return path
+    if !_revision_matches(path, rev)! {
+        return error("checked-out revision does not match `{rev}`")
+    }
+}
+
+fun _revision_matches(path: Path, rev: string) -> bool! {
+    if let expected = _try_resolved_commit(path, rev)! {
+        if let actual = _try_resolved_commit(path, "HEAD")! {
+            return expected == actual
+        }
+    }
+    return false
+}
+
+fun _resolved_commit(path: Path, rev: string) -> string! {
+    if let commit = _try_resolved_commit(path, rev)! {
+        return commit
+    }
+    return error("failed to resolve git revision `{rev}`")
+}
+
+fun _try_resolved_commit(path: Path, rev: string) -> string?! {
+    let cmd = Command.new("git")
+    cmd.args([
+        "-C",
+        path.to_string(),
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        "{rev}^\{commit}",
+    ])
+    cmd.stdout(Stdio.Pipe)
+    const child = cmd.spawn()!
+    const out = child.output()!
+    if out.code != 0 {
+        return null
+    }
+    return to_text(out.stdout)!.trim()
+}
+
+fun _staging_dir(parent: Path, key: string) -> Path! {
+    let cmd = Command.new("sh")
+    cmd.args([
+        "-c",
+        "umask 077; stage=\"$1/.$2.$$\"; mkdir \"$stage\" && printf '%s' \"$stage\"",
+        "czpm-stage",
+        parent.to_string(),
+        key,
+    ])
+    cmd.stdout(Stdio.Pipe)
+    const child = cmd.spawn()!
+    const out = child.output()!
+    if out.code != 0 {
+        return error("failed to create a git staging directory")
+    }
+    return Path.parse(to_text(out.stdout)!)
 }
 
 /**

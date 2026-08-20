@@ -30,3 +30,21 @@ match Manifest.parse(unsupported) {
     Ok { value } => println("registry source accepted"),
     Err { error } => println("registry source rejected"),
 }
+
+const stray = "[package]\nname = \"app\"\nauthors = \"\"\nlicense = \"MIT\"\n\n[dependencies]\nbad = \{ path = \"../local\", rev = \"ignored\" \}\n"
+match Manifest.parse(stray) {
+    Ok { value } => println("stray source field accepted"),
+    Err { error } => println("stray source field rejected"),
+}
+
+const bad_name = "[package]\nname = \"not-importable\"\nauthors = \"\"\nlicense = \"MIT\"\n"
+match Manifest.parse(bad_name) {
+    Ok { value } => println("hyphenated package accepted"),
+    Err { error } => println("hyphenated package rejected"),
+}
+
+const underscore = "[package]\nname = \"_importable\"\nauthors = \"\"\nlicense = \"MIT\"\n"
+match Manifest.parse(underscore) {
+    Ok { value } => println("underscore package accepted"),
+    Err { error } => println("underscore package rejected"),
+}
