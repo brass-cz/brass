@@ -70,7 +70,8 @@ complete verdict is required.
 
 An entry cache is used only when all inputs still identify the same program:
 
-- the compiler version, release identity, and cache format match;
+- the compiler version, release identity, and cache format (currently version
+  8) match;
 - the entry and every loaded source have the recorded contents;
 - package names resolve consistently;
 - imported native plugins still resolve and have the recorded contents.
@@ -80,6 +81,11 @@ unchanged project or toolchain can therefore preserve a valid cache, while a
 changed dependency invalidates it. Any mismatch is handled silently by
 checking again. Cache files are not stable interchange formats and have no
 cross-version compatibility guarantee.
+
+A release build's compiler identity is stable across installations. A nightly
+or other unstamped working-tree build additionally keys every cache on the
+running executable's modification time and byte length, so rebuilding the
+compiler cannot reuse artifacts produced by the previous binary.
 
 ## Context cache (`.czctx`)
 
@@ -134,9 +140,12 @@ The machine code a run materializes is saved next to the entry as
 `<entry>.o0.czobj` (or `.o2.czobj` under `BRASS_OPT=2`) and bound to the
 exact analysis result that produced it: the file records the analysis
 payload's hash, the compile target's identity, and every group's symbol
-list. A later run whose analysis cache hits loads the matching groups as
-prebuilt objects -- no IR generation, optimization, or instruction
-selection -- and any mismatch simply recompiles that group. A `.o2.czobj`
+list. Each group also records the module `_PATH` values its machine code
+embeds. After relocation, only groups whose embedded paths changed are dropped;
+the rest of the pack remains reusable. A later run whose analysis cache hits
+loads the matching groups as prebuilt objects -- no IR generation,
+optimization, or instruction selection -- and any mismatch simply recompiles
+that group. A `.o2.czobj`
 is preferred even in a default-tier session, since a prebuilt object skips
 the compiler entirely regardless of how it was optimized. Distributed
 toolchains ship these artifacts for the bundled tools, built with

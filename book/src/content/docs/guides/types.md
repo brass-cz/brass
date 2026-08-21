@@ -227,8 +227,10 @@ println("result = {eval(expr)}")   // result = 7
 
 A type whose body contains method _signatures_ (a member with parameters but
 no body) acts as an interface. Writing `type B: A = ...` requires `B` to
-provide every member of `A`, checked at compile time. No implementation is
-inherited:
+provide every member of `A`, checked at compile time. A method must have a
+compatible complete signature: parameter types are contravariant, parameter
+passing modes must agree, and the return type must be compatible. No
+implementation is inherited:
 
 ```brass
 type Showable = {

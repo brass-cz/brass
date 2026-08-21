@@ -89,7 +89,7 @@ println(n + 1)
 If the parse had failed, the program would have ended with
 
 ```text
-unhandled error: cannot parse `12x` as integer
+runtime error: unhandled error: cannot parse `12x` as integer
 ```
 
 instead of continuing with a bad value. So the beginner-friendly default is:
@@ -255,7 +255,8 @@ if r {
 
 At the top level and in `main`, a `null` hit by `!` stops the program the
 same way an `Err` does: it aborts with
-`` unhandled error: null value propagated by `!` `` and a non-zero exit,
+`` runtime error: unhandled error: null value propagated by `!` `` and a
+non-zero exit,
 since the null has nowhere to go and silently succeeding would hide the
 failure.
 

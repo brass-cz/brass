@@ -122,8 +122,8 @@ Strings are double-quoted UTF-8. The recognized escapes are:
 Any other escape is an error. `{expr}` inside a string is **interpolation**:
 the expression is evaluated and its text inserted. Literal braces are written
 `\{` and `\}` (there is no `{{` doubling). The interpolation scanner balances
-nested braces and skips nested string literals, so an interpolated expression
-may itself contain strings and braces:
+nested braces and skips nested string literals and comments, so braces inside
+`//`, `#`, or nested block comments do not close an interpolation:
 
 ```brass
 let items = ["a", "b"]
@@ -233,8 +233,9 @@ Notes:
   Method calls are `recv.method(args)`; static methods are
   `Type.method(args)`.
 
-Expression nesting is capped (currently 150 levels) to report a diagnostic
-instead of overflowing the parser stack.
+Expressions, types, patterns, and prefix chains share one 64-level nesting
+budget, so mixing those forms does not reset the limit. Exceeding it reports a
+diagnostic instead of overflowing the parser stack.
 
 ## Statements
 
@@ -255,6 +256,9 @@ let p: Point              // uninitialized: `let` + annotation only
 initializer. An annotated `let` may omit it; the binding must then be
 definitely assigned before use (see
 [definite assignment](/references/types/#definite-assignment)).
+A `const` binding cannot be mutated at any depth of an evaluated expression:
+mutating calls nested in an assignment right-hand side or interpolation
+segment are rejected just like a direct mutation.
 
 ### Loops
 
@@ -301,8 +305,10 @@ fun name(param, other: Type, third: ref(mut(T))) -> ReturnType {
 }
 ```
 
-Both parameter and return annotations are optional. `fun T.m(params)` declares
-a method of type `T` (see [methods](/references/types/#methods)); the standard library
+Both parameter and return annotations are optional. When written, an annotation
+must resolve to a valid type; an invalid annotation is an error rather than an
+unannotated inference hole. `fun T.m(params)` declares a method of type `T`
+(see [methods](/references/types/#methods)); the standard library
 also uses the receiver forms `fun string.m`, `fun int32.m` (any primitive type
 word), `fun infer[].m`, and `fun string[].m` to put methods on primitive and
 array types (user code cannot).

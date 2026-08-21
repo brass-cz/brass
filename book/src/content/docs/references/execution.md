@@ -86,9 +86,10 @@ surface and are tested against each other. The driver is built with the `jit`
 cargo feature by default; without it (or on WebAssembly) only the interpreter
 is available.
 
-The interactive REPL accumulates definitions and re-runs the session history
-each turn (deterministically, printing only the new output), always on the
-interpreter.
+The interactive REPL accumulates definitions and validates the combined session
+history each turn, but executes only the new input. Earlier effectful statements
+are not run again, so an `input()` or a print from a prior turn is not repeated.
+The REPL always uses the interpreter.
 
 ## Runtime behavior guarantees
 

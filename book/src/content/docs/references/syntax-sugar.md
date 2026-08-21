@@ -118,7 +118,9 @@ Two accepted deviations from the pure-sugar reading: `error` is reserved in
 call position (a `match`'s `Err { error }` binding does not shadow the
 function), and the checker types `error(..)` itself (each call's `Ok` payload
 is taken from the position the call flows into) while the prelude body is
-what runs.
+what runs. The reserved path still validates the prelude signature: it accepts
+one payload argument and the optional trailing `Location`, and rejects other
+arities or an explicit argument of the wrong type.
 
 ## Methods are `Default` fields
 
@@ -170,6 +172,12 @@ fun tag(s: Shape) -> string {
     return s.label
 }
 ```
+
+Satisfaction by a method compares the whole signature: parameter types are
+contravariant, passing modes must match, and the return type is covariant. A
+matching name and arity alone are not enough. The compiler-provided `debug`
+behavior remains available as a built-in exception to ordinary protocol
+satisfaction.
 
 The built-in types satisfy `Default` with their zero values: `int32.default()`
 is `0` (likewise every numeric width), `bool.default()` is `false`,

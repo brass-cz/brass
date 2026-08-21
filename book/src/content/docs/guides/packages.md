@@ -30,9 +30,11 @@ mkdir myapp && cd myapp
 czpm init myapp
 ```
 
-The name passed to `new` or `init` must be an ASCII identifier: it begins with
-a letter or `_` and continues with letters, digits, or `_`. Dependency keys
-use the same form. `new` refuses an existing destination directory, while
+The name passed to `new` or `init` begins with an ASCII letter or `_` and may
+continue with letters, digits, `_`, or internal `-` characters. A name cannot
+end in `-`; hyphens become underscores in the generated source file and module
+directory. Dependency keys are ASCII identifiers without hyphens because they
+become import names. `new` refuses an existing destination directory, while
 `init` refuses to overwrite an existing `package.toml` or package root file.
 
 The generated `package.toml` looks like this:
@@ -40,15 +42,17 @@ The generated `package.toml` looks like this:
 ```toml
 [package]
 name = "myapp"
-author = ""
+authors = ""
 license = "MIT"
 
 [dependencies]
 # mylib = { git = "https://github.com/user/mylib", rev = "<rev>" }
 # mylib = { path = "../mylib" }
+# mylib = { tarball = "https://example.com/mylib.tar.gz", hash = "<sha256>" }
 ```
 
-The commented lines show the two dependency forms, ready to fill in.
+The commented lines show the three dependency forms, ready to fill in.
+`authors` accepts either one string or an array of strings.
 
 ## Running and checking
 
@@ -61,9 +65,9 @@ czpm fmt      # format every owned .cz file below the project directory
 ```
 
 All three commands read `package.toml` and resolve its dependencies. `run`
-invokes `brass` on the package root (`<package-name>.cz`); `check` checks every
-owned `.cz` file so errors in unused modules are reported too; `fmt` formats
-those files in place.
+invokes `brass` on the package root (with any name hyphens replaced by
+underscores); `check` checks every owned `.cz` file so errors in unused modules
+are reported too; `fmt` formats those files in place.
 
 ## The language server in a project
 
@@ -76,14 +80,16 @@ configuration works for projects and loose `.cz` files alike.
 
 ## Adding dependencies
 
-A dependency is either a Git repository at a revision, or a local directory
-given by path. Add them to the `[dependencies]` section of `package.toml`:
+A dependency is a Git repository at a revision, a local directory given by
+path, or a tarball pinned by its SHA-256 digest. Add it to the `[dependencies]`
+section of `package.toml`:
 
 ```toml
 [dependencies]
 geometry = { git = "https://github.com/user/geometry-pp", rev = "a1b2c3d4e5f6" }
 utils    = { git = "https://github.com/user/utils-pp",    rev = "deadbeef1234" }
 mylib    = { path = "../mylib" }
+archive  = { tarball = "https://example.com/archive.tar.gz", hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }
 ```
 
 When you run `czpm run` or `czpm check`, each Git dependency is cloned to
@@ -101,6 +107,11 @@ check` with no extra step, which makes `path` the form to use while developing a
 library alongside its consumer; a dependency cannot combine `path` with `git`
 or `rev`.
 
+A `tarball` dependency requires a 64-character lowercase hexadecimal SHA-256
+`hash`. `czpm` verifies the downloaded bytes before extracting the archive and
+caches a completed extraction under `~/.brass/packages/tarball/<hash>`. A
+dependency entry cannot mix `tarball`/`hash` with the Git or path fields.
+
 ## Importing from a dependency
 
 Once a dependency is declared, its modules are available via `import`:
@@ -117,9 +128,9 @@ import geometry
 // then use: geometry.Vec2, geometry.dot(...)
 ```
 
-The package root file is `<package-name>.cz` inside the dependency directory,
-and sub-modules live under the `<package-name>/` directory: the same
-layout that `czpm new` creates.
+The package root file and sub-module directory use the package name with
+hyphens replaced by underscores: for package `my-lib`, they are `my_lib.cz`
+and `my_lib/`. This is the same layout that `czpm new` creates.
 
 ## Writing a library package
 

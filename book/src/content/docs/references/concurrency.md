@@ -58,7 +58,8 @@ These are compile errors today:
 - `spawn`'s argument must be a **closure literal**, or a local variable
   directly bound to one, not a function reference, a call result, or a
   parameter (the ownership pass must see the closure body).
-- The closure must take **zero parameters**; `with`'s closure exactly one.
+- The closure must take **zero parameters** and return `void` (or still have an
+  open return type); `with`'s closure takes exactly one parameter.
 - A spawned task may not read or write a **module global** that any code
   writes; share state through captured objects instead.
 - `spawn` at the top level (in a module initializer, outside any function) is

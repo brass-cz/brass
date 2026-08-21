@@ -120,9 +120,10 @@ flows into a non-nullable one; it must be narrowed first.
 
 `int32.from(3.9)` can fail (and truncates toward zero on success), so it
 returns a Result; `float64.from(big_int64)` cannot fail, so it returns a plain
-float even though it may round. The prelude also provides free function
-aliases (`int32_from`, `int32_parse`, `float64_from`, `float64_parse`,
-`string_from`).
+float even though it may round. Converting a `uint64` uses the whole unsigned
+range, including values above `INT64_MAX`. The prelude also provides free
+function aliases (`int32_from`, `int32_parse`, `float64_from`,
+`float64_parse`, `string_from`).
 
 ## Parameter passing
 
@@ -163,9 +164,11 @@ local).
 
 ### Optional trailing parameters
 
-A trailing parameter of nullable type may be omitted at the call; it defaults
-to `null`. The prelude's `assert(cond, msg: string?)` is callable as
-`assert(cond)`.
+A trailing parameter of nullable type may be omitted at a free, static, or
+instance call; it defaults to `null`. Several trailing nullable parameters may
+be omitted together, followed by an implicit trailing `Location` when the
+signature declares one. The prelude's `assert(cond, msg: string?)` is callable
+as `assert(cond)`.
 
 ## Records and structural typing
 
@@ -177,6 +180,10 @@ use site gets its own instantiation).
 Records and arrays have **reference semantics**: mutating through one binding
 is visible through every binding that shares the object. `const` makes a
 binding immutable (and forbids mutating through it).
+
+When constructing a sum variant, each payload value flows through its declared
+field type, including the same numeric widening and nullable promotion used by
+record fields and function arguments.
 
 ### Structural subtyping
 
@@ -336,8 +343,9 @@ inherited; the constraint is pure satisfaction:
 
 - a required **field** must exist with an _invariant_ type (fields are
   mutable, so a subtype field would be unsound);
-- a required **method signature** must be implemented with invariant
-  parameters and covariant return;
+- a required **method signature** compares the full function type: parameter
+  types are contravariant, parameter passing modes must match, and the return
+  type is covariant;
 - for a sum type, **every variant** must satisfy the interface;
 - conflicting field requirements from multiple constraints are reported at the
   type.
@@ -544,6 +552,10 @@ non-sum values (integers, strings) are not exhaustiveness-checked; add a `_`
 arm. A function with a declared non-void return type must return a value on
 every path (`while true` without `break` counts as diverging).
 
+Return-flow analysis follows divergence through evaluated positions such as
+assignment right-hand sides and interpolation segments. Merely constructing a
+closure whose body returns does not make the enclosing path diverge.
+
 ## Definite assignment
 
 An annotated `let` may omit its initializer (`let p: Point`). The binding must
@@ -559,7 +571,9 @@ then be definitely assigned before use:
   path counts as assigning all fields (see [Reflection](/references/reflection/));
 - reading the binding, or capturing it in a closure, before completion is a
   compile error. `typeof(x)` and `fields(x)` only read the type and are
-  allowed.
+  allowed;
+- the same checks apply inside closure bodies and module initializers, and to
+  reads nested in assignment right-hand sides or interpolation segments.
 
 ## Recursion and program order
 
@@ -588,7 +602,8 @@ that from the closure.
 
 ## Concurrency typing
 
-`spawn(f)` requires a zero-parameter closure and returns `void`; `with(c, f)`
-requires a one-parameter closure and returns the closure's result; `sync()`
-takes nothing. Ownership analysis of captured values happens after type
-checking; see the [concurrency reference](/references/concurrency/).
+`spawn(f)` requires a zero-parameter closure whose return type is `void` (or
+still open), and returns `void`; `with(c, f)` requires a one-parameter closure
+and returns the closure's result; `sync()` takes nothing. Ownership analysis of
+captured values happens after type checking; see the
+[concurrency reference](/references/concurrency/).

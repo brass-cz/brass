@@ -10,7 +10,7 @@ Concurrency is **experimental** and runs on the native (JIT) runtime only.
 Brass's concurrency surface is three functions, with no `async`, no
 locks, and no ownership annotations to write:
 
-- `spawn(f)` runs a zero-argument closure on another thread.
+- `spawn(f)` runs a zero-argument closure returning `void` on another thread.
 - `sync()` waits for all spawned work so far.
 - `with(shared, f)` acquires a shared object and passes it to the closure.
 
@@ -59,15 +59,15 @@ count = 6, total = 21
 ```
 
 Both tasks mutate the same `counter`; the compiler notices the shared capture
-and guards it, so the updates do not race. It also prints a warning that
-every access to `counter` is auto-guarded; acquiring the object
-explicitly with `with(cown, f)` gives finer-grained control and silences it.
+and guards it, so the updates do not race. It also prints warnings that
+accesses to `counter` are auto-guarded; acquiring the object explicitly with
+`with(cown, f)` gives finer-grained control and silences them.
 `sync()` is the barrier that makes the spawned work's effects observable:
 without it, the final read could run ahead of the tasks. Spawned work is
 otherwise joined at the end of `main`.
 
 Current restrictions (enforced as compile errors): `spawn` takes a closure
-literal (or a local bound to one) with zero parameters; a spawned task may not
-write module globals; and spawning at the top level (outside a function) is
-unsupported. See the [concurrency reference](/references/concurrency/) for
-details.
+literal (or a local bound to one) with zero parameters and a return type that
+is `void` or still open to inference; a spawned task may not write module
+globals; and spawning at the top level (outside a function) is unsupported.
+See the [concurrency reference](/references/concurrency/) for details.

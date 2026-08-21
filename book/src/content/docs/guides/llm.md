@@ -45,7 +45,7 @@ whole-program verdict.
 - Top-level statements run in module dependency order; `main()` runs last if
   present.
 
-```brass norun
+```brass
 const greeting = "hello"
 let count = 0
 count += 1
@@ -79,7 +79,7 @@ println("{greeting}: {values}")
 
 ## Functions, parameters, and closures
 
-```brass norun
+```brass
 fun distance(x: float64, y: float64) -> float64 {
     return sqrt(x * x + y * y)
 }
@@ -113,7 +113,7 @@ println(double(2.5))   // 5.0
 Record fields live inside `type`; method implementations live outside it.
 An instance method has `self` first. A method without `self` is static.
 
-```brass norun
+```brass
 type Account = {
     owner: string
     balance: int64
@@ -142,8 +142,10 @@ type Names = Stack { item: string }   // alias pinning the slot
 - Sum types use `type Name = | Variant { fields } | Empty`. Construct a value
   as `Name.Variant { ... }` and match it as `Variant { ... }`.
 - A match on a sum must cover every variant or use `_`.
-- `type Child: Parent` declares structural conformance. Members are checked;
-  implementations are not inherited. Multiple parents are allowed.
+- `type Child: Parent` declares structural conformance. Fields and complete
+  method signatures are checked, including parameter passing modes,
+  contravariant parameter compatibility, and return types; implementations
+  are not inherited. Multiple parents are allowed.
 - An unannotated function parameter is structural without an explicit
   interface: only the fields and methods used by the body are required.
 - `{ field: value }` is an anonymous record. It can dispatch to exactly one
@@ -187,7 +189,7 @@ Unselected paths contribute nothing to an instance: each instance's return
 type comes from its live path alone, and an `error(...)` on a pruned path
 does not make that instance return a Result.
 
-```brass norun
+```brass
 fun length(val) {
     const bytes = if val: infer {          // string: to_bytes pins the hole
         to_bytes(val)
@@ -334,7 +336,8 @@ but not in the browser playground.
 
 Concurrency is native-runtime only:
 
-- `spawn(() -> { ... })` starts a task and is legal only inside a function.
+- `spawn(() -> { ... })` starts a task and is legal only inside a function;
+  its closure takes no arguments and returns `void` (or remains open).
 - `with(shared, (value) -> { ... })` acquires compiler-managed shared state.
 - `sync()` waits for spawned work before its results are observed.
 

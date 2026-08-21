@@ -45,6 +45,10 @@ c's definition and `b.X` resolving to a.b's. A local binding shadows a
 qualifier (`let vec = ...` makes a later `vec.x` a field access), and a
 qualifier that collides with a declared or imported name is rejected.
 
+A declaration in another module always needs an import, even when its bare name
+is unique across the whole program. Program-wide uniqueness is an internal
+symbol-layout detail, not implicit visibility.
+
 Import paths are resolved according to the rules in
 [Module resolution](#module-resolution). Import cycles are detected and
 reported.
@@ -63,7 +67,9 @@ imported.
 The compiler resolves an import in this order:
 
 1. `core.*` and bare prelude module names refer to the embedded `core`
-   library. They never load files from disk.
+   library. A bare spelling such as `import io` is stored as the canonical
+   `core.io` module while keeping `io` as its source qualifier. These imports
+   never load files from disk.
 2. If the first segment is a name in `BRASS_PACKAGES`, the complete path is
    resolved only below that package root. A missing module does not fall
    through to local or include files.

@@ -48,6 +48,8 @@ fixed-length `T[n]`):
 | `arr.len()`        | `() -> int64` (both `T[]` and `T[n]`) |
 
 Indexing is bounds-checked at runtime on both array kinds.
+Builtin slice methods enforce these arities exactly; extra or missing arguments
+are compile errors.
 
 ## Errors (`core.error`)
 
@@ -65,7 +67,9 @@ The error value model behind `error(..)` and `!` (normatively specified in
 `error` and `context` declare a trailing `loc: Location` parameter the
 compiler fills with the call site (the
 [implicit location argument](/references/syntax-sugar/#error-traces)); a
-caller may also pass it explicitly.
+caller may also pass it explicitly. The compiler's reserved handling of
+`error(...)` still validates that signature: one payload is required, only the
+trailing `Location` may be omitted, and other arities or argument types fail.
 
 ## Type tests and defaults
 
@@ -148,6 +152,7 @@ character's byte length.
 | `s.to_upper()` / `s.to_lower()`       | `() -> string`                | ASCII case change                                          |
 | `parts.join(sep)`                     | `string[].(string) -> string` | join a _string array_ with `sep`                           |
 | `s.len()`                             | `() -> int64`                 | byte length                                                |
+| `s.debug()`                           | `() -> string`                | quoted; escapes quotes, backslashes, and control bytes     |
 
 There is no public substring-slicing method and no direct `s[i]` indexing; use
 `chars`, `split`, `find`, `replace`.
@@ -156,7 +161,9 @@ There is no public substring-slicing method and no direct `s[i]` indexing; use
 
 `abs(x)`, `min(a, b)`, `max(a, b)` are polymorphic free functions (any type
 supporting `<` and, for `abs`, `-`). The float routines take and return
-`float64`: `sqrt(x)`, `floor(x)`, `ceil(x)`, `pow(base, exp)`.
+`float64`: `sqrt(x)`, `floor(x)`, `ceil(x)`, `pow(base, exp)`. Signed integer
+`abs` is wrapping: at that type's minimum value, it returns the same minimum
+instead of failing.
 
 ## `core.conv`
 
@@ -170,7 +177,9 @@ Free-function aliases of the conversion methods: `int32_from(x) -> int32!`,
 `int32_parse(s) -> int32!`, `float64_from(x) -> float64`,
 `float64_parse(s) -> float64!`, `string_from(x) -> string`. The method forms
 (`T.from`, `T.parse`) are described in the
-[type system](/references/types/#explicit-conversions).
+[type system](/references/types/#explicit-conversions). Integer-to-float
+conversion reads the full source width, so a `uint64` above `INT64_MAX` remains
+positive (with the expected floating-point rounding).
 
 ## `core.assert`
 
@@ -561,10 +570,11 @@ import std.semver.{ Version, sort }
 
 [Semantic Versioning 2.0.0](https://semver.org): parse a version, render it
 back, and order two of them. Pure Brass on top of `std.regex` (it has no native
-half of its own), and it parses with the **official pattern from semver.org
-verbatim**, so what it accepts is exactly what the spec defines: no leading
-zeros, an optional dot-separated pre-release, optional build metadata, and
-nothing else in the string (`v1.0.0` and `1.0` are rejected).
+half of its own). Its grammar follows the official pattern from semver.org: no
+leading zeros, an optional dot-separated pre-release, optional build metadata,
+and nothing else in the string (`v1.0.0` and `1.0` are rejected). Brass stores
+the three core components as `int64`, so each is additionally capped at
+`INT64_MAX`; this is a documented deviation from the unbounded SemVer grammar.
 
 ```brass norun
 const v = Version.parse("1.4.2-rc.1+build.5")!
@@ -580,7 +590,7 @@ distinct from empty.
 | Method / function                         | Signature                          | Behavior                                   |
 | ----------------------------------------- | ---------------------------------- | ------------------------------------------ |
 | `Version.parse(text)`                     | `(string) -> Version!`             | the whole string must be a version         |
-| `Version.new(major, minor, patch)`        | `(int64, int64, int64) -> Version` | no pre-release, no build                   |
+| `Version.new(major, minor, patch)`        | `(int64, int64, int64) -> Version!` | rejects negatives; no pre-release or build |
 | `v.to_string()`                           | `() -> string`                     | parsing the result yields an equal version |
 | `v.compare(other)`                        | `(Version) -> int64`               | `-1` / `0` / `1` by precedence             |
 | `v.equals` / `less_than` / `greater_than` | `(Version) -> bool`                | in terms of `compare`                      |
@@ -735,6 +745,10 @@ The public supporting modules are:
 key/value separator, and `+` as a space. Formatting emits percent-encoded
 pairs and uses `%20` for spaces.
 
+Reference resolution removes `.` and `..` path segments without collapsing
+empty segments: for example, resolving `g//./h` preserves the double slash as
+`g//h`.
+
 ## `std.http`
 
 ```brass norun
@@ -777,11 +791,19 @@ type HttpResponse = {
 | `response.serialize()`         | `() -> uint8[]`                  | serialize the status line, headers, and body                  |
 | `response.body_text()`         | `() -> string!`                  | decode the body as UTF-8                                      |
 
-The client reads a body using `Content-Length`, or until connection close when
-that header is absent. It does not decode chunked transfer coding. Serializing
-a message does not add `Host`, `Content-Length`, or other headers; callers that
-construct requests or responses must supply the required headers themselves.
-Networking is unavailable in the browser playground.
+The client accepts only `http` and `https` URLs. Host authorities support DNS
+names, addresses, and bracketed IPv6 literals, with port syntax and range
+validated. Request/status lines and headers are checked strictly, including
+header-name tokens and forbidden control characters in values.
+
+Message parsing and the client use a validated, non-negative decimal
+`Content-Length` (duplicate values must agree); the client reads until
+connection close when that header is absent. Informational, `204`, and `304`
+responses are bodyless regardless of framing headers. The client does not
+decode chunked transfer coding. Serializing a message does not add `Host`,
+`Content-Length`, or other headers; callers that construct requests or
+responses must supply the required headers themselves. Networking is
+unavailable in the browser playground.
 
 ## `std.data.json`
 
@@ -817,6 +839,13 @@ not the source document's ordering (stable for a given input).
 | `j.get(key)`                                      | `(string) -> JsonValue!`            | object field, or an error naming the missing field                                                                   |
 | `j.at(index)`                                     | `(int64) -> JsonValue!`             | array element, range-checked                                                                                         |
 | `j.into()`                                        | `-> infer!`                         | decode into the type the call site expects — see [Reflection](/references/reflection/#generic-decoders-with---infer) |
+
+String parsing recognizes the complete JSON escape set (`\"`, `\\`, `\/`,
+`\b`, `\f`, `\n`, `\r`, `\t`, and `\uXXXX`), combines valid UTF-16 surrogate
+pairs, and rejects lone surrogates and raw control characters. `stringify`
+escapes quotes, backslashes, and controls back to valid JSON. Numbers use the
+strict JSON grammar: no leading `+`, leading zero, missing integer or fraction,
+or malformed exponent, and the parsed `float64` must be finite.
 
 Decoding a whole document into a typed structure combines `parse` and `into`:
 
@@ -868,9 +897,13 @@ type TomlValue =
 
 The parser supports comments, bare and quoted dotted keys, basic and literal
 strings, decimal and radix integers, floats, booleans, arrays, inline tables,
-table headers, and arrays of tables. Date and time values are retained as
-source text without calendar validation. Tables use `HashMap`, so key order is
-not preserved by `keys()` or `stringify()`.
+table headers, and arrays of tables. Duplicate keys, reopened tables, and any
+extension of an inline table are rejected. Integer leading-zero and underscore
+placement rules are enforced for every radix, and radix overflow fails instead
+of wrapping. Date and time values are retained as source text after their
+lexical fields and calendar ranges are validated. `stringify()` escapes control
+characters and writes `nan`, `inf`, and `-inf` in lowercase. Tables use
+`HashMap`, so key order is not preserved by `keys()` or `stringify()`.
 
 Reflective decoding supports scalar and record targets recursively. It does
 not decode a TOML array directly into a typed array; use `as_array()` and

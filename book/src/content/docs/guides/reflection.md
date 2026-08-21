@@ -58,8 +58,8 @@ type in type position, and a static receiver for method calls:
 ```brass
 let xs = [1, 2, 3]
 println(typeof(xs))            // int32[] — a growable array
-const ys = [1, 2, 3]
-println(typeof(ys))            // int32[3] — const binds a fixed-length array
+let ys: int32[3] = [1, 2, 3]
+println(typeof(ys))            // int32[3] — an annotation pins a fixed length
 
 let n = 1
 let m: typeof(n) = 2           // m has n's type

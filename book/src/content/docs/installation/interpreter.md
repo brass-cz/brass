@@ -66,6 +66,11 @@ brass repl program.cz    # run with the interpreter
 brass                    # start an interactive REPL
 ```
 
+An interactive session retains definitions and bindings between turns. Before
+executing the new input, it validates that input together with the accumulated
+session, but it does not execute earlier effectful statements again: prior
+prints and `input()` calls are not repeated.
+
 Diagnostics are printed to stderr and produce a non-zero exit status. A normal
 run checks functions as it needs them; use `brass check` for a complete
 whole-program result. See [Hello, world!](/guides/hello/#checking-without-running)
