@@ -1,0 +1,5 @@
+fun main() {
+    spawn(() -> { return 1 })
+}
+
+main()

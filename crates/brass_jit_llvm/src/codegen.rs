@@ -169,7 +169,7 @@ pub struct LlvmCodegen<'ctx, 'p> {
     /// Emitting one before its body lets self-referential types recurse; the map is
     /// cleared per module (a destructor can only be called within its own module).
     ///
-    /// This map and the three below MUST key by `Type::display_full` (the
+    /// This map and the four below MUST key by `Type::display_full` (the
     /// `_`-members included), never `display`: the user-facing rendering hides
     /// `_`-prefixed substitution entries, so two instantiations of a type whose
     /// open members are all private (a `HashMap<string, int32>` and a
@@ -182,6 +182,11 @@ pub struct LlvmCodegen<'ctx, 'p> {
     /// self-referential type recurse through a call; cleared per module like
     /// destructors (the function is local to the module that defines it).
     to_string_fns: fxhash::FxHashMap<String, FunctionValue<'ctx>>,
+    /// Per-record field-wise equality functions (`bool(*Header, *Header)`).
+    /// They are registered before their bodies are emitted so nested or
+    /// recursive record fields call shared helpers instead of expanding code
+    /// generation recursively; cleared per module like the other type glue.
+    equality_fns: fxhash::FxHashMap<String, FunctionValue<'ctx>>,
     /// Per-type deep-copy functions (`fn(*Header) -> *Header`): a fresh, independent
     /// copy of an aggregate value (recursing into managed fields/elements), used to
     /// pass a non-reference argument by value. Memoized to terminate on recursive
@@ -212,6 +217,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             cur_fn: None,
             destructors: fxhash::FxHashMap::default(),
             to_string_fns: fxhash::FxHashMap::default(),
+            equality_fns: fxhash::FxHashMap::default(),
             deep_copy_fns: fxhash::FxHashMap::default(),
             tracers: fxhash::FxHashMap::default(),
             region_barriers: false,
@@ -2015,6 +2021,152 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         f
     }
 
+    /// Return the equality result for one field value. Records recurse through
+    /// their memoized field-wise helper; the other types that can occur inside
+    /// a comparable record use the same scalar/string/identity semantics as a
+    /// direct `==` operation.
+    fn equality_value(
+        &mut self,
+        a: BasicValueEnum<'ctx>,
+        b: BasicValueEnum<'ctx>,
+        ty: &Type,
+    ) -> IntValue<'ctx> {
+        match ty {
+            Type::Int(_) | Type::Bool => self
+                .builder
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    a.into_int_value(),
+                    b.into_int_value(),
+                    "eq",
+                )
+                .unwrap(),
+            Type::Float(_) => self
+                .builder
+                .build_float_compare(
+                    FloatPredicate::OEQ,
+                    a.into_float_value(),
+                    b.into_float_value(),
+                    "eq",
+                )
+                .unwrap(),
+            Type::Str => self.str_bin_op(BinOp::Eq, a, b).into_int_value(),
+            Type::Record(_) => {
+                let helper = self.get_or_emit_record_equality(ty);
+                self.call_basic(helper, &[a.into(), b.into()])
+                    .into_int_value()
+            }
+            Type::Void | Type::Never => self.ctx.bool_type().const_int(1, false),
+            _ => {
+                let pa = self
+                    .builder
+                    .build_ptr_to_int(a.into_pointer_value(), self.abi.i64t(), "eqa")
+                    .unwrap();
+                let pb = self
+                    .builder
+                    .build_ptr_to_int(b.into_pointer_value(), self.abi.i64t(), "eqb")
+                    .unwrap();
+                self.builder
+                    .build_int_compare(IntPredicate::EQ, pa, pb, "eq")
+                    .unwrap()
+            }
+        }
+    }
+
+    /// Emit a null-safe, field-wise equality helper for one record type. Pointer
+    /// identity returns immediately (and terminates comparisons of aliased
+    /// cycles); distinct non-null objects compare each declared field.
+    fn get_or_emit_record_equality(&mut self, ty: &Type) -> FunctionValue<'ctx> {
+        let key = mangle_fn(&format!("eq_{}", ty.display_full()));
+        if let Some(f) = self.equality_fns.get(&key) {
+            return *f;
+        }
+        let ptr = self.abi.ptr();
+        let fty = self
+            .ctx
+            .bool_type()
+            .fn_type(&[ptr.into(), ptr.into()], false);
+        let f = self.module.add_function(&key, fty, Some(Linkage::Private));
+        self.equality_fns.insert(key, f);
+        let fields = match ty {
+            Type::Record(n) => self.record_field_types(n),
+            _ => Vec::new(),
+        };
+
+        let saved_block = self.builder.get_insert_block();
+        let saved_fn = self.cur_fn;
+        self.cur_fn = Some(f);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        let same = self.ctx.append_basic_block(f, "same");
+        let null = self.ctx.append_basic_block(f, "null");
+        let compare = self.ctx.append_basic_block(f, "fields");
+        self.builder.position_at_end(entry);
+        let a = f.get_nth_param(0).unwrap().into_pointer_value();
+        let b = f.get_nth_param(1).unwrap().into_pointer_value();
+        let identical = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                self.builder
+                    .build_ptr_to_int(a, self.abi.i64t(), "a")
+                    .unwrap(),
+                self.builder
+                    .build_ptr_to_int(b, self.abi.i64t(), "b")
+                    .unwrap(),
+                "identical",
+            )
+            .unwrap();
+        let check_null = self.ctx.append_basic_block(f, "check_null");
+        self.builder
+            .build_conditional_branch(identical, same, check_null)
+            .unwrap();
+        self.builder.position_at_end(same);
+        self.builder
+            .build_return(Some(&self.ctx.bool_type().const_int(1, false)))
+            .unwrap();
+        self.builder.position_at_end(check_null);
+        let either_null = self
+            .builder
+            .build_or(
+                self.builder.build_is_null(a, "anull").unwrap(),
+                self.builder.build_is_null(b, "bnull").unwrap(),
+                "null",
+            )
+            .unwrap();
+        self.builder
+            .build_conditional_branch(either_null, null, compare)
+            .unwrap();
+        self.builder.position_at_end(null);
+        self.builder
+            .build_return(Some(&self.ctx.bool_type().const_zero()))
+            .unwrap();
+        self.builder.position_at_end(compare);
+        let mut equal = self.ctx.bool_type().const_int(1, false);
+        for (_, field_ty, offset) in fields {
+            let llvm_ty = self.abi.typed_basic(&field_ty);
+            let av = self
+                .builder
+                .build_load(llvm_ty, self.field_ptr(a, offset), "af")
+                .unwrap();
+            let bv = self
+                .builder
+                .build_load(llvm_ty, self.field_ptr(b, offset), "bf")
+                .unwrap();
+            let field_equal = self.equality_value(av, bv, &field_ty);
+            equal = self
+                .builder
+                .build_and(equal, field_equal, "fields_eq")
+                .unwrap();
+        }
+        self.builder.build_return(Some(&equal)).unwrap();
+
+        self.cur_fn = saved_fn;
+        if let Some(block) = saved_block {
+            self.builder.position_at_end(block);
+        }
+        f
+    }
+
     /// `(field name, concrete type, byte offset)` for each record field (for
     /// rendering), or empty when the type has no record layout. See [`record_fields`].
     fn record_field_types(&self, n: &NominalType) -> Vec<(String, Type, u64)> {
@@ -2583,6 +2735,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         // per-type `to_string` renderers are module-local for the same reason.
         let saved_destructors = std::mem::take(&mut self.destructors);
         let saved_to_string_fns = std::mem::take(&mut self.to_string_fns);
+        let saved_equality_fns = std::mem::take(&mut self.equality_fns);
         let saved_deep_copy_fns = std::mem::take(&mut self.deep_copy_fns);
         let saved_tracers = std::mem::take(&mut self.tracers);
 
@@ -2610,6 +2763,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         self.mir.lazy_has_main = saved_has_main;
         self.destructors = saved_destructors;
         self.to_string_fns = saved_to_string_fns;
+        self.equality_fns = saved_equality_fns;
         self.deep_copy_fns = saved_deep_copy_fns;
         self.tracers = saved_tracers;
         verified?;
@@ -3720,6 +3874,15 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
             }
             // String: `+` is concatenation, `==`/`!=` are byte equality.
             Type::Str => self.str_bin_op(op, a, b),
+            // Records compare field-wise. The helper is null-safe because a
+            // record-typed operand can still be the narrowed side of `x == null`.
+            Type::Record(_) if matches!(op, BinOp::Eq | BinOp::Ne) => {
+                let mut equal = self.equality_value(a, b, operand_ty);
+                if matches!(op, BinOp::Ne) {
+                    equal = self.builder.build_not(equal, "rne").unwrap();
+                }
+                equal.into()
+            }
             // Nullable `==`/`!=`: a pointer (presence/identity) comparison. Other
             // managed heap values take the same path: only a null comparison
             // reaches them (the checker rejects aggregate equality), and mono can
@@ -3728,7 +3891,6 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
             // `Node?` parameter type). Without this arm the comparison read the
             // unit placeholder -- false for `==` and `!=` alike.
             Type::Nullable(_)
-            | Type::Record(..)
             | Type::Sum(..)
             | Type::Slice(..)
             | Type::Array(..)

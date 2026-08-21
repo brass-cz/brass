@@ -2286,15 +2286,17 @@ fn spawn_closure_body_mut(stmt: &mut Stmt) -> Option<&mut Vec<Stmt>> {
     Some(closure_body_stmts_mut(body))
 }
 
-/// Return a mutable statement view of a closure body, preserving the value of
-/// an expression body as the final expression of a synthesized block.
+/// Return a mutable statement view of a closure body. An expression-bodied
+/// closure returns its expression, while a block's trailing expression is only
+/// a statement, so normalization must make that return explicit before the
+/// ownership pass inserts guards or nested-spawn rewrites.
 fn closure_body_stmts_mut(body: &mut Box<Expr>) -> &mut Vec<Stmt> {
     if !matches!(body.as_ref(), Expr::Block(..)) {
         let span = body.span();
         let value = std::mem::replace(body.as_mut(), Expr::Null(span));
         *body.as_mut() = Expr::Block(
             Block {
-                stmts: vec![Stmt::Expr(value)],
+                stmts: vec![Stmt::Return(Some(value), span)],
                 span,
             },
             span,

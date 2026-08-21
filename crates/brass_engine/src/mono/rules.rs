@@ -161,7 +161,7 @@ fn is_supported_rec(ty: &Type, visiting: &mut HashSet<i32>) -> bool {
 }
 
 /// Check that a binary operator's operands have compatible, in-scope types.
-pub(super) fn check_bin(op: BinOp, a: &Type, b: &Type) -> Result<(), String> {
+pub(super) fn check_bin(program: &Program, op: BinOp, a: &Type, b: &Type) -> Result<(), String> {
     // `x == null` / `x != null` (or comparing nullables) is a null/identity test.
     if matches!(op, BinOp::Eq | BinOp::Ne)
         && (matches!(a, Type::Nullable(_)) || matches!(b, Type::Nullable(_)))
@@ -237,10 +237,13 @@ pub(super) fn check_bin(op: BinOp, a: &Type, b: &Type) -> Result<(), String> {
             }
         }
         // A numeric comparison converts mixed operands to a common type; equality
-        // also applies to two bools or two strings.
+        // also applies to two bools, two strings, or two instances of the same
+        // record layout. Record equality is field-wise in both back ends.
         BinOp::Eq | BinOp::Ne => {
             if brass_typesys::common_numeric_type(a, b).is_some()
                 || (same && matches!(a, Type::Bool | Type::Str))
+                || (matches!((a, b), (Type::Record(ra), Type::Record(rb)) if ra.id == rb.id)
+                    && brass_typesys::types_invariant(program, a, b))
             {
                 Ok(())
             } else {

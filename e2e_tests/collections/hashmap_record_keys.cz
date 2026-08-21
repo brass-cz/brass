@@ -1,0 +1,8 @@
+// @lazy: pass
+// @eager: pass
+type Key = { id: int32, name: string }
+
+let values = HashMap.new()
+values.set(Key { id: 1, name: "one" }, "found")
+println(values.get(Key { id: 1, name: "one" }))
+println(values.get(Key { id: 2, name: "two" }))

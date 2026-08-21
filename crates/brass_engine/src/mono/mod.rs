@@ -2452,6 +2452,12 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                     .clone()
             }
         };
+        // Checker contracts and MIR inference may spell the same concrete
+        // declared record differently: the former can be a bare nominal while
+        // the latter carries every declared field in its substitution. Resolve
+        // the contract before it becomes the call site's deferred ABI so later
+        // compilation of the body cannot appear to change that ABI.
+        let ret = resolve_nominal(self.program, &ret);
         if !brass_hir::is_fully_known(&ret) || !is_supported(&ret) {
             return None;
         }
@@ -2863,7 +2869,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                     matches!(a, Operand::Local(_)),
                     matches!(b, Operand::Local(_)),
                 );
-                check_bin(*op, &ta, &tb).map_err(|e| format!("{e} (in `{sym}`)"))?;
+                check_bin(self.program, *op, &ta, &tb).map_err(|e| format!("{e} (in `{sym}`)"))?;
             }
         }
         Ok(())

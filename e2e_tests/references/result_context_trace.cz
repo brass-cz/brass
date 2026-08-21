@@ -1,0 +1,9 @@
+fun a() -> infer! {
+    return error("error in a")
+}
+
+fun b() -> infer! {
+    return a().context("error in b")
+}
+
+b()!

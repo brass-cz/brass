@@ -16,6 +16,7 @@
 
 use fxhash::FxHashMap as HashMap;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::io::Write;
 use std::rc::Rc;
 
@@ -1100,12 +1101,54 @@ fn eval_bin(op: BinOp, a: &Value, b: &Value, ty: &Type) -> Result<Value, String>
         Type::Float(fk) => Ok(float_bin(op, a.as_float(), b.as_float(), *fk)),
         Type::Bool => Ok(bool_bin(op, a.as_bool(), b.as_bool())),
         Type::Str => Ok(str_bin(op, a.as_str(), b.as_str())),
+        Type::Record(_) if matches!(op, BinOp::Eq | BinOp::Ne) => {
+            let equal = values_equal(a, b, &mut HashSet::new());
+            Ok(Value::Bool(if matches!(op, BinOp::Eq) {
+                equal
+            } else {
+                !equal
+            }))
+        }
         // A nullable operand narrows to its element type for arithmetic/ordering.
         Type::Nullable(inner) => eval_bin(op, a, b, inner),
         _ => Err(format!(
             "unsupported binary operand type `{}`",
             ty.display()
         )),
+    }
+}
+
+/// Equality used recursively by record comparison. Record fields are compared
+/// by value; other managed aggregates keep their existing identity semantics.
+/// Already-seen record pairs terminate cycles after their fields agreed on the
+/// path leading back to them.
+fn values_equal(a: &Value, b: &Value, seen: &mut HashSet<(usize, usize)>) -> bool {
+    match (a, b) {
+        (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a == b,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Str(a), Value::Str(b)) => a == b,
+        (Value::Null, Value::Null) | (Value::Void, Value::Void) => true,
+        (Value::Record(a), Value::Record(b)) => {
+            if Rc::ptr_eq(a, b) {
+                return true;
+            }
+            let pair = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
+            if !seen.insert(pair) {
+                return true;
+            }
+            let a = a.borrow();
+            let b = b.borrow();
+            a.len() == b.len()
+                && a.iter().all(|(name, value)| {
+                    b.get(name)
+                        .is_some_and(|other| values_equal(value, other, seen))
+                })
+        }
+        (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
+        (Value::Variant(a), Value::Variant(b)) => Rc::ptr_eq(a, b),
+        (Value::Closure(a), Value::Closure(b)) => Rc::ptr_eq(a, b),
+        _ => false,
     }
 }
 

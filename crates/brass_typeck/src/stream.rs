@@ -501,9 +501,11 @@ pub fn method_receiver_types(typed: &TypedProgram, program: &Program) -> HashMap
     receivers.agreed_map()
 }
 
-/// Per-span agreement for method receiver types. A generic body can be checked
-/// at several concrete receiver types; disagreement poisons the shared span so
-/// lowering never completes arguments from the wrong instance.
+/// Per-span agreement for method owners. A generic body can be checked at
+/// several concrete receiver instances, but the declared signature (and thus
+/// its omitted-argument defaults) belongs to the nominal or primitive owner,
+/// not to those instances' substitutions. A genuinely different owner poisons
+/// the shared span so lowering never completes arguments from the wrong method.
 #[derive(Default)]
 pub(crate) struct ReceiverState {
     per_span: HashMap<Span, Option<Type>>,
@@ -515,13 +517,18 @@ impl ReceiverState {
             return;
         }
         let ty = brass_hir::peel_modes(&expression.ty);
-        if !matches!(ty, Type::Record(_) | Type::Sum(_)) && ty.primitive_class().is_none() {
-            return;
-        }
-        if !brass_hir::is_fully_known(ty) {
-            return;
-        }
-        let ty = complete_aggregate(ty, program);
+        // Preserve only the owner identity for nominals. An Err-only Result,
+        // for example, legitimately leaves its Ok payload open at this point,
+        // but the checker has still resolved `context` to the prelude Result's
+        // declaration and MIR can safely read defaults from that declaration.
+        let ty = match ty {
+            Type::Record(n) | Type::Sum(n) => program.type_by_id(n.id).map(|info| info.type_ref()),
+            other if other.primitive_class().is_some() && brass_hir::is_fully_known(other) => {
+                Some(other.clone())
+            }
+            _ => None,
+        };
+        let Some(ty) = ty else { return };
         match self.per_span.get(&expression.span) {
             None => {
                 self.per_span.insert(expression.span, Some(ty));

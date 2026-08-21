@@ -1,0 +1,13 @@
+// @lazy: pass
+// @eager: pass
+type Point = { x: int64, y: int64 }
+
+fun doubled(p: Point) {
+    let ret: Point
+    for field in fields(ret) {
+        ret[field] = p[field] * 2
+    }
+    return ret
+}
+
+println(doubled(Point { x: 3, y: 4 }))

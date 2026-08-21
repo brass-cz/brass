@@ -1,0 +1,11 @@
+type Marker = { value: int32 }
+
+fun Marker.call_line(self, loc: Location) -> int32 {
+    return loc.line
+}
+
+fun call_from_function(marker: Marker) -> bool {
+    return marker.call_line() > 0
+}
+
+println(call_from_function(Marker { value: 1 }))
