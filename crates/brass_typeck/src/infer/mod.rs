@@ -51,9 +51,9 @@ use assign::{common_nullable_type, integer_literal_fits};
 use builtins::primitive_static_return;
 use helpers::{
     Pipe, apply_method_substitution, apply_nominal_substitution, assign_binop,
-    block_always_returns, block_rebinds, closure_write_targets_block, collect_closure_writes_stmt,
-    const_index, contains_typeof, expr_always_returns, expr_may_branch, field_substitution_key,
-    int_fits_kind, is_concrete_primitive, is_concrete_type, is_maybe_indexable, is_null_comparison,
+    block_always_returns, closure_write_targets_block, collect_closure_writes_stmt, const_index,
+    contains_typeof, expr_always_returns, expr_may_branch, field_substitution_key, int_fits_kind,
+    is_concrete_primitive, is_concrete_type, is_maybe_indexable, is_null_comparison,
     is_result_return_type, is_runtime_builtin_value, is_self_expr, literal_pattern_matches,
     literal_pattern_type, method_param_substitution_key, method_return_substitution_key,
     next_unknown_after_program, numeric_literal_repr, param_expected_type, param_is_location,
@@ -2565,20 +2565,6 @@ impl<'a> Checker<'a> {
                 return;
             }
         };
-        // Shadowing the loop variable is a language rule, not an expansion
-        // limitation: the descriptor decays to a different field constant per
-        // copy, so a same-named binding in the body reads as one variable while
-        // meaning two. Expansion itself is shadow-aware as a defensive layer,
-        // but user programs are rejected up front.
-        if block_rebinds(body, var) {
-            self.errors.push(TypeError {
-                message: format!(
-                    "the fields-loop variable `{var}` must not be shadowed in the body"
-                ),
-                span: s.span(),
-            });
-            return;
-        }
         // Defensive: the channel is span-keyed and consumed by one shared MIR
         // lowering. A generic `fields(..)` operand is rejected before reaching
         // here today, but a disagreement must never be baked silently.

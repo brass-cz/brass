@@ -1,0 +1,12 @@
+// A binding that reuses the fields-loop variable's name shadows the
+// descriptor lexically: uses before the binding still decay to the field
+// name, uses after it read the new binding.
+type P = { x: int64, y: int64 }
+fun main() {
+    const p = P { x: 1, y: 2 }
+    for f in fields(p) {
+        println(f)
+        let f = 3
+        println(f)
+    }
+}

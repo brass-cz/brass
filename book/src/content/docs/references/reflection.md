@@ -35,8 +35,10 @@ dump(Point { x: 3, y: 4 })
 Because the loop is unrolled, each iteration is ordinary typed code: `p[field]`
 has the field's own type, so a type error in one iteration is reported against
 that field ("while expanding field `y` of `Point`"). A type that is not a
-record, using `fields` outside a `for` loop, and shadowing the loop variable in
-the body are all rejected.
+record and using `fields` outside a `for` loop are rejected. The loop variable
+follows ordinary lexical scoping: a binding of the same name in the body
+shadows it from that point on, and only the uses before the binding decay to
+the field name.
 
 ## `typeof(x)`
 
