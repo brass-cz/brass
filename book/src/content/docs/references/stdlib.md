@@ -796,14 +796,17 @@ names, addresses, and bracketed IPv6 literals, with port syntax and range
 validated. Request/status lines and headers are checked strictly, including
 header-name tokens and forbidden control characters in values.
 
-Message parsing and the client use a validated, non-negative decimal
-`Content-Length` (duplicate values must agree); the client reads until
-connection close when that header is absent. Informational, `204`, and `304`
-responses are bodyless regardless of framing headers. The client does not
-decode chunked transfer coding. Serializing a message does not add `Host`,
-`Content-Length`, or other headers; callers that construct requests or
-responses must supply the required headers themselves. Networking is
-unavailable in the browser playground.
+Response parsing and the client frame the body from the headers: a
+`Transfer-Encoding: chunked` body is decoded (chunk extensions and trailer
+fields are read and discarded) and takes precedence over `Content-Length`;
+any other transfer coding is an error. Otherwise a validated, non-negative
+decimal `Content-Length` applies (duplicate values must agree), and the
+client reads until connection close when both framing headers are absent.
+Informational, `204`, and `304` responses are bodyless regardless of framing
+headers. Serializing a message does not add `Host`, `Content-Length`, or
+other headers; callers that construct requests or responses must supply the
+required headers themselves, with a chunked body already in chunked form.
+Networking is unavailable in the browser playground.
 
 ## `std.data.json`
 

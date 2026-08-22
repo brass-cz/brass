@@ -1,0 +1,37 @@
+// The HTTP client against a live chunked response: the main thread serves a
+// `Transfer-Encoding: chunked` body split across two writes, so the client's
+// scan-then-read-more loop must keep reading past the first packet to find
+// the terminator (a Content-Length-less non-chunked body would instead run
+// to connection close). The closure captures only the port -- sharing the
+// listener would cown-guard it under the blocking accept -- and handles
+// errors by match, since `!` inside a closure is unsupported.
+import std.net.{ TcpListener }
+import std.http.{ HttpClient }
+
+fun run_client(port: int32) {
+    let client = HttpClient.http("127.0.0.1", port)
+    match client.fetch("/") {
+        Ok { value } => {
+            match value.body_text() {
+                Ok { value } => println("client got: {value}"),
+                Err { error } => println("client decode failed: {error}"),
+            }
+        }
+        Err { error } => println("client fetch failed: {error}"),
+    }
+}
+
+fun main() {
+    let listener = TcpListener.bind("127.0.0.1", 0)!
+    let port = int32.from(int64.parse(listener.local_addr()!.split(":")[1])!)!
+    spawn(() -> { run_client(port) })
+    let conn = listener.accept()!
+    let req = conn.read(1024)!
+    // Chunk sizes in hex, a trailer field after the terminator, and a split
+    // mid-body so the client cannot see the whole coding in one read.
+    conn.write(to_bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n"))!
+    conn.write(to_bytes("9\r\n serves 0\r\n0\r\nExpires: 0\r\n\r\n"))!
+    conn.close()!
+    sync()
+    println("server done")
+}

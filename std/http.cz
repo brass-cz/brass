@@ -43,6 +43,15 @@ type _HostPort = {
     port: int32
 }
 
+// One `_scan_chunks` pass: the payload of the chunks it decoded, the bytes
+// of input those chunks fully consumed, and whether the coding's terminator
+// was reached.
+type _ChunkScan = {
+    body: uint8[]
+    consumed: int64
+    done: bool
+}
+
 // --- internal helpers ---
 
 fun _split_once(s: string, delim: string) {
@@ -228,7 +237,15 @@ fun HttpRequest.serialize(self) -> uint8[] {
 
 // --- HttpResponse ---
 
-/** Parses a raw HTTP/1.x response string. */
+/**
+ * Parses a raw HTTP/1.x response string.
+ *
+ * The body is framed by the headers: a `Transfer-Encoding: chunked` body is
+ * decoded (chunked takes precedence over `Content-Length`; any other
+ * transfer coding is an error), a `Content-Length` body is cut to that
+ * length, and informational, 204, and 304 responses are bodyless. The
+ * headers are kept exactly as received, even when the body was de-chunked.
+ */
 fun HttpResponse.parse(raw: string) {
     const message = _parse_message(raw, "response")!
     const status = _parse_status_line(message.head.line)!
@@ -247,8 +264,10 @@ fun HttpResponse.parse(raw: string) {
  * connection: the status line, the headers, a blank line, then the body.
  *
  * The headers are written exactly as they stand -- nothing is added, so a
- * `Content-Length` (or a `Transfer-Encoding`) is the caller's business, as it
- * is for `HttpRequest.serialize`. Parsing the result yields an equal response.
+ * `Content-Length` (or a `Transfer-Encoding`, with a body already in chunked
+ * form) is the caller's business, as it is for `HttpRequest.serialize`.
+ * Parsing the result yields an equal response when the framing headers
+ * describe the body as written.
  *
  * The status line keeps the space before the reason phrase even when the reason
  * is empty (`HTTP/1.1 204 `): the grammar asks for it, and it is what lets
@@ -297,7 +316,11 @@ fun HttpClient.https(host: string, port: int32) {
     }
 }
 
-// conn is structurally typed: works with both Tcp and TlsStream
+// conn is structurally typed: works with both Tcp and TlsStream.
+// Response framing, in order: HEAD and bodyless statuses yield an empty
+// body; a chunked body is decoded up to its terminator (taking precedence
+// over Content-Length); else Content-Length bytes are read; else the body
+// runs to connection close.
 fun _read_response_open(conn, req: HttpRequest) {
     conn.write(req.serialize())!
 
@@ -329,6 +352,20 @@ fun _read_response_open(conn, req: HttpRequest) {
             reason: status.reason,
             headers: headers,
             body: [],
+        }
+    }
+
+    // Checked only when a body follows: a HEAD response carries the framing
+    // headers of the GET it mirrors, so an unsupported coding there is not
+    // this exchange's problem.
+    if _is_chunked(headers)! {
+        const body = _read_chunked_body(conn, data.slice(body_start, len(data)))!
+        return HttpResponse {
+            version: status.version,
+            status: status.status,
+            reason: status.reason,
+            headers: headers,
+            body: body,
         }
     }
 
@@ -407,11 +444,168 @@ fun _content_length(headers: Header[]) -> int64?! {
     return found
 }
 
+// Whether the message body uses chunked transfer framing. `chunked` is the
+// only transfer coding this module decodes, so any other coding -- alone or
+// layered under chunked -- is an error rather than a body we would silently
+// hand back still encoded. When chunked framing applies it takes precedence
+// over `Content-Length` (RFC 9112 section 6.3). Every `Transfer-Encoding`
+// header contributes, comma-separated, like `_content_length`.
+fun _is_chunked(headers: Header[]) -> bool! {
+    let codings: string[] = []
+    for h in headers {
+        if h.name.to_lower() == "transfer-encoding" {
+            for raw in h.value.split(",") {
+                const coding = raw.trim().to_lower()
+                if len(coding) > 0 { codings.push(coding) }
+            }
+        }
+    }
+    if len(codings) == 0 { return false }
+    if len(codings) == 1 && codings[0] == "chunked" { return true }
+    const joined = codings.join(", ")
+    return error("unsupported Transfer-Encoding: {joined}")
+}
+
+// Index of the CR of the first CRLF at or after `from`, or -1 when the data
+// ends first (the sentinel keeps the index usable in arithmetic directly).
+fun _find_crlf(data: uint8[], from: int64) -> int64 {
+    let i = from
+    while i + 1 < len(data) {
+        if data[i] == 13 && data[i + 1] == 10 { return i }
+        i += 1
+    }
+    return -1
+}
+
+// Parses the hex chunk size in bytes [from, line_end) of a chunk header line.
+// A chunk extension (";" and what follows) is ignored, and a space or tab also
+// ends the size, tolerating servers that pad it. Thirteen significant hex
+// digits bound the size (leading zeros are free) so the arithmetic stays well
+// inside int64.
+fun _parse_chunk_size(data: uint8[], from: int64, line_end: int64) -> int64! {
+    let size: int64 = 0
+    let digits = 0
+    let significant = 0
+    let i = from
+    let scanning = true
+    while scanning && i < line_end {
+        const b = data[i]
+        if b == 59 || b == 32 || b == 9 {
+            scanning = false
+        } else {
+            let digit: int64 = -1
+            if b >= 48 && b <= 57 { digit = b - 48 }
+            if b >= 97 && b <= 102 { digit = b - 87 }
+            if b >= 65 && b <= 70 { digit = b - 55 }
+            if digit < 0 { return error("invalid chunk size") }
+            digits += 1
+            if size > 0 || digit > 0 {
+                if significant >= 13 { return error("chunk size too large") }
+                size = size * 16 + digit
+                significant += 1
+            }
+            i += 1
+        }
+    }
+    if digits == 0 { return error("invalid chunk size") }
+    return size
+}
+
+// Offset just past the trailer section starting at `from` -- zero or more
+// field lines, then the empty line ending the coding -- or -1 when `data`
+// ends before that. Trailer fields are consumed for framing and discarded.
+fun _scan_trailers(data: uint8[], from: int64) -> int64 {
+    let pos = from
+    let scanning = true
+    while scanning {
+        const line_end = _find_crlf(data, pos)
+        if line_end < 0 { return -1 }
+        if line_end == pos { scanning = false }
+        pos = line_end + 2
+    }
+    return pos
+}
+
+// One pass of the chunked transfer coding (RFC 9112 section 7.1) at the
+// start of `data`: decodes the complete chunks there, stopping cleanly at an
+// incomplete tail. `body` is their concatenated payload, `consumed` how many
+// leading bytes those whole chunks took, and `done` whether the zero-size
+// terminator and its trailer section were reached -- so a caller may demand
+// completeness (`_decode_chunked`) or drop the consumed prefix and read on
+// (`_read_chunked_body`) without rescanning what it already decoded. Only
+// malformed framing is an error; an incomplete tail is not.
+fun _scan_chunks(data: uint8[]) -> _ChunkScan! {
+    let body: uint8[] = []
+    let consumed: int64 = 0
+    let scanning = true
+    while scanning {
+        const size_end = _find_crlf(data, consumed)
+        if size_end < 0 { scanning = false }
+        else {
+            const size = _parse_chunk_size(data, consumed, size_end)!
+            const chunk_start = size_end + 2
+            if size == 0 {
+                const end = _scan_trailers(data, chunk_start)
+                if end >= 0 {
+                    return _ChunkScan { body: body, consumed: end, done: true }
+                }
+                scanning = false
+            } else {
+                if len(data) < chunk_start + size + 2 { scanning = false }
+                else {
+                    if data[chunk_start + size] != 13 || data[chunk_start + size + 1] != 10 {
+                        return error("malformed chunk: no CRLF after chunk data")
+                    }
+                    for i in [chunk_start..chunk_start + size] { body.push(data[i]) }
+                    consumed = chunk_start + size + 2
+                }
+            }
+        }
+    }
+    return _ChunkScan { body: body, consumed: consumed, done: false }
+}
+
+// Decodes a chunked body held in memory whole, as `HttpResponse.parse` has
+// it. A body that ends before the terminating chunk is an error here, where
+// the streaming client would read on instead. Bytes past the terminator are
+// ignored.
+fun _decode_chunked(data: uint8[]) -> uint8[]! {
+    const scan = _scan_chunks(data)!
+    if scan.done { return scan.body }
+    return error("truncated chunked body")
+}
+
+// Reads a chunked response body from the connection: `data` holds whatever
+// arrived past the header block, and more is read until the terminating
+// chunk and its trailer section are complete. Whole chunks are dropped from
+// the buffer as they are decoded, so a body of many chunks is not rescanned
+// once per read; an incomplete single chunk costs each pass only its size
+// line, so that case stays linear too. Returns the decoded payload.
+fun _read_chunked_body(conn, data: uint8[]) -> uint8[]! {
+    let body: uint8[] = []
+    let waiting = true
+    while waiting {
+        const scan = _scan_chunks(data)!
+        for b in scan.body { body.push(b) }
+        if scan.done { return body }
+        if scan.consumed > 0 { data = data.slice(scan.consumed, len(data)) }
+        const chunk = conn.read(4096)!
+        if len(chunk) == 0 { waiting = false }
+        else { for b in chunk { data.push(b) } }
+    }
+    return error("connection closed inside chunked body")
+}
+
 fun _framed_parsed_body(status: int32, headers: Header[], body: uint8[]) -> uint8[]! {
     const content_length = _content_length(headers)!
     if _status_has_no_body(status) {
         let empty: uint8[] = []
         return empty
+    }
+    // Checked only when a body follows, so a bodyless status is returned
+    // whole even under a transfer coding this module cannot decode.
+    if _is_chunked(headers)! {
+        return _decode_chunked(body)!
     }
     if let expected = content_length {
         if len(body) < expected {

@@ -1,0 +1,46 @@
+// `Transfer-Encoding: chunked` response bodies, decoded by `HttpResponse.parse`
+// (the client's streaming read shares the same scanner). Chunk sizes are hex
+// with optional extensions, chunk data may contain CRLF, and the zero-size
+// terminator may carry trailer fields -- all exercised here, plus the
+// malformed framings that must be rejected. `chunked` is the only transfer
+// coding the module decodes, and it takes precedence over `Content-Length`.
+import std.http.{ HttpResponse }
+
+fun show(label: string, value) {
+    match value {
+        Ok { value } => println("{label}: accepted"),
+        Err { error } => println("{label}: rejected"),
+    }
+}
+
+fun main() {
+    // Two chunks, then the terminator, no trailers.
+    const basic = HttpResponse.parse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n")!
+    println(basic.body_text()!)
+
+    // Chunk extension, zero-padded and uppercase hex sizes, CRLF inside chunk
+    // data, and trailer fields after the terminator; the header name and its
+    // value are matched case-insensitively.
+    const fancy = HttpResponse.parse("HTTP/1.1 200 OK\r\ntransfer-ENCODING: Chunked\r\n\r\n4;ext=\"x\"\r\nWiki\r\n0005\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\nExpires: 0\r\n\r\n")!
+    println(fancy.body_text()!.replace("\r\n", "<CRLF>"))
+
+    // Chunked framing wins over a Content-Length that says otherwise.
+    const both = HttpResponse.parse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n2\r\nok\r\n0\r\n\r\n")!
+    println(both.body_text()!)
+
+    // A bodyless status stays bodyless whatever the framing headers say.
+    const none = HttpResponse.parse("HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n")!
+    println(len(none.body))
+
+    // A bodyless status is returned whole even under a coding the module
+    // cannot decode -- framing only matters when a body follows.
+    show("bodyless other coding", HttpResponse.parse("HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: gzip\r\n\r\n"))
+
+    show("other coding", HttpResponse.parse("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nzz"))
+    show("layered coding", HttpResponse.parse("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"))
+    show("bad size", HttpResponse.parse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nok\r\n0\r\n\r\n"))
+    show("huge size", HttpResponse.parse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFF\r\nok\r\n0\r\n\r\n"))
+    show("no CRLF after data", HttpResponse.parse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nokX\r\n0\r\n\r\n"))
+    show("truncated body", HttpResponse.parse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n"))
+    show("unterminated trailers", HttpResponse.parse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nExpires: 0\r\n"))
+}

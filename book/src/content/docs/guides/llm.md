@@ -323,7 +323,8 @@ Import these with their complete `std.*` paths:
   `std.url.query`, `std.url.percent`, `std.url.validate`,
   `std.url.charset`, and `std.url.text`.
 - `std.http`: HTTP/HTTPS `fetch`, clients, requests, responses, and headers.
-  It handles `Content-Length` or connection-close bodies, not chunked coding.
+  It handles chunked, `Content-Length`, and connection-close response bodies;
+  other transfer codings are errors.
 - `std.data.json`: `JsonValue` parse/stringify/accessors and typed record
   decoding with `into()`; typed-array decoding is not supported.
 - `std.data.toml`: `TomlValue` parse/stringify/accessors and scalar/record

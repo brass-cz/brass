@@ -1,0 +1,12 @@
+Wikipedia
+Wikipedia in<CRLF><CRLF>chunks.
+ok
+0
+bodyless other coding: accepted
+other coding: rejected
+layered coding: rejected
+bad size: rejected
+huge size: rejected
+no CRLF after data: rejected
+truncated body: rejected
+unterminated trailers: rejected
