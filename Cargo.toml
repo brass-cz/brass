@@ -58,7 +58,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 license = "MPL-2.0"
 authors = ["Yuki Okamoto <cord@x56.cx>"]
