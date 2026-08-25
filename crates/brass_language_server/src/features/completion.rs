@@ -36,6 +36,7 @@ use crate::analysis::world::{prelude_module_names, prelude_source};
 use crate::analysis::{DocAnalyzer, FullAnalysis};
 use crate::document::Document;
 use crate::features::hover::typedef_method_signatures;
+use crate::features::nav;
 use crate::render::{
     NULLABLE_CONTEXT_DOC, UnknownNamer, is_public_member, render_nullable_context_signature,
     render_signature, render_type,
@@ -96,7 +97,7 @@ pub(crate) fn completion_with(
             }
         };
     }
-    if let Some(items) = member_completion(doc, analyzer, offset) {
+    if let Some(items) = member_completion(doc, analyzer, doc_path, offset, search) {
         return items;
     }
     symbol_items(analyzer, doc, doc_path)
@@ -393,7 +394,9 @@ const PROBE: &str = "__brass_completion_probe__";
 fn member_completion(
     doc: &Document,
     analyzer: &DocAnalyzer,
+    doc_path: &Path,
     cursor: usize,
+    search: &SearchPaths,
 ) -> Option<Vec<CompletionItem>> {
     let bytes = doc.text.as_bytes();
     // The current partial member name `[word_start, cursor)`.
@@ -432,23 +435,35 @@ fn member_completion(
     // Otherwise a value receiver: its members come from its inferred type, found
     // as the expression that ends exactly at the `.`.
     let recv_hi = full.main_base + dot;
-    let items = match receiver_type_at(&full, recv_hi) {
+    let items = match nav::receiver_type_at(&full, recv_hi) {
         Some(ty) => value_member_items(&full, &ty, include_private),
         None => Vec::new(),
     };
+    // A lone identifier naming a bare module import's QUALIFIER offers the
+    // module's public exports (`import std.regex` + `regex.|`) -- the same
+    // list the brace form of the import completes. Only when no value members
+    // resolved: a local binding shadowing the qualifier keeps its own members.
+    if items.is_empty()
+        && let Some(module) = module_qualifier_before(&full, &doc.text, dot)
+    {
+        return Some(import_name_items(
+            &module, partial, analyzer, doc_path, search,
+        ));
+    }
     Some(filter_prefix(items, partial))
 }
 
-/// The inferred type of the receiver expression ending at global offset `hi`
-/// (just before the `.`); the widest such expression, so `foo.bar.|` uses
-/// `foo.bar` rather than `bar`.
-fn receiver_type_at(full: &FullAnalysis, hi: usize) -> Option<Type> {
-    full.typed
-        .expressions
+/// The import path whose qualified-use name the lone identifier ending at
+/// `dot` is: a brace-less module import is used qualified through its final
+/// path segment (`import std.regex` -> `regex.escape(..)`) or its explicit
+/// alias (`import std.regex as re` -> `re.escape(..)`).
+fn module_qualifier_before(full: &FullAnalysis, text: &str, dot: usize) -> Option<Vec<String>> {
+    let name = lone_ident_before(text, dot)?;
+    full.main_ast
+        .imports
         .iter()
-        .filter(|e| e.span.hi == hi)
-        .min_by_key(|e| e.span.lo)
-        .map(|e| e.ty.clone())
+        .find(|imp| imp.bare && imp.alias.as_deref() == Some(name))
+        .map(|imp| imp.path.clone())
 }
 
 /// Members reachable on a value of `ty`: a record type's fields and methods,
@@ -521,7 +536,7 @@ fn value_member_items(
     // symbol in `functions`).
     if let Some(class) = base.primitive_class() {
         for ((c, name), symbol) in &full.program.primitive_methods {
-            if c == class {
+            if c == class && (include_private || is_public_member(name)) {
                 let f = full.program.functions.get(symbol);
                 items.push(doc_item(
                     name.clone(),
@@ -617,22 +632,7 @@ fn type_qualified_items(
     dot: usize,
     include_private: bool,
 ) -> Option<Vec<CompletionItem>> {
-    let bytes = text.as_bytes();
-    let mut start = dot;
-    while start > 0 && is_ident_byte(bytes[start - 1]) {
-        start -= 1;
-    }
-    // The receiver must be a lone identifier, not part of a longer chain.
-    if start == dot {
-        return None;
-    }
-    if let Some(prev) = start.checked_sub(1) {
-        let b = bytes[prev];
-        if is_ident_byte(b) || b == b'.' || b == b')' || b == b']' {
-            return None;
-        }
-    }
-    let name = &text[start..dot];
+    let name = lone_ident_before(text, dot)?;
     let module = ["main".to_string()];
     let (info, substitution) = if let Some(info) = full.program.resolve_type(&module, name) {
         (info, brass_hir::Substitution::empty())
@@ -661,6 +661,27 @@ fn type_qualified_items(
         MethodKind::Static,
     ));
     Some(items)
+}
+
+/// The lone identifier ending exactly at `dot` -- not the tail of a longer
+/// member chain (`foo.bar.`) or a call/index result (`f().`, `a[0].`) -- so it
+/// can name a type or a module qualifier rather than a value.
+fn lone_ident_before(text: &str, dot: usize) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut start = dot;
+    while start > 0 && is_ident_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    if start == dot {
+        return None;
+    }
+    if let Some(prev) = start.checked_sub(1) {
+        let b = bytes[prev];
+        if is_ident_byte(b) || b == b'.' || b == b')' || b == b']' {
+            return None;
+        }
+    }
+    Some(&text[start..dot])
 }
 
 /// Strip transparent wrappers so a nullable/const/mut receiver still resolves to

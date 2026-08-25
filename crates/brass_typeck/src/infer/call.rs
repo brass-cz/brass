@@ -231,6 +231,7 @@ impl<'a> Checker<'a> {
                         );
                     }
                 }
+                self.recheck_closure_args(args, &arg_types, scopes);
                 // User code ran conceptually: a narrowed global (or a local a
                 // closure of this body assigns) may have been re-nulled.
                 self.invalidate_narrowed_after_call(scopes);
@@ -581,7 +582,7 @@ impl<'a> Checker<'a> {
                 arg_types.push(self.check_expr(&a.expr, scopes));
             }
         }
-        self.instantiate_function_call(
+        let ret = self.instantiate_function_call(
             &func.symbol,
             &func.module,
             signature_params,
@@ -590,7 +591,113 @@ impl<'a> Checker<'a> {
             fallback_ret,
             &arg_types,
             span,
-        )
+        );
+        self.recheck_closure_args(args, &arg_types[1..], scopes);
+        ret
+    }
+
+    /// Editor-mode display pass: re-check each closure literal argument at the
+    /// parameter types its one application was observed to instantiate (see
+    /// `record_closure_binding`), run right after the callee-body elaboration
+    /// that produced the observations.
+    ///
+    /// The first check of such a closure ran with its parameters OPEN (the
+    /// callee's parameter is unannotated), so everything derived from a
+    /// parameter -- `v.group(1)` in `xs.map((v) -> v.group(1))` -- took the
+    /// deferred-dispatch path and was typed as an unconstrained unknown;
+    /// nothing links it to the concrete receiver after the fact. The re-check
+    /// types the body at the observed parameter types, recording the concrete
+    /// sidecar entries hover and completion read (they prefer a resolved entry
+    /// over an open one at the same span).
+    ///
+    /// Display-only by construction: it runs only in editor mode
+    /// (`set_editor_mode`), its diagnostics are dropped, the MIR span channels
+    /// and the elaboration memo are suspended while it runs
+    /// (`display_recheck_depth`), and the solver state is rolled back, so the
+    /// closure value the callee received keeps its generic type. The concrete
+    /// result is harvested first and fed back as an observation on the
+    /// closure's RETURN variables, so the enclosing call's own result
+    /// (`xs.map(..) : R[]`) display-resolves as well.
+    fn recheck_closure_args(&mut self, args: &[Arg], arg_types: &[Type], scopes: &mut ScopeStack) {
+        // The depth bound cuts pathological closure-in-closure nesting; real
+        // code is one or two levels.
+        if !crate::editor_mode() || self.display_recheck_depth >= 4 {
+            return;
+        }
+        for (arg, ty) in args.iter().zip(arg_types) {
+            if !matches!(arg.expr, Expr::Closure(..)) {
+                continue;
+            }
+            let Type::Fun(params, ret) = self.resolve_head(ty) else {
+                continue;
+            };
+            if params.is_empty() {
+                continue;
+            }
+            // Every parameter must be concrete after applying the
+            // observations, and at least one must come FROM an observation --
+            // otherwise the first check already typed the body concretely and
+            // there is nothing to recover.
+            let mut observed_any = false;
+            let mut want_params = Vec::with_capacity(params.len());
+            let mut usable = true;
+            for p in &params {
+                let resolved = self.resolve(p);
+                if brass_hir::is_fully_known(&resolved) {
+                    want_params.push(resolved);
+                    continue;
+                }
+                match resolved {
+                    Type::Unknown(id) => match self.closure_bindings.get(&id) {
+                        Some(Some(t)) => {
+                            observed_any = true;
+                            want_params.push(t.clone());
+                        }
+                        _ => {
+                            usable = false;
+                            break;
+                        }
+                    },
+                    _ => {
+                        usable = false;
+                        break;
+                    }
+                }
+            }
+            if !usable || !observed_any {
+                continue;
+            }
+            let errors_before = self.errors.len();
+            let warnings_before = self.warnings.len();
+            let snapshot = self.solver.snapshot();
+            self.display_recheck_depth += 1;
+            let want_ret = self.fresh_unknown();
+            let want = Type::Fun(want_params, Box::new(want_ret));
+            let got = self.check_expr_against(&arg.expr, &want, scopes);
+            // Harvest the concrete return before the rollback discards the
+            // re-check's bindings, and record it against the ORIGINAL return
+            // variables. Sidecar entries recorded during the re-check keep
+            // their types: they were resolved at record time.
+            let mut harvested: Vec<(u32, Type)> = Vec::new();
+            if let Type::Fun(_, got_ret) = self.resolve_head(&got) {
+                let got_ret = self.resolve(&got_ret);
+                let mut subst = Subst::new();
+                let _ = subst.unify(&ret, &got_ret);
+                for id in brass_hir::type_vars(&ret) {
+                    let observed = subst.resolve_deep(&Type::Unknown(id));
+                    if observed != Type::Unknown(id) {
+                        harvested.push((id, self.resolve(&observed)));
+                    }
+                }
+            }
+            self.display_recheck_depth -= 1;
+            self.solver.rollback(snapshot);
+            self.errors.truncate(errors_before);
+            self.warnings.truncate(warnings_before);
+            for (id, observed) in harvested {
+                self.record_closure_binding(id, &observed);
+            }
+        }
     }
 
     /// Type-check a call whose callee is a value (closure/function value).
@@ -755,6 +862,7 @@ impl<'a> Checker<'a> {
                 self.reattribute_errors_to_call(before, method, span);
             }
         }
+        self.recheck_closure_args(args, &arg_types, scopes);
         // The method body ran conceptually: undo narrowings it may have
         // invalidated (see `invalidate_narrowed_after_call`).
         self.invalidate_narrowed_after_call(scopes);
@@ -941,6 +1049,18 @@ impl<'a> Checker<'a> {
                         self.verify_shape_constraints(param, &got, arg.expr.span());
                     } else {
                         self.check_expr(&arg.expr, scopes);
+                    }
+                }
+                // Remember what this application instantiated the callable's
+                // open parameter variables to. The instantiation stays in the
+                // LOCAL substitution above, so the sidecar entries mentioning
+                // those variables (the closure's type, its parameter's uses)
+                // would render as `unknown` forever; the observation lets the
+                // language server show the concrete type instead.
+                for id in params.iter().flat_map(brass_hir::type_vars) {
+                    let observed = subst.resolve_deep(&Type::Unknown(id));
+                    if observed != Type::Unknown(id) {
+                        self.record_closure_binding(id, &observed);
                     }
                 }
                 self.resolve(&subst.resolve_deep(&ret))

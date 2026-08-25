@@ -25,12 +25,38 @@ pub fn ident_at(text: &str, off: usize) -> Option<(String, Span)> {
 }
 
 /// The smallest typed expression whose global span contains `global_off`.
+/// Checker-only method-receiver evidence is excluded: it shares the enclosing
+/// call's span, so it would tie with (and, recorded first, win over) the call's
+/// own result entry. Same-span ties keep recording order -- the FIRST entry is
+/// the generic view, which is what hover shows for a generic body (unlike
+/// member resolution, see [`receiver_type_at`]).
 pub fn smallest_typed_at(full: &FullAnalysis, global_off: usize) -> Option<&TypedExpr> {
     full.typed
         .expressions
         .iter()
-        .filter(|e| global_off >= e.span.lo && global_off <= e.span.hi)
+        .filter(|e| {
+            global_off >= e.span.lo
+                && global_off <= e.span.hi
+                && !matches!(e.kind, TypedExprKind::MethodReceiver)
+        })
         .min_by_key(|e| e.span.hi - e.span.lo)
+}
+
+/// The inferred type of the receiver expression ending at global offset `hi`
+/// (just before a `.`): the widest such expression, so `foo.bar.` uses
+/// `foo.bar` rather than `bar`. Method-receiver evidence is excluded here too:
+/// the checker records it under the whole call's span, so after
+/// `re.find(x).` it would answer with `re`'s type instead of the call's
+/// result. Same-span ties prefer the resolved entry (a closure body checked
+/// open and re-checked at its observed instantiation records both).
+/// Shared by completion, hover, and go-to-definition.
+pub fn receiver_type_at(full: &FullAnalysis, hi: usize) -> Option<Type> {
+    full.typed
+        .expressions
+        .iter()
+        .filter(|e| e.span.hi == hi && !matches!(e.kind, TypedExprKind::MethodReceiver))
+        .min_by_key(|e| (e.span.lo, !brass_hir::is_fully_known(&e.ty)))
+        .map(|e| e.ty.clone())
 }
 
 /// Turn a global span into a `Location`, resolving the file it lives in through

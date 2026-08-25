@@ -2124,3 +2124,228 @@ fn hover_completes_the_error_payload_of_a_fallible_annotation() {
         );
     }
 }
+
+/// A method-call receiver completes on the CALL's result type, not on the
+/// method's own receiver. The checker records method-receiver evidence under
+/// the whole call's span, and that entry must not shadow the call result:
+/// `re.find_all(x).` offers array members, not `R`'s methods.
+#[test]
+fn completion_uses_call_result_not_method_receiver() {
+    let src = concat!(
+        "type M = {\n    s: string\n}\n",
+        "type R = {\n    p: string\n}\n",
+        "fun R.new(p: string) -> R! {\n    return R { p: p }\n}\n",
+        "fun R.find_all(self, t: string) -> M[] {\n    return [M { s: t }]\n}\n",
+        "fun title(html: string) {\n",
+        "    const re = R.new(\"x\")!\n",
+        "    return re.find_all(html).\n",
+        "}\n",
+    );
+    let analyzer = DocAnalyzer::new(path());
+    let doc = Document::new(src.to_string(), 1);
+    let off = src.find(").\n").expect("cursor") + 2;
+    let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(off));
+    let labels = labels(&items);
+    assert!(
+        labels.contains(&"map".to_string()),
+        "array member: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"len".to_string()),
+        "array member: {labels:?}"
+    );
+    // R's methods are not reachable on the call's result.
+    assert!(!labels.contains(&"find_all".to_string()), "{labels:?}");
+}
+
+/// The nullable-unwrap chain from the regex example: `re.find(html)!.` offers
+/// the members of the unwrapped result record.
+#[test]
+fn completion_after_unwrap_offers_result_members() {
+    let src = concat!(
+        "type M = {\n    s: string\n}\n",
+        "fun M.group(self, i: int64) -> string {\n    return self.s\n}\n",
+        "type R = {\n    p: string\n}\n",
+        "fun R.new(p: string) -> R! {\n    return R { p: p }\n}\n",
+        "fun R.find(self, t: string) -> M? {\n    return M { s: t }\n}\n",
+        "fun title(html) {\n",
+        "    const re = R.new(\"x\")!\n",
+        "    return re.find(html)!.\n",
+        "}\n",
+    );
+    let analyzer = DocAnalyzer::new(path());
+    let doc = Document::new(src.to_string(), 1);
+    let off = src.find("!.\n").expect("cursor") + 2;
+    let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(off));
+    let labels = labels(&items);
+    assert!(labels.contains(&"group".to_string()), "{labels:?}");
+    assert!(labels.contains(&"s".to_string()), "{labels:?}");
+    assert!(!labels.contains(&"find".to_string()), "{labels:?}");
+}
+
+/// Member completion keeps working while the enclosing body is unclosed (the
+/// common mid-edit state): the recovered AST keeps the partial function, so
+/// the receiver still types.
+#[test]
+fn completion_works_in_an_unclosed_body() {
+    let src = concat!(
+        "type M = {\n    s: string\n}\n",
+        "fun M.group(self, i: int64) -> string {\n    return self.s\n}\n",
+        "type R = {\n    p: string\n}\n",
+        "fun R.new(p: string) -> R! {\n    return R { p: p }\n}\n",
+        "fun R.find(self, t: string) -> M? {\n    return M { s: t }\n}\n",
+        "fun title(html) {\n",
+        "    const re = R.new(\"x\")!\n",
+        "    return re.find(html)!.\n",
+    );
+    let analyzer = DocAnalyzer::new(path());
+    let doc = Document::new(src.to_string(), 1);
+    let off = src.find("!.\n").expect("cursor") + 2;
+    let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(off));
+    let labels = labels(&items);
+    assert!(labels.contains(&"group".to_string()), "{labels:?}");
+}
+
+/// Go-to-definition through a method-call receiver resolves on the call's
+/// result: in `re.find_all(html).map(..)` the receiver of `map` is `M[]`.
+#[test]
+fn definition_member_after_call_uses_result_type() {
+    let src = concat!(
+        "type M = {\n    s: string\n}\n",
+        "fun M.group(self, i: int64) -> string {\n    return self.s\n}\n",
+        "type R = {\n    p: string\n}\n",
+        "fun R.new(p: string) -> R! {\n    return R { p: p }\n}\n",
+        "fun R.find(self, t: string) -> M? {\n    return M { s: t }\n}\n",
+        "fun title(html: string) -> string {\n",
+        "    return re(html).find(html)!.group(1)\n",
+        "}\n",
+        "fun re(p: string) -> R {\n    return R { p: p }\n}\n",
+    );
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "group(1)", false);
+    let location = definition::definition(&doc, &full, pos).expect("method definition");
+    // `group` is declared on line 3 (0-based line 3 is `fun M.group..`).
+    assert_eq!(location.range.start.line, 3);
+}
+
+/// A qualified module name (`import util` + `util.|`) completes the module's
+/// public exports, the same list the brace form of the import offers.
+#[test]
+fn completion_offers_module_exports_after_qualifier() {
+    let root = std::env::temp_dir().join(format!(
+        "brass_lsp_module_qualifier_test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("create module directory");
+    std::fs::write(
+        root.join("util.cz"),
+        concat!(
+            "type Thing = {\n    n: int32\n}\n",
+            "fun visible() -> int32 {\n    return 1\n}\n",
+            "fun _hidden() -> int32 {\n    return 2\n}\n",
+        ),
+    )
+    .expect("write util module");
+    let main = root.join("main.cz");
+    let analyzer = DocAnalyzer::new(main.clone());
+
+    let src = concat!("import util\n", "fun main() {\n", "    util.\n", "}\n");
+    let doc = Document::new(src.to_string(), 1);
+    let off = src.find("util.\n").expect("cursor") + "util.".len();
+    let items = completion::completion(&doc, &analyzer, &main, doc.position_at(off));
+    let labels = labels(&items);
+    assert!(labels.contains(&"visible".to_string()), "{labels:?}");
+    assert!(labels.contains(&"Thing".to_string()), "{labels:?}");
+    assert!(!labels.contains(&"_hidden".to_string()), "{labels:?}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A closure parameter passed to a generic method is display-resolved to its
+/// observed instantiation: the checker's closure application is local (it
+/// must not commit -- let-polymorphism), but the observation channel lets
+/// member completion work inside `ps.map((v) -> v.|)`.
+#[test]
+fn completion_inside_closure_uses_observed_param_type() {
+    let src = concat!(
+        "type P = {\n    x: int32\n}\n",
+        "fun main() {\n",
+        "    let ps = [P { x: 1 }]\n",
+        "    let qs = ps.map((v) -> v.)\n",
+        "}\n",
+    );
+    let analyzer = DocAnalyzer::new(path());
+    let doc = Document::new(src.to_string(), 1);
+    let off = src.find("v.)").expect("cursor") + 2;
+    let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(off));
+    let labels = labels(&items);
+    assert!(labels.contains(&"x".to_string()), "{labels:?}");
+}
+
+/// Hover on the same closure parameter names the observed record type instead
+/// of `unknown`.
+#[test]
+fn hover_closure_param_shows_observed_type() {
+    let src = concat!(
+        "type P = {\n    x: int32\n}\n",
+        "fun main() {\n",
+        "    let ps = [P { x: 1 }]\n",
+        "    let qs = ps.map((v) -> v)\n",
+        "}\n",
+    );
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "v)", true);
+    let h = hover::hover(&doc, &full, pos).expect("hover");
+    let HoverContents::Markup(m) = h.contents else {
+        panic!("markup hover");
+    };
+    assert!(m.value.contains("P"), "{}", m.value);
+    assert!(!m.value.contains("unknown"), "{}", m.value);
+}
+
+/// Member completion works on a CHAIN inside a closure passed to a generic
+/// callee: the closure's first check defers `v.wrap()` on the open parameter,
+/// and the editor-mode re-check at the observed instantiation supplies the
+/// concrete entries (`v.wrap().` offers `G`'s fields).
+#[test]
+fn completion_chain_inside_closure() {
+    let src = concat!(
+        "type G = {\n    t: string\n}\n",
+        "type M = {\n    s: string\n}\n",
+        "fun M.wrap(self) -> G {\n    return G { t: self.s }\n}\n",
+        "fun apply(f, x) {\n    return f(x)\n}\n",
+        "fun main() {\n",
+        "    let m = M { s: \"a\" }\n",
+        "    let r = apply((v) -> v.wrap()., m)\n",
+        "}\n",
+    );
+    let analyzer = DocAnalyzer::new(path());
+    let doc = Document::new(src.to_string(), 1);
+    let off = src.find("wrap().").expect("cursor") + "wrap().".len();
+    let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(off));
+    let labels = labels(&items);
+    assert!(labels.contains(&"t".to_string()), "{labels:?}");
+    assert!(!labels.contains(&"wrap".to_string()), "{labels:?}");
+}
+
+/// The re-check feeds the closure's concrete RESULT back to the enclosing
+/// call: `apply((v) -> v.wrap(), m)`'s binding completes with `G`'s members.
+#[test]
+fn completion_on_closure_call_result() {
+    let src = concat!(
+        "type G = {\n    t: string\n}\n",
+        "type M = {\n    s: string\n}\n",
+        "fun M.wrap(self) -> G {\n    return G { t: self.s }\n}\n",
+        "fun apply(f, x) {\n    return f(x)\n}\n",
+        "fun main() {\n",
+        "    let m = M { s: \"a\" }\n",
+        "    let r = apply((v) -> v.wrap(), m)\n",
+        "    r.\n",
+        "}\n",
+    );
+    let analyzer = DocAnalyzer::new(path());
+    let doc = Document::new(src.to_string(), 1);
+    let off = src.find("r.\n").expect("cursor") + 2;
+    let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(off));
+    let labels = labels(&items);
+    assert!(labels.contains(&"t".to_string()), "{labels:?}");
+}

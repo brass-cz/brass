@@ -60,6 +60,11 @@ pub(super) enum ElaborationJournalEntry {
     ViewArg(Span),
     KeyedCall(Span, String, String, Type),
     InstanceReturn(String, Vec<Type>, Type),
+    /// A display-only observation that one application of a Fun-typed value
+    /// instantiated an open parameter variable (first, kept as `Type::Unknown`
+    /// so memo canonicalization and replay substitution apply) to a concrete
+    /// type (second). See `Checker::record_closure_binding`.
+    ClosureBinding(Type, Type),
 }
 
 /// The reusable result of one clean elaboration.
@@ -181,6 +186,12 @@ fn substitute_journal_entry(
                 receiver.clone(),
                 method.clone(),
                 brass_hir::substitute_vars(key, substitution),
+            )
+        }
+        ElaborationJournalEntry::ClosureBinding(var, ty) => {
+            ElaborationJournalEntry::ClosureBinding(
+                brass_hir::substitute_vars(var, substitution),
+                brass_hir::substitute_vars(ty, substitution),
             )
         }
         ElaborationJournalEntry::InstanceReturn(symbol, args, ret) => {
@@ -336,6 +347,7 @@ impl Checker<'_> {
                     | ElaborationJournalEntry::TypeTest(..)
                     | ElaborationJournalEntry::KeyedCall(..)
                     | ElaborationJournalEntry::InstanceReturn(..)
+                    | ElaborationJournalEntry::ClosureBinding(..)
             ) {
                 let observation = substitute_journal_entry(observation, &substitution);
                 self.replay_elaboration_journal_entry(&observation);
@@ -431,6 +443,12 @@ impl Checker<'_> {
                     self.memo_skeleton_type(&ret, skeleton),
                 )
             }
+            ElaborationJournalEntry::ClosureBinding(var, ty) => {
+                ElaborationJournalEntry::ClosureBinding(
+                    self.memo_skeleton_type(&var, skeleton),
+                    self.memo_skeleton_type(&ty, skeleton),
+                )
+            }
             other => other,
         }
     }
@@ -468,6 +486,14 @@ impl Checker<'_> {
             ElaborationJournalEntry::InstanceReturn(symbol, args, ret) => {
                 self.record_instance_return(symbol.clone(), args.clone(), ret.clone())
             }
+            // The variable side may have been substituted to the current
+            // call's own variable (record it) or to a type already concrete
+            // here (nothing left to display-resolve).
+            ElaborationJournalEntry::ClosureBinding(var, ty) => {
+                if let Type::Unknown(id) = self.resolve_head(var) {
+                    self.record_closure_binding(id, &ty.clone());
+                }
+            }
         }
     }
 
@@ -501,17 +527,63 @@ impl Checker<'_> {
         self.typed_seen.entry(hash).or_default().push(index);
     }
 
+    /// Record what one application of a Fun-typed value instantiated the open
+    /// parameter variable `var` to. Display-only: the application's
+    /// unification is deliberately local (committing it would defeat
+    /// let-polymorphism -- see `apply_callable`), so the solver never learns
+    /// it and every sidecar entry mentioning `var` renders as `unknown`. The
+    /// language server substitutes these observations into the sidecar when
+    /// all applications agree; a second, different observation poisons the
+    /// variable back to open.
+    pub(super) fn record_closure_binding(&mut self, var: u32, observed: &Type) {
+        // Mode wrappers are not part of the bound value's own type, and
+        // peeling them keeps a `const` argument from spuriously conflicting
+        // with the same type passed mutably.
+        let resolved = brass_hir::peel_modes(&self.resolve(observed)).clone();
+        if matches!(resolved, Type::Unknown(_)) {
+            return;
+        }
+        self.journal_elaboration(ElaborationJournalEntry::ClosureBinding(
+            Type::Unknown(var),
+            resolved.clone(),
+        ));
+        match self.closure_bindings.get(&var) {
+            Some(Some(prev)) if *prev != resolved => {
+                self.closure_bindings.insert(var, None);
+            }
+            Some(_) => {}
+            None => {
+                self.closure_bindings.insert(var, Some(resolved));
+            }
+        }
+    }
+
+    // The span-keyed MIR channels below (and their kin in expr.rs/assign.rs)
+    // are suppressed during a display-only closure re-check: the re-check
+    // types the SAME spans a second time at concrete types, and a channel's
+    // conflict-poisoning must not fire on (or its entries be replaced by)
+    // display work the compile pipeline never performs.
+
     pub(super) fn record_null_prop(&mut self, span: Span) {
+        if self.display_recheck_depth > 0 {
+            return;
+        }
         self.journal_elaboration(ElaborationJournalEntry::NullProp(span));
         self.null_props.insert(span);
     }
 
     pub(super) fn record_lift_err(&mut self, span: Span) {
+        if self.display_recheck_depth > 0 {
+            return;
+        }
         self.journal_elaboration(ElaborationJournalEntry::LiftErr(span));
         self.lift_errs.insert(span);
     }
 
     pub(super) fn record_type_name(&mut self, span: Span, name: String) {
+        if self.display_recheck_depth > 0 {
+            return;
+        }
         self.journal_elaboration(ElaborationJournalEntry::TypeName(span, name.clone()));
         if let Some(prev) = self.type_names.insert(span, name.clone())
             && prev != name
@@ -528,6 +600,9 @@ impl Checker<'_> {
     }
 
     pub(super) fn record_typeof_type(&mut self, span: Span, ty: &Type) {
+        if self.display_recheck_depth > 0 {
+            return;
+        }
         let concrete = self.resolve(ty);
         if !is_concrete_type(&concrete) || self.typeof_poisoned.contains(&span) {
             return;
@@ -545,6 +620,10 @@ impl Checker<'_> {
     }
 
     pub(super) fn record_fields_loop(&mut self, span: Span, fields: Vec<String>) -> bool {
+        if self.display_recheck_depth > 0 {
+            // Approved without recording: the caller still types the copies.
+            return true;
+        }
         self.journal_elaboration(ElaborationJournalEntry::FieldsLoop(span, fields.clone()));
         if let Some(prev) = self.fields_loops.get(&span)
             && prev != &fields
@@ -562,6 +641,9 @@ impl Checker<'_> {
     }
 
     pub(super) fn record_view_arg(&mut self, span: Span) {
+        if self.display_recheck_depth > 0 {
+            return;
+        }
         self.journal_elaboration(ElaborationJournalEntry::ViewArg(span));
         self.view_args.insert(span);
     }
@@ -573,6 +655,9 @@ impl Checker<'_> {
         method: String,
         key: Type,
     ) {
+        if self.display_recheck_depth > 0 {
+            return;
+        }
         self.journal_elaboration(ElaborationJournalEntry::KeyedCall(
             span,
             receiver.clone(),

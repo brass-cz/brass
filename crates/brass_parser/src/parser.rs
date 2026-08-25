@@ -737,7 +737,20 @@ impl Parser {
             }
             self.eat_newlines();
         }
-        let hi = self.expect(TokenKind::RBrace, "'}'")?.span;
+        // End of input inside the block: report the missing '}' but close the
+        // block implicitly, so the enclosing declaration and every statement
+        // parsed so far survive in the recovered AST (editor features analyze
+        // half-typed bodies; dropping the whole item would blind them). At the
+        // error cap the error propagates and unwinds as before.
+        let hi = if self.at_p(TokenKind::Eof) {
+            let e = self.error(format!("expected '}}', found {}", describe(self.peek())));
+            if !self.record_error(e.clone()) {
+                return Err(e);
+            }
+            self.span()
+        } else {
+            self.expect(TokenKind::RBrace, "'}'")?.span
+        };
         self.depth = saved_depth;
         self.no_struct = saved_ns;
         self.norm();

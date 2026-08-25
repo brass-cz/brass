@@ -116,6 +116,10 @@ pub struct DocAnalyzer {
 
 impl DocAnalyzer {
     pub fn new(path: PathBuf) -> Self {
+        // The whole server analyzes for display: closure arguments are
+        // re-checked at their observed instantiations so hover and completion
+        // see concrete types inside closure bodies. Compilers leave this off.
+        brass_typeck::set_editor_mode(true);
         DocAnalyzer {
             path,
             cache: ItemCache::default(),
@@ -362,14 +366,47 @@ fn run_pipeline(
     for warning in &analysis.warnings {
         diags.push((warning.message.clone(), warning.span, DiagSeverity::Warning));
     }
+    let mut typed = analysis.typed;
+    resolve_closure_bindings(&mut typed, &analysis.closure_bindings);
     (
         program,
-        analysis.typed,
+        typed,
         analysis.schemes,
         analysis.function_returns,
         analysis.method_returns,
         diags,
     )
+}
+
+/// Substitute the checker's display-only closure-parameter observations into
+/// the typed sidecar. A closure application's unification is local to the call
+/// (committing it would defeat let-polymorphism), so a parameter that is, at
+/// every application, one concrete type still reads back as `unknown` from
+/// the sidecar -- hover would render `unknown` and member completion would
+/// offer nothing inside `xs.map((v) -> v.|)`. This server-local pass closes
+/// that gap; the compile pipeline never sees the rewritten types.
+fn resolve_closure_bindings(
+    typed: &mut TypedProgram,
+    bindings: &fxhash::FxHashMap<u32, brass_hir::Type>,
+) {
+    if bindings.is_empty() {
+        return;
+    }
+    let map: std::collections::BTreeMap<u32, brass_hir::Type> =
+        bindings.iter().map(|(v, t)| (*v, t.clone())).collect();
+    for e in &mut typed.expressions {
+        // An observed type may itself mention an observed variable, so iterate
+        // a few rounds toward a fixpoint. The bound also cuts off a (never
+        // yet observed) cyclic observation instead of growing the type forever;
+        // display depth beyond it is not worth rendering anyway.
+        for _ in 0..4 {
+            let next = brass_hir::substitute_vars(&e.ty, &map);
+            if next == e.ty {
+                break;
+            }
+            e.ty = next;
+        }
+    }
 }
 
 /// Rebuild the document module keeping only the items whose index is in `keep`.

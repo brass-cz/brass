@@ -55,15 +55,7 @@ fn member_definition(doc: &Document, full: &FullAnalysis, local: usize) -> Optio
         return None;
     }
     let recv_hi = full.main_base + (span.lo - 1);
-    // The widest receiver expression ending at the `.` (so `foo.bar.method` uses
-    // `foo.bar`), mirroring hover/completion.
-    let recv_ty = full
-        .typed
-        .expressions
-        .iter()
-        .filter(|e| e.span.hi == recv_hi)
-        .min_by_key(|e| e.span.lo)
-        .map(|e| e.ty.clone())?;
+    let recv_ty = nav::receiver_type_at(full, recv_hi)?;
     resolve_member(full, &recv_ty, &name)
 }
 

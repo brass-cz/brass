@@ -283,7 +283,7 @@ fn method_hover(doc: &Document, full: &FullAnalysis, local: usize) -> Option<Hov
         return None;
     }
     let recv_hi = full.main_base + (span.lo - 1);
-    let recv_ty = receiver_type_at(full, recv_hi)?;
+    let recv_ty = nav::receiver_type_at(full, recv_hi)?;
     let member_span = Span::new(full.main_base + span.lo, full.main_base + span.hi);
     let call = callee_call(full, member_span);
     if name == "context"
@@ -685,18 +685,6 @@ fn specialize_method_signature(
         out.ret_ty = Some(r.clone());
     }
     out
-}
-
-/// The inferred type of the receiver expression ending at global offset `hi` (the
-/// widest one, so `foo.bar.method` uses `foo.bar`). Mirrors completion's receiver
-/// lookup.
-fn receiver_type_at(full: &FullAnalysis, hi: usize) -> Option<Type> {
-    full.typed
-        .expressions
-        .iter()
-        .filter(|e| e.span.hi == hi)
-        .min_by_key(|e| e.span.lo)
-        .map(|e| e.ty.clone())
 }
 
 /// The signature of method `name` declared on the record type `recv_ty` resolves

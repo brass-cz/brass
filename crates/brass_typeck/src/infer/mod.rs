@@ -441,6 +441,11 @@ pub struct Inference {
     /// The same for methods, keyed by (type name, method name). Covers both an
     /// unannotated return and the open Err payload of a `T!` one.
     pub method_returns: HashMap<(String, String), Type>,
+    /// Unambiguous display-only closure-parameter instantiations, var id ->
+    /// observed type (see `Checker::record_closure_binding`). The language
+    /// server substitutes these into the typed sidecar before rendering; the
+    /// compile pipeline ignores them.
+    pub closure_bindings: HashMap<u32, Type>,
     /// This run's cross-module tables, extracted for reuse as a context seed
     /// (see [`ContextTables`]); meaningful to reapply only when this was a
     /// context-only, error-free run.
@@ -823,6 +828,7 @@ pub fn analyze_generated(
         .iter()
         .map(|(span, ty)| (*span, checker.resolve(ty)))
         .collect();
+    let closure_bindings = checker.finalized_closure_bindings();
     Inference {
         errors: checker.errors,
         warnings: checker.warnings,
@@ -839,6 +845,7 @@ pub fn analyze_generated(
         null_props: checker.null_props,
         function_returns,
         method_returns,
+        closure_bindings,
         context_tables: seed.clone(),
     }
 }
@@ -1280,6 +1287,7 @@ pub(crate) fn analyze_inner(
             (*s, t)
         })
         .collect();
+    let closure_bindings = checker.finalized_closure_bindings();
     (
         Inference {
             errors: checker.errors,
@@ -1297,6 +1305,7 @@ pub(crate) fn analyze_inner(
             null_props: checker.null_props,
             function_returns,
             method_returns,
+            closure_bindings,
             context_tables,
         },
         final_delta,
@@ -1820,6 +1829,17 @@ struct Checker<'a> {
     fields_loops: HashMap<Span, Vec<String>>,
     /// Resolved type names of checked `typeof(x)` calls, keyed by call span.
     type_names: HashMap<Span, String>,
+    /// Display-only observations of what each application of a Fun-typed value
+    /// instantiated its open parameter variables to, var id -> observed type.
+    /// The solver deliberately never learns these (see
+    /// `Checker::record_closure_binding`); `None` poisons a variable observed
+    /// at two different types (a genuinely polymorphic closure).
+    closure_bindings: HashMap<u32, Option<Type>>,
+    /// Nesting depth of display-only closure re-checks (see
+    /// `Checker::recheck_closure_args`). While positive, the MIR span
+    /// channels do not record (their conflict-poisoning must not fire on
+    /// display work) and body elaborations are not memoized.
+    display_recheck_depth: u32,
     /// Spans of `expr!` operators whose operand is a NULLABLE (not a `Result`):
     /// the null case propagates as `Result.Null`. MIR lowering emits the
     /// presence-test shape for exactly these spans (see [`Inference::null_props`]).
@@ -2069,6 +2089,8 @@ impl<'a> Checker<'a> {
             sum_views: HashMap::default(),
             fields_loops: HashMap::default(),
             type_names: HashMap::default(),
+            closure_bindings: HashMap::default(),
+            display_recheck_depth: 0,
             null_props: HashSet::default(),
             in_entry_main: false,
             static_divergence: false,
@@ -2814,6 +2836,20 @@ impl<'a> Checker<'a> {
     /// substitution (so a `HashMap`'s `_entries` element pinned by a later `push`
     /// shows its concrete type) -- and preserves the `ConstOf` wrapper, so
     /// constness is unchanged.
+    /// The unambiguous closure-parameter observations, resolved against the
+    /// final substitution (later unification may have pinned parts of an
+    /// observed type). Conflict-poisoned and still-open observations are
+    /// dropped; consumers fall back to rendering the variable as unknown.
+    fn finalized_closure_bindings(&self) -> HashMap<u32, Type> {
+        self.closure_bindings
+            .iter()
+            .filter_map(|(var, ty)| {
+                let ty = self.solver.resolve(ty.as_ref()?);
+                (!matches!(ty, Type::Unknown(_))).then_some((*var, ty))
+            })
+            .collect()
+    }
+
     fn finalize_typed(&mut self) {
         let resolved: Vec<Type> = self
             .typed

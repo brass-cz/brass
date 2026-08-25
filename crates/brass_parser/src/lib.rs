@@ -400,6 +400,33 @@ mod tests {
     }
 
     #[test]
+    fn recovery_keeps_a_function_left_unclosed_at_end_of_input() {
+        // A body still being typed (no closing brace yet) keeps the function
+        // and its parsed statements in the recovered AST; only the missing
+        // brace is reported. Editor features rely on the partial body.
+        let src = "fun f() -> int32 {\n    let x = 1\n    return x\n";
+        let (m, errors) = crate::parse_recovering(src, 0);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("expected '}'"));
+        assert_eq!(m.items.len(), 1);
+        let TopLevel::Fun(f) = &m.items[0] else {
+            panic!("expected a function");
+        };
+        assert_eq!(f.body.stmts.len(), 2);
+    }
+
+    #[test]
+    fn recovery_closes_nested_blocks_at_end_of_input() {
+        // Every open block closes at end of input, so a statement inside a
+        // half-typed `if` survives too.
+        let src = "fun f() {\n    if true {\n        let x = 1\n";
+        let (m, errors) = crate::parse_recovering(src, 0);
+        // One missing '}' per open block.
+        assert_eq!(errors.len(), 2, "errors: {errors:?}");
+        assert_eq!(m.items.len(), 1);
+    }
+
+    #[test]
     fn recovery_is_capped() {
         // A pathological file stops at the error cap instead of flooding.
         let src = "let a = )\n".repeat(100);

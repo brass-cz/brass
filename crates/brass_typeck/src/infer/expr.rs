@@ -190,6 +190,16 @@ impl<'a> Checker<'a> {
         // body returns through the `return` context handled above.
         if !matches!(body, Expr::Block(..)) {
             self.expect_expr_assignable(&body_val, want_ret, body);
+            // A display re-check (see `recheck_closure_args`) checks against
+            // its OWN fresh return variable; the probe above commits nothing,
+            // so bind the body value here for the harvest that feeds the
+            // enclosing call's result. Ordinary checking must stay
+            // probe-only: an open expected return there can belong to a
+            // caller structure that stays deliberately polymorphic.
+            if self.display_recheck_depth > 0 && matches!(self.resolve(want_ret), Type::Unknown(_))
+            {
+                let _ = self.solver.unify(want_ret, &body_val);
+            }
         }
         let ty = Type::Fun(param_types, Box::new(want_ret.clone()));
         self.record_expr_type(expr, &ty);
@@ -281,6 +291,9 @@ impl<'a> Checker<'a> {
     /// forced onto the `Result` instance, which then returns (or renders) the
     /// whole `Result` where its Ok payload was meant.
     pub(super) fn record_prop_kind(&mut self, span: brass_parser::Span, kind: PropKind) {
+        if self.display_recheck_depth > 0 {
+            return;
+        }
         self.journal_elaboration(ElaborationJournalEntry::PropKind(span, kind));
         match self.prop_kinds.get(&span) {
             None => {
@@ -310,6 +323,9 @@ impl<'a> Checker<'a> {
     /// lift (or drop the wrap of the one that must). Only called once the
     /// payload type is resolved, so the template elaboration stays silent.
     pub(super) fn record_lift_kind(&mut self, span: brass_parser::Span, lifted: bool) {
+        if self.display_recheck_depth > 0 {
+            return;
+        }
         self.journal_elaboration(ElaborationJournalEntry::LiftKind(span, lifted));
         if self.lift_poisoned.contains(&span) {
             return;
@@ -977,6 +993,9 @@ impl<'a> Checker<'a> {
     /// shared generic body whose instantiations pin a hole differently (one
     /// lowering serves them all, so no single pattern would be right).
     pub(super) fn record_type_test(&mut self, span: brass_parser::Span, pattern: &Type) {
+        if self.display_recheck_depth > 0 {
+            return;
+        }
         self.journal_elaboration(ElaborationJournalEntry::TypeTest(span, pattern.clone()));
         if self.type_test_poisoned.contains(&span) {
             return;

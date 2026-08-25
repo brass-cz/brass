@@ -104,6 +104,12 @@ pub struct Analysis {
     pub function_returns: fxhash::FxHashMap<String, brass_hir::Type>,
     /// The same for methods, keyed by (type name, method name).
     pub method_returns: fxhash::FxHashMap<(String, String), brass_hir::Type>,
+    /// Unambiguous display-only closure-parameter instantiations, var id ->
+    /// observed type. A closure application's unification is local to the
+    /// call (committing it would defeat let-polymorphism), so the typed
+    /// sidecar keeps the open variable; the language server substitutes these
+    /// observations in before rendering. The compile pipeline ignores them.
+    pub closure_bindings: fxhash::FxHashMap<u32, brass_hir::Type>,
     /// The run's cross-module tables, reusable as a context seed when this was
     /// a context-only, error-free run (see [`infer::ContextTables`]).
     pub context_tables: infer::ContextTables,
@@ -197,6 +203,22 @@ pub fn context_seed_with(program: &Program, seed: Option<&ContextTables>) -> Opt
     Some(analysis.context_tables)
 }
 
+/// Editor mode: when enabled, analysis additionally re-checks closure
+/// arguments at their observed parameter instantiations so the typed sidecar
+/// carries concrete types for closure bodies (see
+/// `Checker::recheck_closure_args`). Display-only work with its own
+/// diagnostics dropped and the MIR span channels suppressed; compilers must
+/// leave this off (the default). Set once by the language server at startup.
+static EDITOR_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_editor_mode(enabled: bool) {
+    EDITOR_MODE.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn editor_mode() -> bool {
+    EDITOR_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Run all static checks and collect the typed-expression sidecar.
 pub fn analyze(program: &Program) -> Analysis {
     analyze_with(program, None)
@@ -241,6 +263,7 @@ pub fn analyze_generated(
         null_props: infer.null_props,
         function_returns: infer.function_returns,
         method_returns: infer.method_returns,
+        closure_bindings: infer.closure_bindings,
         context_tables: infer.context_tables,
     }
 }
@@ -346,6 +369,7 @@ fn analyze_impl(
         null_props: infer.null_props,
         function_returns: infer.function_returns,
         method_returns: infer.method_returns,
+        closure_bindings: infer.closure_bindings,
         context_tables: infer.context_tables,
     }
 }
@@ -1233,6 +1257,56 @@ mod tests {
             "{prog}fun main() {{\n    let s = Slots.new()\n    s.put(\"a\", 7)\n    let x: int32? = s.value_at()\n}}\n"
         ));
         assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    /// A closure applied (through a generic callee) at exactly one type gets a
+    /// display-only observation: the parameter variable maps to the argument
+    /// type in `closure_bindings`, while the sidecar keeps the open variable
+    /// (the application must not commit -- let-polymorphism).
+    #[test]
+    fn closure_binding_observed_at_single_application() {
+        let a = analysis(
+            "fun apply(f, x) {\n    return f(x)\n}\n\
+             fun main() {\n    let y = apply((v) -> v, 3)\n}\n",
+        );
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        let v = a
+            .typed
+            .expressions
+            .iter()
+            .find(|e| matches!(&e.kind, brass_hir::TypedExprKind::Ident(n) if n == "v"))
+            .expect("typed entry for v");
+        let brass_hir::Type::Unknown(id) = v.ty else {
+            panic!("v stays an open variable in the sidecar: {:?}", v.ty);
+        };
+        let observed = a.closure_bindings.get(&id).expect("observation for v");
+        assert!(
+            !matches!(observed, brass_hir::Type::Unknown(_)),
+            "{observed:?}"
+        );
+    }
+
+    /// The same closure applied at two different types is genuinely
+    /// polymorphic: the observation is poisoned and dropped, so display falls
+    /// back to the open variable (and neither application errors).
+    #[test]
+    fn closure_binding_poisoned_on_conflicting_applications() {
+        let a = analysis(
+            "fun apply(f, x) {\n    return f(x)\n}\n\
+             fun main() {\n    let id = (v) -> v\n    let a = apply(id, 3)\n    let b = apply(id, \"s\")\n}\n",
+        );
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        for e in &a.typed.expressions {
+            if let (brass_hir::TypedExprKind::Ident(n), brass_hir::Type::Unknown(id)) =
+                (&e.kind, &e.ty)
+                && n == "v"
+            {
+                assert!(
+                    !a.closure_bindings.contains_key(id),
+                    "conflicting observations must poison var {id}"
+                );
+            }
+        }
     }
 
     #[test]

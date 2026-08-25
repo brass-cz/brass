@@ -76,6 +76,7 @@ impl<'a> Checker<'a> {
         // return instead of consulting or populating the body memo.
         let memo_enabled = !self.co_checking
             && self.type_test_holes.is_empty()
+            && self.display_recheck_depth == 0
             && !self.instantiating.contains(&key);
         let memo_key = memo_enabled
             .then(|| self.elaboration_memo_key("fn", symbol, None, arg_types, &[]))
@@ -527,6 +528,7 @@ impl<'a> Checker<'a> {
         // bindings for its holes. Recursive calls must take the fallback path.
         let memo_enabled = !self.co_checking
             && self.type_test_holes.is_empty()
+            && self.display_recheck_depth == 0
             && !self.instantiating.contains(&key);
         let memo_key = memo_enabled.then(|| {
             receiver_ty
