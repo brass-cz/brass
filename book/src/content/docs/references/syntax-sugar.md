@@ -99,6 +99,15 @@ b()!
     [main.cz:2:12] unhandled error: error in a
 ```
 
+Nullable values have a compiler-provided method with the same intent and
+implicit location parameter. For a non-Result receiver, `T?.context(message)`
+produces `T!`: a present value becomes `Ok`, while `null` produces the same
+`Error { value: message, location: <call site>, frames: [] }` as
+`error(message)`. For the explicit two-layer receiver `Result<T, E>?`, the
+return is flattened to `Result<T, E>`. An outer `null` produces that traced
+error, an existing `Err` goes through `Result.context` and gains a `Frame`, and
+an `Ok` passes through unchanged. No nested `Result<Result<...>>` is created.
+
 Two mechanisms make this work:
 
 - **The implicit location parameter.** A callable whose _last_ parameter is

@@ -1432,6 +1432,7 @@ fn judge_fatal(
 #[cfg(jit_backend)]
 struct LazyState {
     events: tokio::sync::mpsc::UnboundedReceiver<brass_typeck::stream::CheckEvent>,
+    sources: brass_resolve::SourceMap,
     merged: MergedChannels,
     checked_fns: HashSet<String>,
     inits_checked: usize,
@@ -1439,6 +1440,10 @@ struct LazyState {
     /// error unless execution needs the body it lives in (see
     /// [`LazyState::fatal`] and [`BodySpans`]).
     held: Vec<brass_typeck::TypeError>,
+    /// Warnings are printed as soon as their body delta arrives. The set keeps
+    /// terminal and generated-continuation snapshots from printing a warning
+    /// already delivered by an earlier window.
+    printed_warnings: HashSet<(String, Span)>,
     /// The bodies execution needs: `main`, plus every demanded function.
     /// (Top-level code needs no entry here -- its spans lie outside every
     /// body, which is always fatal.) Grows at each demand; held errors are
@@ -1550,6 +1555,7 @@ impl LazyState {
     /// content marks the current lowering stale.
     fn absorb_delta(&mut self, d: &brass_typeck::stream::ChannelDelta) {
         self.held.extend(d.errors.iter().cloned());
+        self.emit_warnings(&d.warnings);
         if !d.keyed_calls.is_empty() {
             if self.entry_open {
                 // Per-demand specialization is future work; before execution
@@ -1595,6 +1601,19 @@ impl LazyState {
         d.typeof_types_removed.iter().for_each(|span| mark(*span));
         d.type_tests.iter().for_each(|(span, _)| mark(*span));
         d.type_tests_removed.iter().for_each(|span| mark(*span));
+    }
+
+    fn emit_warnings(&mut self, warnings: &[brass_typeck::TypeError]) {
+        let fresh: Vec<(String, Span)> = warnings
+            .iter()
+            .filter_map(|warning| {
+                let key = (warning.message.clone(), warning.span);
+                self.printed_warnings.insert(key.clone()).then_some(key)
+            })
+            .collect();
+        for line in render_warnings(&fresh, &self.sources) {
+            eprintln!("{line}");
+        }
     }
 
     /// Refresh only stale free-function MIR. `false` asks the caller to rebuild
@@ -2227,10 +2246,12 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         .collect();
     let mut lazy = LazyState {
         events: events_rx,
+        sources: front.sources.clone(),
         merged: MergedChannels::default(),
         checked_fns: HashSet::default(),
         inits_checked: 0,
         held: Vec::new(),
+        printed_warnings: HashSet::default(),
         needed: HashSet::from_iter(["main".to_string()]),
         stop,
         paused,
@@ -2253,6 +2274,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         // skipped body immediately, and counting those events keeps one
         // bookkeeping path.
         lazy.merged = MergedChannels::from_snapshot(snap);
+        lazy.emit_warnings(&snap.warnings);
     }
     let resumed = resume.is_some();
     let resume_entry: Option<&Path> = resumed.then_some(entry_path.as_path());
@@ -3098,8 +3120,8 @@ struct FrontEnd {
     /// Byte-offset base the entry source was parsed at (identifies the entry
     /// in `sources` when hashing the context).
     entry_base: usize,
-    /// Clean-program warnings (spawn auto-acquire notes), already printed;
-    /// carried for the cache payload so warm runs replay them.
+    /// Driver-side clean-program warnings (spawn auto-acquire notes), already
+    /// printed; checker warnings join them after analysis for cache replay.
     warnings: Vec<String>,
     /// Qualified-use and spawn-ownership diagnostics: not fatal on their own
     /// here -- they abort the analysis together with lowering and type
@@ -3203,11 +3225,12 @@ fn check_front(
     };
     let entry_path = PathBuf::from(main_label);
     let ctx_key = front_context_key(&front);
+    let streaming = sched.is_some();
     let FrontEnd {
         modules,
         sources,
         entry_base: _,
-        warnings,
+        mut warnings,
         errors: front_errors,
     } = front;
 
@@ -3316,6 +3339,20 @@ fn check_front(
     for e in &analysis.errors {
         errors.push((e.message.clone(), e.span));
     }
+    let mut checker_warnings: Vec<(String, Span)> = analysis
+        .warnings
+        .iter()
+        .map(|warning| (warning.message.clone(), warning.span))
+        .collect();
+    checker_warnings.sort_by(|a, b| (a.1.lo, &a.0).cmp(&(b.1.lo, &b.0)));
+    checker_warnings.dedup();
+    let rendered_warnings = render_warnings(&checker_warnings, &sources);
+    if !streaming {
+        for warning in &rendered_warnings {
+            eprintln!("{warning}");
+        }
+    }
+    warnings.extend(rendered_warnings);
     tracing::debug!(errors = errors.len(), "front-end analysis complete");
     if !errors.is_empty() {
         errors.sort_by(|a, b| (a.1.lo, &a.0).cmp(&(b.1.lo, &b.0)));
@@ -3423,6 +3460,7 @@ fn analysis_channel_delta(
             .map(|(span, ty)| (*span, ty.clone()))
             .collect(),
         errors: analysis.errors.clone(),
+        warnings: analysis.warnings.clone(),
         ..Default::default()
     }
 }
@@ -3529,6 +3567,16 @@ fn specialize_keyed(
                 .extend(continuation.errors.into_iter().map(|mut error| {
                     error.span = brass_hir::unshift_span(error.span);
                     error
+                }));
+            analysis
+                .warnings
+                .extend(continuation.warnings.into_iter().map(|mut warning| {
+                    warning.span = brass_hir::unshift_span(warning.span);
+                    warning.message =
+                        brass_typeck::remap_diagnostic_source_offsets(&warning.message, |offset| {
+                            brass_hir::unshift_span(Span::new(offset, offset)).lo
+                        });
+                    warning
                 }));
         }
         pending = next_pending;
@@ -3789,6 +3837,10 @@ fn render_errors(errors: &[(String, Span)], sources: &brass_resolve::SourceMap) 
     render_diagnostics(errors, sources, "error")
 }
 
+fn render_warnings(warnings: &[(String, Span)], sources: &brass_resolve::SourceMap) -> Vec<String> {
+    render_diagnostics(warnings, sources, "warning")
+}
+
 fn render_diagnostics(
     items: &[(String, Span)],
     sources: &brass_resolve::SourceMap,
@@ -3796,6 +3848,11 @@ fn render_diagnostics(
 ) -> Vec<String> {
     let mut out = Vec::with_capacity(items.len());
     for (msg, span) in items {
+        let msg = brass_typeck::render_diagnostic_message(msg, |offset| {
+            let loc = sources.locate(offset)?;
+            let (line, col) = line_col(loc.src, loc.local);
+            Some(format!("{}:{line}:{col}", loc.label))
+        });
         match sources.locate(span.lo) {
             Some(loc) => {
                 let (line, col) = line_col(loc.src, loc.local);

@@ -214,6 +214,18 @@ impl<'p> ProgramCtx<'p> {
         self.null_props.contains(&span)
     }
 
+    /// The inner value at a call the checker resolved as nullable. Method
+    /// lowering uses this evidence to distinguish the compiler-owned nullable
+    /// `context` from the ordinary `Result.context` declaration with the same
+    /// name.
+    fn nullable_receiver_inner(&self, span: Span) -> Option<Type> {
+        let receiver = self.receiver_types.get(&span)?;
+        match brass_hir::peel_modes(receiver) {
+            Type::Nullable(inner) => Some((**inner).clone()),
+            _ => None,
+        }
+    }
+
     /// The parent sum instance the checker recorded for the value expression
     /// at `span`, when that value flows as a declared sum subtype.
     fn sum_view_target(&self, span: Span) -> Option<&Type> {
@@ -1090,10 +1102,7 @@ fn lower_function_into(ctx: &ProgramCtx, out: &mut MirProgram, info: &brass_hir:
         &info.decl.body,
         entry_main,
     );
-    body.declared_fallible = matches!(
-        info.decl.ret,
-        Some(brass_parser::ast::TypeExpr::Fallible(..))
-    );
+    body.declared_fallible = info.decl.ret.as_ref().is_some_and(annotation_is_fallible);
     let fallible = if entry_main && info.decl.ret.is_none() {
         crate::analysis::constructs_error_block(&info.decl.body)
     } else {
@@ -1226,7 +1235,7 @@ fn lower_method(
         body,
         false,
     );
-    mir_body.declared_fallible = matches!(ret, Some(brass_parser::ast::TypeExpr::Fallible(..)));
+    mir_body.declared_fallible = ret.is_some_and(annotation_is_fallible);
     MirMethod {
         type_name: info.name.clone(),
         type_symbol: info.symbol.clone(),
@@ -1258,9 +1267,20 @@ fn function_fallible(
     null_props: &fxhash::FxHashSet<Span>,
 ) -> bool {
     match ret {
-        Some(brass_parser::ast::TypeExpr::Fallible(..)) => true,
+        Some(ret) if annotation_is_fallible(ret) => true,
         Some(_) => false,
         None => crate::analysis::fallible_block_except(body, null_props),
+    }
+}
+
+/// Whether a return annotation explicitly contains the Result layer. The
+/// nullable suffix may wrap it (`T!?`), but that outer layer must not disable
+/// the ordinary fallible return and propagation lowering.
+fn annotation_is_fallible(ret: &brass_parser::ast::TypeExpr) -> bool {
+    match ret {
+        brass_parser::ast::TypeExpr::Fallible(..) => true,
+        brass_parser::ast::TypeExpr::Nullable(inner, _) => annotation_is_fallible(inner),
+        _ => false,
     }
 }
 

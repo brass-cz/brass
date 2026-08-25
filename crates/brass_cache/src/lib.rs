@@ -49,7 +49,7 @@ use brass_parser::Span;
 
 /// Bumped whenever the payload layout changes, so an old file is discarded by
 /// the header check instead of misread by postcard (which carries no schema).
-pub const FORMAT_VERSION: u16 = 8;
+pub const FORMAT_VERSION: u16 = 9;
 
 /// Leading magic, so a foreign file is rejected before any decoding.
 const MAGIC: &[u8; 8] = b"PPCACHE\0";
@@ -342,8 +342,9 @@ pub struct Payload {
     /// Storing them keeps a cache hit to deterministic HIR lowering with no
     /// type-checker or specializer work.
     pub generated: Vec<brass_hir::GeneratedDecl>,
-    /// Diagnostics the full pipeline prints for a CLEAN program (the spawn
-    /// auto-acquire notes); replayed on a hit so warm runs warn identically.
+    /// Diagnostics the full pipeline prints for a CLEAN program (checker
+    /// warnings and spawn auto-acquire notes); replayed on a hit so warm runs
+    /// warn identically.
     pub warnings: Vec<String>,
     pub channels: Channels,
 }

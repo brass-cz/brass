@@ -207,12 +207,13 @@ fn runnable_book_fences_typecheck() {
             .args(["check", program.to_str().expect("UTF-8 temporary path")])
             .output()
             .expect("check book example");
-        if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() || stderr.contains(": warning:") {
             failures.push(format!(
                 "{}:{}\n{}",
                 example.source_path.display(),
                 example.line,
-                String::from_utf8_lossy(&output.stderr)
+                stderr
             ));
         }
     }

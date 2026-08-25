@@ -88,6 +88,19 @@ const PARITY_CASES: &[&str] = &[
     "e2e_tests/control_flow/type_test_dispatch.cz",
     "e2e_tests/control_flow/type_test_chain.cz",
     "e2e_tests/control_flow/type_test_structural.cz",
+    // Nullable context must take the same plain-value and Result paths in both
+    // runtimes, including mutation of an existing Error's frame array.
+    "e2e_tests/references/nullable_context_success.cz",
+    "e2e_tests/references/nullable_result_context_flatten.cz",
+    "e2e_tests/regex/title_context.cz",
+];
+
+/// Failure cases keep their non-zero status and exact rendered trace across
+/// back ends; comparing stderr catches location or frame-order drift that a
+/// successful parity case cannot expose.
+const PARITY_ERROR_CASES: &[&str] = &[
+    "e2e_tests/references/nullable_context_failure.cz",
+    "e2e_tests/regex/title_context_missing.cz",
 ];
 
 #[test]
@@ -103,6 +116,20 @@ fn repl_matches_jit_on_supported_examples() {
             jit_out, repl_out,
             "REPL and JIT stdout differ for {ex}\nJIT:\n{jit_out}\nREPL:\n{repl_out}",
         );
+    }
+}
+
+#[test]
+fn repl_matches_jit_on_nullable_context_errors() {
+    let root = repo_root();
+    for ex in PARITY_ERROR_CASES {
+        let path = format!("{root}/{ex}");
+        let (jit_ok, jit_out, jit_err) = run_mode("run", &path);
+        let (repl_ok, repl_out, repl_err) = run_mode("repl", &path);
+        assert!(!jit_ok, "JIT unexpectedly succeeded for {ex}");
+        assert!(!repl_ok, "REPL unexpectedly succeeded for {ex}");
+        assert_eq!(jit_out, repl_out, "stdout differs for {ex}");
+        assert_eq!(jit_err, repl_err, "error trace differs for {ex}");
     }
 }
 

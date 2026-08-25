@@ -1,0 +1,7 @@
+fun missing() -> int32? {
+    return null
+}
+
+fun main() {
+    missing().context("required number")!
+}

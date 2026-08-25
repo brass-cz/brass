@@ -19,8 +19,17 @@ use brass_parser::ast::{
     TypeDecl, TypeExpr,
 };
 
-/// A single diagnostic: a message and the global span it is reported at.
-pub type Diag = (String, Span);
+/// Severity retained by the incremental diagnostic cache. The type checker
+/// intentionally keeps errors and warnings as separate `TypeError` vectors;
+/// this enum exists only at the LSP boundary where protocol severity is needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagSeverity {
+    Error,
+    Warning,
+}
+
+/// A single diagnostic: message, global source span, and LSP-facing severity.
+pub type Diag = (String, Span, DiagSeverity);
 
 /// What kind of top-level construct an item is. The synthetic `Init` item
 /// gathers every module-level statement into one unit.

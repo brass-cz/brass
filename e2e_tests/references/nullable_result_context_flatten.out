@@ -1,0 +1,4 @@
+ok 42
+[e2e_tests/references/nullable_result_context_flatten.cz:13:11] unhandled error: layer unavailable
+[e2e_tests/references/nullable_result_context_flatten.cz:13:11] unhandled error: layer unavailable
+    [e2e_tests/references/nullable_result_context_flatten.cz:5:16] unhandled error: original failure

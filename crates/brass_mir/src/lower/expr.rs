@@ -26,6 +26,7 @@ use crate::value::{Callee, Literal, Operand, Place, Projection, Rvalue};
 /// `Var` -- seeding them is unnecessary and perturbs value ownership.
 fn is_seedable_result(ty: &Type) -> bool {
     matches!(ty, Type::Record(_) | Type::Sum(_))
+        || matches!(ty, Type::Nullable(inner) if matches!(inner.as_ref(), Type::Record(_) | Type::Sum(_)))
 }
 
 /// Whether a checker-resolved array-literal type must be seeded onto its result
@@ -95,6 +96,12 @@ impl<'a, 'p> FnLower<'a, 'p> {
             }
             Expr::Binary(op, a, b, _) => self.lower_binary(*op, a, b),
             Expr::Call(callee, args, span) => {
+                if let Expr::Field(base, method, _) = &**callee
+                    && method == "context"
+                    && self.ctx.nullable_receiver_inner(*span).is_some()
+                {
+                    return self.lower_nullable_context(base, args, *span);
+                }
                 let rv = self.lower_call(callee, args, *span);
                 // A call whose checker-resolved result is a constructed aggregate
                 // (a record/sum/array) seeds its result local `Known`, so the back
@@ -149,6 +156,91 @@ impl<'a, 'p> FnLower<'a, 'p> {
             Expr::Match(scrut, arms, _) => self.lower_match(scrut, arms),
             Expr::Block(b, _) => self.lower_block_value(b),
         }
+    }
+
+    /// Expand nullable context into explicit control flow. The missing arm
+    /// calls the prelude `error` function so its Error construction and caller
+    /// location stay canonical; the present Result arm calls the unchanged
+    /// `Result.context`, preserving its frame-append policy.
+    fn lower_nullable_context(&mut self, base: &Expr, args: &[Arg], span: Span) -> Operand {
+        let base = self.lower_expr(base);
+        let receiver = self.b.make_local(base);
+        let lowered_args = self.lower_args(args);
+        let message = lowered_args.first().cloned().unwrap_or_else(Operand::void);
+        let location = lowered_args
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| self.location_operand(span));
+        let result = match self.ctx.expr_type(span) {
+            Some(ty) if is_seedable_result(ty) => self.b.fresh_local_typed(None, ty.clone()),
+            _ => self.b.fresh_local(None),
+        };
+        let present = self.b.emit(Rvalue::Call(
+            Callee::Builtin("__nullable_context_present".into()),
+            vec![Operand::Local(receiver)],
+        ));
+        let value_bb = self.b.new_block();
+        let missing_bb = self.b.new_block();
+        let merge_bb = self.b.new_block();
+        self.b.terminate(Terminator::CondBranch {
+            cond: present,
+            then: value_bb,
+            els: missing_bb,
+        });
+
+        self.b.switch_to(value_bb);
+        let value = self.b.emit(Rvalue::Call(
+            Callee::Builtin("__nonnull".into()),
+            vec![Operand::Local(receiver)],
+        ));
+        let result_pattern = Type::Sum(brass_hir::NominalType::new(
+            brass_hir::RESULT_TYPE_ID,
+            brass_hir::RESULT_TYPE_NAME,
+        ));
+        let is_result = self.b.emit(Rvalue::TypeTest(value.clone(), result_pattern));
+        let result_bb = self.b.new_block();
+        let plain_bb = self.b.new_block();
+        self.b.terminate(Terminator::CondBranch {
+            cond: is_result,
+            then: result_bb,
+            els: plain_bb,
+        });
+
+        self.b.switch_to(result_bb);
+        let contextualized = self.b.emit(Rvalue::Call(
+            Callee::Method("context".into()),
+            vec![value.clone(), message.clone(), location.clone()],
+        ));
+        self.b
+            .push(MirStmt::Assign(result, Rvalue::Use(contextualized)));
+        self.b.terminate(Terminator::Goto(merge_bb));
+
+        self.b.switch_to(plain_bb);
+        let ok = self.b.emit(Rvalue::Variant {
+            ty: "Result".to_string(),
+            variant: "Ok".to_string(),
+            fields: vec![("value".to_string(), value)],
+        });
+        self.b.push(MirStmt::Assign(result, Rvalue::Use(ok)));
+        self.b.terminate(Terminator::Goto(merge_bb));
+
+        self.b.switch_to(missing_bb);
+        let missing_result = match self.ctx.resolve_fn_symbol(&self.module, "error") {
+            Some(error) => self
+                .b
+                .emit(Rvalue::Call(Callee::Free(error), vec![message, location])),
+            None => self.b.emit(Rvalue::Variant {
+                ty: "Result".to_string(),
+                variant: "Err".to_string(),
+                fields: vec![("error".to_string(), message)],
+            }),
+        };
+        self.b
+            .push(MirStmt::Assign(result, Rvalue::Use(missing_result)));
+        self.b.terminate(Terminator::Goto(merge_bb));
+
+        self.b.switch_to(merge_bb);
+        Operand::Local(result)
     }
 
     /// Rebuild `source` (a value of a declared sum subtype) as its parent sum

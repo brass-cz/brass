@@ -190,6 +190,12 @@ fn check_success_mode(bin: &str, pp: &Path, expected: &str, eager: bool) {
         out.status.code(),
         String::from_utf8_lossy(&out.stderr),
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains(": warning:"),
+        "{} produced an unpinned checker warning:\n{stderr}",
+        pp.display(),
+    );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         expected,
@@ -329,6 +335,110 @@ fn eager_flag_matches_the_lazy_pipeline() {
         String::from_utf8_lossy(&lazy.stdout),
         String::from_utf8_lossy(&eager.stdout),
     );
+}
+
+#[test]
+fn checker_warning_is_nonfatal_and_replayed_from_cache() {
+    let bin = env!("CARGO_BIN_EXE_brass");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "checker_warning_cache-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).expect("create warning cache directory");
+    let source = root.join("mixed.cz");
+    fs::write(
+        &source,
+        concat!(
+            "fun mixed(c: int32) {\n",
+            "    if c == 1 {\n",
+            "        error(\"a\")!\n",
+            "    } else if c == 2 {\n",
+            "        null!\n",
+            "    }\n",
+            "    return 7\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "    let result = mixed(0)\n",
+            "    if result {\n",
+            "        match result {\n",
+            "            Ok { value } => println(value),\n",
+            "            Err { error } => println(error),\n",
+            "        }\n",
+            "    }\n",
+            "}\n",
+        ),
+    )
+    .expect("write warning program");
+    let run = || {
+        Command::new(bin)
+            .env("BRASS_CACHE", "on")
+            .arg("--eager")
+            .arg(&source)
+            .output()
+            .expect("run warning program")
+    };
+    let expected_warning = format!(
+        "{}:1:1: warning: `mixed` returns `Result<int32, Error>?`: the body \
+         propagates both null ({}:5:9) and errors ({}:3:9), so callers must unwrap two \
+         layers; convert the null with `.context(message)` or annotate the return type\n",
+        source.display(),
+        source.display(),
+        source.display(),
+    );
+
+    let cold = run();
+    assert!(
+        cold.status.success(),
+        "cold warning run failed: {}",
+        String::from_utf8_lossy(&cold.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&cold.stdout), "7\n");
+    assert_eq!(String::from_utf8_lossy(&cold.stderr), expected_warning);
+    assert!(
+        source.with_extension("czcache").is_file(),
+        "the clean warning run should populate the cache"
+    );
+
+    let warm = run();
+    assert!(warm.status.success(), "warm warning run failed");
+    assert_eq!(warm.stdout, cold.stdout);
+    assert_eq!(warm.stderr, cold.stderr, "cache replay must be identical");
+
+    for (mode, args, expected_stdout) in [
+        ("lazy", vec![source.as_os_str()], "7\n"),
+        (
+            "check",
+            vec![std::ffi::OsStr::new("check"), source.as_os_str()],
+            "",
+        ),
+        (
+            "repl",
+            vec![std::ffi::OsStr::new("repl"), source.as_os_str()],
+            "7\n",
+        ),
+    ] {
+        let output = Command::new(bin)
+            .env("BRASS_CACHE", "off")
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("run {mode} warning program: {error}"));
+        assert!(
+            output.status.success(),
+            "{mode} warning run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected_stdout);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            expected_warning,
+            "{mode} must use the common warning formatter"
+        );
+    }
 }
 
 /// The interpreter's call-depth guard must fire before the host stack

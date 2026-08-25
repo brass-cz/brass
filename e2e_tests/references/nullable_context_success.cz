@@ -1,0 +1,10 @@
+fun choose(present: bool) -> string? {
+    if present {
+        return "Brass"
+    }
+    return null
+}
+
+fun main() {
+    println(choose(true).context("value is missing")!)
+}

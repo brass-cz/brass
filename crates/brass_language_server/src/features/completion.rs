@@ -36,7 +36,10 @@ use crate::analysis::world::{prelude_module_names, prelude_source};
 use crate::analysis::{DocAnalyzer, FullAnalysis};
 use crate::document::Document;
 use crate::features::hover::typedef_method_signatures;
-use crate::render::{UnknownNamer, is_public_member, render_signature, render_type};
+use crate::render::{
+    NULLABLE_CONTEXT_DOC, UnknownNamer, is_public_member, render_nullable_context_signature,
+    render_signature, render_type,
+};
 
 /// Built-in type names that are always in scope.
 const BUILTIN_TYPES: &[&str] = &[
@@ -458,6 +461,14 @@ fn value_member_items(
     ty: &Type,
     include_private: bool,
 ) -> Vec<CompletionItem> {
+    if let Some(signature) = render_nullable_context_signature(&full.program, ty, None) {
+        return vec![doc_item(
+            "context".to_string(),
+            CompletionItemKind::METHOD,
+            Some(signature),
+            Some(NULLABLE_CONTEXT_DOC),
+        )];
+    }
     let base = strip(ty);
     let mut items = Vec::new();
 

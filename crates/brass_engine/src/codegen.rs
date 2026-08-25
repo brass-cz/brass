@@ -1668,7 +1668,7 @@ pub trait Codegen {
             // nullable subject reaches runtime (non-nullable subjects fold in
             // `cond_static_truthiness`), where truthiness of a nullable is the
             // non-null test.
-            "__present" | "__null_prop_present" => {
+            "__present" | "__null_prop_present" | "__nullable_context_present" => {
                 let ty = operand_type_of(&args[0], &f.local_types);
                 let v = self.codegen_operand(program, f, &args[0], &ty);
                 self.truthy(v, &ty)
@@ -2415,7 +2415,7 @@ pub fn str_const(op: &Operand) -> Option<&str> {
 /// slot).
 fn builtin_result_type(name: &str, args: &[Operand], local_types: &[Type]) -> Option<Type> {
     match name {
-        "value_matches" | "result_is_ok" => Some(Type::Bool),
+        "value_matches" | "result_is_ok" | "__nullable_context_present" => Some(Type::Bool),
         "__deep_copy" => args.first().map(|op| operand_type_of(op, local_types)),
         "__nonnull" => args
             .first()

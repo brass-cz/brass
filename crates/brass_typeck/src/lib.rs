@@ -29,16 +29,70 @@ use brass_hir::{MethodInfo, NominalInfo, Program, TypeKind, TypedProgram, resolv
 use brass_parser::Span;
 use brass_parser::ast::*;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TypeError {
     pub message: String,
     pub span: Span,
+}
+
+const SOURCE_LOCATION_MARKER: char = '\u{1f}';
+
+/// Resolve source-offset placeholders carried by diagnostics whose messages
+/// mention secondary locations. Keeping those offsets inside the existing
+/// message-plus-span shape lets every diagnostic consumer render the same
+/// warning without introducing a richer public diagnostic model prematurely.
+pub fn render_diagnostic_message(
+    message: &str,
+    mut locate: impl FnMut(usize) -> Option<String>,
+) -> String {
+    let mut parts = message.split(SOURCE_LOCATION_MARKER);
+    let Some(first) = parts.next() else {
+        return message.to_string();
+    };
+    let mut rendered = first.to_string();
+    let mut location = true;
+    for part in parts {
+        if location {
+            let replacement = part
+                .parse()
+                .ok()
+                .and_then(&mut locate)
+                .unwrap_or_else(|| "unknown location".to_string());
+            rendered.push_str(&replacement);
+        } else {
+            rendered.push_str(part);
+        }
+        location = !location;
+    }
+    rendered
+}
+
+/// Remap source-offset placeholders without rendering them. Incremental
+/// consumers use this when an unchanged diagnostic moves with its containing
+/// source item, preserving accurate secondary locations until final display.
+pub fn remap_diagnostic_source_offsets(
+    message: &str,
+    mut remap: impl FnMut(usize) -> usize,
+) -> String {
+    render_diagnostic_message(message, |offset| Some(source_offset(remap(offset))))
+}
+
+fn source_offset(offset: usize) -> String {
+    format!("{SOURCE_LOCATION_MARKER}{offset}{SOURCE_LOCATION_MARKER}")
+}
+
+fn source_location(span: Span) -> String {
+    source_offset(span.lo)
 }
 
 /// Static checking result plus typed expression information.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Analysis {
     pub errors: Vec<TypeError>,
+    /// Non-fatal checker diagnostics. Warnings are sorted and deduplicated
+    /// independently from errors so an identical message in both channels
+    /// cannot suppress either diagnostic.
+    pub warnings: Vec<TypeError>,
     pub typed: TypedProgram,
     /// Per record-type generalized scheme (inferred type parameters and the
     /// field/method signatures over them), keyed by the type's source name. The
@@ -168,8 +222,12 @@ pub fn analyze_generated(
     let mut errors = infer.errors;
     errors.sort_by(|a, b| (a.span.lo, &a.message).cmp(&(b.span.lo, &b.message)));
     errors.dedup();
+    let mut warnings = infer.warnings;
+    warnings.sort_by(|a, b| (a.span.lo, &a.message).cmp(&(b.span.lo, &b.message)));
+    warnings.dedup();
     Analysis {
         errors,
+        warnings,
         typed: infer.typed,
         schemes: infer.schemes,
         view_args: infer.view_args,
@@ -262,6 +320,9 @@ fn analyze_impl(
     // adjacent and collapse in the dedup.
     errors.sort_by(|a, b| (a.span.lo, &a.message).cmp(&(b.span.lo, &b.message)));
     errors.dedup();
+    let mut warnings = infer.warnings;
+    warnings.sort_by(|a, b| (a.span.lo, &a.message).cmp(&(b.span.lo, &b.message)));
+    warnings.dedup();
     tracing::debug!(total = errors.len(), "type analysis finished");
     if let Some(ctl) = ctl {
         ctl.sched.emit(stream::CheckEvent::Finished(
@@ -271,6 +332,7 @@ fn analyze_impl(
     }
     Analysis {
         errors,
+        warnings,
         typed: infer.typed,
         schemes: infer.schemes,
         view_args: infer.view_args,
@@ -806,7 +868,7 @@ fn collect_expr(expr: &Expr, out: &mut Vec<TypeExpr>) {
 mod tests {
     use super::{Analysis, analyze, check, context_seed};
     use brass_hir::{Constness, IntKind, LoadedModule, Program, Type, TypedExprKind, lower};
-    use brass_parser::ast::BinOp;
+    use brass_parser::ast::{BinOp, TopLevel};
     use brass_parser::parse;
     use fxhash::FxHashSet as HashSet;
 
@@ -3464,6 +3526,119 @@ mod tests {
             "fun f(c: int32) {\n    if c == 0 {\n        return 1\n    } else if c == 1 {\n        error(\"a\")!\n    } else {\n        null!\n    }\n}\nfun main() {\n    let r = f(0)\n    if r {\n        match r {\n            Ok { value } => println(value),\n            Err { error } => println(error),\n        }\n    }\n}\n",
         );
         assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn implicit_nullable_result_warning_uses_signature_span_and_annotation_silences_it() {
+        let body = "\n    if c == 1 {\n        error(\"a\")!\n    } else if c == 2 {\n        null!\n    }\n    return 1\n";
+        let src = format!("fun mixed(c: int32) {{{body}}}\n");
+        let ast = parse(&src).expect("parse");
+        let TopLevel::Fun(function) = &ast.items[0] else {
+            panic!("expected function");
+        };
+        let signature_span = function.span;
+        let (program, lower_errors) = lower(&[LoadedModule {
+            is_prelude: false,
+            path: vec!["main".into()],
+            ast,
+        }]);
+        assert!(lower_errors.is_empty(), "lower errors: {lower_errors:?}");
+        let analyzed = analyze(&program);
+        assert!(analyzed.errors.is_empty(), "errors: {:?}", analyzed.errors);
+        let [warning] = analyzed.warnings.as_slice() else {
+            panic!("expected one warning, got {:?}", analyzed.warnings);
+        };
+        assert_eq!(warning.span, signature_span);
+        let message = super::render_diagnostic_message(&warning.message, |offset| {
+            Some(format!("offset:{offset}"))
+        });
+        assert!(
+            message.starts_with(
+                "`mixed` returns `Result<int32, string>?`: the body propagates both null (offset:"
+            ),
+            "{message}"
+        );
+        assert!(message.contains(") and errors (offset:"), "{message}");
+
+        let explicit = format!("fun mixed(c: int32) -> int32!? {{{body}}}\n");
+        let explicit = analysis(&explicit);
+        assert!(explicit.errors.is_empty(), "errors: {:?}", explicit.errors);
+        assert!(
+            explicit.warnings.is_empty(),
+            "explicit return annotations opt in to both layers: {:?}",
+            explicit.warnings
+        );
+    }
+
+    #[test]
+    fn nullable_context_rewrite_infers_one_result_layer_without_warning() {
+        let analyzed = analysis(
+            "fun maybe(c: int32) -> int32? {\n\
+                 if c > 0 { return c }\n\
+                 return null\n\
+             }\n\
+             fun rewritten(c: int32) {\n\
+                 if c == 0 { error(\"bad input\")! }\n\
+                 return maybe(c).context(\"missing value\")!\n\
+             }\n",
+        );
+        assert!(analyzed.errors.is_empty(), "errors: {:?}", analyzed.errors);
+        assert!(
+            analyzed.warnings.is_empty(),
+            "the suggested rewrite must remove the mixed-propagation warning: {:?}",
+            analyzed.warnings
+        );
+        assert_eq!(
+            analyzed.function_returns.get("rewritten"),
+            Some(&Type::result(Type::Int(IntKind::I32), Type::Str)),
+        );
+    }
+
+    #[test]
+    fn implicit_nullable_result_warning_covers_methods_but_not_forwarded_or_closure_flows() {
+        let method = analysis(
+            "type Box = { value: int32 }\n\
+             fun Box.mixed(self, c: int32) {\n\
+                 if c == 1 { error(\"a\")! } else if c == 2 { null! }\n\
+                 return self.value\n\
+             }\n",
+        );
+        assert!(method.errors.is_empty(), "errors: {:?}", method.errors);
+        assert_eq!(method.warnings.len(), 1, "warnings: {:?}", method.warnings);
+
+        let forwarded = analysis(
+            "fun source(c: int32) -> int32!? {\n\
+                 if c == 1 { error(\"a\")! } else if c == 2 { null! }\n\
+                 return null\n\
+             }\n\
+             fun forward(c: int32) -> int32!? { return source(c) }\n",
+        );
+        assert!(
+            forwarded.errors.is_empty(),
+            "errors: {:?}",
+            forwarded.errors
+        );
+        assert!(
+            forwarded.warnings.is_empty(),
+            "an annotation and a forwarded two-layer value are deliberate: {:?}",
+            forwarded.warnings
+        );
+
+        let closure = analysis(
+            "fun outer(c: int32) {\n\
+                 let nested = (value: int32) -> {\n\
+                     if value == 1 { error(\"a\")! } else if value == 2 { null! }\n\
+                     return 1\n\
+                 }\n\
+                 return nested(c)\n\
+             }\n",
+        );
+        assert!(closure.errors.is_empty(), "errors: {:?}", closure.errors);
+        assert!(
+            closure.warnings.is_empty(),
+            "closure return flows must not warn on the outer function: {:?}",
+            closure.warnings
+        );
     }
 
     #[test]

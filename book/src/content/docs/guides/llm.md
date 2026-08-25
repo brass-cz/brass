@@ -211,8 +211,13 @@ fun length(val) {
 - `error(payload)` creates an `Err`. Returning a plain value from a fallible
   function wraps it as `Ok`.
 - `result!` unwraps `Ok` or returns the `Err` from the enclosing named
-  function. `nullable!` unwraps a value or returns `null` early.
+  function. `nullable!` unwraps a value or returns `null` early. Mixing those
+  propagation kinds in an unannotated callable warns because it creates
+  `Result<T, E>?`.
 - `result.context(message)` adds trace context only on failure.
+- `nullable.context(message)` converts absence into a traced error: `T?`
+  becomes `T!`, while `Result<T, E>?` flattens to `Result<T, E>` instead of
+  nesting Results. Use it when null and error should be one failure channel.
 - At top level or in `main`, an unhandled `!` prints the error and exits
   non-zero.
 - When matching a standard error, inspect `error.value`; interpolating

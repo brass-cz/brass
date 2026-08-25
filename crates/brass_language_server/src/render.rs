@@ -11,8 +11,12 @@ use fxhash::FxHashMap as HashMap;
 use std::collections::BTreeMap;
 
 use brass_hir::{
-    CallableSignature, FieldInfo, Substitution, Type, TypeInfo, TypeKind, VariantInfo,
+    CallableSignature, FieldInfo, NominalType, Program, Substitution, Type, TypeInfo, TypeKind,
+    VariantInfo,
 };
+
+pub(crate) const NULLABLE_CONTEXT_DOC: &str =
+    "Converts a missing nullable value into a traced error. A nullable Result is flattened.";
 
 /// Assigns stable `unknown_N` names to inference variables, numbered by order
 /// of first appearance. Share one namer across everything that should agree on
@@ -90,6 +94,45 @@ impl UnknownNamer {
 /// on type syntax; only the inference-variable spelling differs.
 pub fn render_type(ty: &Type, namer: &mut UnknownNamer) -> String {
     ty.display_with(&mut |id| namer.named(id))
+}
+
+/// Render the compiler-owned method exposed only by a nullable receiver. The
+/// signature is derived from the same receiver shape the checker sees, keeping
+/// completion and hover honest about the Result-flattening exception.
+pub(crate) fn render_nullable_context_signature(
+    program: &Program,
+    receiver: &Type,
+    inferred_ret: Option<&Type>,
+) -> Option<String> {
+    fn nullable_inner(ty: &Type) -> Option<&Type> {
+        match ty {
+            Type::Ref(inner) | Type::Mut(inner) | Type::ConstOf(inner) => nullable_inner(inner),
+            Type::Nullable(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
+    let inner = nullable_inner(receiver)?;
+    let ret = inferred_ret.cloned().unwrap_or_else(|| {
+        if matches!(inner, Type::Sum(result) if result.id == brass_hir::RESULT_TYPE_ID) {
+            return inner.clone();
+        }
+        let error = match program.types.get("Error") {
+            Some(info) => {
+                let mut error = NominalType::new(info.id, &info.name);
+                error.substitution.insert("value", Type::Str);
+                Type::Record(error)
+            }
+            None => Type::Str,
+        };
+        Type::result(inner.clone(), error)
+    });
+    let mut namer = UnknownNamer::default();
+    Some(format!(
+        "fun context(self: {}, message: string, location: Location) -> {}",
+        render_type(receiver, &mut namer),
+        render_type(&ret, &mut namer),
+    ))
 }
 
 /// Render a function or method signature as `fun name(p: T, ...) -> R`.

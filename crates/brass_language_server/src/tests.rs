@@ -3,18 +3,17 @@
 
 use std::path::PathBuf;
 
-use brass_parser::Span;
-
+use crate::analysis::items::Diag;
 use crate::analysis::{DocAnalyzer, FullAnalysis};
 use crate::document::Document;
-use crate::features::{completion, definition, hover, semantic_tokens};
-use tower_lsp_server::ls_types::{CompletionItem, HoverContents, Position};
+use crate::features::{completion, definition, diagnostics, hover, semantic_tokens};
+use tower_lsp_server::ls_types::{CompletionItem, DiagnosticSeverity, HoverContents, Position};
 
 fn path() -> PathBuf {
     PathBuf::from("/tmp/brass_lsp_test/main.cz")
 }
 
-fn sorted(mut v: Vec<(String, Span)>) -> Vec<(String, Span)> {
+fn sorted(mut v: Vec<Diag>) -> Vec<Diag> {
     v.sort_by(|a, b| (a.1.lo, a.1.hi, &a.0).cmp(&(b.1.lo, b.1.hi, &b.0)));
     v
 }
@@ -71,14 +70,36 @@ fn whitespace_edit_preserves_diagnostics() {
     let d2 = a.diagnostics(v2);
     assert!(!d1.is_empty(), "the program has a type error");
     // The messages survive the edit unchanged (only positions move).
-    let msgs1: Vec<&String> = d1.iter().map(|(m, _)| m).collect();
-    let msgs2: Vec<&String> = d2.iter().map(|(m, _)| m).collect();
+    let msgs1: Vec<&String> = d1.iter().map(|(m, _, _)| m).collect();
+    let msgs2: Vec<&String> = d2.iter().map(|(m, _, _)| m).collect();
     assert_eq!(
         msgs1, msgs2,
         "a whitespace edit must not change the diagnostics"
     );
     // The incremental result matches a fresh from-scratch check.
     assert_eq!(sorted(d2), sorted(DocAnalyzer::new(path()).diagnostics(v2)));
+}
+
+#[test]
+fn implicit_nullable_result_is_published_as_a_warning() {
+    let src = concat!(
+        "fun mixed(c: int32) {\n",
+        "    if c == 1 {\n",
+        "        error(\"a\")!\n",
+        "    } else if c == 2 {\n",
+        "        null!\n",
+        "    }\n",
+        "    return 1\n",
+        "}\n",
+    );
+    let mut analyzer = DocAnalyzer::new(path());
+    let raw = analyzer.diagnostics(src);
+    let published = diagnostics::to_lsp(&raw, &Document::new(src.to_string(), 1));
+    let warning = published
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("returns `Result"))
+        .expect("mixed propagation warning");
+    assert_eq!(warning.severity, Some(DiagnosticSeverity::WARNING));
 }
 
 /// An import rename can change an unchanged function body's meaning, so import
@@ -639,6 +660,29 @@ fn hover_method_call_shows_method_signature() {
         text.contains("fun display(self: ref(Self)) -> string"),
         "method type with inferred return must be shown, not the call result: {text}"
     );
+}
+
+#[test]
+fn hover_nullable_context_shows_builtin_signature() {
+    let src = concat!(
+        "fun maybe(flag: bool) -> string? {\n",
+        "    if flag { return \"value\" }\n",
+        "    return null\n",
+        "}\n",
+        "fun main() {\n",
+        "    println(maybe(true).context(\"missing\")!)\n",
+        "}\n",
+    );
+    let full = full_analysis(src);
+    let (doc, pos) = position(src, "context", false);
+    let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover nullable context"));
+    assert!(
+        text.contains(
+            "fun context(self: string?, message: string, location: Location) -> Result<string, Error<value=string>>"
+        ),
+        "builtin nullable signature: {text}"
+    );
+    assert!(text.contains("nullable Result is flattened"), "doc: {text}");
 }
 
 /// A member used as an argument is not the containing call's callee, so that
@@ -1436,6 +1480,29 @@ fn completion_offers_array_members() {
     );
 }
 
+#[test]
+fn completion_offers_only_context_on_nullable_receiver() {
+    let src = concat!(
+        "fun maybe() -> string? { return null }\n",
+        "fun main() {\n",
+        "    let value = maybe()\n",
+        "    value.\n",
+        "}\n",
+    );
+    let analyzer = DocAnalyzer::new(path());
+    let doc = Document::new(src.to_string(), 1);
+    let off = src.find("value.\n").expect("nullable receiver") + "value.".len();
+    let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(off));
+    assert_eq!(labels(&items), vec!["context".to_string()]);
+    let detail = items[0].detail.as_deref().unwrap_or_default();
+    assert!(
+        detail.contains(
+            "fun context(self: string?, message: string, location: Location) -> Result<string, Error<value=string>>"
+        ),
+        "signature: {detail}"
+    );
+}
+
 /// Literal endings are valid receiver boundaries; the probe analysis, not a
 /// byte whitelist, decides whether their member access parses and types.
 #[test]
@@ -1890,7 +1957,7 @@ fn hashmap_instance_type_mismatch_is_reported_at_the_call() {
     assert!(
         diags
             .iter()
-            .any(|(m, _)| m.contains("does not match the receiver's type")),
+            .any(|(m, _, _)| m.contains("does not match the receiver's type")),
         "expected a use-site receiver-mismatch error: {diags:?}"
     );
 }
@@ -1903,7 +1970,7 @@ fn for_over_non_iterable_is_an_error() {
     let src = "fun for_type(a) {\n    for e in a {\n        println(e)\n    }\n}\n\nfor_type(5)\n";
     let diags = a.diagnostics(src);
     assert!(
-        diags.iter().any(|(m, _)| m.contains("cannot iterate")),
+        diags.iter().any(|(m, _, _)| m.contains("cannot iterate")),
         "expected a cannot-iterate error: {diags:?}"
     );
 }
@@ -2005,7 +2072,7 @@ fn duplicate_module_qualifier_matches_the_driver_message() {
     assert!(
         diags
             .iter()
-            .any(|(m, _)| m.contains("two module imports share the qualifier `util`")),
+            .any(|(m, _, _)| m.contains("two module imports share the qualifier `util`")),
         "diags: {diags:?}"
     );
 }

@@ -521,6 +521,26 @@ impl<'a> Checker<'a> {
                 }
             }
             let recv = self.infer_expr_light(base, env, props);
+            if method == "context"
+                && let Type::Nullable(inner) = self.resolve(&recv)
+            {
+                args.iter().for_each(|arg| {
+                    self.infer_expr_light(&arg.expr, env, props);
+                });
+                let inner = *inner;
+                if matches!(&inner, Type::Sum(result) if result.id == brass_hir::RESULT_TYPE_ID) {
+                    return inner;
+                }
+                let error = match self.program.types.get("Error") {
+                    Some(info) => {
+                        let mut error = NominalType::new(info.id, &info.name);
+                        error.substitution.insert("value", Type::Str);
+                        Type::Record(error)
+                    }
+                    None => Type::Str,
+                };
+                return Type::result(inner, error);
+            }
             // A user method's precomputed return: methods of a nominal
             // receiver (peeling a narrowed nullable) resolve through the same
             // table the full pass consults, so a body that propagates another

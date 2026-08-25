@@ -1,0 +1,23 @@
+fun layered(kind: int32) -> int32!? {
+    if kind == 0 {
+        return 42
+    } else if kind == 1 {
+        return error("original failure")
+    } else {
+        null!
+    }
+    return null
+}
+
+fun inspect(kind: int32) {
+    match layered(kind).context("layer unavailable") {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println(error.display()),
+    }
+}
+
+fun main() {
+    inspect(0)
+    inspect(2)
+    inspect(1)
+}

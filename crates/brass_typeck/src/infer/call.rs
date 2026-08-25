@@ -304,11 +304,11 @@ impl<'a> Checker<'a> {
                 resolved_receiver,
                 Constness::Unknown,
             );
-            if let Type::Nullable(_) = self.resolve_head(&recv_ty) {
-                self.report_nullable_use(base.span());
-            }
             if let Some(ret) = self.builtin_method_type(&recv_ty, method, args, scopes, span) {
                 return ret;
+            }
+            if let Type::Nullable(_) = self.resolve_head(&recv_ty) {
+                self.report_nullable_use(base.span());
             }
             // A reflective `-> infer!` method is keyed by the caller's
             // expectation: its result type is fixed per call site, and the

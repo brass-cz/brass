@@ -174,6 +174,17 @@ fn error_propagation_branches_and_returns_on_err() {
 }
 
 #[test]
+fn nullable_fallible_annotation_keeps_fallible_lowering() {
+    let text = lower_whole(
+        "fun f(c: int32) -> int32!? {\n\
+             if c == 1 { error(\"a\")! } else if c == 2 { null! }\n\
+             return 1\n\
+         }\n",
+    );
+    assert!(text.contains("fn f [f] (fallible)"), "{text}");
+}
+
+#[test]
 fn match_chains_pattern_tests_and_panics_on_fallthrough() {
     let src = "fun f(n) { return match n { 0 => 10, _ => 20 } }";
     let (body, _) = lower_first(src);

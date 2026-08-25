@@ -228,10 +228,26 @@ if d {
 
 A body can mix all three return kinds: plain values, `error(...)`, and a
 nullable `!`. The plain and error returns make it a `Result`, and the null
-propagation wraps that in `?`:
+propagation wraps that in `?`. An unannotated function with this inferred shape
+warns because callers must unwrap twice:
+
+```brass norun
+fun maybe_number(c: int32) -> int32? {
+    if c > 0 { return c }
+    return null
+}
+
+// Inferred as Result<int32, Error>?: the error and null propagate separately.
+fun ambiguous(c: int32) {
+    if c < 0 { error("negative number")! }
+    return maybe_number(c)!
+}
+```
+
+If that two-layer API is intentional, write it explicitly:
 
 ```brass
-fun f(c: int32) {
+fun f(c: int32) -> int32!? {
     if c == 0 {
         return 1          // Result.Ok { value: 1 }
     } else if c == 1 {
@@ -239,6 +255,7 @@ fun f(c: int32) {
     } else {
         null!             // null itself
     }
+    return null           // satisfies the declared nullable fallthrough
 }
 
 // f is (int32) -> Result<int32, Error>?: narrow the `?` first, then match.
@@ -252,6 +269,31 @@ if r {
     println("null")
 }
 ```
+
+More often, absence is a failure at the current layer. Call `context` on the
+nullable instead of propagating its `null`: a present `T` becomes `Ok`, while
+`null` becomes an `Error` carrying the message and the `context` call site.
+The result is one ordinary `T!`, so the mixed-propagation warning disappears:
+
+```brass
+fun maybe_number(c: int32) -> int32? {
+    if c > 0 { return c }
+    return null
+}
+
+fun required_number(c: int32) {
+    if c < 0 { error("negative number")! }
+    return maybe_number(c).context("number is missing")!
+}
+
+println(required_number(2)!)
+```
+
+The same operation flattens the deliberate two-layer shape:
+`Result<T, E>?.context(message)` returns `Result<T, E>`, never a nested
+`Result<Result<...>>`. An outer `null` becomes the traced error, an existing
+`Err` gains the same context frame as `Result.context`, and an `Ok` passes
+through unchanged.
 
 At the top level and in `main`, a `null` hit by `!` stops the program the
 same way an `Err` does: it aborts with

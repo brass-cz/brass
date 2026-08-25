@@ -19,7 +19,7 @@ use brass_hir::{LoadedModule, Program, TypedProgram, lower};
 use brass_parser::Span;
 use brass_parser::ast::{Module, TopLevel};
 
-use items::{Diag, Item, ItemCache, ItemKind};
+use items::{Diag, DiagSeverity, Item, ItemCache, ItemKind};
 use world::SourceMap;
 
 /// The shared context seeds, keyed by context content (see
@@ -135,19 +135,25 @@ impl DocAnalyzer {
     /// The incremental cache is left ALONE: it still describes the last checked
     /// version, and the next full run diffs against it, so the items the edit did
     /// not touch keep their diagnostics instead of being re-checked.
-    pub fn syntax_diagnostics(&self, text: &str) -> Vec<(String, Span)> {
+    pub fn syntax_diagnostics(&self, text: &str) -> Vec<Diag> {
         let (_, errors) = brass_parser::parse_recovering(text, 0);
         errors
             .into_iter()
-            .map(|e| (format!("syntax error: {}", e.message), e.span))
+            .map(|e| {
+                (
+                    format!("syntax error: {}", e.message),
+                    e.span,
+                    DiagSeverity::Error,
+                )
+            })
             .collect()
     }
 
     /// Recompute the document's diagnostics for `text`, reusing cached results
     /// for items whose source is unchanged and that do not use a changed name.
-    /// Returns `(message, global span)` pairs; map spans through the active
-    /// document to publish them.
-    pub fn diagnostics(&mut self, text: &str) -> Vec<(String, Span)> {
+    /// Returns message, global span, and severity triples; map spans through
+    /// the active document to publish them.
+    pub fn diagnostics(&mut self, text: &str) -> Vec<Diag> {
         // The driver's on-disk analysis cache (`.czcache`). It stamps FILES, so
         // it can only vouch for this buffer when the buffer IS the file -- and
         // it is written only after an error-free driver analysis, whose checks
@@ -166,7 +172,7 @@ impl DocAnalyzer {
                 let search = brass_resolve::SearchPaths::from_env();
                 brass_cache::load(&self.path, "jit", &search)
                     .or_else(|| brass_cache::load(&self.path, "repl", &search))
-                    .is_some()
+                    .is_some_and(|loaded| loaded.payload.warnings.is_empty())
             }
         {
             return Vec::new();
@@ -178,7 +184,12 @@ impl DocAnalyzer {
             // cascading name/type errors -- and drop the cache so the next
             // clean parse re-checks from scratch.
             self.cache = ItemCache::default();
-            return localize(world.parse_errors, world.main_base, text.len());
+            let errors = world
+                .parse_errors
+                .into_iter()
+                .map(|(message, span)| (message, span, DiagSeverity::Error))
+                .collect();
+            return localize(errors, world.main_base, text.len());
         }
 
         let mut new_items = items::split(&world.main_ast, text, world.main_base);
@@ -233,12 +244,18 @@ impl DocAnalyzer {
         // span coordinates (so cross-version shifting works); the returned
         // diagnostics are converted to document-local spans and filtered to the
         // active file -- errors located in a dependency are not shown here.
-        let mut out: Vec<(String, Span)> = Vec::new();
+        let mut out: Vec<Diag> = Vec::new();
         for item in &self.cache.items {
             out.extend(item.diags.iter().cloned());
         }
         out.extend(global);
-        out.extend(world.load_errors);
+        out.extend(
+            world
+                .load_errors
+                .into_iter()
+                .map(|(message, span)| (message, span, DiagSeverity::Error)),
+        );
+        render_secondary_locations(&mut out, &world.sources);
         localize(out, world.main_base, text.len())
     }
 
@@ -313,7 +330,7 @@ fn run_pipeline(
     fxhash::FxHashMap<String, brass_hir::TypeScheme>,
     fxhash::FxHashMap<String, brass_hir::Type>,
     fxhash::FxHashMap<(String, String), brass_hir::Type>,
-    Vec<(String, Span)>,
+    Vec<Diag>,
 ) {
     let mut modules = context.to_vec();
     modules.push(LoadedModule {
@@ -328,19 +345,22 @@ fn run_pipeline(
     let qualified_errors = brass_resolve::resolve_qualified_uses(&mut modules);
 
     let (program, lower_errors) = lower(&modules);
-    let mut diags: Vec<(String, Span)> = Vec::new();
+    let mut diags: Vec<Diag> = Vec::new();
     for e in qualified_errors {
-        diags.push((e.message, e.span));
+        diags.push((e.message, e.span, DiagSeverity::Error));
     }
     for e in lower_errors {
-        diags.push((e.message, e.span));
+        diags.push((e.message, e.span, DiagSeverity::Error));
     }
     for e in brass_resolve::check_imports(&modules) {
-        diags.push((e.message, e.span));
+        diags.push((e.message, e.span, DiagSeverity::Error));
     }
     let analysis = brass_typeck::analyze_with(&program, seed.as_deref());
     for e in &analysis.errors {
-        diags.push((e.message.clone(), e.span));
+        diags.push((e.message.clone(), e.span, DiagSeverity::Error));
+    }
+    for warning in &analysis.warnings {
+        diags.push((warning.message.clone(), warning.span, DiagSeverity::Warning));
     }
     (
         program,
@@ -386,46 +406,58 @@ fn reduce_main(main: &Module, item_list: &[Item], keep: &HashSet<usize>) -> Modu
 fn attribute(diags: &[Diag], item_list: &[Item]) -> (Vec<Vec<Diag>>, Vec<Diag>) {
     let mut per_item = vec![Vec::new(); item_list.len()];
     let mut global = Vec::new();
-    for (msg, span) in diags {
+    for (msg, span, severity) in diags {
         match item_list
             .iter()
             .position(|it| span.lo >= it.span.lo && span.lo <= it.span.hi)
         {
-            Some(i) => per_item[i].push((msg.clone(), *span)),
-            None => global.push((msg.clone(), *span)),
+            Some(i) => per_item[i].push((msg.clone(), *span, *severity)),
+            None => global.push((msg.clone(), *span, *severity)),
         }
     }
     (per_item, global)
+}
+
+/// Render the checker's embedded secondary source offsets after incremental
+/// reuse has shifted them. Keeping placeholders in the cache lets a carried
+/// warning continue to name the current source position after an edit.
+fn render_secondary_locations(diags: &mut [Diag], sources: &SourceMap) {
+    for (message, _, _) in diags {
+        *message = brass_typeck::render_diagnostic_message(message, |offset| {
+            let loc = sources.locate(offset)?;
+            let (line, col) = brass_parser::line_col(loc.src, loc.local);
+            Some(format!("{}:{line}:{col}", loc.label))
+        });
+    }
 }
 
 /// Convert global diagnostic spans to document-local spans, keeping only those
 /// that fall within the active document `[base, base + len]`. A diagnostic
 /// whose span lies in a dependency or the prelude is dropped (it belongs to a
 /// different file's diagnostics).
-fn localize(diags: Vec<(String, Span)>, base: usize, len: usize) -> Vec<(String, Span)> {
+fn localize(diags: Vec<Diag>, base: usize, len: usize) -> Vec<Diag> {
     diags
         .into_iter()
-        .filter_map(|(msg, span)| {
+        .filter_map(|(msg, span, severity)| {
             if span.lo < base || span.lo > base + len {
                 return None;
             }
             let lo = span.lo - base;
             let hi = span.hi.saturating_sub(base).min(len);
-            Some((msg, Span::new(lo, hi.max(lo))))
+            Some((msg, Span::new(lo, hi.max(lo)), severity))
         })
         .collect()
 }
 
-fn shift(diags: &[(String, Span)], delta: i64) -> Vec<(String, Span)> {
+fn shift(diags: &[Diag], delta: i64) -> Vec<Diag> {
     diags
         .iter()
-        .map(|(msg, span)| {
+        .map(|(msg, span, severity)| {
+            let shift_offset = |offset: usize| (offset as i64 + delta).max(0) as usize;
             (
-                msg.clone(),
-                Span::new(
-                    (span.lo as i64 + delta).max(0) as usize,
-                    (span.hi as i64 + delta).max(0) as usize,
-                ),
+                brass_typeck::remap_diagnostic_source_offsets(msg, shift_offset),
+                Span::new(shift_offset(span.lo), shift_offset(span.hi)),
+                *severity,
             )
         })
         .collect()

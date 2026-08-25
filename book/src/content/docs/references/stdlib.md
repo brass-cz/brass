@@ -56,13 +56,15 @@ are compile errors.
 The error value model behind `error(..)` and `!` (normatively specified in
 [Error traces](/references/syntax-sugar/#error-traces)):
 
-| Name             | Shape / signature                                | Behavior                                                             |
-| ---------------- | ------------------------------------------------ | -------------------------------------------------------------------- |
-| `Location`       | `{ file: string, line: int32, col: int32 }`      | a source position; `display()` renders `file:line:col`               |
-| `Frame`          | `{ message, location: Location }`                | one `context` annotation                                             |
-| `Error`          | `{ value, location: Location, frames: Frame[] }` | the payload `error(..)` raises; `display()` renders the nested trace |
-| `error(value)`   | `-> infer!`                                      | an `Err` wrapping `value` into an `Error` stamped with the call site |
-| `r.context(msg)` | `(string) -> Result`                             | appends a `Frame` to a failed result; leaves a success untouched     |
+| Name                     | Shape / signature                                | Behavior                                                                    |
+| ------------------------ | ------------------------------------------------ | --------------------------------------------------------------------------- |
+| `Location`               | `{ file: string, line: int32, col: int32 }`      | a source position; `display()` renders `file:line:col`                      |
+| `Frame`                  | `{ message, location: Location }`                | one `context` annotation                                                    |
+| `Error`                  | `{ value, location: Location, frames: Frame[] }` | the payload `error(..)` raises; `display()` renders the nested trace        |
+| `error(value)`           | `-> infer!`                                      | an `Err` wrapping `value` into an `Error` stamped with the call site        |
+| `result.context(msg)`    | `(string) -> Result`                             | appends a `Frame` to a failed result; leaves a success untouched            |
+| `value.context(msg)`     | `T? -> T!`                                       | turns `null` into a traced error and a present `T` into `Ok`                 |
+| `result.context(msg)`    | `Result<T, E>? -> Result<T, E>`                  | flattens: `null` errors, `Err` gains a frame, and `Ok` passes through        |
 
 `error` and `context` declare a trailing `loc: Location` parameter the
 compiler fills with the call site (the
@@ -70,6 +72,9 @@ compiler fills with the call site (the
 caller may also pass it explicitly. The compiler's reserved handling of
 `error(...)` still validates that signature: one payload is required, only the
 trailing `Location` may be omitted, and other arities or argument types fail.
+The nullable overload belongs to the compiler because `T?` has no nominal
+type. Its `Result<T, E>?` case recognizes the prelude `Result` and removes the
+outer `?`; it never constructs `Result<Result<T, E>, ...>`.
 
 ## Type tests and defaults
 

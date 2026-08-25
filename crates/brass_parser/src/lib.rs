@@ -334,6 +334,20 @@ mod tests {
     }
 
     #[test]
+    fn fallible_then_nullable_return_type_parses() {
+        // Postfix order is semantic: `T!?` is a nullable whose payload is the
+        // fallible Result, the spelling an explicit two-layer return uses.
+        let m = module("fun f() -> string!? {\n}\n");
+        let TopLevel::Fun(f) = &m.items[0] else {
+            panic!("expected a function");
+        };
+        let Some(TypeExpr::Nullable(inner, _)) = &f.ret else {
+            panic!("expected nullable return, got {:?}", f.ret);
+        };
+        assert!(matches!(inner.as_ref(), TypeExpr::Fallible(..)));
+    }
+
+    #[test]
     fn tuple_type_annotation() {
         // A leading-bracket type `[T0, T1, ...]` is a tuple (distinct from the
         // postfix array `T[]`).

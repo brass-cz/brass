@@ -618,10 +618,70 @@ impl<'a> Checker<'a> {
         scopes: &mut ScopeStack,
         span: brass_parser::Span,
     ) -> Option<Type> {
+        if let Some(ret) = self.nullable_context_method_type(recv_ty, method, args, scopes, span) {
+            return Some(ret);
+        }
         if let Some(ret) = self.debug_method_type(recv_ty, method, args, scopes, span) {
             return Some(ret);
         }
         self.array_method_type(recv_ty, method, args, scopes, span)
+    }
+
+    /// The nullable `context` surface turns absence into the same traced error
+    /// value as `error(message)`. A nullable prelude Result is deliberately
+    /// returned as its inner Result, because exposing a second Result layer
+    /// would preserve the ambiguity this method resolves.
+    fn nullable_context_method_type(
+        &mut self,
+        recv_ty: &Type,
+        method: &str,
+        args: &[Arg],
+        scopes: &mut ScopeStack,
+        span: brass_parser::Span,
+    ) -> Option<Type> {
+        if method != "context" {
+            return None;
+        }
+        let resolved = self.resolve(recv_ty);
+        let Type::Nullable(inner) = brass_hir::peel_modes(&resolved) else {
+            return None;
+        };
+
+        if !(1..=2).contains(&args.len()) {
+            self.errors.push(TypeError {
+                message: format!("`context` expects 1 to 2 argument(s), got {}", args.len()),
+                span,
+            });
+        }
+        if let Some(message) = args.first() {
+            self.check_expr_against(&message.expr, &Type::Str, scopes);
+        }
+        if let Some(location) = args.get(1) {
+            let location_ty = self
+                .program
+                .types
+                .get("Location")
+                .map(brass_hir::TypeInfo::type_ref)
+                .unwrap_or_else(|| self.fresh_unknown());
+            self.check_expr_against(&location.expr, &location_ty, scopes);
+        }
+        for arg in args.iter().skip(2) {
+            self.check_expr(&arg.expr, scopes);
+        }
+
+        let inner = (**inner).clone();
+        if matches!(&inner, Type::Sum(result) if result.id == brass_hir::RESULT_TYPE_ID) {
+            return Some(inner);
+        }
+        let error = match self.program.types.get("Error") {
+            Some(info) => {
+                let mut error = NominalType::new(info.id, &info.name);
+                error.substitution.insert("value", Type::Str);
+                Type::Record(error)
+            }
+            None => Type::Str,
+        };
+        Some(Type::result(inner, error))
     }
 
     /// The built-in `debug` renderer: every value can `v.debug()` itself into a

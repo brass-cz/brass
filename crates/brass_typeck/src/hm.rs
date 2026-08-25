@@ -364,8 +364,15 @@ impl<'p> Hm<'p> {
         tracing::debug!(context, fallible = self.fallible, "checking callable body");
         if self.fallible {
             let inferred = self.scoped_result(self.ok.clone(), self.err.clone());
-            self.unify(&declared, &inferred, span);
-            self.ret = inferred;
+            // A written `T!?` keeps nullability outside the fallible layer.
+            // Reconcile the inner Result here while retaining the declared
+            // outer shape for whole-value return flows.
+            let declared_result = match self.solver.resolve(&declared) {
+                Type::Nullable(inner) if inner.is_result_type() => *inner,
+                _ => declared.clone(),
+            };
+            self.unify(&declared_result, &inferred, span);
+            self.ret = declared;
         } else {
             self.ret = declared;
         }
@@ -1492,6 +1499,26 @@ impl<'p> Hm<'p> {
             }
             let recv = self.infer_expr(base);
             let arg_tys: Vec<Type> = args.iter().map(|a| self.infer_expr(&a.expr)).collect();
+            if method == "context"
+                && let Type::Nullable(inner) = self.solver.resolve(&recv)
+            {
+                if let Some(message) = arg_tys.first() {
+                    self.flow_into(message, &Type::Str, span);
+                }
+                let inner = *inner;
+                if matches!(&inner, Type::Sum(result) if result.id == brass_hir::RESULT_TYPE_ID) {
+                    return inner;
+                }
+                let error = match self.program.types.get("Error") {
+                    Some(info) => {
+                        let mut error = brass_hir::NominalType::new(info.id, &info.name);
+                        error.substitution.insert("value", Type::Str);
+                        Type::Record(error)
+                    }
+                    None => Type::Str,
+                };
+                return Type::result(inner, error);
+            }
             if let Some((params, ret)) = self.method_sig(&recv, method) {
                 for (p, a) in params.iter().zip(&arg_tys) {
                     if let Some(pty) = p {
@@ -1882,6 +1909,7 @@ impl<'p> Hm<'p> {
 /// Whether a (resolved) type is the built-in `Result`.
 fn is_result(ty: &Type) -> bool {
     matches!(ty, Type::Sum(n) if n.is_result_type())
+        || matches!(ty, Type::Nullable(inner) if inner.is_result_type())
 }
 
 /// Whether a function body is fallible: it constructs an error (`error(x)`) or

@@ -22,8 +22,8 @@ use crate::analysis::FullAnalysis;
 use crate::document::Document;
 use crate::features::nav;
 use crate::render::{
-    UnknownNamer, match_type_vars, render_alias_def, render_signature_into, render_type,
-    render_type_def_with,
+    NULLABLE_CONTEXT_DOC, UnknownNamer, match_type_vars, render_alias_def,
+    render_nullable_context_signature, render_signature_into, render_type, render_type_def_with,
 };
 
 /// Build the hover response for `pos` in `doc`, using the full analysis.
@@ -284,12 +284,23 @@ fn method_hover(doc: &Document, full: &FullAnalysis, local: usize) -> Option<Hov
     }
     let recv_hi = full.main_base + (span.lo - 1);
     let recv_ty = receiver_type_at(full, recv_hi)?;
+    let member_span = Span::new(full.main_base + span.lo, full.main_base + span.hi);
+    let call = callee_call(full, member_span);
+    if name == "context"
+        && let Some(signature) =
+            render_nullable_context_signature(&full.program, &recv_ty, call.map(|expr| &expr.ty))
+    {
+        return Some(markup_with_doc(
+            signature,
+            Some(NULLABLE_CONTEXT_DOC),
+            Some(doc.range_of(span)),
+        ));
+    }
     // Specialize to this call's argument types when the cursor is in a call: the
     // receiver is the call's first argument, aligned with `self`, so `map.get(1)`
     // can pin a parameter the scheme leaves open (a key compared with `==` does
     // not unify onto the scheme's parameter).
-    let member_span = Span::new(full.main_base + span.lo, full.main_base + span.hi);
-    let (call_span, ret) = callee_call(full, member_span)
+    let (call_span, ret) = call
         .map(|e| (Some(e.span), Some(e.ty.clone())))
         .unwrap_or((None, None));
     let call_args = call_span.and_then(|s| nav::call_args_at_span(full, s));

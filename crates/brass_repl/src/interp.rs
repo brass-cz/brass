@@ -709,7 +709,7 @@ impl<'p, 'm> Interp<'p, 'm> {
             // `__present(x)`: the `if let x = e` presence test -- false only for a
             // null subject. Non-nullable subjects fold statically in
             // `cond_static_truthiness` and never reach here.
-            "__present" | "__null_prop_present" => {
+            "__present" | "__null_prop_present" | "__nullable_context_present" => {
                 let ty = operand_type_of(&args[0], &f.local_types);
                 let v = self.eval_operand(f, frame, &args[0], &ty)?;
                 Ok(Value::Bool(!v.is_null()))

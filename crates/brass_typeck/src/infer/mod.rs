@@ -391,6 +391,7 @@ impl ContextTables {
 
 pub struct Inference {
     pub errors: Vec<TypeError>,
+    pub warnings: Vec<TypeError>,
     pub typed: TypedProgram,
     /// Per record-type generalized scheme (its inferred type parameters and the
     /// field/method signatures over them), keyed by the type's source name. Read
@@ -630,6 +631,9 @@ fn check_method_bodies(checker: &mut Checker, program: &Program, schemes_only: b
                         // (`Result`/`?`) only the light assembly builds, so it
                         // keeps its precomputed type.
                         let key = (t.name.clone(), m.signature.name.clone());
+                        if let Some(inferred) = checker.method_returns.get(&key).cloned() {
+                            checker.warn_implicit_nullable_result(&m.signature, body, &inferred);
+                        }
                         if let Some(full) = full
                             && !checker.method_return_props.contains(&key)
                         {
@@ -654,6 +658,14 @@ fn check_method_bodies(checker: &mut Checker, program: &Program, schemes_only: b
                                 &t.name,
                                 &v.name,
                             );
+                            let key = (format!("{}.{}", t.name, v.name), m.signature.name.clone());
+                            if let Some(inferred) = checker.method_returns.get(&key).cloned() {
+                                checker.warn_implicit_nullable_result(
+                                    &m.signature,
+                                    body,
+                                    &inferred,
+                                );
+                            }
                         }
                     }
                 }
@@ -750,6 +762,10 @@ pub fn analyze_generated(
                     &info.name,
                 );
                 checker.current_co_method = None;
+                let key = (info.name.clone(), method.signature.name.clone());
+                if let Some(inferred) = checker.method_returns.get(&key).cloned() {
+                    checker.warn_implicit_nullable_result(&method.signature, body, &inferred);
+                }
                 checker.errors.extend(crate::exhaustive::check_block(
                     program,
                     &checker.typed,
@@ -772,6 +788,13 @@ pub fn analyze_generated(
                         &info.name,
                         &variant.name,
                     );
+                    let key = (
+                        format!("{}.{}", info.name, variant.name),
+                        method.signature.name.clone(),
+                    );
+                    if let Some(inferred) = checker.method_returns.get(&key).cloned() {
+                        checker.warn_implicit_nullable_result(&method.signature, body, &inferred);
+                    }
                     checker.errors.extend(crate::exhaustive::check_block(
                         program,
                         &checker.typed,
@@ -802,6 +825,7 @@ pub fn analyze_generated(
         .collect();
     Inference {
         errors: checker.errors,
+        warnings: checker.warnings,
         typed: checker.typed,
         schemes: checker.schemes,
         view_args: checker.view_args,
@@ -872,6 +896,14 @@ pub(crate) fn analyze_inner(
     phase("typeck/seed-schemes", t);
     let mut checker = Checker::new(program, rows);
     checker.lazy_profile = ctl.is_some();
+    // A resumed run may skip every body that produced an earlier warning.
+    // Seed the final Analysis as well as the flush bookkeeping so completing
+    // the run can persist the full warning set into the ordinary cache.
+    if let Some(ctl) = ctl.as_deref() {
+        checker
+            .warnings
+            .extend(ctl.state.warnings_flushed.iter().cloned());
+    }
     if checker.lazy_profile {
         checker.keyed_tainted = crate::taint::keyed_reachable(program);
     }
@@ -1251,6 +1283,7 @@ pub(crate) fn analyze_inner(
     (
         Inference {
             errors: checker.errors,
+            warnings: checker.warnings,
             typed: checker.typed,
             schemes: checker.schemes,
             view_args: checker.view_args,
@@ -1285,6 +1318,9 @@ fn check_function_body(checker: &mut Checker, symbol: &str, f: &FunInfo) {
     // requirement for its own body.
     checker.in_entry_main = symbol == "main";
     checker.check_block_root(&f.decl.body, &mut scopes, ret.as_ref());
+    if let Some(inferred) = checker.function_returns.get(symbol).cloned() {
+        checker.warn_implicit_nullable_result(&f.signature, &f.decl.body, &inferred);
+    }
 }
 
 /// A demanded body's dedicated pass, run at the concrete argument types the
@@ -1344,6 +1380,9 @@ fn check_function_body_at(
     checker.in_entry_main = symbol == "main";
     let errors_before = checker.errors.len();
     let full = checker.check_block_root(&f.decl.body, &mut scopes, f.signature.ret_ty.as_ref());
+    if let Some(inferred) = checker.function_returns.get(symbol).cloned() {
+        checker.warn_implicit_nullable_result(&f.signature, &f.decl.body, &inferred);
+    }
     if f.signature.ret_ty.is_some() || checker.errors.len() != errors_before {
         return None;
     }
@@ -1552,12 +1591,25 @@ fn flush_delta(
     // analysis sorts and dedups the full set).
     delta.errors = checker.errors[state.errors_seen..].to_vec();
     state.errors_seen = checker.errors.len();
+    // Warnings can be rediscovered by call-site and dedicated-body checks, so
+    // flush by value instead of by prefix. The same delivered set survives a
+    // partial-cache resume, where the fresh checker vector starts at zero.
+    delta.warnings = checker
+        .warnings
+        .iter()
+        .filter(|warning| !state.warnings_flushed.contains(warning))
+        .cloned()
+        .collect();
+    state
+        .warnings_flushed
+        .extend(delta.warnings.iter().cloned());
     delta
 }
 
 struct Checker<'a> {
     program: &'a Program,
     errors: Vec<TypeError>,
+    warnings: Vec<TypeError>,
     typed: TypedProgram,
     /// Exact typed observations already present in `typed`, bucketed by their
     /// fxhash so replay remains idempotent without a linear scan of the sidecar.
@@ -1844,11 +1896,116 @@ enum PropKind {
     Err,
 }
 
+/// Find one direct nullable propagation and one direct error propagation in a
+/// callable body. Closure spans are excluded because a closure owns its return
+/// flow even when the light return-inference walk visits it while checking the
+/// surrounding callable.
+fn mixed_propagation_sites(
+    body: &Block,
+    kinds: &HashMap<Span, Option<PropKind>>,
+) -> Option<(Span, Span)> {
+    #[derive(Default)]
+    struct Sites {
+        props: Vec<Span>,
+        closures: Vec<Span>,
+    }
+
+    impl crate::walk::ExprVisitor for Sites {
+        fn visit(&mut self, expr: &Expr) {
+            match expr {
+                Expr::ErrorProp(_, span) => self.props.push(*span),
+                Expr::Closure(_, _, span) => self.closures.push(*span),
+                _ => {}
+            }
+        }
+    }
+
+    let mut sites = Sites::default();
+    crate::walk::walk_block(body, &mut sites);
+    sites.props.sort_by_key(|span| span.lo);
+    let direct = sites.props.into_iter().filter(|span| {
+        !sites
+            .closures
+            .iter()
+            .any(|closure| closure.lo <= span.lo && span.hi <= closure.hi)
+    });
+    let mut null = None;
+    let mut error = None;
+    for span in direct {
+        match kinds.get(&span) {
+            Some(Some(PropKind::Null)) => null.get_or_insert(span),
+            Some(Some(PropKind::Err)) => error.get_or_insert(span),
+            _ => continue,
+        };
+        if null.is_some() && error.is_some() {
+            break;
+        }
+    }
+    Some((null?, error?))
+}
+
 impl<'a> Checker<'a> {
+    /// Emit the warning only for an unannotated callable whose own direct `!`
+    /// sites inferred both layers. A nullable Result merely forwarded from an
+    /// annotated callee has no mixed pair here and remains deliberate plumbing.
+    fn warn_implicit_nullable_result(
+        &mut self,
+        signature: &CallableSignature,
+        body: &Block,
+        inferred: &Type,
+    ) {
+        if signature.ret.is_some() {
+            return;
+        }
+        let resolved = self.resolve(inferred);
+        let Type::Nullable(inner) = &resolved else {
+            return;
+        };
+        let Type::Sum(result) = inner.as_ref() else {
+            return;
+        };
+        if result.id != brass_hir::RESULT_TYPE_ID {
+            return;
+        }
+        let Some((null, error)) = mixed_propagation_sites(body, &self.prop_kinds) else {
+            return;
+        };
+        // The Err payload is almost always the prelude `Error`, whose rendered
+        // substitution restates its own field layout and drowns the message.
+        // The warning is about the two layers, not the payload internals, so
+        // that nominal renders bare; any other error type keeps its full form.
+        let error_id = self.program.types.get("Error").map(|info| info.id);
+        let type_text = match result.result_payloads() {
+            Some((ok, err)) => {
+                let err_text = match err {
+                    Type::Record(n) | Type::Sum(n) if Some(n.id) == error_id => {
+                        n.name().to_string()
+                    }
+                    other => other.display(),
+                };
+                format!("Result<{}, {err_text}>?", ok.display())
+            }
+            None => resolved.display(),
+        };
+        self.warnings.push(TypeError {
+            message: format!(
+                "`{}` returns `{}`: the body propagates both null ({}) and errors ({}), so \
+                 callers must unwrap two layers; convert the null with `.context(message)` or \
+                 annotate the return type",
+                signature.name,
+                type_text,
+                crate::source_location(null),
+                crate::source_location(error),
+            ),
+            span: signature.span,
+        });
+    }
+
     fn new(program: &'a Program, rows: Rc<brass_typesys::RowInfo>) -> Self {
         Self {
             program,
             errors: Vec::new(),
+            warnings: Vec::new(),
             typed: TypedProgram::default(),
             typed_seen: HashMap::default(),
             const_scopes: Vec::new(),
@@ -2140,7 +2297,11 @@ impl<'a> Checker<'a> {
                     // A `Result`-typed value flows whole. This mirrors the inferred
                     // fallible path and the HM checker (`hm::Stmt::Return`).
                     let resolved = self.resolve(&want);
-                    if let Some((ok, _err)) = resolved.result_payloads() {
+                    let result_return = match &resolved {
+                        Type::Nullable(inner) if inner.is_result_type() => inner.as_ref(),
+                        other => other,
+                    };
+                    if let Some((ok, _err)) = result_return.result_payloads() {
                         let ok = ok.clone();
                         // `return e!` where the enclosing return is `T!` keys a
                         // reflective method inside `e` by the Ok payload `ok`
@@ -2152,17 +2313,28 @@ impl<'a> Checker<'a> {
                         let got = self.check_expr(e, scopes);
                         self.call_expected = None;
                         // A declared subtype of the return's Result also flows
-                        // whole (the flow site coerces it); only a genuinely
-                        // bare value is checked against the Ok payload.
+                        // whole (the flow site coerces it). A null or an
+                        // already-nullable Result belongs to the declared outer
+                        // nullable layer rather than to the Result's Ok payload.
                         let got_res = self.resolve(&got);
-                        let whole = got_res.is_result_type()
-                            || matches!((&got_res, &resolved), (Type::Sum(h), Type::Sum(w))
-                                if crate::structural::declares_sum_parent(self.program, h.id, w.id, 0));
-                        if whole {
-                            let flowed = self.link_forwarded_error(&got_res, &resolved, e.span());
-                            self.expect_expr_assignable(&flowed, &want, e);
+                        let outer_nullable = matches!(resolved, Type::Nullable(_));
+                        let nullable_result = matches!(
+                            &got_res,
+                            Type::Nullable(inner) if inner.is_result_type()
+                        );
+                        if outer_nullable && (got_res.is_null() || nullable_result) {
+                            self.expect_expr_assignable(&got, &want, e);
                         } else {
-                            self.expect_expr_assignable(&got, &ok, e);
+                            let whole = got_res.is_result_type()
+                                || matches!((&got_res, result_return), (Type::Sum(h), Type::Sum(w))
+                                    if crate::structural::declares_sum_parent(self.program, h.id, w.id, 0));
+                            if whole {
+                                let flowed =
+                                    self.link_forwarded_error(&got_res, result_return, e.span());
+                                self.expect_expr_assignable(&flowed, &want, e);
+                            } else {
+                                self.expect_expr_assignable(&got, &ok, e);
+                            }
                         }
                         got
                     } else {
@@ -2177,7 +2349,11 @@ impl<'a> Checker<'a> {
                     // `Result`). Mirrors the HM checker, which skips the
                     // void-return unification in a fallible body.
                     let resolved = self.resolve(&want);
-                    if let Some((ok, _err)) = resolved.result_payloads() {
+                    let result_return = match &resolved {
+                        Type::Nullable(inner) if inner.is_result_type() => inner.as_ref(),
+                        other => other,
+                    };
+                    if let Some((ok, _err)) = result_return.result_payloads() {
                         let ok = ok.clone();
                         self.expect_assignable(&Type::Void, &ok, span);
                     } else {

@@ -1,0 +1,11 @@
+import std.regex.{ Regex }
+
+fun title(html) -> string! {
+    const re = Regex.new("<title>(.+)</title>")!
+    return re.find(html).context("no <title> tag")!.group(1).context("no capture group")!.text
+}
+
+fun main() {
+    const text = "<html><title>Hello Brass</title></html>"
+    println(title(text)!)
+}

@@ -1846,7 +1846,9 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                 // `__present(x)` is the `if let x = e` presence test: false for a
                 // null, true for anything else. Non-nullable subjects fold
                 // statically (see `cond_static_truthiness`).
-                "__present" | "__null_prop_present" => Ok(Some(Type::Bool)),
+                "__present" | "__null_prop_present" | "__nullable_context_present" => {
+                    Ok(Some(Type::Bool))
+                }
                 // `__nonnull(x)` narrows a nullable to its inner type (the if-let
                 // binding of a nullable, proven non-null); a non-nullable is itself.
                 "__nonnull" => match args.first() {

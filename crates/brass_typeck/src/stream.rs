@@ -81,6 +81,9 @@ pub struct ChannelDelta {
     /// possibly duplicated across re-checked bodies; the final `Analysis`
     /// carries the sorted, deduplicated set).
     pub errors: Vec<TypeError>,
+    /// Warnings first reported in this window. They are non-fatal and use a
+    /// separate channel so error deduplication can never suppress them.
+    pub warnings: Vec<TypeError>,
     /// The resolved return type of an UNANNOTATED body elaborated at a concrete
     /// instance (`(symbol, type_args, return)`): the consumer's monomorphizer
     /// uses it to compile the call site as a runtime-deferred call without
@@ -109,6 +112,7 @@ impl ChannelDelta {
             && self.type_tests.is_empty()
             && self.type_tests_removed.is_empty()
             && self.errors.is_empty()
+            && self.warnings.is_empty()
             && self.instance_returns.is_empty()
             && self.keyed_calls.is_empty()
     }
@@ -228,6 +232,7 @@ pub(crate) struct StreamCtl<'s> {
 pub(crate) struct FlushState {
     pub(crate) typed_seen: usize,
     pub(crate) errors_seen: usize,
+    pub(crate) warnings_flushed: Vec<TypeError>,
     pub(crate) agg: AggState,
     pub(crate) expr_flushed: HashMap<Span, Type>,
     pub(crate) receivers: ReceiverState,
@@ -275,6 +280,10 @@ pub struct StreamSnapshot {
     pub sum_views: Vec<(Span, Type)>,
     pub type_names: Vec<(Span, String)>,
     pub typeof_types: Vec<(Span, Type)>,
+    /// Warnings already delivered before an interrupted run stopped. A resumed
+    /// consumer replays these immediately while the checker suppresses them
+    /// from later deltas.
+    pub warnings: Vec<TypeError>,
     /// Settled type-test patterns (may be absent in snapshots written by
     /// older builds; missing entries just re-derive on the next run).
     #[serde(default)]
@@ -340,6 +349,7 @@ impl FlushState {
                 .iter()
                 .map(|(s, t)| (*s, t.clone()))
                 .collect(),
+            warnings: self.warnings_flushed.clone(),
             type_tests: self
                 .type_tests
                 .iter()
@@ -356,6 +366,7 @@ impl FlushState {
         FlushState {
             typed_seen: 0,
             errors_seen: 0,
+            warnings_flushed: snap.warnings.clone(),
             agg: AggState {
                 per_span: snap.agg.iter().map(|(s, t)| (*s, t.clone())).collect(),
             },
@@ -522,6 +533,14 @@ impl ReceiverState {
         // but the checker has still resolved `context` to the prelude Result's
         // declaration and MIR can safely read defaults from that declaration.
         let ty = match ty {
+            // A direct nullable method receiver can only be the compiler-owned
+            // `context` hook (all other nullable member calls are rejected).
+            // Preserve one canonical marker across generic instantiations;
+            // keeping the concrete inner type would poison the shared call span
+            // when the same generic body is used at more than one T.
+            Type::Nullable(_) => Some(Type::Nullable(Box::new(Type::Unknown(
+                brass_hir::INFER_VAR,
+            )))),
             Type::Record(n) | Type::Sum(n) => program.type_by_id(n.id).map(|info| info.type_ref()),
             other if other.primitive_class().is_some() && brass_hir::is_fully_known(other) => {
                 Some(other.clone())
@@ -657,7 +676,9 @@ fn complete_aggregate_rec(ty: &Type, program: &Program, in_progress: &mut Vec<i3
 /// constructor's result, whose array fields the back end cannot otherwise
 /// type).
 fn is_seedable_instance(ty: &Type) -> bool {
-    matches!(ty, Type::Record(_) | Type::Sum(_)) && brass_hir::is_fully_known(ty)
+    (matches!(ty, Type::Record(_) | Type::Sum(_))
+        || matches!(ty, Type::Nullable(inner) if matches!(inner.as_ref(), Type::Record(_) | Type::Sum(_))))
+        && brass_hir::is_fully_known(ty)
 }
 
 /// Whether an array literal's checked type is worth seeding onto its result
@@ -746,6 +767,18 @@ mod tests {
         assert!(!delta.is_empty());
     }
 
+    #[test]
+    fn warning_makes_a_delta_nonempty() {
+        let delta = ChannelDelta {
+            warnings: vec![TypeError {
+                message: "warning".to_string(),
+                span: Span::new(0, 1),
+            }],
+            ..ChannelDelta::default()
+        };
+        assert!(!delta.is_empty());
+    }
+
     /// The consumer-side channel state after replaying a delta stream: what
     /// the lazy driver would hold.
     #[derive(Default)]
@@ -760,6 +793,7 @@ mod tests {
         type_names: HashMap<Span, String>,
         typeof_types: HashMap<Span, Type>,
         type_tests: HashMap<Span, Type>,
+        warnings: Vec<TypeError>,
         final_errors: Option<Vec<TypeError>>,
     }
 
@@ -803,6 +837,7 @@ mod tests {
             for (s, t) in &d.type_tests {
                 self.type_tests.insert(*s, t.clone());
             }
+            self.warnings.extend(d.warnings.iter().cloned());
         }
     }
 
@@ -840,6 +875,7 @@ mod tests {
             Some(&streamed.errors),
             "Finished must carry the full error set"
         );
+        assert_eq!(m.warnings, eager.warnings, "warnings diverge for {src}");
         assert_eq!(
             m.expr_types,
             aggregate_result_types(&streamed.typed, &program)
@@ -891,14 +927,26 @@ mod tests {
     }
 
     #[test]
+    fn streaming_matches_eager_on_a_warning() {
+        assert_stream_matches_eager(
+            "fun mixed(c: int32) {\n\
+                 if c == 1 { error(\"a\")! } else if c == 2 { null! }\n\
+                 return 1\n\
+             }\n",
+        );
+    }
+
+    #[test]
     fn snapshot_roundtrips_the_flush_state() {
         // A resumed run must diff against EXACTLY what the stopped run had
         // delivered: the snapshot -> state -> snapshot cycle loses nothing
         // (cursors excepted -- the new run's vectors are fresh).
         let program = lower(
-            "type P = { x: int32 }\n\
-             fun make(v: int32) -> P { return P { x: v } }\n\
-             fun main() { println(make(2).x) }\n",
+            "fun make(c: int32) {\n\
+                 if c == 1 { error(\"a\")! } else if c == 2 { null! }\n\
+                 return 1\n\
+             }\n\
+             fun main() { let result = make(0) }\n",
         );
         let mut rec = Recorder {
             requests: Vec::new(),
@@ -912,6 +960,7 @@ mod tests {
         state.receivers_flushed = merged.receiver_types.clone();
         state.sum_views = merged.sum_views.clone();
         state.view_args = merged.view_args.clone();
+        state.warnings_flushed = merged.warnings.clone();
         let fields: HashMap<Span, Vec<String>> = HashMap::default();
         let snap = state.snapshot(vec!["make".into(), "main".into()], 1, &fields);
         let back = FlushState::from_snapshot(&snap);
@@ -919,8 +968,23 @@ mod tests {
         assert_eq!(back.receivers_flushed, state.receivers_flushed);
         assert_eq!(back.sum_views, state.sum_views);
         assert_eq!(back.view_args, state.view_args);
+        assert_eq!(back.warnings_flushed, state.warnings_flushed);
+        assert!(
+            !snap.warnings.is_empty(),
+            "the fixture must carry a warning"
+        );
         assert_eq!(snap.checked, vec!["make".to_string(), "main".to_string()]);
         assert_eq!(snap.inits_checked, 1);
+
+        let mut resumed_rec = Recorder {
+            requests: Vec::new(),
+            events: Vec::new(),
+        };
+        let resumed = analyze_streaming(&program, None, &mut resumed_rec, Some(&snap));
+        assert_eq!(
+            resumed.warnings, snap.warnings,
+            "a completed resume must retain warnings from skipped bodies"
+        );
     }
 
     #[test]
