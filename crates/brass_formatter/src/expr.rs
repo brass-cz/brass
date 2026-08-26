@@ -192,7 +192,11 @@ impl<'a> Printer<'a> {
         } else {
             let mut parts = Vec::with_capacity(fields.len());
             for (n, v) in fields {
-                parts.push(format!("{n}: {}", self.flat_expr(v, false)?));
+                if field_shorthand(n, v) {
+                    parts.push(n.clone());
+                } else {
+                    parts.push(format!("{n}: {}", self.flat_expr(v, false)?));
+                }
             }
             format!("{{ {} }}", parts.join(", "))
         };
@@ -528,7 +532,14 @@ impl<'a> Printer<'a> {
         }
         for (fname, v) in fields {
             self.start(v.span().lo);
-            self.expr_lines(format!("{fname}: "), v, ",", false);
+            // The shorthand head is empty: the value IS the same-named
+            // identifier, so emitting it alone prints `field,`.
+            let head = if field_shorthand(fname, v) {
+                String::new()
+            } else {
+                format!("{fname}: ")
+            };
+            self.expr_lines(head, v, ",", false);
             self.finish(v.span().hi);
         }
         self.flush_comments(span.hi);
@@ -777,4 +788,12 @@ fn collect_operands<'e>(e: &'e Expr, p: u8, operands: &mut Vec<&'e Expr>, ops: &
         }
         _ => operands.push(e),
     }
+}
+
+/// Whether a literal field renders in the shorthand form `{ field }`: its
+/// value is the same-named identifier. The parser desugars the shorthand to
+/// exactly this shape, and a written `field: field` normalizes to it -- the
+/// two are indistinguishable in the AST and mean the same read.
+fn field_shorthand(name: &str, v: &Expr) -> bool {
+    matches!(v, Expr::Ident(n, _) if n == name)
 }

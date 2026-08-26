@@ -366,6 +366,43 @@ mod tests {
         }
     }
 
+    /// `P { x }`, `{ x }`, and `S.T { x }` desugar the field shorthand to
+    /// `x: x` -- the value is an identifier read at the field name's span --
+    /// and the anonymous form is a record, not a block.
+    #[test]
+    fn field_shorthand_desugars_to_same_named_ident() {
+        let src = "fun main() {\n    let p = P { x, y: 2 }\n    let a = { x }\n    let v = S.T { x }\n}\n";
+        let m = crate::parse(src).expect("parse");
+        let TopLevel::Fun(f) = &m.items[0] else {
+            panic!("expected a function");
+        };
+        let values: Vec<&Expr> = f
+            .body
+            .stmts
+            .iter()
+            .map(|s| match s {
+                Stmt::Let { value: Some(v), .. } => v,
+                other => panic!("expected let, got {other:?}"),
+            })
+            .collect();
+        let Expr::TypeLit(name, fields, _) = values[0] else {
+            panic!("nominal literal: {:?}", values[0]);
+        };
+        assert_eq!(name, "P");
+        assert!(matches!(&fields[0], (n, Expr::Ident(v, _)) if n == "x" && v == "x"));
+        assert!(matches!(&fields[1], (n, Expr::Int(2, _)) if n == "y"));
+        let Expr::TypeLit(name, fields, _) = values[1] else {
+            panic!("anonymous record, not a block: {:?}", values[1]);
+        };
+        assert!(name.is_empty());
+        assert!(matches!(&fields[0], (n, Expr::Ident(v, _)) if n == "x" && v == "x"));
+        let Expr::VariantLit(t, v, fields, _) = values[2] else {
+            panic!("variant literal: {:?}", values[2]);
+        };
+        assert_eq!((t.as_str(), v.as_str()), ("S", "T"));
+        assert!(matches!(&fields[0], (n, Expr::Ident(v, _)) if n == "x" && v == "x"));
+    }
+
     #[test]
     fn recovery_collects_multiple_statement_errors() {
         // Two bad statements in one body: both are reported at the offending

@@ -50,6 +50,17 @@ mod tests {
         once
     }
 
+    /// Field shorthand round-trips, and an explicit `field: field` normalizes
+    /// to it (the two are indistinguishable after the parser's desugar).
+    #[test]
+    fn field_shorthand_collapses() {
+        let src = "fun main() {\n    let x = 1\n    let p = P { x, y: 2 }\n    let q = P { x: x, y: 2 }\n    let a = { x }\n}\n";
+        assert_eq!(
+            roundtrip(src),
+            "fun main() {\n    let x = 1\n    let p = P { x, y: 2 }\n    let q = P { x, y: 2 }\n    let a = { x }\n}\n"
+        );
+    }
+
     #[test]
     fn normalizes_indentation_and_spacing() {
         let src = "fun main()   {\n  let x=1+2\n        println( x )\n}\n";

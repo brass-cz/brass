@@ -136,8 +136,10 @@ type Stack = {
 type Names = Stack { item: string }   // alias pinning the slot
 ```
 
-- Construct a record as `Type { field: value, ... }` and call methods as
-  `value.method()` or `Type.static_method()`. There is no UFCS.
+- Construct a record as `Type { field: value, ... }`; a bare `field` is
+  shorthand for `field: field` (also in `{ ... }` and variant literals).
+- Call methods as `value.method()` or `Type.static_method()`. There is no
+  UFCS.
 - A member written as `name(params) -> Return` inside a type is a required
   method signature, not stored data.
 - Sum types use `type Name = | Variant { fields } | Empty`. Construct a value

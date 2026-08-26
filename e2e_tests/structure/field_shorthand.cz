@@ -1,0 +1,25 @@
+// Field-init shorthand: `{ name }` initializes the field from the same-named
+// binding, in nominal, anonymous, and variant literals; mixing with explicit
+// `name: value` is fine.
+type P = {
+    x: int32
+    y: int32
+}
+type Shape = | Circle { radius: int32 } | Dot
+fun main() {
+    let x = 4
+    let y = 7
+    let p = P { x, y }
+    println(p.x + p.y)
+    let mixed = P { x, y: 9 }
+    println(mixed.y)
+    const field = "a"
+    const data = { field }
+    println(data.field)
+    let radius = 3
+    let c = Shape.Circle { radius }
+    match c {
+        Circle { radius } => println(radius),
+        Dot => println("dot"),
+    }
+}

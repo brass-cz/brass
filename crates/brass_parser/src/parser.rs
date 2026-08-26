@@ -147,9 +147,13 @@ impl Parser {
         std::mem::discriminant(self.peek()) == std::mem::discriminant(&k)
     }
 
-    /// True when the current `{` opens an anonymous-record literal (`{ field: ...`)
-    /// rather than a block: the next non-newline token is an identifier followed by
-    /// a `:`. Lookahead only -- the parser position is unchanged.
+    /// True when the current `{` opens an anonymous-record literal rather than
+    /// a block: the next non-newline token is an identifier followed by a `:`
+    /// (`{ field: ... }`), or -- the field-shorthand form -- by a `,` or the
+    /// closing `}` (`{ field }`, `{ field, ... }`). A lone identifier as a
+    /// BLOCK expression yielded void (a block's value comes only from
+    /// `return`), so reading it as a record takes over no meaningful program.
+    /// Lookahead only -- the parser position is unchanged.
     fn at_anon_record(&self) -> bool {
         let skip_newlines = |mut i: usize| {
             while i < self.tokens.len() && matches!(self.tokens[i].kind, TokenKind::Newline) {
@@ -162,7 +166,11 @@ impl Parser {
             return false;
         }
         let colon = skip_newlines(name + 1);
-        colon < self.tokens.len() && matches!(self.tokens[colon].kind, TokenKind::Colon)
+        colon < self.tokens.len()
+            && matches!(
+                self.tokens[colon].kind,
+                TokenKind::Colon | TokenKind::Comma | TokenKind::RBrace
+            )
     }
 
     /// Skip newline tokens when inside brackets. Maintains the invariant that
@@ -1212,9 +1220,17 @@ impl Parser {
         self.open(TokenKind::LBrace, "'{'")?;
         let mut fields = Vec::new();
         while !self.at_p(TokenKind::RBrace) {
-            let (name, _) = self.ident()?;
-            self.expect(TokenKind::Colon, "':'")?;
-            let value = self.parse_expr()?;
+            let (name, nspan) = self.ident()?;
+            // `name: value`, or the shorthand `name` alone -- sugar for
+            // `name: name`, initializing the field from the same-named binding
+            // in scope (the pattern side already binds this way:
+            // `Circle { radius }`). Desugared here, so the checker and the
+            // back ends see an ordinary identifier read at the name's span.
+            let value = if self.eat(TokenKind::Colon) {
+                self.parse_expr()?
+            } else {
+                Expr::Ident(name.clone(), nspan)
+            };
             fields.push((name, value));
             if !self.eat(TokenKind::Comma) {
                 break;

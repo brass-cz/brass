@@ -66,6 +66,25 @@ anything else, and an alias named `Result`, is rejected at the declaration.
 The shadow and the prelude's Result are distinct types: values of one are
 not usable as the other.
 
+## Field-init shorthand
+
+In a record, anonymous-record, or variant literal, a field written as a bare
+name initializes itself from the same-named binding in scope:
+
+```brass norun
+const field = "a"
+const data = { field }          // { field: field }
+let p = Point { x, y: 0 }       // Point { x: x, y: 0 }
+let c = Shape.Circle { radius } // Shape.Circle { radius: radius }
+```
+
+The shorthand desugars to `name: name` at parse time -- the value is an
+ordinary identifier read, so scoping, inference, hover, and go-to-definition
+behave exactly as if the long form had been written. It mirrors the pattern
+side, which has always bound this way (`Circle { radius } => ...`). The
+formatter prints the shorthand whenever a field's value is the same-named
+identifier.
+
 ## Error traces
 
 `core/error.cz` defines the error value model:
