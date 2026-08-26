@@ -2349,3 +2349,28 @@ fn completion_on_closure_call_result() {
     let labels = labels(&items);
     assert!(labels.contains(&"t".to_string()), "{labels:?}");
 }
+
+/// A null-propagating closure through a generic method keeps the outer `?`
+/// in the observed result: `ms.map((v) -> v.group(1)!.t)` binds `string?[]`
+/// (the closure returns null on the absent case), not `string[]`.
+#[test]
+fn hover_null_prop_closure_result_keeps_nullable_element() {
+    let src = concat!(
+        "type G = {\n    t: string\n}\n",
+        "type M = {\n    s: string\n}\n",
+        "fun M.group(self, i: int64) -> G? {\n    if i == 0 {\n        return null\n    }\n    return G { t: self.s }\n}\n",
+        "fun main() {\n",
+        "    let ms = [M { s: \"a\" }]\n",
+        "    let result = ms.map((v) -> v.group(1)!.t)\n",
+        "    println(result)\n",
+        "}\n",
+    );
+    let analyzer = DocAnalyzer::new(path());
+    let full = analyzer.analyze_full(src);
+    let (doc, pos) = position(src, "result =", false);
+    let h = hover::hover(&doc, &full, pos).expect("hover");
+    let HoverContents::Markup(m) = h.contents else {
+        panic!("markup hover");
+    };
+    assert!(m.value.contains("string?[]"), "{}", m.value);
+}

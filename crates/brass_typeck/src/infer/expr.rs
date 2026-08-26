@@ -232,12 +232,18 @@ impl<'a> Checker<'a> {
             // A display re-check (see `recheck_closure_args`) checks against
             // its OWN fresh return variable; the probe above commits nothing,
             // so bind the body value here for the harvest that feeds the
-            // enclosing call's result. Ordinary checking must stay
-            // probe-only: an open expected return there can belong to a
-            // caller structure that stays deliberately polymorphic.
+            // enclosing call's result. The body value is the SUCCESS path:
+            // a nullable-operand `!` also returns null from the closure, so
+            // the committed return carries that outer `?` (binding the bare
+            // value displayed `xs.map((v) -> v.group(1)!.t)` as `string[]`
+            // where the elements are really `string?`). Ordinary checking
+            // must stay probe-only: an open expected return there can belong
+            // to a caller structure that stays deliberately polymorphic.
             if self.closure_recheck_depth > 0 && matches!(self.resolve(want_ret), Type::Unknown(_))
             {
-                let _ = self.solver.unify(want_ret, &body_val);
+                let wrapped =
+                    super::precompute::wrap_null_propagated_return(body_val, &light_props.nulls);
+                let _ = self.solver.unify(want_ret, &wrapped);
             }
         }
         let ty = Type::Fun(param_types, Box::new(want_ret.clone()));
