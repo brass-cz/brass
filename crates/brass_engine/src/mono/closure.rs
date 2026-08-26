@@ -535,7 +535,10 @@ impl Monomorphizer<'_, '_> {
             &capture_seed,
             clo.captures.clone(),
             true,
-            false,
+            // A fallible closure gets the same per-instance treatment as a
+            // body-inferred fallible function: its result is `Result<ok, err>`
+            // and codegen Ok-wraps its bare returns.
+            clo.fallible,
         );
         self.closure_depth -= 1;
         let stored = stored?;

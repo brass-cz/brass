@@ -86,6 +86,12 @@ struct Hm<'p> {
     fallible: bool,
     ok: Type,
     err: Type,
+    /// Whether the CURRENT closure body unwrapped a `Result` with `!`. A
+    /// Result-operand `!` cannot be seen from syntax alone (see
+    /// `check_callable` -- a nullable-operand `!` must not force a Result),
+    /// so the closure arm resets this and the `ErrorProp` Result arms set it;
+    /// a closure whose body raised this way returns `Result<ret, err>`.
+    raised: bool,
     /// Numeric-literal variables to finalize: `(id, default, span)`. A literal
     /// stays a fresh variable so context can pin its exact kind; afterwards it
     /// must have resolved to the right numeric class, or defaults to `default`
@@ -111,6 +117,7 @@ impl<'p> Hm<'p> {
             ret: Type::Void,
             self_type: None,
             fallible: false,
+            raised: false,
             ok: Type::Void,
             err: Type::Void,
             lit_vars: Vec::new(),
@@ -754,12 +761,27 @@ impl<'p> Hm<'p> {
                 // reconcile against the enclosing callable's payloads either.
                 let saved_ret =
                     std::mem::replace(&mut self.ret, self.solver.fresh(InferenceVarKind::Source));
-                let saved_fallible = std::mem::replace(&mut self.fallible, false);
+                // A closure body that constructs an error is its own fallible
+                // callable, exactly like an unannotated function whose body
+                // does (see `check_callable`): its result is `Result<ok, err>`,
+                // a bare `return v` is the Ok payload, and an error site
+                // reconciles to `err`. A bare `expr!` does not count here for
+                // the same reasons as in `check_callable`.
+                let constructs = match body.as_ref() {
+                    Expr::Block(block, _) => block_constructs_error(block),
+                    other => expr_constructs_error(other),
+                };
+                let saved_fallible = std::mem::replace(&mut self.fallible, constructs);
+                let saved_raised = std::mem::replace(&mut self.raised, false);
                 let saved_ok =
                     std::mem::replace(&mut self.ok, self.solver.fresh(InferenceVarKind::Source));
                 let saved_err =
                     std::mem::replace(&mut self.err, self.solver.fresh(InferenceVarKind::Source));
                 let cret = self.ret.clone();
+                if constructs {
+                    let inferred = self.scoped_result(self.ok.clone(), self.err.clone());
+                    self.unify(&cret, &inferred, body.span());
+                }
                 match body.as_ref() {
                     // A block body returns via `return` (binding `cret`); a
                     // trailing expression value, if any, is also the result.
@@ -778,6 +800,16 @@ impl<'p> Hm<'p> {
                         self.unify(&val, &cret, body.span());
                     }
                 }
+                // A body that unwrapped a `Result` with `!` (and did not
+                // already reconcile against `Result<ok, err>` via `constructs`)
+                // propagates that Result: the body's value is the Ok payload,
+                // so the closure returns `Result<cret, err>`.
+                let raised = std::mem::replace(&mut self.raised, saved_raised);
+                let cret = if raised && !constructs {
+                    self.scoped_result(cret, self.err.clone())
+                } else {
+                    cret
+                };
                 self.ret = saved_ret;
                 self.fallible = saved_fallible;
                 self.ok = saved_ok;
@@ -1060,6 +1092,7 @@ impl<'p> Hm<'p> {
                     let (ok, err) = (ok.clone(), err.clone());
                     let err = crate::lift_err_payload(self.program, self.solver.resolve(&err));
                     self.reconcile_err(&err, *span);
+                    self.raised = true;
                     return ok;
                 }
                 // A declared subtype of the Result in scope unwraps like a
@@ -1082,6 +1115,7 @@ impl<'p> Hm<'p> {
                         .map(|e| crate::lift_err_payload(self.program, self.solver.resolve(&e)))
                         .unwrap_or_else(|| self.solver.fresh(InferenceVarKind::Source));
                         self.reconcile_err(&err, *span);
+                        self.raised = true;
                         return crate::structural::sum_field_payload(
                             self.program,
                             h,
@@ -1095,6 +1129,7 @@ impl<'p> Hm<'p> {
                 let res = self.scoped_result(o.clone(), e_err.clone());
                 self.unify(&et, &res, *span);
                 self.reconcile_err(&e_err, *span);
+                self.raised = true;
                 o
             }
             // Record construction `Name { f: v, .. }`: each field value must match

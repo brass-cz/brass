@@ -1,0 +1,20 @@
+// A `!` chain inside a closure passed to a generic array method: the closure
+// body is re-typed at its observed instantiation, so the nullable `group`
+// lookup propagates null out of the closure and `map` collects the payloads.
+type G = {
+    t: string
+}
+type M = {
+    s: string
+}
+fun M.group(self, i: int64) -> G? {
+    if i == 0 {
+        return null
+    }
+    return G { t: self.s }
+}
+fun main() {
+    let ms = [M { s: "a" }, M { s: "b" }]
+    let ts = ms.map((v) -> v.group(1)!.t)
+    println(ts)
+}

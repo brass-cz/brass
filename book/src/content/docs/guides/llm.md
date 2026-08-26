@@ -104,8 +104,9 @@ println(double(2.5))   // 5.0
   requires an array with an inferred element type.
 - `self` is a reference, so instance methods can mutate their receiver.
 - Closures capture live bindings by reference and may mutate them.
-- Closures cannot currently contain `error(...)` or apply `!` to a Result.
-  Put fallible work in a named function and call it from the closure.
+- Closures may be fallible: a body using `error(...)` or a Result-operand `!`
+  returns `Result<T, E>` (no `!` sugar on closure types); the caller unwraps
+  with `!` or a `match`. `spawn` still requires a `void`-returning closure.
 - Mutual-recursion cycles should annotate their return types.
 
 ## Records, methods, sums, and interfaces
@@ -373,7 +374,7 @@ reading results that tasks mutate.
   `T.from(value)!`.
 - Narrow `T?` before use and match Results as `Ok { value }` / `Err { error }`.
 - A block-bodied function or closure needs `return` to produce a value.
-- Do not put fallible propagation directly in a closure.
+- A closure using `error(...)`/`!` returns a `Result`; unwrap it at the call.
 - Compile a `Regex` once rather than inside a loop.
 - Run `brass check` after every generated edit.
 

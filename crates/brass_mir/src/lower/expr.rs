@@ -1355,12 +1355,18 @@ fn lower_closure_body(
         }
     }
     let mir_body = fl.b.finish(param_locals.clone(), BlockId(0));
+    // A closure has no return annotation, so its fallibility is always the
+    // inferred form: an `error(...)`/Result-`!` body returns a `Result` whose
+    // bare returns codegen Ok-wraps. A nullable-operand `!` (a `null_props`
+    // span) instead makes the return nullable, exactly as for functions.
+    let fallible = crate::analysis::fallible_block_except(&closure_block(body), ctx.null_props);
     MirClosure {
         id,
         params: param_locals,
         captures,
         capture_names: capture_names.to_vec(),
         module,
+        fallible,
         body: mir_body,
     }
 }

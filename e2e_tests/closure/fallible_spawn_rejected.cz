@@ -1,0 +1,6 @@
+// `spawn` requires a void closure; a fallible closure returns a Result and
+// is rejected at the call.
+fun main() {
+    spawn(() -> error("boom"))
+    sync()
+}

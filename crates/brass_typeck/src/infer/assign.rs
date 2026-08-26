@@ -224,9 +224,6 @@ impl<'a> Checker<'a> {
     }
 
     pub(super) fn record_sum_view_type(&mut self, span: brass_parser::Span, view: Type) {
-        if self.display_recheck_depth > 0 {
-            return;
-        }
         self.journal_elaboration(ElaborationJournalEntry::SumView(span, view.clone()));
         self.note_sum_view(span, Some(&view));
         self.sum_views.insert(span, view);
@@ -237,9 +234,6 @@ impl<'a> Checker<'a> {
     /// a generic body where another instantiation coerces at the same span is
     /// rejected instead of executing the baked rebuild on an uncoerced value.
     pub(super) fn record_sum_view_identity(&mut self, span: brass_parser::Span) {
-        if self.display_recheck_depth > 0 {
-            return;
-        }
         self.journal_elaboration(ElaborationJournalEntry::SumViewIdentity(span));
         self.note_sum_view(span, None);
     }

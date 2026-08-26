@@ -289,7 +289,20 @@ impl<'a> Checker<'a> {
                         .expect("closure scope frame")
                         .insert(param.name.clone(), ty);
                 }
-                let ret = self.infer_expr_light(body, &inner, props);
+                // The closure is its OWN callable: its error/null sites shape
+                // the closure's return, never the enclosing function's (the
+                // caller's `props` stays untouched -- threading it through
+                // wrapped the PARENT's inferred return in the closure's
+                // `Result` even though the propagation returns from the
+                // closure alone).
+                let mut own = LightProps::default();
+                let ret = self.infer_expr_light(body, &inner, &mut own);
+                let ret = if own.errors.is_empty() {
+                    ret
+                } else {
+                    self.result_from_payloads(Some(ret), &own.errors, false)
+                };
+                let ret = super::precompute::wrap_null_propagated_return(ret, &own.nulls);
                 Type::Fun(
                     params
                         .iter()

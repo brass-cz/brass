@@ -1,0 +1,20 @@
+// A fallible closure passed through an unannotated higher-order parameter:
+// the callee's result is the closure's Result, per call site.
+fun call_it(f) {
+    return f("7")
+}
+fun main() {
+    match call_it((s) -> int32.parse(s)!) {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err"),
+    }
+    match call_it((s: string) -> {
+        if s == "7" {
+            return error("seven")
+        }
+        return s
+    }) {
+        Ok { value } => println("ok2 {value}"),
+        Err { error } => println("err2 {error.value}"),
+    }
+}

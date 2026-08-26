@@ -1,0 +1,19 @@
+// A block-bodied closure mixing `return error(..)` with bare returns: the
+// bare value is the Ok payload, the error path an Err -- like a named
+// function whose unannotated body raises.
+fun main() {
+    let classify = (s: string) -> {
+        if s == "" {
+            return error("empty")
+        }
+        return s
+    }
+    match classify("hi") {
+        Ok { value } => println("ok: {value}"),
+        Err { error } => println("err: {error.value}"),
+    }
+    match classify("") {
+        Ok { value } => println("ok: {value}"),
+        Err { error } => println("err: {error.value}"),
+    }
+}

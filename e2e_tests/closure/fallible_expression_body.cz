@@ -1,0 +1,11 @@
+// A closure whose expression body unwraps a Result with `!` is fallible: it
+// returns `Result<T, E>`, callers unwrap with `!` or match on it.
+fun main() {
+    let parse = (s: string) -> int32.parse(s)!
+    let n = parse("41")!
+    println(n + 1)
+    match parse("xx") {
+        Ok { value } => println("unexpected {value}"),
+        Err { error } => println("caught: {error}"),
+    }
+}

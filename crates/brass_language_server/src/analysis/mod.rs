@@ -116,10 +116,6 @@ pub struct DocAnalyzer {
 
 impl DocAnalyzer {
     pub fn new(path: PathBuf) -> Self {
-        // The whole server analyzes for display: closure arguments are
-        // re-checked at their observed instantiations so hover and completion
-        // see concrete types inside closure bodies. Compilers leave this off.
-        brass_typeck::set_editor_mode(true);
         DocAnalyzer {
             path,
             cache: ItemCache::default(),

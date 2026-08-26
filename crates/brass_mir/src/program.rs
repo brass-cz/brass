@@ -55,6 +55,13 @@ pub struct MirClosure {
     /// Defining module path (inherited from the enclosing body), for resolving
     /// the type names this closure constructs.
     pub module: Vec<String>,
+    /// Whether the body uses `error(...)` or a Result-operand `expr!`: the
+    /// closure returns `Result<ok, err>` and a bare `return v` is implicitly
+    /// wrapped as `Ok { value: v }`, exactly like a named function whose
+    /// unannotated body raises (closures have no return annotation, so this is
+    /// always the inferred form). Per instance the backend still requires a
+    /// live error site (see the monomorphizer's `live_fallible_site`).
+    pub fallible: bool,
     pub body: MirBody,
 }
 

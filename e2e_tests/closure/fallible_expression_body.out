@@ -1,0 +1,2 @@
+42
+caught: [e2e_tests/closure/fallible_expression_body.cz:4:32] unhandled error: cannot parse `xx` as integer

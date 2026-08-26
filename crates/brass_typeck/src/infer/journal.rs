@@ -558,32 +558,17 @@ impl Checker<'_> {
         }
     }
 
-    // The span-keyed MIR channels below (and their kin in expr.rs/assign.rs)
-    // are suppressed during a display-only closure re-check: the re-check
-    // types the SAME spans a second time at concrete types, and a channel's
-    // conflict-poisoning must not fire on (or its entries be replaced by)
-    // display work the compile pipeline never performs.
-
     pub(super) fn record_null_prop(&mut self, span: Span) {
-        if self.display_recheck_depth > 0 {
-            return;
-        }
         self.journal_elaboration(ElaborationJournalEntry::NullProp(span));
         self.null_props.insert(span);
     }
 
     pub(super) fn record_lift_err(&mut self, span: Span) {
-        if self.display_recheck_depth > 0 {
-            return;
-        }
         self.journal_elaboration(ElaborationJournalEntry::LiftErr(span));
         self.lift_errs.insert(span);
     }
 
     pub(super) fn record_type_name(&mut self, span: Span, name: String) {
-        if self.display_recheck_depth > 0 {
-            return;
-        }
         self.journal_elaboration(ElaborationJournalEntry::TypeName(span, name.clone()));
         if let Some(prev) = self.type_names.insert(span, name.clone())
             && prev != name
@@ -600,9 +585,6 @@ impl Checker<'_> {
     }
 
     pub(super) fn record_typeof_type(&mut self, span: Span, ty: &Type) {
-        if self.display_recheck_depth > 0 {
-            return;
-        }
         let concrete = self.resolve(ty);
         if !is_concrete_type(&concrete) || self.typeof_poisoned.contains(&span) {
             return;
@@ -620,10 +602,6 @@ impl Checker<'_> {
     }
 
     pub(super) fn record_fields_loop(&mut self, span: Span, fields: Vec<String>) -> bool {
-        if self.display_recheck_depth > 0 {
-            // Approved without recording: the caller still types the copies.
-            return true;
-        }
         self.journal_elaboration(ElaborationJournalEntry::FieldsLoop(span, fields.clone()));
         if let Some(prev) = self.fields_loops.get(&span)
             && prev != &fields
@@ -641,9 +619,6 @@ impl Checker<'_> {
     }
 
     pub(super) fn record_view_arg(&mut self, span: Span) {
-        if self.display_recheck_depth > 0 {
-            return;
-        }
         self.journal_elaboration(ElaborationJournalEntry::ViewArg(span));
         self.view_args.insert(span);
     }
@@ -655,9 +630,6 @@ impl Checker<'_> {
         method: String,
         key: Type,
     ) {
-        if self.display_recheck_depth > 0 {
-            return;
-        }
         self.journal_elaboration(ElaborationJournalEntry::KeyedCall(
             span,
             receiver.clone(),

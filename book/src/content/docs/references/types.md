@@ -595,10 +595,23 @@ parameter and return types are inferred (annotations optional); a closure used
 polymorphically instantiates per call. A closure parameter shadows a global
 function of the same name; the local value is called.
 
-Closures cannot yet be **fallible**: a closure body that uses `error(...)` or
-a Result-operand `!` is not supported (it currently fails when the closure is
-compiled or called). Move the fallible logic into a named function and call
-that from the closure.
+Closures may be **fallible**, exactly like a named function whose unannotated
+body raises: a body that uses `error(...)` or a Result-operand `!` returns
+`Result<T, E>`, a bare `return v` (or an expression body's value) is the Ok
+payload, and the null case of a nullable-operand `!` propagates null (the
+return becomes `T?`). There is no `!` sugar on closure types -- the `Result`
+appears directly in the inferred function type, and the caller unwraps it with
+`!` or a `match`:
+
+```brass
+let parse = (s: string) -> int32.parse(s)!
+let n = parse("41")!            // parse: (string) -> Result<int32, string>
+```
+
+A fallible closure also works through a generic (unannotated) higher-order
+parameter -- `xs.map((v) -> v.lookup(k)!.name)` propagates the closure's
+failure out of `map`'s per-call result. `spawn` still requires a closure
+returning `void`, so a fallible closure is rejected there.
 
 ## Concurrency typing
 

@@ -596,32 +596,36 @@ impl<'a> Checker<'a> {
         ret
     }
 
-    /// Editor-mode display pass: re-check each closure literal argument at the
-    /// parameter types its one application was observed to instantiate (see
-    /// `record_closure_binding`), run right after the callee-body elaboration
-    /// that produced the observations.
+    /// Re-check each closure literal argument at the parameter types its
+    /// application was observed to instantiate (see `record_closure_binding`),
+    /// run right after the callee-body elaboration that produced the
+    /// observations.
     ///
     /// The first check of such a closure ran with its parameters OPEN (the
     /// callee's parameter is unannotated), so everything derived from a
     /// parameter -- `v.group(1)` in `xs.map((v) -> v.group(1))` -- took the
-    /// deferred-dispatch path and was typed as an unconstrained unknown;
-    /// nothing links it to the concrete receiver after the fact. The re-check
-    /// types the body at the observed parameter types, recording the concrete
-    /// sidecar entries hover and completion read (they prefer a resolved entry
-    /// over an open one at the same span).
+    /// deferred-dispatch path: it was typed as an unconstrained unknown and
+    /// recorded NOTHING in the span channels MIR lowers from (a `!` on such an
+    /// operand has no null-vs-Result kind). This pass is where a closure body
+    /// under a generic callee is finally typed at concrete types: it records
+    /// the sidecar entries hover and completion read, fills the propagation
+    /// channels for the body's spans (conflicting instantiations poison them,
+    /// the same rule shared generic bodies already follow), and reports the
+    /// concrete-type errors the deferred pass could not see (duplicates
+    /// collapse in the final sort+dedup).
     ///
-    /// Display-only by construction: it runs only in editor mode
-    /// (`set_editor_mode`), its diagnostics are dropped, the MIR span channels
-    /// and the elaboration memo are suspended while it runs
-    /// (`display_recheck_depth`), and the solver state is rolled back, so the
-    /// closure value the callee received keeps its generic type. The concrete
-    /// result is harvested first and fed back as an observation on the
-    /// closure's RETURN variables, so the enclosing call's own result
-    /// (`xs.map(..) : R[]`) display-resolves as well.
+    /// The unifications stay local: the solver is rolled back (recorded types
+    /// were resolved at record time), so the closure value the callee received
+    /// keeps its generic type -- like the other speculative passes, which is
+    /// also why the elaboration memo stays off inside (`closure_recheck_depth`
+    /// in `memo_enabled`). The concrete result is harvested before the
+    /// rollback and fed back as an observation on the closure's RETURN
+    /// variables, so the enclosing call's own result (`xs.map(..) : R[]`)
+    /// resolves for display too.
     fn recheck_closure_args(&mut self, args: &[Arg], arg_types: &[Type], scopes: &mut ScopeStack) {
         // The depth bound cuts pathological closure-in-closure nesting; real
         // code is one or two levels.
-        if !crate::editor_mode() || self.display_recheck_depth >= 4 {
+        if self.closure_recheck_depth >= 4 {
             return;
         }
         for (arg, ty) in args.iter().zip(arg_types) {
@@ -667,10 +671,8 @@ impl<'a> Checker<'a> {
             if !usable || !observed_any {
                 continue;
             }
-            let errors_before = self.errors.len();
-            let warnings_before = self.warnings.len();
             let snapshot = self.solver.snapshot();
-            self.display_recheck_depth += 1;
+            self.closure_recheck_depth += 1;
             let want_ret = self.fresh_unknown();
             let want = Type::Fun(want_params, Box::new(want_ret));
             let got = self.check_expr_against(&arg.expr, &want, scopes);
@@ -690,10 +692,8 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            self.display_recheck_depth -= 1;
+            self.closure_recheck_depth -= 1;
             self.solver.rollback(snapshot);
-            self.errors.truncate(errors_before);
-            self.warnings.truncate(warnings_before);
             for (id, observed) in harvested {
                 self.record_closure_binding(id, &observed);
             }

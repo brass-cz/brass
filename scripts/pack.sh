@@ -150,10 +150,6 @@ cwd="$(pwd)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' 0
 artifact="$cwd/brass-$(rustc --print=host-tuple).tar.gz"
-if [[ -e "$artifact" ]]; then
-    echo "refusing to overwrite existing artifact: $artifact" >&2
-    exit 1
-fi
 
 ./x cargo install --path crates/brass_driver --root "$tmp"
 ./x cargo install --path crates/brass_language_server --root "$tmp"

@@ -203,22 +203,6 @@ pub fn context_seed_with(program: &Program, seed: Option<&ContextTables>) -> Opt
     Some(analysis.context_tables)
 }
 
-/// Editor mode: when enabled, analysis additionally re-checks closure
-/// arguments at their observed parameter instantiations so the typed sidecar
-/// carries concrete types for closure bodies (see
-/// `Checker::recheck_closure_args`). Display-only work with its own
-/// diagnostics dropped and the MIR span channels suppressed; compilers must
-/// leave this off (the default). Set once by the language server at startup.
-static EDITOR_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn set_editor_mode(enabled: bool) {
-    EDITOR_MODE.store(enabled, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub(crate) fn editor_mode() -> bool {
-    EDITOR_MODE.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Run all static checks and collect the typed-expression sidecar.
 pub fn analyze(program: &Program) -> Analysis {
     analyze_with(program, None)
@@ -3743,6 +3727,69 @@ mod tests {
                     .contains("cannot use `Result<int32, string>` where `int32` is required")),
             "{e:?}"
         );
+    }
+
+    /// A block-bodied closure mixing `return error(..)` with a bare return is
+    /// fallible: the bare value is the Ok payload, so the call result is a
+    /// `Result` and matches like one. Unwrapping the call with `!` yields the
+    /// payload (the HM pass must agree with the infer pass here).
+    #[test]
+    fn fallible_closure_mixed_returns_and_unwrap() {
+        let e = errs(concat!(
+            "fun main() {\n",
+            "    let f = (s: string) -> {\n",
+            "        if s == \"\" {\n",
+            "            return error(\"empty\")\n",
+            "        }\n",
+            "        return s\n",
+            "    }\n",
+            "    let ok: string = f(\"hi\")!\n",
+            "}\n",
+        ));
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    /// A fallible closure through an UNANNOTATED higher-order parameter: the
+    /// callee's per-call result is the closure's `Result`, so matching on the
+    /// `Ok`/`Err` variants type-checks (the closure argument is re-checked at
+    /// its observed instantiation).
+    #[test]
+    fn fallible_closure_through_generic_callee_matches_result() {
+        let e = errs(concat!(
+            "fun call_it(f) {\n    return f(\"7\")\n}\n",
+            "fun main() {\n",
+            "    let r = call_it((s: string) -> {\n",
+            "        if s == \"7\" {\n",
+            "            return error(\"seven\")\n",
+            "        }\n",
+            "        return s\n",
+            "    })\n",
+            "    match r {\n",
+            "        Ok { value } => println(value),\n",
+            "        Err { error } => println(\"e\"),\n",
+            "    }\n",
+            "}\n",
+        ));
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    /// A fallible closure's error sites belong to the CLOSURE alone: the
+    /// enclosing function's inferred return stays the plain value (the light
+    /// pass used to thread the parent's props into the closure body, wrapping
+    /// the parent's return in the closure's Result).
+    #[test]
+    fn closure_error_sites_do_not_make_the_parent_fallible() {
+        let e = errs(concat!(
+            "fun outer() {\n",
+            "    let f = (s: string) -> int32.parse(s)!\n",
+            "    let r = f(\"xx\")\n",
+            "    return \"done\"\n",
+            "}\n",
+            "fun main() {\n",
+            "    let x: string = outer()\n",
+            "}\n",
+        ));
+        assert!(e.is_empty(), "{e:?}");
     }
 
     #[test]

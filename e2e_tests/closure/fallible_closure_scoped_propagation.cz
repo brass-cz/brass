@@ -1,0 +1,15 @@
+// `!` inside a closure propagates to the CLOSURE's return, not the enclosing
+// function's: the parent receives the Err/null as an ordinary value and keeps
+// running, and its own inferred return stays the plain value.
+fun outer() {
+    let parse = (s: string) -> int32.parse(s)!
+    match parse("xx") {
+        Ok { value } => println("unexpected {value}"),
+        Err { error } => println("closure err: {error.value}"),
+    }
+    return "outer-done"
+}
+fun main() {
+    let x: string = outer()
+    println(x)
+}

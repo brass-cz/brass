@@ -177,6 +177,26 @@ impl<'a> Checker<'a> {
         closure_scopes.push(Scope::new(closure_scope));
         let mut light_props = LightProps::default();
         self.infer_expr_light(body, &closure_scopes, &mut light_props);
+        // A FALLIBLE closure body checked against a still-open expected
+        // return: bind the expectation to `Result<ok, err>` up front, so the
+        // body's returns reconcile order-independently -- a bare `return v`
+        // against the Ok payload, a `return error(..)` against the whole
+        // Result (the same shape `check_callable` sets up for a named
+        // fallible body). Left open, the first return seen would fix the
+        // shape and the other kind would clash against it.
+        if matches!(self.resolve(want_ret), Type::Unknown(_)) && !light_props.errors.is_empty() {
+            let ok = self.fresh_unknown();
+            let err = self
+                .reconcile_error_payloads(&light_props.errors, true)
+                .unwrap_or_else(|| self.fresh_unknown());
+            let span = light_props
+                .errors
+                .first()
+                .map(|(_, s)| *s)
+                .unwrap_or(brass_parser::Span::new(0, 0));
+            let inferred = self.scoped_result(ok, err, span);
+            let _ = self.solver.unify(want_ret, &inferred);
+        }
         self.const_scopes.push(HashSet::default());
         self.return_contexts
             .push(ReturnContext::Explicit(want_ret.clone()));
@@ -187,16 +207,35 @@ impl<'a> Checker<'a> {
         self.const_scopes.pop();
         // An expression-bodied closure (not a `{ ... }` block) returns its body
         // value directly, so that value must match the expected return; a block
-        // body returns through the `return` context handled above.
+        // body returns through the `return` context handled above. Against a
+        // RESULT expectation (a fallible closure -- the pre-binding above, or
+        // an explicitly Result-typed parameter) a bare body value is the Ok
+        // payload, exactly as `check_return` treats a bare `return v`; a body
+        // that is itself a whole Result (an `error(..)`, a forwarded fallible
+        // call) flows whole.
         if !matches!(body, Expr::Block(..)) {
-            self.expect_expr_assignable(&body_val, want_ret, body);
+            let resolved_want = self.resolve(want_ret);
+            let want_result = match &resolved_want {
+                Type::Nullable(inner) if inner.is_result_type() => Some(inner.as_ref()),
+                other if other.is_result_type() => Some(other),
+                _ => None,
+            };
+            match want_result.and_then(|w| w.result_payloads()) {
+                Some((ok, _err)) if !self.resolve(&body_val).is_result_type() => {
+                    let ok = ok.clone();
+                    self.expect_expr_assignable(&body_val, &ok, body);
+                }
+                _ => {
+                    self.expect_expr_assignable(&body_val, want_ret, body);
+                }
+            }
             // A display re-check (see `recheck_closure_args`) checks against
             // its OWN fresh return variable; the probe above commits nothing,
             // so bind the body value here for the harvest that feeds the
             // enclosing call's result. Ordinary checking must stay
             // probe-only: an open expected return there can belong to a
             // caller structure that stays deliberately polymorphic.
-            if self.display_recheck_depth > 0 && matches!(self.resolve(want_ret), Type::Unknown(_))
+            if self.closure_recheck_depth > 0 && matches!(self.resolve(want_ret), Type::Unknown(_))
             {
                 let _ = self.solver.unify(want_ret, &body_val);
             }
@@ -291,9 +330,6 @@ impl<'a> Checker<'a> {
     /// forced onto the `Result` instance, which then returns (or renders) the
     /// whole `Result` where its Ok payload was meant.
     pub(super) fn record_prop_kind(&mut self, span: brass_parser::Span, kind: PropKind) {
-        if self.display_recheck_depth > 0 {
-            return;
-        }
         self.journal_elaboration(ElaborationJournalEntry::PropKind(span, kind));
         match self.prop_kinds.get(&span) {
             None => {
@@ -323,9 +359,6 @@ impl<'a> Checker<'a> {
     /// lift (or drop the wrap of the one that must). Only called once the
     /// payload type is resolved, so the template elaboration stays silent.
     pub(super) fn record_lift_kind(&mut self, span: brass_parser::Span, lifted: bool) {
-        if self.display_recheck_depth > 0 {
-            return;
-        }
         self.journal_elaboration(ElaborationJournalEntry::LiftKind(span, lifted));
         if self.lift_poisoned.contains(&span) {
             return;
@@ -606,13 +639,37 @@ impl<'a> Checker<'a> {
                 // is the implicit return. (Previously inverted on both counts:
                 // the trailing expression typed a block closure's result and an
                 // explicit `return` typed it void.)
+                // A `return error(..)` -- a Result whose Ok payload is still
+                // open -- is an ERROR SITE, not an ordinary return: its Err
+                // payload joins the fallible layer and the bare returns alone
+                // reconcile as the Ok side, exactly how `infer_returns_block`
+                // classifies a named function's returns. A COMPLETE forwarded
+                // Result (known Ok payload) still flows whole.
+                let normal: Vec<(Type, brass_parser::Span)> = collected
+                    .into_iter()
+                    .filter(|(t, span)| match self.resolve(t).result_payloads() {
+                        Some((ok, err)) if ok.is_unknown() => {
+                            let lifted = crate::lift_err_payload(self.program, self.resolve(err));
+                            propagated.errors.push((lifted, *span));
+                            false
+                        }
+                        _ => true,
+                    })
+                    .collect();
                 let ret = if matches!(&**body, Expr::Block(..)) {
-                    self.reconcile_return_types(&collected, false)
+                    self.reconcile_return_types(&normal, false)
                         .unwrap_or(Type::Void)
                 } else {
                     body_val
                 };
-                let ret = self.wrap_inferred_fallible_return(ret, &propagated);
+                // An already-`Result` value (a pure thrower or forwarder) must
+                // not gain a second Result layer from the sites that built it;
+                // the null-propagation wrapper still applies.
+                let ret = if self.resolve(&ret).is_result_type() {
+                    super::precompute::wrap_null_propagated_return(ret, &propagated.nulls)
+                } else {
+                    self.wrap_inferred_fallible_return(ret, &propagated)
+                };
                 // Reuse the parameter types from the scope the body was checked
                 // against, so an unannotated parameter's inference variable is
                 // shared between the `Fun` parameter and the return type. This
@@ -993,9 +1050,6 @@ impl<'a> Checker<'a> {
     /// shared generic body whose instantiations pin a hole differently (one
     /// lowering serves them all, so no single pattern would be right).
     pub(super) fn record_type_test(&mut self, span: brass_parser::Span, pattern: &Type) {
-        if self.display_recheck_depth > 0 {
-            return;
-        }
         self.journal_elaboration(ElaborationJournalEntry::TypeTest(span, pattern.clone()));
         if self.type_test_poisoned.contains(&span) {
             return;

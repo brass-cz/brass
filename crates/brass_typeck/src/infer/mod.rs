@@ -1835,11 +1835,11 @@ struct Checker<'a> {
     /// `Checker::record_closure_binding`); `None` poisons a variable observed
     /// at two different types (a genuinely polymorphic closure).
     closure_bindings: HashMap<u32, Option<Type>>,
-    /// Nesting depth of display-only closure re-checks (see
-    /// `Checker::recheck_closure_args`). While positive, the MIR span
-    /// channels do not record (their conflict-poisoning must not fire on
-    /// display work) and body elaborations are not memoized.
-    display_recheck_depth: u32,
+    /// Nesting depth of closure-argument re-checks (see
+    /// `Checker::recheck_closure_args`). While positive, body elaborations are
+    /// not memoized: the re-check's unifications are rolled back, so its
+    /// context is speculative the same way a co-check or type-test probe is.
+    closure_recheck_depth: u32,
     /// Spans of `expr!` operators whose operand is a NULLABLE (not a `Result`):
     /// the null case propagates as `Result.Null`. MIR lowering emits the
     /// presence-test shape for exactly these spans (see [`Inference::null_props`]).
@@ -2090,7 +2090,7 @@ impl<'a> Checker<'a> {
             fields_loops: HashMap::default(),
             type_names: HashMap::default(),
             closure_bindings: HashMap::default(),
-            display_recheck_depth: 0,
+            closure_recheck_depth: 0,
             null_props: HashSet::default(),
             in_entry_main: false,
             static_divergence: false,
