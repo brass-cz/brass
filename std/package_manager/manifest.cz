@@ -65,11 +65,7 @@ fun Manifest.parse(s: string) -> Manifest! {
         _ => error("Invalid value type in `package.authors`")!,
     }
     const license: string = package_raw.get("license")!.as_string()!
-    const package = PackageInfo {
-        name: name,
-        authors: authors,
-        license: license,
-    }
+    const package = PackageInfo { name, authors, license }
 
     let dependencies: Dependencies = HashMap.new()
     if _has(toml.keys()!, "dependencies") {
@@ -84,7 +80,7 @@ fun Manifest.parse(s: string) -> Manifest! {
             dependencies.set(name, _dependency(table.get(name)!)!)
         }
     }
-    return Manifest { package: package, dependencies: dependencies }
+    return Manifest { package, dependencies }
 }
 
 /**
@@ -123,7 +119,7 @@ fun _dependency(entry: TomlValue) -> Dependency! {
         } else {
             DEFAULT_REV
         }
-        return Dependency.Git { git: entry.get("git")!.as_string()!, rev: rev }
+        return Dependency.Git { git: entry.get("git")!.as_string()!, rev }
     } else if has_path && _only(keys, ["path"]) {
         return Dependency.Path {
             path: Path.parse(entry.get("path")!.as_string()!),

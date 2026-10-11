@@ -133,7 +133,7 @@ fun HashMap._insert(self, key, value) {
             if self._states[idx] == 2 {
                 self._tombs -= one
             }
-            self._entries[idx] = _Entry { key: key, value: value }
+            self._entries[idx] = _Entry { key, value }
             self._states[idx] = 1
             self._count += one
             return
@@ -182,7 +182,7 @@ fun HashMap.set(self, key, value) {
         // Overwrite by replacing the whole slot: the element is a nullable
         // `_Entry?`, so its `value` field cannot be assigned through in place.
         if let e = self._entries[existing] {
-            self._entries[existing] = _Entry { key: e.key, value: value }
+            self._entries[existing] = _Entry { key: e.key, value }
         }
         return
     }

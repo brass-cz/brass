@@ -16,7 +16,7 @@ type Vec2 = {
 }
 
 fun Vec2.new(x, y) {
-    return Self { x: x, y: y }
+    return Self { x, y }
 }
 
 fun Vec2.add(self, other) {

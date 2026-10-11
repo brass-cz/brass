@@ -121,7 +121,7 @@ type Account = {
 }
 
 fun Account.new(owner: string) -> Account {
-    return Self { owner: owner, balance: 0 }
+    return Self { owner, balance: 0 }
 }
 
 fun Account.deposit(self, amount: int64) {
@@ -138,6 +138,7 @@ type Names = Stack { item: string }   // alias pinning the slot
 
 - Construct a record as `Type { field: value, ... }`; a bare `field` is
   shorthand for `field: field` (also in `{ ... }` and variant literals).
+  Prefer the shorthand whenever the value is the same-named binding.
 - Call methods as `value.method()` or `Type.static_method()`. There is no
   UFCS.
 - A member written as `name(params) -> Return` inside a type is a required
@@ -376,6 +377,8 @@ reading results that tasks mutate.
   `T.from(value)!`.
 - Narrow `T?` before use and match Results as `Ok { value }` / `Err { error }`.
 - A block-bodied function or closure needs `return` to produce a value.
+  `(x) -> { x }` is a block returning `void`; write `(x) -> x`, or
+  `(x) -> ({ x })` for a record.
 - A closure using `error(...)`/`!` returns a `Result`; unwrap it at the call.
 - Compile a `Regex` once rather than inside a loop.
 - Run `brass check` after every generated edit.

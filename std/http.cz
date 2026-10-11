@@ -99,7 +99,7 @@ fun _parse_header_lines(text: string) {
                 return error("invalid HTTP header value for {name}")
             }
             const value = val.trim()
-            headers.push(Header { name: name, value: value })
+            headers.push(Header { name, value })
         }
     }
     return headers
@@ -139,7 +139,7 @@ fun _parse_status_line(line: string) {
     return _StatusLine {
         version: parts[0],
         status: int32.parse(parts[1])!,
-        reason: reason,
+        reason,
     }
 }
 
@@ -255,7 +255,7 @@ fun HttpResponse.parse(raw: string) {
         status: status.status,
         reason: status.reason,
         headers: message.head.headers,
-        body: body,
+        body,
     }
 }
 
@@ -300,8 +300,8 @@ type HttpClient = {
 
 fun HttpClient.http(host: string, port: int32) {
     return Self {
-        host: host,
-        port: port,
+        host,
+        port,
         _default_port: 80,
         _connect: () -> { return Tcp.connect(host, port) },
     }
@@ -309,8 +309,8 @@ fun HttpClient.http(host: string, port: int32) {
 
 fun HttpClient.https(host: string, port: int32) {
     return Self {
-        host: host,
-        port: port,
+        host,
+        port,
         _default_port: 443,
         _connect: () -> { return TlsStream.connect(host, port) },
     }
@@ -350,7 +350,7 @@ fun _read_response_open(conn, req: HttpRequest) {
             version: status.version,
             status: status.status,
             reason: status.reason,
-            headers: headers,
+            headers,
             body: [],
         }
     }
@@ -364,8 +364,8 @@ fun _read_response_open(conn, req: HttpRequest) {
             version: status.version,
             status: status.status,
             reason: status.reason,
-            headers: headers,
-            body: body,
+            headers,
+            body,
         }
     }
 
@@ -393,7 +393,7 @@ fun _read_response_open(conn, req: HttpRequest) {
         version: status.version,
         status: status.status,
         reason: status.reason,
-        headers: headers,
+        headers,
         body: data.slice(body_start, body_end),
     }
 }
@@ -547,7 +547,7 @@ fun _scan_chunks(data: uint8[]) -> _ChunkScan! {
             if size == 0 {
                 const end = _scan_trailers(data, chunk_start)
                 if end >= 0 {
-                    return _ChunkScan { body: body, consumed: end, done: true }
+                    return _ChunkScan { body, consumed: end, done: true }
                 }
                 scanning = false
             } else {
@@ -562,7 +562,7 @@ fun _scan_chunks(data: uint8[]) -> _ChunkScan! {
             }
         }
     }
-    return _ChunkScan { body: body, consumed: consumed, done: false }
+    return _ChunkScan { body, consumed, done: false }
 }
 
 // Decodes a chunked body held in memory whole, as `HttpResponse.parse` has
@@ -631,7 +631,7 @@ fun HttpClient.fetch(self, path: string) {
     }
     let req = HttpRequest {
         method: "GET",
-        path: path,
+        path,
         version: "HTTP/1.1",
         headers: [Header { name: "Host", value: host_str }],
         body: [],
@@ -662,13 +662,13 @@ fun _parse_host_port(value: string, default_port: int32) -> _HostPort! {
             const host = _string_slice(text, 1, close)
             const rest = _string_slice(text, close + 1, len(text))
             if len(rest) == 0 {
-                return _HostPort { host: host, port: default_port }
+                return _HostPort { host, port: default_port }
             }
             if !rest.starts_with(":") || len(rest) == 1 {
                 return error("malformed bracketed host: {text}")
             }
             return _HostPort {
-                host: host,
+                host,
                 port: _parse_port(_string_slice(rest, 1, len(rest)))!,
             }
         }

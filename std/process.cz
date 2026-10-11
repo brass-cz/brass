@@ -289,5 +289,5 @@ fun Child.output(self) -> Output! {
     const code = int32.from(process_wait_captured(self._handle)!)!
     const out = process_take_captured(self._handle, 1)!
     const err = process_take_captured(self._handle, 2)!
-    return Output { code: code, stdout: out, stderr: err }
+    return Output { code, stdout: out, stderr: err }
 }

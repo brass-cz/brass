@@ -8,7 +8,7 @@ type Vec2 = {
 }
 
 fun Vec2.new(x: float64, y: float64) {
-    return Self { x: x, y: y }
+    return Self { x, y }
 }
 
 fun Vec2.add(self, other: Vec2) -> Vec2 {

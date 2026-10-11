@@ -76,11 +76,11 @@ fun _parse_ip_literal(cs: string[], n: int64) -> Authority! {
     validate(substr(cs, 1, close), CharClass.IpLiteral)!
     let host = substr(cs, 0, close + 1)
     let next: int64 = close + 1
-    if next == n { return Authority { userinfo: null, host: host, port: null } }
+    if next == n { return Authority { userinfo: null, host, port: null } }
     if cs[next] != ":" {
         return error("expected `:` after the IP literal in authority: {substr(cs, 0, n)}")
     }
-    return Authority { userinfo: null, host: host, port: _parse_port(substr(cs, next + 1, n))! }
+    return Authority { userinfo: null, host, port: _parse_port(substr(cs, next + 1, n))! }
 }
 
 /** Parses the digits after the port colon; no digits at all means "no port". */

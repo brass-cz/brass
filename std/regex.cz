@@ -142,7 +142,7 @@ type Regex = {
 fun Regex.new(pattern: string) -> Regex! {
     const handle = regex_compile(pattern)!
     return Self {
-        pattern: pattern,
+        pattern,
         _handle: handle,
         _names: regex_group_names(handle),
     }
@@ -260,7 +260,7 @@ fun _match_at(text: string, spans: int64[], base: int64, names: string[]) -> Mat
             groups.push(null)
         } else {
             // The engine's offsets always fall on character boundaries.
-            groups.push(Group { text: _string_slice(text, start, end), start: start, end: end })
+            groups.push(Group { text: _string_slice(text, start, end), start, end })
         }
         i += 1
     }
@@ -269,9 +269,9 @@ fun _match_at(text: string, spans: int64[], base: int64, names: string[]) -> Mat
     const end = spans[base + 1]
     return Match {
         text: _string_slice(text, start, end),
-        start: start,
-        end: end,
-        groups: groups,
+        start,
+        end,
+        groups,
         _names: names,
     }
 }

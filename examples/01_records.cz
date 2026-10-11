@@ -10,7 +10,7 @@ type Account = {
 
 // A static method has no `self` parameter and is called as `Type.method`.
 fun Account.open(owner: string) -> Account {
-    return Self { owner: owner, balance: 0 }
+    return Self { owner, balance: 0 }
 }
 
 // Instance methods take `self` first and are called as `value.method`.

@@ -108,19 +108,19 @@ fun URI.parse_reference(s: string) -> URI! {
     // { .. }` once `a` is stored into a record.
     if has_authority {
         return Self {
-            scheme: scheme,
+            scheme,
             authority: Authority.parse(authority_text)!,
-            path: path,
-            query: query,
-            fragment: fragment,
+            path,
+            query,
+            fragment,
         }
     }
     return Self {
-        scheme: scheme,
+        scheme,
         authority: null,
-        path: path,
-        query: query,
-        fragment: fragment,
+        path,
+        query,
+        fragment,
     }
 }
 
@@ -202,8 +202,8 @@ fun URI.resolve(self, reference: string) -> URI! {
     return URI {
         scheme: base_scheme,
         authority: self.authority,
-        path: path,
-        query: query,
+        path,
+        query,
         fragment: r.fragment,
     }
 }

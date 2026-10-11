@@ -28,7 +28,7 @@ type Account = {
 
 // A static method has no `self` parameter.
 fun Account.open(owner) -> Account {
-    return Self { owner: owner, balance: 0 }
+    return Self { owner, balance: 0 }
 }
 
 // Instance methods take `self` first.
@@ -47,6 +47,11 @@ fun main() {
     println(acc.describe())   // Alice: 150
 }
 ```
+
+`Self { owner, balance: 0 }` uses the field-init shorthand: a bare field
+name takes the same-named binding, so `owner` stands for `owner: owner`. It
+works in every record, anonymous-record, and variant literal (see
+[Syntax sugar](/references/syntax-sugar/#field-init-shorthand)).
 
 Records have reference semantics: `acc.deposit(100)` mutates the account the
 caller sees, because `self` is always a reference. A method is in scope

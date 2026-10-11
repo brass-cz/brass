@@ -331,7 +331,7 @@ type _ParseState = {
  * first malformed statement, naming the byte offset.
  */
 fun TomlValue.parse(text: string) -> TomlValue! {
-    let cur = _Cursor { text: text, pos: 0 }
+    let cur = _Cursor { text, pos: 0 }
     let root: _TomlTable = HashMap.new()
     let current = root
     let current_path = ""
@@ -340,10 +340,10 @@ fun TomlValue.parse(text: string) -> TomlValue! {
     let sealed: _PathSet = HashMap.new()
     let arrays: _PathSet = HashMap.new()
     let state = _ParseState {
-        declared: declared,
-        dotted: dotted,
-        sealed: sealed,
-        arrays: arrays,
+        declared,
+        dotted,
+        sealed,
+        arrays,
         latest_keys: [],
         latest_values: [],
         serial: 0,

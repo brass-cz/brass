@@ -164,7 +164,7 @@ fun Udp.recv_from(self, max: int64) -> Datagram! {
     let raw = udp_recv_from(self._fd, max)!
     let alen: int64 = raw[0]
     let addr = to_text(raw.slice(1, 1 + alen))!
-    return Datagram { data: raw.slice(1 + alen, len(raw)), addr: addr }
+    return Datagram { data: raw.slice(1 + alen, len(raw)), addr }
 }
 
 /** The socket's own `"ip:port"` address. */

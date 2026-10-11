@@ -199,9 +199,13 @@ Notes:
 - **Record construction** `TypeName { field: value, ... }`,
   `Self { ... }` inside methods, and variant construction
   `Type.Variant { ... }` (a unit variant is `Type.Variant` with no braces).
+  A bare `field` is shorthand for `field: field`; see
+  [Field-init shorthand](/references/syntax-sugar/#field-init-shorthand).
 - **Anonymous record literal** `{ field: value, ... }`: a structural record
-  with no declared type. At statement position an opening `{` starts a block;
-  the literal form is recognized by the `name:` lookahead.
+  with no declared type. An opening `{` otherwise starts a block; the literal
+  form is recognized by the lookahead `{ name:`, `{ name,`, or `{ name }`. A
+  closure's `-> {` always opens a block body, so a closure returning a record
+  parenthesizes it: `(x) -> ({ x })`.
 - **`if` / `else`** is an expression and yields a value; `else if` chains.
   The condition does not take a record literal directly (parenthesize if
   needed).

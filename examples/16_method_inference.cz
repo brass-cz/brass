@@ -8,7 +8,7 @@ type Account = {
 }
 
 fun Account.open(owner: string) {
-    return Self { owner: owner, balance: 0 }
+    return Self { owner, balance: 0 }
 }
 
 fun Account.deposit(self, amount: int32) {

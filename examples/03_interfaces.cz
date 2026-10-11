@@ -19,7 +19,7 @@ type User: Showable, Comparable = {
 }
 
 fun User.new(name: string, age: int32) {
-    return Self { name: name, age: age }
+    return Self { name, age }
 }
 
 fun User.to_string(self) -> string {

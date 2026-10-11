@@ -80,9 +80,9 @@ fun Version.new(major: int64, minor: int64, patch: int64) -> Version! {
         return error("semantic version components must be non-negative")
     }
     return Self {
-        major: major,
-        minor: minor,
-        patch: patch,
+        major,
+        minor,
+        patch,
         prerelease: null,
         build: null,
     }

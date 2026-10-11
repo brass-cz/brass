@@ -64,7 +64,7 @@ fun Error.display(self) -> string {
 fun error(value, loc: Location) -> infer! {
     // The annotation types the empty literal for the back end.
     let frames: Frame[] = []
-    return Result.Err { error: Error { value: value, location: loc, frames: frames } }
+    return Result.Err { error: Error { value, location: loc, frames } }
 }
 
 // Attach a context message to a failed Result, keeping a success untouched.

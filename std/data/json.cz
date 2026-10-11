@@ -223,7 +223,7 @@ type _Cursor = {
  * content is an error.
  */
 fun JsonValue.parse(text: string) -> JsonValue! {
-    let cur = _Cursor { text: text, pos: 0 }
+    let cur = _Cursor { text, pos: 0 }
     cur._skip_ws()
     const value = cur._value()!
     cur._skip_ws()
@@ -288,7 +288,7 @@ fun _Cursor._object(self) -> JsonValue! {
     self._skip_ws()
     if self._peek() == "\}" {
         self.pos = self.pos + 1
-        return JsonValue.Object { values: values }
+        return JsonValue.Object { values }
     }
     while true {
         self._skip_ws()
@@ -305,7 +305,7 @@ fun _Cursor._object(self) -> JsonValue! {
         const sep = self._peek()
         self.pos = self.pos + 1
         if sep == "\}" {
-            return JsonValue.Object { values: values }
+            return JsonValue.Object { values }
         }
         if sep != "," {
             return error("expected ',' or '\}' in object at offset {self.pos}")
@@ -431,7 +431,7 @@ fun _Cursor._number(self) -> JsonValue! {
     if value != value || value - value != 0.0 {
         return error("JSON number is not finite: {raw}")
     }
-    return JsonValue.Number { value: value }
+    return JsonValue.Number { value }
 }
 
 fun _is_digit(c: string) -> bool {

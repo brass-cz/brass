@@ -85,6 +85,12 @@ side, which has always bound this way (`Circle { radius } => ...`). The
 formatter prints the shorthand whenever a field's value is the same-named
 identifier.
 
+An anonymous record needs no leading `name:`: a `{` followed by `name,` or
+`name }` also opens a literal, so `const a = { x }` builds `{ x: x }`. The
+exception is a closure body: `->` followed by `{` always opens a block, so
+`(x) -> { x }` is a block that yields nothing (a block's value comes only
+from `return`). Parenthesize to return a record: `(x) -> ({ x })`.
+
 ## Error traces
 
 `core/error.cz` defines the error value model:
@@ -96,7 +102,7 @@ type Error = { value, location: Location, frames: Frame[] }
 ```
 
 `error(value)` wraps its payload:
-`Result.Err { error: Error { value: value, location: <call site>, frames: [] } }`.
+`Result.Err { error: Error { value, location: <call site>, frames: [] } }`.
 `Result.context(self, ctx)` appends a `Frame` to a failed result and leaves a
 success untouched. An unhandled `!` renders the trace through
 `Error.display`, newest context first:
