@@ -2374,3 +2374,23 @@ fn hover_null_prop_closure_result_keeps_nullable_element() {
     };
     assert!(m.value.contains("string?[]"), "{}", m.value);
 }
+
+/// Pattern qualifiers resolve as type names, while field shorthand retains
+/// its binding hover and definition. A qualified unit variant binds nothing.
+#[test]
+fn qualified_pattern_hover_and_definition() {
+    let src = "type Shape = Circle { r: int32 } | Dot\nfun f(s: Shape) {\n    match s {\n        Shape.Circle { r } => r,\n        Shape.Dot => 0,\n    }\n}\n";
+    let full = full_analysis(src);
+    for needle in ["Shape.Circle", "Shape.Dot"] {
+        let (doc, pos) = position(src, needle, false);
+        let text = hover_text(&hover::hover(&doc, &full, pos).expect("qualifier hover"));
+        assert!(text.contains("type Shape"), "{text}");
+        let loc = definition::definition(&doc, &full, pos).expect("qualifier definition");
+        assert_eq!(loc.range.start.line, 0);
+    }
+    let (doc, pos) = position(src, "r,", false);
+    let text = hover_text(&hover::hover(&doc, &full, pos).expect("field hover"));
+    assert!(text.contains("int32"), "{text}");
+    let loc = definition::definition(&doc, &full, pos).expect("field binding definition");
+    assert_eq!(loc.range.start.line, 3);
+}

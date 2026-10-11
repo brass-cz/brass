@@ -56,34 +56,32 @@ pub fn check_imports(modules: &[LoadedModule]) -> Vec<ResolveError> {
                 }
             }
         }
-        // The same local name imported from two different modules is a local
-        // ambiguity in the importing module: neither
-        // origin wins, so a bare use cannot be resolved.
-        let mut origins: HashMap<&str, Vec<String>> = HashMap::default();
+        // Compare full targets in source order so the second local name is
+        // diagnosed even when both exports come from the same module.
+        let mut origins: HashMap<&str, String> = HashMap::default();
         for imp in &m.ast.imports {
-            let key = imp.path.join(".");
+            let path = imp.path.join(".");
+            let path = if exports.contains_key(&path) {
+                path
+            } else if exports.contains_key(&format!("core.{path}")) {
+                format!("core.{path}")
+            } else {
+                path
+            };
             for name in &imp.names {
-                let seen = origins.entry(name.local.as_str()).or_default();
-                if !seen.contains(&key) {
-                    seen.push(key.clone());
-                }
-            }
-        }
-        for imp in &m.ast.imports {
-            for name in &imp.names {
-                if let Some(paths) = origins.get(name.local.as_str())
-                    && paths.len() > 1
-                    && paths.first() == Some(&imp.path.join("."))
-                {
-                    errors.push(ResolveError {
-                        message: format!(
-                            "`{}` is imported from multiple modules (`{}`); \
-                                 the import is ambiguous",
-                            name.local,
-                            paths.join("`, `")
-                        ),
-                        span: imp.span,
-                    });
+                let target = format!("{path}.{}", name.remote);
+                if let Some(first) = origins.get(name.local.as_str()) {
+                    if first != &target {
+                        errors.push(ResolveError {
+                            message: format!(
+                                "`{}` is imported twice (`{first}` and `{target}`)",
+                                name.local
+                            ),
+                            span: name.span,
+                        });
+                    }
+                } else {
+                    origins.insert(&name.local, target);
                 }
             }
         }
@@ -93,14 +91,14 @@ pub fn check_imports(modules: &[LoadedModule]) -> Vec<ResolveError> {
                 if !is_public(&name.remote) {
                     errors.push(ResolveError {
                         message: format!("cannot import private name `{}`", name.remote),
-                        span: imp.span,
+                        span: name.span,
                     });
                     continue;
                 }
                 match exports.get(&key) {
                     Some(names) if !names.contains(&name.remote) => errors.push(ResolveError {
                         message: format!("module `{key}` has no exported name `{}`", name.remote),
-                        span: imp.span,
+                        span: name.span,
                     }),
                     Some(_) => {}
                     None => {
@@ -119,13 +117,13 @@ pub fn check_imports(modules: &[LoadedModule]) -> Vec<ResolveError> {
                                         "module `{key}` has no exported name `{}`",
                                         name.remote
                                     ),
-                                    span: imp.span,
+                                    span: name.span,
                                 });
                             }
                             Some(_) => {}
                             None => errors.push(ResolveError {
                                 message: format!("cannot import from unknown module `{key}`"),
-                                span: imp.span,
+                                span: name.span,
                             }),
                         }
                     }
@@ -228,11 +226,11 @@ mod tests {
             .collect();
         let ambiguous: Vec<_> = errors
             .iter()
-            .filter(|m| m.contains("imported from multiple modules"))
+            .filter(|m| m.contains("imported twice"))
             .collect();
         assert_eq!(ambiguous.len(), 1, "reported once: {errors:?}");
         assert!(
-            ambiguous[0].contains("`a.util`") && ambiguous[0].contains("`b.util`"),
+            ambiguous[0].contains("`a.util.helper`") && ambiguous[0].contains("`b.util.helper`"),
             "{errors:?}"
         );
     }

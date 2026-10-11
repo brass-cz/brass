@@ -1,0 +1,4 @@
+// Pin a later arm and the likely intended variant after a binding typo.
+type Color = Red | Green | Blue
+let c = Color.Blue
+println(match c { Rde => "red", Green => "green", Blue => "blue" })

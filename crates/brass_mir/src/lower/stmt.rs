@@ -51,7 +51,7 @@ pub fn resolve_simple_type(te: &TypeExpr) -> Option<Type> {
         }
         TypeExpr::Anonymous(fields, _) => {
             let mut resolved = Vec::with_capacity(fields.len());
-            for (name, fty) in fields {
+            for (name, fty, _) in fields {
                 resolved.push((name.clone(), resolve_simple_type(fty)?));
             }
             Some(brass_hir::structural_record(resolved))
@@ -148,7 +148,7 @@ impl FnLower<'_, '_> {
                 // a plain loop variable can be a fields-loop (see
                 // `fields_loop_target`), so its name is available here.
                 if let Some(fields) = self.ctx.fields_loops.get(span)
-                    && let Pattern::Binding(var, _) = pat
+                    && let Pattern::Binding(var, _, _) = pat
                 {
                     let fields = fields.clone();
                     let exit = self.b.new_block();
@@ -277,7 +277,7 @@ impl FnLower<'_, '_> {
             // own slot. A resolvable annotation fixes the slot's type so an
             // annotation the initializer cannot express (e.g. `int32?` for `null`)
             // survives into monomorphization.
-            Pattern::Binding(name, _) => {
+            Pattern::Binding(name, _, _) => {
                 let v = self.lower_expr(value);
                 // A captured-and-mutated binding is heap-promoted to a shared cell
                 // by `bind_value`; the scalar type annotation does not apply to the
@@ -316,7 +316,7 @@ impl FnLower<'_, '_> {
     /// allocation. The checker's definite-assignment pass rejects any read
     /// before full initialization, so a default value is never observed.
     fn lower_let_uninit(&mut self, pat: &Pattern, ty: Option<&TypeExpr>) {
-        let Pattern::Binding(name, _) = pat else {
+        let Pattern::Binding(name, _, _) = pat else {
             // The checker rejects uninitialized wildcard/destructuring lets.
             return;
         };
@@ -576,7 +576,7 @@ impl FnLower<'_, '_> {
         // A range counts through a single variable; the checker rejects a
         // destructuring pattern over one.
         if let Expr::Range(lo, hi, span) = iter
-            && let Pattern::Binding(var, _) = pat
+            && let Pattern::Binding(var, _, _) = pat
         {
             return self.lower_for_range(var, lo, hi, *span, body);
         }
@@ -626,7 +626,7 @@ impl FnLower<'_, '_> {
         // A DESTRUCTURING pattern binds the element's parts, which are values of
         // their own -- there is no single binding to write back through.
         let writeback = match pat {
-            Pattern::Binding(var, _) => {
+            Pattern::Binding(var, _, _) => {
                 self.bind_value(var, elem);
                 reassigns_var(body, var).then(|| (arr, i, var.to_string()))
             }
@@ -803,7 +803,7 @@ fn expr_reassigns_var(e: &Expr, var: &str) -> bool {
                 || (!pat.bound_names().contains(&var) && reassigns_var(then, var))
                 || els.as_ref().is_some_and(|e| expr_reassigns_var(e, var))
         }
-        Expr::TypeTest(subject, _, _) => expr_reassigns_var(subject, var),
+        Expr::TypeTest(subject, _, _, _) => expr_reassigns_var(subject, var),
         Expr::Match(subject, arms, _) => {
             expr_reassigns_var(subject, var)
                 || arms.iter().any(|arm| {

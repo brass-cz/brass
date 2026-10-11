@@ -26,7 +26,9 @@ fun _packages_dir() {
 
 fun download_and_extract_tarball(url: string, hash: string) {
     if !_valid_sha256(hash) {
-        return error("tarball hash must be exactly 64 lowercase hexadecimal characters")
+        return error(
+            "tarball hash must be exactly 64 lowercase hexadecimal characters",
+        )
     }
     const cache = _packages_dir()!.join("tarball")
     if !cache.is_dir() {
@@ -51,12 +53,15 @@ fun download_and_extract_tarball(url: string, hash: string) {
     match populated {
         Err { error } => {
             remove_dir(staging)!
-        }
-        Ok { value } => {}
+        },
+        Ok { value } => {
+        },
     }
     populated!
     match move_dir(staging, path) {
-        Ok { value } => { return path }
+        Ok { value } => {
+            return path
+        },
         Err { error } => {
             remove_dir(staging)!
             // Another process may have published the same verified package.
@@ -64,7 +69,7 @@ fun download_and_extract_tarball(url: string, hash: string) {
                 return path
             }
             return error("failed to publish the extracted tarball")
-        }
+        },
     }
 }
 
@@ -105,13 +110,15 @@ fun _valid_sha256(hash: string) -> bool {
 // is the exclusive operation; a concurrent fetch therefore gets its own tree.
 fun _staging_dir(parent: Path, key: string) -> Path! {
     let cmd = Command.new("sh")
-    cmd.args([
-        "-c",
-        "umask 077; stage=\"$1/.$2.$$\"; mkdir \"$stage\" && printf '%s' \"$stage\"",
-        "czpm-stage",
-        parent.to_string(),
-        key,
-    ])
+    cmd.args(
+        [
+            "-c",
+            "umask 077; stage=\"$1/.$2.$$\"; mkdir \"$stage\" && printf '%s' \"$stage\"",
+            "czpm-stage",
+            parent.to_string(),
+            key,
+        ],
+    )
     cmd.stdout(Stdio.Pipe)
     const child = cmd.spawn()!
     const out = child.output()!

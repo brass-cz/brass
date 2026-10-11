@@ -1,0 +1,34 @@
+// Module-qualified record heads preserve their type in let, match, for,
+// and nested patterns. Open arguments infer that record, even when a sum
+// declares a variant with the same bare name.
+import geo.pt
+
+type Holder = | Wrap { point: pt.P }
+type Collision = | P { x: int32 }
+
+fun inferred(point) {
+    return match point {
+        pt.P { x, y } => x + y,
+    }
+}
+
+fun main() {
+    let p = pt.P { x: 1, y: 2 }
+    let pt.P { x, y } = p
+    println(x + y)
+    match p {
+        pt.P { x } => println(x),
+    }
+    let holder = Holder.Wrap { point: p }
+    match holder {
+        Holder.Wrap { point: pt.P { x, y } } => println(x + y),
+    }
+    for pt.P { x, y } in [p] {
+        println(x + y)
+    }
+    println(inferred(p))
+    let read = (point) -> match point {
+        pt.P { x, y } => x + y,
+    }
+    println(read(p))
+}

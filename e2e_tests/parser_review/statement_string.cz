@@ -1,0 +1,3 @@
+// Adjacent strings require a statement boundary.
+let s = "abc" "def"
+println(s)

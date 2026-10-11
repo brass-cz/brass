@@ -296,7 +296,7 @@ fn auto_acquire_modules(modules: &mut [LoadedModule]) -> Vec<(String, Span)> {
 
         fn pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
             match pat {
-                Pattern::Binding(name, _) => {
+                Pattern::Binding(name, _, _) => {
                     out.insert(name.clone());
                 }
                 Pattern::Array(pats, _) => {
@@ -682,7 +682,7 @@ fn context_seed(
 fn module_source_base(module: &LoadedModule) -> Option<usize> {
     match module.ast.items.first()? {
         TopLevel::Stmt(Stmt::Let {
-            pat: brass_parser::ast::Pattern::Binding(name, span),
+            pat: brass_parser::ast::Pattern::Binding(name, _, span),
             is_const: true,
             ..
         }) if name == brass_resolve::MODULE_PATH_CONST => Some(span.lo),
@@ -1023,8 +1023,8 @@ fn print_diags(diags: Vec<String>) -> u8 {
 /// diagnostic to the body containing it. Lazy checking HOLDS an error whose
 /// span lies inside a body execution never needs; an error inside a needed
 /// body -- or outside any body at all (top-level code, declarations,
-/// signatures) -- is fatal at the next gate. Methods use keys no demand ever
-/// names, so their errors surface through the mono-failure path instead.
+/// signatures) -- is fatal at the next gate. Method owners are marked needed
+/// from the monomorphized batch before native compilation.
 #[cfg(jit_backend)]
 struct BodySpans {
     ranges: Vec<(String, usize, usize)>,
@@ -1033,13 +1033,12 @@ struct BodySpans {
 #[cfg(jit_backend)]
 impl BodySpans {
     fn new(program: &Program) -> Self {
-        // The WHOLE declaration's range, not just the body block: a
-        // signature-level diagnostic (a return-path error points at the
-        // return annotation) about a function nothing runs is as ignorable
-        // as one inside its body.
+        // Declarations establish the shared typing environment. Only body
+        // diagnostics may be held for an uncalled function; a rejected
+        // signature must not reach a caller or native compilation.
         let mut ranges = Vec::new();
         for (symbol, f) in &program.functions {
-            let span = f.decl.span;
+            let span = f.decl.body.span;
             ranges.push((symbol.clone(), span.lo, span.hi));
         }
         for info in program.types.values() {
@@ -1053,9 +1052,13 @@ impl BodySpans {
                 }
             }
             for m in methods {
-                if m.decl.body.is_some() {
-                    let span = m.decl.span;
-                    ranges.push((format!("{}.{}", info.name, m.decl.name), span.lo, span.hi));
+                if let Some(body) = &m.decl.body {
+                    let span = body.span;
+                    ranges.push((
+                        format!("method:{}:{}", info.symbol, m.decl.name),
+                        span.lo,
+                        span.hi,
+                    ));
                 }
             }
         }
@@ -1139,7 +1142,8 @@ struct LazyState {
     /// terminal and generated-continuation snapshots from printing a warning
     /// already delivered by an earlier window.
     printed_warnings: HashSet<(String, Span)>,
-    /// The bodies execution needs: `main`, plus every demanded function.
+    /// The bodies execution needs: `main`, every demanded free function, and
+    /// every method in a batch about to enter native compilation.
     /// (Top-level code needs no entry here -- its spans lie outside every
     /// body, which is always fatal.) Grows at each demand; held errors are
     /// re-judged against it at every gate.
@@ -1206,6 +1210,28 @@ fn demand_loop_progress(
 
 #[cfg(jit_backend)]
 impl LazyState {
+    /// Methods already have checked and lowered bodies when free-function
+    /// demands begin. Match their MIR body identities against this batch so
+    /// their held diagnostics gate native compilation too. Storage symbols
+    /// distinguish identically named types in different modules.
+    fn need_monomorphized_methods(
+        &mut self,
+        mir: &brass_mir::MirProgram,
+        mono: &brass_engine::MonoProgram<'_>,
+    ) {
+        let compiled: HashSet<*const brass_mir::MirBody> = mono
+            .functions
+            .iter()
+            .map(|f| std::ptr::from_ref(f.body))
+            .collect();
+        self.needed.extend(
+            mir.methods
+                .iter()
+                .filter(|m| compiled.contains(&std::ptr::from_ref(&m.body)))
+                .map(|m| format!("method:{}:{}", m.type_symbol, m.method)),
+        );
+    }
+
     /// Release the checker's background queue (idempotent). Called when
     /// execution begins, and before any wait on the checker's own progress.
     fn resume_background(&self) {
@@ -1604,16 +1630,29 @@ fn drain_targets_for_spawn(
 /// prior side effects, so the narrow demand fallback asks for `--eager`.
 #[cfg(jit_backend)]
 fn exit_if_fatal(lazy: &mut LazyState, bodies: &BodySpans, sources: &brass_resolve::SourceMap) {
-    if lazy.fatal(bodies).is_empty() {
+    if lazy.fatal(bodies).is_empty() && !lazy.needs_eager {
         return;
     }
     // Wait for the checker thread's final verdict. The wait is on its own
     // progress, so its queue must be running.
     lazy.resume_background();
-    while !lazy.closed && !lazy.needs_eager {
+    while !lazy.closed {
         lazy.pump_blocking();
     }
     use std::io::Write;
+    // A runtime specialization fallback cannot replay prior side effects,
+    // but it can finish checking. Preserve that source verdict before giving
+    // rerun guidance for a program whose continuation actually checked cleanly.
+    let fatal = if lazy.needs_eager {
+        lazy.held_all()
+    } else {
+        lazy.fatal(bodies)
+    };
+    if !fatal.is_empty() {
+        let _ = io::stdout().flush();
+        print_diags(render_errors(&fatal, sources));
+        std::process::exit(1);
+    }
     if lazy.needs_eager {
         let _ = io::stdout().flush();
         eprintln!(
@@ -1621,15 +1660,6 @@ fn exit_if_fatal(lazy: &mut LazyState, bodies: &BodySpans, sources: &brass_resol
         );
         std::process::exit(1);
     }
-    let fatal = lazy.fatal(bodies);
-    if fatal.is_empty() {
-        return;
-    }
-    let _ = io::stdout().flush();
-    for line in render_errors(&fatal, sources) {
-        eprintln!("{line}");
-    }
-    std::process::exit(1);
 }
 
 /// A fatal diagnostic discovered here means the program needed ill-typed
@@ -1692,6 +1722,8 @@ fn resolve_deferred(
             lazy.merged.instance_returns.clone(),
         ) {
             Ok(mono) => {
+                lazy.need_monomorphized_methods(&lowering.mir, &mono);
+                exit_if_fatal(lazy, bodies, sources);
                 // An UNANNOTATED instance was deferred against the checker's
                 // reported return; the monomorphized body is the authority.
                 // A mismatch would make the already-compiled call site an
@@ -1809,6 +1841,18 @@ fn resolve_deferred(
                         continue;
                     }
                 }
+                // A failed batch may never expose its method dependencies.
+                // The completed source verdict takes precedence over the
+                // secondary compilation error, just as at the entry gate.
+                if lazy.closed && !lazy.needs_eager {
+                    let held = lazy.held_all();
+                    if !held.is_empty() {
+                        use std::io::Write;
+                        let _ = io::stdout().flush();
+                        print_diags(render_errors(&held, sources));
+                        std::process::exit(1);
+                    }
+                }
                 return fatal_exit(
                     lazy,
                     &format!("error: runtime compilation of `{}` failed: {e}", sig.base),
@@ -1832,8 +1876,8 @@ fn resolve_deferred(
 ///    which checks that body next; its channel delta lands here, the body
 ///    is lowered, and monomorphization retries. Unreachable code never
 ///    gates execution.
-/// 3. Any diagnostic that arrives before the program starts aborts the run
-///    with the checker's full, eager-identical report. Once the program
+/// 3. Declaration diagnostics and errors in needed bodies abort the run
+///    with the checker's diagnostic text and source locations. Once the program
 ///    ran, the run's verdict is the executed path's alone: the checker is
 ///    stopped at the next body boundary and whatever it held for code the
 ///    run never needed is discarded by policy (pinned by
@@ -1841,12 +1885,6 @@ fn resolve_deferred(
 ///    `brass check`'s (or `--eager`'s) job.
 /// 4. A keyed-specialization restart or an executor-side assembly failure
 ///    falls back to [`finish_eagerly`] -- behaviorally the eager pipeline.
-///
-/// The one diagnostic class that can land after its code ran is a
-/// whole-program-terminal one (match exhaustiveness): a non-exhaustive match
-/// reached before its diagnostic is still DEFINED behavior -- the lowered
-/// match chain ends in an explicit no-arm panic, never LLVM `unreachable` --
-/// so the program aborts cleanly and the exit is non-zero either way.
 #[cfg(jit_backend)]
 fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
     // The checker recurses per call-site re-elaboration much like the
@@ -2386,6 +2424,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
     // path that arrived meanwhile aborts before the program runs; held
     // diagnostics elsewhere stay held -- lazy checking ignores code the run
     // never executes.
+    lazy.need_monomorphized_methods(&lowering.mir, &mono);
     lazy.pump_pending();
     if lazy.needs_eager {
         drop(mono);
@@ -2421,6 +2460,13 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
     // would, compile the startup set, then run with the resolver installed --
     // a deferred site's first call lands there.
     if program.functions.contains_key("main") && mono.lookup("main").is_none() {
+        // A rejected entry may have prevented monomorphization from exposing
+        // its method dependencies. Prefer the completed source verdict over
+        // a secondary lowering failure, as for MonoStop::Fail above.
+        let held = lazy.held_all();
+        if !held.is_empty() {
+            return Err(print_diags(render_errors(&held, &front.sources)));
+        }
         let reason = match &mono.main_skip {
             Some(reason) => {
                 format!("program uses constructs outside the typed (Value-free) subset: {reason}")
@@ -2746,6 +2792,26 @@ fn check_front(
                     (generated, keyed_dispatch)
                 }
                 Err(error) => {
+                    // A streaming consumer cannot observe this function's
+                    // returned Result while executing a runtime demand. Send
+                    // the final snapshot so provisional errors removed by
+                    // specialization cannot survive in the consumer either.
+                    if let Some(s) = sched {
+                        let mut delta = analysis_channel_delta(&analysis, &program);
+                        delta
+                            .errors
+                            .extend(errors.iter().chain(std::iter::once(&error)).map(
+                                |(message, span)| brass_typeck::TypeError {
+                                    message: message.clone(),
+                                    span: *span,
+                                },
+                            ));
+                        s.emit(brass_typeck::stream::CheckEvent::KeyedReady(
+                            Vec::new(),
+                            Vec::new(),
+                            delta,
+                        ));
+                    }
                     errors.push(error);
                     (Vec::new(), HashMap::default())
                 }

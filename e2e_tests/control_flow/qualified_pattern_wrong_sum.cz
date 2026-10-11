@@ -1,0 +1,11 @@
+// A shared variant name cannot hide a qualifier naming a different sum.
+type A = X { v: int32 } | Y
+type B = X { v: int32 } | Z
+
+fun main() {
+    let a = A.X { v: 7 }
+    match a {
+        B.X { v } => println(v),
+        B.Y => println("y"),
+    }
+}

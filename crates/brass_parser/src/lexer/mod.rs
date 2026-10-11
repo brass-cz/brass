@@ -76,6 +76,132 @@ mod tests {
     }
 
     #[test]
+    fn malformed_numbers_report_the_offending_character() {
+        // Invalid digits, suffixes, and incomplete exponents must not split
+        // into another statement. Spans identify the first offending character.
+        for (src, offset, message) in [
+            ("0b12", 3, "invalid digit `2` in binary literal"),
+            ("0b1012", 5, "invalid digit `2` in binary literal"),
+            ("0b2", 2, "invalid digit `2` in binary literal"),
+            ("0o78", 3, "invalid digit `8` in octal literal"),
+            ("0o9", 2, "invalid digit `9` in octal literal"),
+            ("0xFFg", 4, "invalid suffix `g` on numeric literal"),
+            ("12abc", 2, "invalid suffix `a` on numeric literal"),
+            ("1.5f", 3, "invalid suffix `f` on numeric literal"),
+            ("1e2x", 3, "invalid suffix `x` on numeric literal"),
+            ("1e", 1, "missing digits after the exponent"),
+            ("1e+", 1, "missing digits after the exponent"),
+            ("1E-_", 1, "missing digits after the exponent"),
+            ("1.0efoo", 3, "missing digits after the exponent"),
+        ] {
+            let err = lex(src).unwrap_err();
+            assert_eq!(err.message, message, "{src}");
+            assert_eq!(err.span, Span::new(offset, offset + 1), "{src}");
+        }
+    }
+
+    #[test]
+    fn valid_numeric_boundaries_and_separators() {
+        // Separators, decimal leading zeros, ranges, and method calls remain valid.
+        for (src, expected) in [
+            ("0755", TokenKind::Int(755)),
+            ("0b_10_", TokenKind::Int(2)),
+            ("0o7_7", TokenKind::Int(63)),
+            ("0xF_F", TokenKind::Int(255)),
+            ("1_0.5_0e-1_0", TokenKind::Float(10.5e-10)),
+            ("1e-400", TokenKind::Float(0.0)),
+        ] {
+            assert_eq!(kinds(src), vec![expected, TokenKind::Eof]);
+        }
+        assert_eq!(
+            kinds("[0..n]"),
+            vec![
+                TokenKind::LBracket,
+                TokenKind::Int(0),
+                TokenKind::DotDot,
+                TokenKind::Ident("n".into()),
+                TokenKind::RBracket,
+                TokenKind::Eof
+            ]
+        );
+        assert_eq!(
+            kinds("5.abs()"),
+            vec![
+                TokenKind::Int(5),
+                TokenKind::Dot,
+                TokenKind::Ident("abs".into()),
+                TokenKind::LParen,
+                TokenKind::RParen,
+                TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn non_finite_float_literals_are_rejected() {
+        // Overflow is a literal error covering the number; finite extremes remain valid.
+        for src in ["1e400", "1.8e308"] {
+            let err = lex(src).unwrap_err();
+            assert_eq!(err.message, "float literal out of range");
+            assert_eq!(err.span, Span::new(0, src.len()));
+        }
+        assert_eq!(
+            kinds("1.7976931348623157e308")[0],
+            TokenKind::Float(f64::MAX)
+        );
+    }
+
+    #[test]
+    fn string_newlines_point_to_the_opening_quote() {
+        // Raw LF, CRLF, CR, and escaped physical newlines fail in outer and nested text.
+        for newline in ["\n", "\r\n", "\r", "\\\n"] {
+            for prefix in ["let s = ", "\"{ id("] {
+                let src = format!("{prefix}\"line1{newline}line2\"");
+                let err = lex(&src).unwrap_err();
+                assert_eq!(err.message, "unterminated string literal");
+                assert_eq!(err.span, Span::new(prefix.len(), prefix.len() + 1));
+            }
+        }
+        assert_eq!(
+            kinds(r#""line1\nline2""#)[0],
+            TokenKind::Str(vec![StrPart::Lit("line1\nline2".into())])
+        );
+    }
+
+    #[test]
+    fn recursive_interpolation_keeps_quoted_braces_and_newlines() {
+        // A quoted closing brace inside a nested interpolation cannot close its parent.
+        let src = "\"A{ id(\"x{\n \"}\" // }\n }y\") }B\"";
+        assert_eq!(
+            kinds(src)[0],
+            TokenKind::Str(vec![
+                StrPart::Lit("A".into()),
+                StrPart::Interp(" id(\"x{\n \"}\" // }\n }y\") ".into(), 3),
+                StrPart::Lit("B".into()),
+            ])
+        );
+        // Nested strings use the same escape validation and absolute source spans.
+        let src = r#""{ "\q" }""#;
+        let err = lex(src).unwrap_err();
+        assert_eq!(err.message, "unknown escape sequence");
+        assert_eq!(err.span, Span::new(5, 6));
+    }
+
+    #[test]
+    fn long_utf8_string_preserves_text_around_escapes() {
+        // Large multibyte runs exercise text copying without per-character suffix validation.
+        let text = "\u{3042}".repeat(80_000);
+        let src = format!("\"{text}\\n{text}\"");
+        assert_eq!(
+            kinds(&src),
+            vec![
+                TokenKind::Str(vec![StrPart::Lit(format!("{text}\n{text}"))]),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
     fn newline_collapsing() {
         // Leading and repeated newlines collapse; comment newline kept.
         let k = kinds("\n\nlet a = 1\n\n\nlet b = 2\n");

@@ -139,16 +139,15 @@ fun join_deps(deps: ResolvedDependencies) {
 
 fun help(code: int64) {
     println(
-        "czpm - brass Package Manager
-
-Usage:
-    czpm new [name]  -> Create a new brass package in a new directory
-    czpm init [name] -> Initialize a brass package in the current directory
-    czpm run         -> Run the current package
-    czpm check       -> Type-check the current package
-    czpm fmt         -> Format all brass files
-    czpm lsp         -> Start the Language Server (czls)
-",
+        "czpm - brass Package Manager\n" +
+            "\n" +
+            "Usage:\n" +
+            "    czpm new [name]  -> Create a new brass package in a new directory\n" +
+            "    czpm init [name] -> Initialize a brass package in the current directory\n" +
+            "    czpm run         -> Run the current package\n" +
+            "    czpm check       -> Type-check the current package\n" +
+            "    czpm fmt         -> Format all brass files\n" +
+            "    czpm lsp         -> Start the Language Server (czls)\n",
     )
     exit(code)
 }
@@ -181,16 +180,15 @@ fun init_dir(path: Path, name: string) {
     // been checked, so a failed initialization never overwrites either one.
     _write_new(
         manifest_path,
-        "[package]
-name = \"{name}\"
-authors = \"\"
-license = \"MIT\"
-
-[dependencies]
-# mylib = \{ git = \"https://github.com/user/mylib\", rev = \"<rev>\" \}
-# mylib = \{ path = \"../mylib\" \}
-# mylib = \{ tarball = \"http:///github.com/...\", hash = \"<hash>\" \}
-",
+        "[package]\n" +
+            "name = \"{name}\"\n" +
+            "authors = \"\"\n" +
+            "license = \"MIT\"\n" +
+            "\n" +
+            "[dependencies]\n" +
+            "# mylib = \{ git = \"https://github.com/user/mylib\", rev = \"<rev>\" \}\n" +
+            "# mylib = \{ path = \"../mylib\" \}\n" +
+            "# mylib = \{ tarball = \"http:///github.com/...\", hash = \"<hash>\" \}\n",
     )!
 
     _write_new(source_path, "println(\"Hello, {name}!\")")!
@@ -210,7 +208,9 @@ fun list_files(root: Path, dir: Path) {
         }
         const path = entry.canonicalize()!
         if !path.starts_with(root) {
-            return error("project entry escapes the project root: {entry.to_string()}")
+            return error(
+                "project entry escapes the project root: {entry.to_string()}",
+            )
         }
         if path.is_dir() {
             for path in list_files(root, path)! {
@@ -227,18 +227,22 @@ fun list_files(root: Path, dir: Path) {
 // noclobber redirection performs the existence check and creation atomically.
 fun _write_new(path: Path, content: string) {
     let cmd = Command.new("sh")
-    cmd.args([
-        "-c",
-        "umask 077; set -C; printf '%s' \"$2\" > \"$1\"",
-        "czpm-create",
-        path.to_string(),
-        content,
-    ])
+    cmd.args(
+        [
+            "-c",
+            "umask 077; set -C; printf '%s' \"$2\" > \"$1\"",
+            "czpm-create",
+            path.to_string(),
+            content,
+        ],
+    )
     cmd.stdin(Stdio.Null)
     const child = cmd.spawn()!
     const code = child.wait()!
     if code != 0 {
-        return error("cannot create {path.to_string()}: destination already exists")
+        return error(
+            "cannot create {path.to_string()}: destination already exists",
+        )
     }
 }
 

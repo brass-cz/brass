@@ -70,7 +70,7 @@ impl<'a> Checker<'a> {
     ) {
         let mut seen = HashSet::default();
         for (name, span) in params {
-            if !seen.insert(name) {
+            if name != "_" && !seen.insert(name) {
                 self.errors.push(TypeError {
                     message: format!("duplicate parameter `{name}` in {owner}"),
                     span,
@@ -316,24 +316,30 @@ impl<'a> Checker<'a> {
     /// `-> infer!` template is exempt -- it has no fixed type at all, being
     /// specialized per call site from the caller's expectation.
     pub(super) fn report_uninferable_error_types(&mut self) {
-        let mut open: Vec<Span> = Vec::new();
         for f in self.program.functions.values() {
-            if self.seeded_module(&f.module) {
-                continue;
-            }
-            let Some(ret) = self.function_returns.get(&f.symbol) else {
-                continue;
-            };
-            if f.signature.ret_ty.is_some()
-                && self.error_sites.contains(&format!("fn:{}", f.symbol))
-                && !self
-                    .generic_error_returns
-                    .contains(&format!("fn:{}", f.symbol))
-                && let Some(span) = self.open_error_span(ret, f.decl.ret.as_ref())
-            {
-                open.push(span);
-            }
+            self.report_uninferable_function_error_type(f);
         }
+        self.report_uninferable_method_error_types();
+    }
+
+    /// A body's return contract must be validated before its checked event.
+    /// The caller runs this only after the body's inference has settled.
+    pub(super) fn report_uninferable_function_error_type(&mut self, f: &FunInfo) {
+        if self.seeded_module(&f.module) || f.signature.ret_ty.is_none() {
+            return;
+        }
+        if let Some(ret) = self.function_returns.get(&f.symbol)
+            && let Some(span) =
+                self.uninferable_error_span(&format!("fn:{}", f.symbol), ret, f.decl.ret.as_ref())
+        {
+            self.report_uninferable_error_type(span);
+        }
+    }
+
+    /// Methods settle together in the shared context phase. Report their
+    /// unresolved return contracts before any entry body can be released.
+    pub(super) fn report_uninferable_method_error_types(&mut self) {
+        let mut open: Vec<Span> = Vec::new();
         for info in self.program.types.values() {
             if self.seeded_module(&info.module) {
                 continue;
@@ -342,16 +348,13 @@ impl<'a> Checker<'a> {
                 if brass_hir::keyed_return(m.decl.ret.as_ref()) || m.signature.ret_ty.is_none() {
                     return;
                 }
-                if !self.error_sites.contains(&format!("m:{qualifier}.{name}"))
-                    || self
-                        .generic_error_returns
-                        .contains(&format!("m:{qualifier}.{name}"))
-                {
-                    return;
-                }
                 let key = (qualifier.to_string(), name.clone());
                 if let Some(ret) = self.method_returns.get(&key)
-                    && let Some(span) = self.open_error_span(ret, m.decl.ret.as_ref())
+                    && let Some(span) = self.uninferable_error_span(
+                        &format!("m:{qualifier}.{name}"),
+                        ret,
+                        m.decl.ret.as_ref(),
+                    )
                 {
                     open.push(span);
                 }
@@ -372,14 +375,30 @@ impl<'a> Checker<'a> {
             }
         }
         for span in open {
-            self.errors.push(TypeError {
-                message: "cannot infer the error type of `!`: this body propagates an error \
+            self.report_uninferable_error_type(span);
+        }
+    }
+
+    fn uninferable_error_span(
+        &self,
+        key: &str,
+        ret: &Type,
+        annotation: Option<&TypeExpr>,
+    ) -> Option<Span> {
+        if !self.error_sites.contains(key) || self.generic_error_returns.contains(key) {
+            return None;
+        }
+        self.open_error_span(ret, annotation)
+    }
+
+    fn report_uninferable_error_type(&mut self, span: Span) {
+        self.errors.push(TypeError {
+            message: "cannot infer the error type of `!`: this body propagates an error \
 whose type nothing determines -- the only error it forwards is its own. Raise an `error(..)`, \
 or drop the `!`"
-                    .to_string(),
-                span,
-            });
-        }
+                .to_string(),
+            span,
+        });
     }
 
     /// Whether a sum carries the fallibility sugar's shape: the (possibly
@@ -921,6 +940,7 @@ or drop the `!`"
     pub(super) fn param_scope(&mut self, params: &[Param]) -> HashMap<String, Type> {
         params
             .iter()
+            .filter(|p| p.name != "_")
             .map(|p| {
                 let ty =
                     p.ty.as_ref()
@@ -934,6 +954,7 @@ or drop the `!`"
     fn signature_param_scope(&mut self, params: &[ParamInfo]) -> HashMap<String, Type> {
         params
             .iter()
+            .filter(|p| p.name != "_")
             .map(|param| {
                 let ty = param
                     .resolved_ty

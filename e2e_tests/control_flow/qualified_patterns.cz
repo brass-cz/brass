@@ -1,0 +1,61 @@
+// Qualified patterns retain their sum in match, if-let, let, for, and nested
+// fields. Open function arguments and closure arguments select B, even though
+// A declares the same variant name first. Aliases preserve nominal identity.
+type A = X { text: string } | Y
+type B = X { v: int32 } | Z
+type Alias = B
+type Box = | Wrap { item: B }
+
+fun describe(item) {
+    return match item {
+        B.X { v } => v,
+        B.Z => 0,
+    }
+}
+
+fun main() {
+    let b = B.X { v: 7 }
+    println(describe(b))
+    let read = (item) -> match item {
+        B.X { v } => v,
+        B.Z => 0,
+    }
+    println(read(b))
+    if let B.X { v } = b {
+        println(v)
+    }
+    if let Box.Wrap { item: B.X { v } } = (Box.Wrap { item: b }) {
+        println(v)
+    }
+    // A one-variant sum makes let/for destructuring total without a tag test.
+    let boxed = Box.Wrap { item: b }
+    let Box.Wrap { item } = boxed
+    println(describe(item))
+    for Box.Wrap { item } in [boxed] {
+        println(describe(item))
+    }
+    match b {
+        Alias.X { v } => println(v),
+        Alias.Z => println("z"),
+    }
+    match B.Z {
+        B.X { v } => println(v),
+        B.Z => println("z"),
+    }
+    show_result(true)
+    show_result(false)
+}
+
+fun outcome(ok: bool) -> int32! {
+    if ok {
+        return 9
+    }
+    return error("bad")
+}
+
+fun show_result(ok: bool) {
+    match outcome(ok) {
+        Result.Ok { value } => println(value),
+        Result.Err { error } => println(error.value),
+    }
+}

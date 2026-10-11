@@ -1,0 +1,2 @@
+// Type-body signatures have the same receiver restriction.
+type T = { n(x, self) }

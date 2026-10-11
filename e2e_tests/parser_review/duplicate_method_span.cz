@@ -1,0 +1,4 @@
+// Duplicate methods point at the implementation name.
+type T = {}
+fun T.m(self) {}
+fun T.m(self) {}

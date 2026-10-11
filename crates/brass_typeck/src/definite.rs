@@ -274,7 +274,7 @@ impl<'p, 'e> Walker<'p, 'e> {
                 value: None,
                 ..
             } => {
-                let Pattern::Binding(name, _) = pat else {
+                let Pattern::Binding(name, None, _) = pat else {
                     return; // rejected by the infer pass
                 };
                 let (fields, block_reason) = match ty.as_ref().and_then(|te| self.named_type(te)) {
@@ -579,7 +579,7 @@ impl<'p, 'e> Walker<'p, 'e> {
                     self.require_init(id, *span);
                 }
             }
-            Expr::TypeTest(subject, _, _) => self.walk_expr(subject),
+            Expr::TypeTest(subject, _, _, _) => self.walk_expr(subject),
             Expr::Field(base, fname, span) => {
                 if let Expr::Ident(name, _) = &**base
                     && let Some(id) = self.lookup(name)
@@ -724,13 +724,13 @@ fn pattern_names(pat: &Pattern) -> Vec<String> {
 
 fn collect_pattern_names(pat: &Pattern, out: &mut Vec<String>) {
     match pat {
-        Pattern::Binding(name, _) => out.push(name.clone()),
+        Pattern::Binding(name, None, _) => out.push(name.clone()),
         Pattern::Array(ps, _) => {
             for p in ps {
                 collect_pattern_names(p, out);
             }
         }
-        Pattern::Record(_, fields, _) => {
+        Pattern::Record(_, _, fields, _) => {
             // Shorthand `{ name }` binds the field to its own name; an explicit
             // sub-pattern binds whatever names it introduces.
             for f in fields {
@@ -821,7 +821,7 @@ impl FreeVariables {
             Expr::Unary(_, inner, _)
             | Expr::ErrorProp(inner, _)
             | Expr::Field(inner, _, _)
-            | Expr::TypeTest(inner, _, _) => self.expr(inner),
+            | Expr::TypeTest(inner, _, _, _) => self.expr(inner),
             Expr::Binary(_, left, right, _)
             | Expr::Index(left, right, _)
             | Expr::Range(left, right, _) => {

@@ -1,0 +1,4 @@
+unreachable match arm
+`Rde` binds a new name; did you mean the variant `Red`?
+unreachable_variant_typo.cz:4:33: error:
+unreachable_variant_typo.cz:4:51: error:

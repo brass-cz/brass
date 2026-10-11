@@ -1,0 +1,24 @@
+// Only the matching else arm pins infer; dead arms contribute no errors or fallibility.
+fun length(val) {
+    const bytes = if !(val: infer) {
+        if val: uint8[] {
+            val
+        } else if !(val: infer[]) {
+            return error("unsupported")
+        } else {
+            val
+        }
+    } else {
+        to_bytes(val)
+    }
+    return bytes.len()
+}
+fun main() {
+    println(length("hello") + 1)
+    println(length([1, 2, 3]) + 1)
+    println(length(to_bytes("ab")) + 1)
+    match length(true) {
+        Ok { value } => println("unexpected")
+        Err { error } => println("unsupported")
+    }
+}

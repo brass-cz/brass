@@ -173,10 +173,10 @@ fn collect_stmt_defines(stmt: &Stmt, out: &mut HashSet<String>) {
 
 fn collect_pattern_defines(pat: &Pattern, out: &mut HashSet<String>) {
     match pat {
-        Pattern::Binding(name, _) => {
+        Pattern::Binding(name, _, _) => {
             out.insert(name.clone());
         }
-        Pattern::Record(_, fields, _) => {
+        Pattern::Record(_, _, fields, _) => {
             for f in fields {
                 match &f.pat {
                     Some(sub) => collect_pattern_defines(sub, out),
@@ -421,7 +421,7 @@ fn refs_type(ty: &TypeExpr, out: &mut HashSet<String>) {
             }
         }
         TypeExpr::Anonymous(fields, _) => {
-            for (_, fty) in fields {
+            for (_, fty, _) in fields {
                 refs_type(fty, out);
             }
         }
@@ -430,7 +430,7 @@ fn refs_type(ty: &TypeExpr, out: &mut HashSet<String>) {
         // A refinement mentions its base type name and each pinned field's type.
         TypeExpr::Refine(base, fields, _) => {
             refs_type(base, out);
-            for (_, fty) in fields {
+            for (_, fty, _) in fields {
                 refs_type(fty, out);
             }
         }
@@ -526,7 +526,7 @@ fn refs_expr(e: &Expr, out: &mut HashSet<String>) {
                 refs_expr(v, out);
             }
         }
-        Expr::TypeTest(subject, ty, _) => {
+        Expr::TypeTest(subject, ty, _, _) => {
             refs_expr(subject, out);
             refs_type(ty, out);
         }
@@ -557,10 +557,13 @@ fn refs_expr(e: &Expr, out: &mut HashSet<String>) {
 }
 
 fn refs_pattern(p: &Pattern, out: &mut HashSet<String>) {
+    if let Pattern::Binding(_, Some(q), _) | Pattern::Record(_, Some(q), _, _) = p {
+        out.insert(q.ty.clone());
+    }
     match p {
-        Pattern::Wildcard(_) | Pattern::Binding(_, _) => {}
+        Pattern::Wildcard(_) | Pattern::Binding(_, _, _) => {}
         Pattern::Literal(e, _) => refs_expr(e, out),
-        Pattern::Record(name, fields, _) => {
+        Pattern::Record(name, _, fields, _) => {
             out.insert(name.clone());
             for FieldPat { pat, .. } in fields {
                 if let Some(p) = pat {

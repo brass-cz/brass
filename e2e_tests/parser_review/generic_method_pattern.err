@@ -1,0 +1,2 @@
+refutable pattern in `const`; use `if let` or `match`
+generic_method_pattern.cz:6:11: error:

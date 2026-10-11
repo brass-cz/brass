@@ -1,0 +1,3 @@
+// Numeric negation needs grouping when used as a type-test subject.
+fun main() { let x = 1
+if -x: int32 {} }

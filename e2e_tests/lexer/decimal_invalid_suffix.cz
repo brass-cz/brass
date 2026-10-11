@@ -1,0 +1,2 @@
+// Decimal literals cannot touch identifier suffixes.
+let x = 12foo

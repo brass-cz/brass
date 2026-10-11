@@ -89,19 +89,24 @@ fun git_clone(repo: string, rev: string) {
     match populated {
         Err { error } => {
             remove_dir(staging)!
-        }
-        Ok { value } => {}
+        },
+        Ok { value } => {
+        },
     }
     populated!
     match move_dir(staging, path) {
-        Ok { value } => { return path }
+        Ok { value } => {
+            return path
+        },
         Err { error } => {
             remove_dir(staging)!
-            if path.is_dir() && path.join(".git").is_dir() && _revision_matches(path, rev)! {
+            if path.is_dir() &&
+                path.join(".git").is_dir() &&
+                _revision_matches(path, rev)! {
                 return path
             }
             return error("failed to publish the git checkout")
-        }
+        },
     }
 }
 
@@ -146,14 +151,16 @@ fun _resolved_commit(path: Path, rev: string) -> string! {
 
 fun _try_resolved_commit(path: Path, rev: string) -> string?! {
     let cmd = Command.new("git")
-    cmd.args([
-        "-C",
-        path.to_string(),
-        "rev-parse",
-        "--verify",
-        "--end-of-options",
-        "{rev}^\{commit}",
-    ])
+    cmd.args(
+        [
+            "-C",
+            path.to_string(),
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            "{rev}^\{commit}",
+        ],
+    )
     cmd.stdout(Stdio.Pipe)
     const child = cmd.spawn()!
     const out = child.output()!
@@ -165,13 +172,15 @@ fun _try_resolved_commit(path: Path, rev: string) -> string?! {
 
 fun _staging_dir(parent: Path, key: string) -> Path! {
     let cmd = Command.new("sh")
-    cmd.args([
-        "-c",
-        "umask 077; stage=\"$1/.$2.$$\"; mkdir \"$stage\" && printf '%s' \"$stage\"",
-        "czpm-stage",
-        parent.to_string(),
-        key,
-    ])
+    cmd.args(
+        [
+            "-c",
+            "umask 077; stage=\"$1/.$2.$$\"; mkdir \"$stage\" && printf '%s' \"$stage\"",
+            "czpm-stage",
+            parent.to_string(),
+            key,
+        ],
+    )
     cmd.stdout(Stdio.Pipe)
     const child = cmd.spawn()!
     const out = child.output()!

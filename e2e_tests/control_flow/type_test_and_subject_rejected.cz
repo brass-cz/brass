@@ -1,0 +1,4 @@
+// Logical operators need grouping when used as a type-test subject.
+fun main() { let a = true
+let b = false
+if a && b: bool {} }

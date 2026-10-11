@@ -1,0 +1,2 @@
+// Leading-pipe sum names obey the same rule.
+type X = | nomod.Thing | Other

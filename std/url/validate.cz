@@ -1,15 +1,16 @@
 // Validation of a single URI component against its RFC 3986 character class.
 
-import charset.{ is_hex_digit, is_userinfo_char, is_reg_name_char, is_path_char, is_query_char, is_ip_literal_char }
+import charset.{
+    is_hex_digit,
+    is_userinfo_char,
+    is_reg_name_char,
+    is_path_char,
+    is_query_char,
+    is_ip_literal_char,
+}
 
 /** The character class a component is checked against. */
-type CharClass =
-    | Userinfo
-    | RegName
-    | IpLiteral
-    | Path
-    | Query
-    | Fragment
+type CharClass = Userinfo | RegName | IpLiteral | Path | Query | Fragment
 
 fun CharClass.name(self) -> string {
     return match self {
@@ -49,7 +50,9 @@ fun validate(s: string, kind: CharClass) -> string! {
             if let IpLiteral = kind {
                 return error("percent-encoding is not allowed in an IP literal")
             }
-            if i + 2 >= n { return error("truncated percent escape in {kind.name()}: {s}") }
+            if i + 2 >= n {
+                return error("truncated percent escape in {kind.name()}: {s}")
+            }
             if !is_hex_digit(cs[i + 1]) || !is_hex_digit(cs[i + 2]) {
                 return error("invalid percent escape in {kind.name()}: {s}")
             }

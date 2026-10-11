@@ -1,0 +1,11 @@
+// Pin literal, nested literal, multi-variant and unit tests in let patterns.
+type Shape = | Circle { r: int32 } | Square { s: int32 }
+type Color = Red | Green
+type P = { a: int32 }
+let n = 5
+let 5 = n
+let Circle { r } = Shape.Square { s: 4 }
+let Red = Color.Green
+let Color.Red = Color.Green
+let P { a: 1 } = P { a: 2 }
+let [x, 2] = [1, 2]

@@ -141,11 +141,7 @@ type Regex = {
  */
 fun Regex.new(pattern: string) -> Regex! {
     const handle = regex_compile(pattern)!
-    return Self {
-        pattern,
-        _handle: handle,
-        _names: regex_group_names(handle),
-    }
+    return Self { pattern, _handle: handle, _names: regex_group_names(handle) }
 }
 
 /**
@@ -250,7 +246,12 @@ fun escape(text: string) -> string {
 // rather than in the plugin so a match crossing the boundary is a pair of
 // offsets, not a copy of every group's bytes -- and the offsets stay available
 // to a caller that wants them.
-fun _match_at(text: string, spans: int64[], base: int64, names: string[]) -> Match {
+fun _match_at(
+    text: string,
+    spans: int64[],
+    base: int64,
+    names: string[],
+) -> Match {
     let groups: Group?[] = []
     let i: int64 = 0
     while i < len(names) {
@@ -260,7 +261,9 @@ fun _match_at(text: string, spans: int64[], base: int64, names: string[]) -> Mat
             groups.push(null)
         } else {
             // The engine's offsets always fall on character boundaries.
-            groups.push(Group { text: _string_slice(text, start, end), start, end })
+            groups.push(
+                Group { text: _string_slice(text, start, end), start, end },
+            )
         }
         i += 1
     }

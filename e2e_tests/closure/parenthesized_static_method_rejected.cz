@@ -1,0 +1,4 @@
+// A grouped static method member is also a value callee, not static dispatch.
+type B = { v: int32 }
+fun B.make(x: int32) -> Self { return Self { v: x } }
+fun main() { println((B.make)(3)) }

@@ -1,0 +1,13 @@
+// Templates and statically pruned arms follow ordinary full-inference rules.
+type T = {}
+fun T.unused(self) -> infer! {
+    let 5 = 5
+    let bad: int32 = "bad"
+    return 1
+}
+fun main() {
+    if null {
+        let 5 = 5
+    }
+    println("selected body")
+}

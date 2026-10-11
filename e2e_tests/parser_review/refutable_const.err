@@ -1,0 +1,5 @@
+refutable pattern in `const`; use `if let` or `match`
+refutable_const.cz:2:7: error:
+refutable_const.cz:4:11: error:
+cannot use a fixed-length array pattern in `const` with a growable array; use `if let` or `match`
+refutable_const.cz:8:7: error:

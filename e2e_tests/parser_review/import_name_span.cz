@@ -1,0 +1,2 @@
+// Unknown imported names point at the imported token.
+import lib.{ absent }

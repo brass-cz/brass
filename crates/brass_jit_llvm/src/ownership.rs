@@ -131,7 +131,7 @@ fn scan_stmt(s: &Stmt, aliases: &mut HashSet<String>, found: &mut bool) {
                 // another handle to (or a container of) the same object; track it
                 // for the rest of the scan (see `mutates` for why
                 // over-approximating here is safe).
-                if let Pattern::Binding(name, _) = pat
+                if let Pattern::Binding(name, _, _) = pat
                     && expr_mentions_any(value, aliases)
                 {
                     aliases.insert(name.clone());
@@ -193,6 +193,7 @@ fn scan_expr(e: &Expr, aliases: &mut HashSet<String>, found: &mut bool) {
         Expr::Call(callee, args, _) => {
             // A method call on a place rooted at an alias may mutate it.
             if let Expr::Field(base, _, _) = &**callee
+                && !callee.span().is_parenthesized()
                 && root_ident(base).is_some_and(|r| aliases.contains(r))
             {
                 *found = true;
@@ -229,7 +230,7 @@ fn scan_expr(e: &Expr, aliases: &mut HashSet<String>, found: &mut bool) {
             }
         }),
         Expr::Block(block, _) => scan_block(block, aliases, found),
-        Expr::TypeTest(subject, _, _) => scan_expr(subject, aliases, found),
+        Expr::TypeTest(subject, _, _, _) => scan_expr(subject, aliases, found),
         Expr::If(c, t, e, _) => {
             scan_expr(c, aliases, found);
             scan_block(t, aliases, found);
@@ -397,7 +398,7 @@ fn capture_expr(expr: &Expr, scopes: &mut Vec<HashSet<String>>, free: &mut HashS
             }
         }
         Expr::Block(block, _) => capture_block(block, scopes, free, HashSet::default()),
-        Expr::TypeTest(subject, _, _) => capture_expr(subject, scopes, free),
+        Expr::TypeTest(subject, _, _, _) => capture_expr(subject, scopes, free),
         Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Null(_) => {}
     }
 }
@@ -590,7 +591,7 @@ fn analyze_nested_spawns_expr(
             }
         }
         Expr::Block(block, _) => analyze_block(&block.stmts, visible, params, fn_scope, out),
-        Expr::TypeTest(subject, _, _) => {
+        Expr::TypeTest(subject, _, _, _) => {
             analyze_nested_spawns_expr(subject, visible, params, fn_scope, out)
         }
         // Spawned closure bodies are handled from their enclosing call statement;
@@ -626,7 +627,7 @@ fn collect_mention_aliases(stmts: &[Stmt], handles: &mut HashSet<String>) {
     for stmt in stmts {
         let binding: Option<(&String, &Expr)> = match stmt {
             Stmt::Let {
-                pat: Pattern::Binding(name, _),
+                pat: Pattern::Binding(name, _, _),
                 value: Some(value),
                 ..
             } => Some((name, value)),
@@ -791,7 +792,7 @@ fn collect_lexical_expr(expr: &Expr, visible: &HashSet<String>, scopes: &mut Lex
             }
         }
         Expr::Block(block, _) => collect_lexical_stmts(&block.stmts, visible, scopes),
-        Expr::TypeTest(subject, _, _) => collect_lexical_expr(subject, visible, scopes),
+        Expr::TypeTest(subject, _, _, _) => collect_lexical_expr(subject, visible, scopes),
         Expr::Closure(..)
         | Expr::Int(..)
         | Expr::Float(..)
@@ -882,7 +883,7 @@ fn nested_block_stmts_expr(e: &Expr, f: &mut dyn FnMut(&[Stmt])) {
                 nested_block_stmts_expr(&arm.body, f);
             }
         }
-        Expr::TypeTest(subject, _, _) => nested_block_stmts_expr(subject, f),
+        Expr::TypeTest(subject, _, _, _) => nested_block_stmts_expr(subject, f),
         Expr::Closure(..)
         | Expr::Int(..)
         | Expr::Float(..)
@@ -972,7 +973,7 @@ fn nested_block_stmts_expr_mut(e: &mut Expr, f: &mut dyn FnMut(&mut Vec<Stmt>)) 
                 nested_block_stmts_expr_mut(&mut arm.body, f);
             }
         }
-        Expr::TypeTest(subject, _, _) => nested_block_stmts_expr_mut(subject, f),
+        Expr::TypeTest(subject, _, _, _) => nested_block_stmts_expr_mut(subject, f),
         Expr::Closure(..)
         | Expr::Int(..)
         | Expr::Float(..)
@@ -985,10 +986,10 @@ fn nested_block_stmts_expr_mut(e: &mut Expr, f: &mut dyn FnMut(&mut Vec<Stmt>)) 
 
 fn collect_pattern_bindings(pat: &Pattern, out: &mut HashSet<String>) {
     match pat {
-        Pattern::Binding(name, _) => {
+        Pattern::Binding(name, _, _) => {
             out.insert(name.clone());
         }
-        Pattern::Record(_, fields, _) => {
+        Pattern::Record(_, _, fields, _) => {
             for field in fields {
                 match &field.pat {
                     Some(sub) => collect_pattern_bindings(sub, out),
@@ -1139,7 +1140,7 @@ fn find_spawn_bindings_stmts(
         }
         if let Stmt::Let { pat, value, .. } = stmt {
             let closure = match (pat, value) {
-                (Pattern::Binding(binding, _), Some(Expr::Closure(params, body, _))) => Some((
+                (Pattern::Binding(binding, _, _), Some(Expr::Closure(params, body, _))) => Some((
                     binding.clone(),
                     vec![ClosureBinding {
                         params: params.clone(),
@@ -1147,7 +1148,7 @@ fn find_spawn_bindings_stmts(
                         span: stmt_span(stmt),
                     }],
                 )),
-                (Pattern::Binding(binding, _), _) => Some((binding.clone(), Vec::new())),
+                (Pattern::Binding(binding, _, _), _) => Some((binding.clone(), Vec::new())),
                 _ => None,
             };
             if let Some((binding, values)) = closure {
@@ -1274,7 +1275,7 @@ fn find_spawn_bindings_expr(
             let mut inner = env.clone();
             find_spawn_bindings_stmts(&block.stmts, target, name, &mut inner)
         }
-        Expr::TypeTest(subject, _, _) => find(subject),
+        Expr::TypeTest(subject, _, _, _) => find(subject),
         Expr::Closure(..)
         | Expr::Int(..)
         | Expr::Float(..)
@@ -1426,7 +1427,9 @@ fn each_call<'a>(block: &'a Block, f: &mut impl FnMut(&'a str, Option<&'a Expr>,
             Expr::Call(callee, args, _) => {
                 match callee.as_ref() {
                     Expr::Ident(name, _) => f(name, None, args),
-                    Expr::Field(base, method, _) => f(method, Some(base), args),
+                    Expr::Field(base, method, _) if !callee.span().is_parenthesized() => {
+                        f(method, Some(base), args)
+                    }
                     _ => {}
                 }
                 walk_expr(callee, f);
@@ -1435,7 +1438,7 @@ fn each_call<'a>(block: &'a Block, f: &mut impl FnMut(&'a str, Option<&'a Expr>,
             Expr::Field(b, _, _)
             | Expr::Unary(_, b, _)
             | Expr::ErrorProp(b, _)
-            | Expr::TypeTest(b, _, _) => walk_expr(b, f),
+            | Expr::TypeTest(b, _, _, _) => walk_expr(b, f),
             Expr::Index(b, i, _) | Expr::Range(b, i, _) | Expr::Binary(_, b, i, _) => {
                 walk_expr(b, f);
                 walk_expr(i, f);
@@ -2024,7 +2027,7 @@ fn collect_alias_roots(
     for stmt in stmts {
         let binding: Option<(&String, &Expr)> = match stmt {
             Stmt::Let {
-                pat: Pattern::Binding(name, _),
+                pat: Pattern::Binding(name, _, _),
                 value: Some(value),
                 ..
             } => Some((name, value)),
@@ -2178,7 +2181,7 @@ fn transform_spawned_binding(stmt: &mut Stmt, ctx: &ScopeCtx, errors: &mut Vec<S
     let binding_span = stmt_span(stmt);
     let (params, body) = match stmt {
         Stmt::Let {
-            pat: Pattern::Binding(_, _),
+            pat: Pattern::Binding(_, _, _),
             value: Some(Expr::Closure(params, body, _)),
             ..
         } => (params, body),
@@ -2251,7 +2254,7 @@ fn insert_summary_promotion_after_binding(
     ctx: &ScopeCtx,
 ) -> usize {
     let Stmt::Let {
-        pat: Pattern::Binding(name, _),
+        pat: Pattern::Binding(name, _, _),
         ..
     } = &stmts[i]
     else {
@@ -2455,7 +2458,7 @@ fn guard_children(expr: &mut Expr, guards: &BTreeMap<String, BTreeSet<String>>) 
                 guard_stmt_accesses(s, guards);
             }
         }
-        Expr::TypeTest(subject, _, _) => guard_expr_accesses(subject, guards),
+        Expr::TypeTest(subject, _, _, _) => guard_expr_accesses(subject, guards),
         Expr::If(c, t, e, _) => {
             guard_expr_accesses(c, guards);
             for s in &mut t.stmts {
@@ -2518,6 +2521,7 @@ fn direct_guard_roots(expr: &Expr, guards: &BTreeMap<String, BTreeSet<String>>) 
                 return Vec::new();
             }
             if let Expr::Field(base, _, _) = callee.as_ref()
+                && !callee.span().is_parenthesized()
                 && let Some(r) = place_guard_roots(base, guards)
             {
                 roots.extend(r);
@@ -3138,7 +3142,7 @@ mod tests {
         assert!(errors.is_empty());
         let guarded = body.stmts.iter().any(|stmt| {
             let Stmt::Let {
-                pat: Pattern::Binding(name, _),
+                pat: Pattern::Binding(name, _, _),
                 value: Some(Expr::Closure(_, body, _)),
                 ..
             } = stmt

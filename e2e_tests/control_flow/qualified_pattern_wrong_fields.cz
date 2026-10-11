@@ -1,0 +1,10 @@
+// Report the wrong sum before attempting field lookup in the scrutinee.
+type A = X { v: int32 } | Y
+type B = X { v: int32 } | Z
+
+fun main() {
+    match (A.X { v: 7 }) {
+        B.X { w } => println(w),
+        A.Y => println("y"),
+    }
+}

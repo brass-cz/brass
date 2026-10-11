@@ -33,11 +33,11 @@ pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -
             info.span,
             &mut errors,
         );
-        for iface_name in &info.interfaces {
+        for (iface_name, iface_span) in info.interfaces.iter().zip(&info.interface_spans) {
             let Some(iface) = program.types.get(iface_name) else {
                 errors.push(TypeError {
                     message: format!("unknown interface `{iface_name}`"),
-                    span: info.span,
+                    span: *iface_span,
                 });
                 continue;
             };

@@ -1,0 +1,8 @@
+// Pin wildcard, record, tuple and singleton-sum catch-alls.
+type P = { a: int32 }
+type Single = | Only { a: int32 }
+println(match 1 { _ => 1, 2 => 2 })
+println(match (P { a: 1 }) { P { a } => a, _ => 0 })
+println(match (Single.Only { a: 1 }) { Only { a } => a, _ => 0 })
+const pair = [1, 2]
+println(match pair { [a, b] => a, _ => 0 })

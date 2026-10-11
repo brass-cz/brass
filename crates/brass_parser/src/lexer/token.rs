@@ -15,6 +15,8 @@ pub struct Span {
     /// provenance in the span makes diagnostic restoration independent of any
     /// assumed maximum source-map offset.
     source: Option<(usize, usize)>,
+    /// Offsets from the outer extent to the expression inside written parentheses.
+    grouping: Option<(usize, usize)>,
 }
 
 impl Span {
@@ -23,6 +25,35 @@ impl Span {
             lo,
             hi,
             source: None,
+            grouping: None,
+        }
+    }
+
+    /// Cover written parentheses while retaining the innermost expression extent.
+    /// Offsets survive synthetic shifts without losing literal spellings.
+    pub fn with_parentheses(self, outer: Span) -> Span {
+        let inner = self.ungrouped();
+        Span {
+            grouping: Some((inner.lo - outer.lo, outer.hi - inner.hi)),
+            ..outer
+        }
+    }
+
+    /// Whether this expression extent includes its own written parentheses.
+    pub fn is_parenthesized(self) -> bool {
+        self.grouping.is_some()
+    }
+
+    /// The expression extent without its own parentheses, for source spelling.
+    pub fn ungrouped(self) -> Span {
+        match self.grouping {
+            Some((left, right)) => Span {
+                lo: self.lo + left,
+                hi: self.hi - right,
+                source: self.source.map(|(lo, hi)| (lo + left, hi - right)),
+                grouping: None,
+            },
+            None => self,
         }
     }
 
@@ -39,6 +70,7 @@ impl Span {
             lo: self.lo.min(other.lo),
             hi: self.hi.max(other.hi),
             source,
+            grouping: None,
         }
     }
 
@@ -49,6 +81,7 @@ impl Span {
             lo: self.lo.checked_add(delta).expect("synthetic span overflow"),
             hi: self.hi.checked_add(delta).expect("synthetic span overflow"),
             source: self.source.or(Some((self.lo, self.hi))),
+            grouping: self.grouping,
         }
     }
 
@@ -56,7 +89,10 @@ impl Span {
     /// parser spans are returned unchanged.
     pub fn source_span(self) -> Span {
         self.source
-            .map(|(lo, hi)| Span::new(lo, hi))
+            .map(|(lo, hi)| Span {
+                grouping: self.grouping,
+                ..Span::new(lo, hi)
+            })
             .unwrap_or(self)
     }
 }

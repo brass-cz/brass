@@ -1,0 +1,14 @@
+`x` is bound more than once in this pattern
+`y` is bound more than once in this pattern
+`z` is bound more than once in this pattern
+`f` is bound more than once in this pattern
+`i` is bound more than once in this pattern
+`a` is bound more than once in this pattern
+`k` is bound more than once in this pattern
+duplicate_bindings.cz:3:9: error:
+duplicate_bindings.cz:4:11: error:
+duplicate_bindings.cz:5:18: error:
+duplicate_bindings.cz:6:9: error:
+duplicate_bindings.cz:7:12: error:
+duplicate_bindings.cz:8:43: error:
+duplicate_bindings.cz:9:16: error:

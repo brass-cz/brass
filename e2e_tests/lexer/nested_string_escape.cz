@@ -1,0 +1,2 @@
+// Nested string escapes are validated at their absolute source position.
+let s = "A{ "\q" }B"

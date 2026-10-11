@@ -1,0 +1,3 @@
+// Function arguments must remain finite at the parameter width.
+fun consume(x: float32) { println(x) }
+consume(1e39)

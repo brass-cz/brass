@@ -97,6 +97,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
             Expr::Binary(op, a, b, _) => self.lower_binary(*op, a, b),
             Expr::Call(callee, args, span) => {
                 if let Expr::Field(base, method, _) = &**callee
+                    && !callee.span().is_parenthesized()
                     && method == "context"
                     && self.ctx.nullable_receiver_inner(*span).is_some()
                 {
@@ -123,12 +124,14 @@ impl<'a, 'p> FnLower<'a, 'p> {
             Expr::VariantLit(ty, variant, fields, _) => self.lower_variant(ty, variant, fields),
             // A type test folds to a constant bool per monomorphized instance
             // (the back ends match the operand's type against the pattern);
-            // the subject is still evaluated like any operand. The pattern is
+            // the subject is still evaluated like any operand. `lower_if`
+            // handles negation by swapping successors, so MIR tests stay positive.
+            // The pattern is
             // the checker-resolved channel entry; a body no instantiation
             // ever decided falls back to the syntactic annotation with every
             // hole a wildcard -- such a body is never monomorphized, the
             // fallback only keeps the shared lowering total.
-            Expr::TypeTest(subject, te, span) => {
+            Expr::TypeTest(subject, te, _, span) => {
                 let subj = self.lower_expr(subject);
                 let pattern = self.ctx.type_tests.get(span).cloned().unwrap_or_else(|| {
                     let program = self.ctx.program;
@@ -455,10 +458,12 @@ impl<'a, 'p> FnLower<'a, 'p> {
         let then_bb = self.b.new_block();
         let else_bb = self.b.new_block();
         let merge_bb = self.b.new_block();
+        // Keep MIR's test positive so compile-time pruning sees it directly.
+        let negated = matches!(cond, Expr::TypeTest(_, _, true, _));
         self.b.terminate(Terminator::CondBranch {
             cond: c,
-            then: then_bb,
-            els: else_bb,
+            then: if negated { else_bb } else { then_bb },
+            els: if negated { then_bb } else { else_bb },
         });
 
         let mut reached = false;
@@ -519,7 +524,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
         // `if let p = T.from(v)` (whose result is `T?`) take the else arm when the
         // conversion yields null. Other patterns test as usual.
         let cond = match pat {
-            brass_parser::ast::Pattern::Binding(name, _) if !self.is_variant_name(name) => {
+            brass_parser::ast::Pattern::Binding(name, _, _) if !self.is_variant_name(name) => {
                 self.b.emit(Rvalue::Call(
                     Callee::Builtin("__present".into()),
                     vec![Operand::Local(subj)],
@@ -544,7 +549,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
         // the nullable -- `__nonnull` narrows it (and is the identity for a
         // non-nullable). Other patterns bind their parts as usual.
         match pat {
-            brass_parser::ast::Pattern::Binding(name, _) if !self.is_variant_name(name) => {
+            brass_parser::ast::Pattern::Binding(name, _, _) if !self.is_variant_name(name) => {
                 let nn = self.b.emit(Rvalue::Call(
                     Callee::Builtin("__nonnull".into()),
                     vec![Operand::Local(subj)],
@@ -1034,7 +1039,9 @@ impl<'a, 'p> FnLower<'a, 'p> {
             return Rvalue::TypeName(op);
         }
         // `recv.method(args)` or `Type.method(args)`.
-        if let Expr::Field(base, method, _) = callee {
+        if let Expr::Field(base, method, _) = callee
+            && !callee.span().is_parenthesized()
+        {
             // `typeof(v).method(args)`: a static call on v's type, whose name the
             // checker resolved into the type-name channel keyed by the inner
             // `typeof(v)` span. Route it exactly like a written `Type.method`.

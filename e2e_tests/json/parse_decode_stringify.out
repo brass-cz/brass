@@ -3,4 +3,4 @@ hi
 42.0
 {"x":1.0,"y":[2.0,3.0]}
 Aki 30 Tokyo 100
-error: [std/data/json.cz:76:20] unhandled error: missing field 'age'
+error: [std/data/json.cz:85:20] unhandled error: missing field 'age'

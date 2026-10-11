@@ -283,7 +283,7 @@ fn same_function_name_in_two_modules_coexists_and_dispatches() {
             ),
             (
                 "main.cz",
-                "import a.util.{ helper }\nimport b.util.{ thing }\nfun main() { println(helper()) println(thing()) }\n",
+                "import a.util.{ helper }\nimport b.util.{ thing }\nfun main() { println(helper())\nprintln(thing()) }\n",
             ),
         ],
     );
@@ -312,7 +312,7 @@ fn same_global_name_in_two_modules_gets_its_own_slot() {
             (
                 "main.cz",
                 "import m.{ mtag, bump, count }\n\nlet tag = \"main\"\n\
-                 fun main() { println(mtag()) println(tag) bump() bump() println(count()) }\n",
+                 fun main() { println(mtag())\nprintln(tag)\nbump()\nbump()\nprintln(count()) }\n",
             ),
         ],
     );
@@ -345,7 +345,7 @@ fn typed_int_functions_compile_and_run_correctly() {
             "fun add(a: int32, b: int32) -> int32 { return a + b }\n\
              fun madd(a: int32, b: int32, c: int32) -> int32 { return a * b - c }\n\
              fun neg1(x: int64) -> int64 { return -x }\n\
-             fun main() { println(add(-1, 41)) println(madd(4, 5, 6)) println(neg1(9)) }\n",
+             fun main() { println(add(-1, 41))\nprintln(madd(4, 5, 6))\nprintln(neg1(9)) }\n",
         )],
     );
     let (ok, out) = run(&main);
@@ -363,10 +363,10 @@ fn typed_integer_control_flow_runs_correctly() {
         "typed_int_control_flow",
         &[(
             "main.cz",
-            "fun maxi(a: int32, b: int32) -> int32 { if a > b { return a } return b }\n\
-             fun absi(x: int32) -> int32 { if x < 0 { return -x } return x }\n\
-             fun clamp(x: int32) -> int32 { let hi: int32 = 10\n if x > hi { return hi } if x < 0 { return 0 } return x }\n\
-             fun main() { println(maxi(3, 7)) println(absi(-5)) println(clamp(15)) println(clamp(4)) }\n",
+            "fun maxi(a: int32, b: int32) -> int32 { if a > b { return a }\nreturn b }\n\
+             fun absi(x: int32) -> int32 { if x < 0 { return -x }\nreturn x }\n\
+             fun clamp(x: int32) -> int32 { let hi: int32 = 10\n if x > hi { return hi }\nif x < 0 { return 0 }\nreturn x }\n\
+             fun main() { println(maxi(3, 7))\nprintln(absi(-5))\nprintln(clamp(15))\nprintln(clamp(4)) }\n",
         )],
     );
     let (ok, out) = run(&main);
@@ -388,9 +388,9 @@ fn typed_integer_direct_calls_run_correctly() {
             "main.cz",
             "fun square(x: int32) -> int32 { return x * x }\n\
              fun sum_sq(a: int32, b: int32) -> int32 { return square(a) + square(b) }\n\
-             fun absdiff(a: int32, b: int32) -> int32 { if a > b { return a - b } return b - a }\n\
+             fun absdiff(a: int32, b: int32) -> int32 { if a > b { return a - b }\nreturn b - a }\n\
              fun combo(a: int32, b: int32) -> int32 { let d = absdiff(a, b)\n return sum_sq(a, b) - d }\n\
-             fun main() { println(sum_sq(3, 4)) println(combo(3, 4)) }\n",
+             fun main() { println(sum_sq(3, 4))\nprintln(combo(3, 4)) }\n",
         )],
     );
     let (ok, out) = run(&main);
@@ -412,7 +412,7 @@ fn typed_integer_while_loop_runs_correctly() {
              while x != 1 {\n\
              if x % 2 == 0 { x = x / 2 } else { x = 3 * x + 1 }\n\
              count += 1\n }\n return count\n}\n\
-             fun main() { println(collatz(6)) println(collatz(27)) }\n",
+             fun main() { println(collatz(6))\nprintln(collatz(27)) }\n",
         )],
     );
     let (ok, out) = run(&main);
@@ -432,7 +432,7 @@ fn typed_float_and_comparison_functions_run_correctly() {
             "fun scale(x: float64, k: float64) -> float64 { return x * k + 1.0 }\n\
              fun lt(a: int32, b: int32) -> bool { return a < b }\n\
              fun feq(a: float64, b: float64) -> bool { return a == b }\n\
-             fun main() { println(scale(3.0, 2.0)) println(lt(2, 5)) println(lt(5, 2)) println(feq(1.5, 1.5)) }\n",
+             fun main() { println(scale(3.0, 2.0))\nprintln(lt(2, 5))\nprintln(lt(5, 2))\nprintln(feq(1.5, 1.5)) }\n",
         )],
     );
     let (ok, out) = run(&main);
@@ -498,7 +498,7 @@ fn same_type_name_in_two_modules_constructs_and_dispatches() {
             ),
             (
                 "main.cz",
-                "import a.shape.{ make_a }\nimport b.shape.{ make_b }\nfun main() { println(make_a(3.0).area()) println(make_b(2.0).area()) }\n",
+                "import a.shape.{ make_a }\nimport b.shape.{ make_b }\nfun main() { println(make_a(3.0).area())\nprintln(make_b(2.0).area()) }\n",
             ),
         ],
     );
@@ -526,7 +526,7 @@ fn importing_same_name_from_two_modules_is_ambiguous() {
     let (ok, out) = check(&main);
     assert!(!ok, "expected failure");
     assert!(
-        out.contains("`helper` is imported from multiple modules"),
+        out.contains("`helper` is imported twice (`a.util.helper` and `b.util.helper`)"),
         "{out}"
     );
 }
@@ -987,7 +987,7 @@ fun main() {
     let (ok, out) = check(&main);
     assert!(!ok, "expected failure");
     assert!(
-        out.contains("is imported from multiple modules"),
+        out.contains("`h` is imported twice (`a.util.f` and `b.util.g`)"),
         "got: {out}"
     );
 }
@@ -1081,7 +1081,7 @@ fn include_submodule_and_sibling_imports_resolve() {
         "inc_lib_tree",
         &[(
             "main.cz",
-            "import mylib.{ api }\nimport mylib.b.{ b_val }\nfun main() { println(api() + 1) println(b_val()) }\n",
+            "import mylib.{ api }\nimport mylib.b.{ b_val }\nfun main() { println(api() + 1)\nprintln(b_val()) }\n",
         )],
     );
     let (ok, out) = with_include(&main, &inc.display().to_string(), "");

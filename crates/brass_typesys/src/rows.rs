@@ -613,7 +613,7 @@ impl ParamScan<'_> {
                 self.walk_value(inner, active, forced)
             }
             // A type test reads its subject; the annotation names no value.
-            Expr::TypeTest(subject, _, _) => self.walk_value(subject, active, None),
+            Expr::TypeTest(subject, _, _, _) => self.walk_value(subject, active, None),
             Expr::Binary(_, a, b, _) | Expr::Range(a, b, _) => {
                 self.walk_value(a, active, None);
                 self.walk_value(b, active, None);
@@ -900,8 +900,8 @@ impl ParamScan<'_> {
 /// Whether a pattern binds `name` (shadowing the tracked parameter).
 fn pattern_binds(pat: &Pattern, name: &str) -> bool {
     match pat {
-        Pattern::Binding(n, _) => n == name,
-        Pattern::Record(_, fields, _) => fields.iter().any(|f| match &f.pat {
+        Pattern::Binding(n, _, _) => n == name,
+        Pattern::Record(_, _, fields, _) => fields.iter().any(|f| match &f.pat {
             Some(sub) => pattern_binds(sub, name),
             None => f.name == name,
         }),
@@ -933,7 +933,7 @@ fn visit(e: &Expr, f: &mut impl FnMut(&Expr)) {
         Expr::Unary(_, a, _)
         | Expr::ErrorProp(a, _)
         | Expr::Field(a, _, _)
-        | Expr::TypeTest(a, _, _) => visit(a, f),
+        | Expr::TypeTest(a, _, _, _) => visit(a, f),
         Expr::Binary(_, a, b, _) | Expr::Range(a, b, _) | Expr::Index(a, b, _) => {
             visit(a, f);
             visit(b, f);

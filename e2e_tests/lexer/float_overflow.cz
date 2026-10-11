@@ -1,0 +1,2 @@
+// Float64 overflow is rejected at the literal.
+let big = 1e400

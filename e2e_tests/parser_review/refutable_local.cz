@@ -1,0 +1,4 @@
+// Pin rejection inside an invoked function in both execution profiles.
+fun main() {
+    let false = true
+}

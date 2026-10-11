@@ -1,0 +1,3 @@
+// Pin duplicate refinement pins before a later type can overwrite one.
+type Box = { type value }
+type B = Box { value: int32, value: string }

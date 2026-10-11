@@ -1,0 +1,4 @@
+// Passing modes are whole parameter annotations, never stored or nested types.
+type P = { type t }
+let p: P { t: ref(int32) }
+fun main() {}

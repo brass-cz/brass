@@ -63,7 +63,7 @@ fn three_addresses_arithmetic() {
 fn if_expression_merges_through_a_result_local() {
     // Both arms of a value `if` write the same result local; control rejoins at
     // the merge block.
-    let (body, _) = lower_first("fun f(c) { let x = if c { 1 } else { 2 } return x }");
+    let (body, _) = lower_first("fun f(c) { let x = if c { 1 } else { 2 }\nreturn x }");
     let text = body_to_string(&body);
     assert!(text.contains("if _0 -> bb1 else bb2"), "{text}");
     // The then/else arms both assign the shared if-result local _1.
@@ -85,7 +85,7 @@ fn short_circuit_and_only_evaluates_rhs_when_needed() {
 
 #[test]
 fn while_loop_has_back_edge_and_break_target() {
-    let (body, _) = lower_first("fun f(n) { let i = 0 while i < n { i = i + 1 } return i }");
+    let (body, _) = lower_first("fun f(n) { let i = 0\nwhile i < n { i = i + 1 }\nreturn i }");
     let text = body_to_string(&body);
     // The condition block branches to body or end; the body jumps back.
     assert!(text.contains("Lt"), "{text}");
@@ -124,7 +124,7 @@ fn for_over_range_counts_without_materializing_an_array() {
 #[test]
 fn range_as_a_value_still_materializes() {
     // Outside a `for` head the range IS the value, so the fill loop remains.
-    let (body, _) = lower_first("fun f() { let xs = [0..3] return xs }");
+    let (body, _) = lower_first("fun f() { let xs = [0..3]\nreturn xs }");
     let text = body_to_string(&body);
     assert!(text.contains("push"), "{text}");
 }
@@ -165,7 +165,7 @@ fn mutated_and_escaping_literals_keep_per_evaluation_construction() {
 #[test]
 fn error_propagation_branches_and_returns_on_err() {
     // `r!` tests the Result, unwraps on Ok, returns the Result on Err.
-    let (body, _) = lower_first("fun f(r) { let x = r! return x }");
+    let (body, _) = lower_first("fun f(r) { let x = r!\nreturn x }");
     let text = body_to_string(&body);
     assert!(text.contains("builtin result_is_ok(_0)"), "{text}");
     assert!(text.contains("load _0.value"), "{text}");
@@ -200,7 +200,7 @@ fn match_chains_pattern_tests_and_panics_on_fallthrough() {
 fn closure_captures_enclosing_local() {
     // The closure references `base`, which is bound in the enclosing function,
     // so it becomes a capture; `x` is its own parameter and is not captured.
-    let src = "fun f(base) { let g = (x) -> x + base return g(1) }";
+    let src = "fun f(base) { let g = (x) -> x + base\nreturn g(1) }";
     let (body, closures) = lower_first(src);
     assert_eq!(closures.len(), 1, "one closure lowered");
     let clo = &closures[0];

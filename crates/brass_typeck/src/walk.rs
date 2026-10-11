@@ -130,7 +130,7 @@ pub fn walk_expr(e: &Expr, v: &mut impl ExprVisitor) {
             }
         }
         Expr::Block(b, _) => walk_block(b, v),
-        Expr::TypeTest(subject, _, _) => walk_expr(subject, v),
+        Expr::TypeTest(subject, _, _, _) => walk_expr(subject, v),
         _ => {}
     }
 }

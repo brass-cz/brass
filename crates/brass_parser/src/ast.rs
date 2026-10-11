@@ -21,6 +21,7 @@ pub struct ImportedName {
     pub remote: String,
     /// The name as it appears in the importing module's scope.
     pub local: String,
+    /// The local name token (the alias token when renamed).
     pub span: Span,
 }
 
@@ -55,6 +56,10 @@ pub struct ImportDecl {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Keep surface AST nodes inline; patterns retain source qualifiers."
+)]
 pub enum TopLevel {
     Type(TypeDecl),
     Fun(FunDecl),
@@ -66,6 +71,10 @@ pub enum TopLevel {
 #[derive(Clone, Debug)]
 pub struct TypeDecl {
     pub name: String,
+    /// The declared type name token.
+    pub name_span: Span,
+    /// Source spans corresponding to `interfaces`, in declaration order.
+    pub interface_spans: Vec<Span>,
     pub interfaces: Vec<String>,
     pub body: TypeBody,
     pub span: Span,
@@ -108,6 +117,8 @@ pub struct Field {
 #[derive(Clone, Debug)]
 pub struct Method {
     pub name: String,
+    /// The method name token, retained for member-collision diagnostics.
+    pub name_span: Span,
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
     /// `None` for an interface method declaration (signature only, no body).
@@ -121,6 +132,8 @@ pub struct Method {
 #[derive(Clone, Debug)]
 pub struct FunDecl {
     pub name: String,
+    /// The function or method name token, excluding its receiver and body.
+    pub name_span: Span,
     /// `Some(T)` when this is a method implementation `fun T.m(...)`: `T` is the
     /// receiver type (a named type, or an array `T[]` for primitive-array
     /// methods). `None` for a plain free function `fun m(...)`.
@@ -136,6 +149,7 @@ pub struct FunDecl {
 
 #[derive(Clone, Debug)]
 pub struct Param {
+    /// The parameter spelling; `_` reserves an argument position without binding.
     pub name: String,
     pub ty: Option<TypeExpr>,
     pub span: Span,
@@ -357,12 +371,14 @@ pub enum Expr {
     /// statically from the subject's type (`infer` holes in the annotation
     /// match any type), and only the selected arm is type-checked and
     /// compiled.
-    TypeTest(Box<Expr>, TypeExpr, Span),
+    /// The boolean is true for `!(subject: Type)`; only `if` heads carry it.
+    TypeTest(Box<Expr>, TypeExpr, bool, Span),
     Match(Box<Expr>, Vec<MatchArm>, Span),
     Block(Block, Span),
 }
 
 impl Expr {
+    /// The complete source extent, including any written grouping parentheses.
     pub fn span(&self) -> Span {
         match self {
             Expr::Int(_, s)
@@ -385,9 +401,38 @@ impl Expr {
             | Expr::VariantLit(_, _, _, s)
             | Expr::If(_, _, _, s)
             | Expr::IfLet(_, _, _, _, s)
-            | Expr::TypeTest(_, _, s)
+            | Expr::TypeTest(_, _, _, s)
             | Expr::Match(_, _, s)
             | Expr::Block(_, s) => *s,
+        }
+    }
+
+    /// Mutate only the source extent, preserving the expression and all its children.
+    pub fn span_mut(&mut self) -> &mut Span {
+        match self {
+            Expr::Int(_, s)
+            | Expr::Float(_, s)
+            | Expr::Str(_, s)
+            | Expr::Bool(_, s)
+            | Expr::Null(s)
+            | Expr::Ident(_, s)
+            | Expr::SelfExpr(s)
+            | Expr::Unary(_, _, s)
+            | Expr::Binary(_, _, _, s)
+            | Expr::Call(_, _, s)
+            | Expr::Field(_, _, s)
+            | Expr::Index(_, _, s)
+            | Expr::ErrorProp(_, s)
+            | Expr::Closure(_, _, s)
+            | Expr::Array(_, s)
+            | Expr::Range(_, _, s)
+            | Expr::TypeLit(_, _, s)
+            | Expr::VariantLit(_, _, _, s)
+            | Expr::If(_, _, _, s)
+            | Expr::IfLet(_, _, _, _, s)
+            | Expr::TypeTest(_, _, _, s)
+            | Expr::Match(_, _, s)
+            | Expr::Block(_, s) => s,
         }
     }
 }
@@ -399,25 +444,46 @@ pub struct MatchArm {
     pub span: Span,
 }
 
+/// The written qualifier of a named pattern, retained for nominal type
+/// checking, formatting, and source navigation rather than inferred from the
+/// variant name (which may occur in several unrelated sums).
+#[derive(Clone, Debug)]
+pub struct PatternQualifier {
+    /// The type part of a variant path (`Shape` or `vec.Shape`), or a module
+    /// alias in a record pattern (`pt` in `pt.P { x }`) before name resolution.
+    pub ty: String,
+    /// The source extent of the qualifier, excluding the final name.
+    pub span: Span,
+}
+
+/// A destructuring or matching pattern. Named heads retain an optional type
+/// qualifier so the checker can verify the nominal type selected in source.
 #[derive(Clone, Debug)]
 pub enum Pattern {
     Wildcard(Span),
     /// A bare name: a binding, or a unit variant when it names one (resolved
-    /// during type/exhaustiveness checking).
-    Binding(String, Span),
+    /// during type/exhaustiveness checking). A qualified `Binding` is always a
+    /// unit-variant test, never a binding, even if its name cannot be resolved.
+    /// Its span covers the whole head, including the qualifier.
+    Binding(String, Option<PatternQualifier>, Span),
     Literal(Box<Expr>, Span),
-    /// `Name { field, field: subpat, ... }` record/variant destructuring.
-    Record(String, Vec<FieldPat>, Span),
+    /// `Name { field, field: subpat, ... }` record/variant destructuring, with
+    /// an optional written qualifier. Its span includes the whole qualified head
+    /// and the field list. Name resolution normalizes a module-qualified record
+    /// head to a dotted name (`Record("pt.P", None, ...)`), keeping it distinct
+    /// from a sum variant while preserving the spelling for formatting.
+    Record(String, Option<PatternQualifier>, Vec<FieldPat>, Span),
     Array(Vec<Pattern>, Span),
 }
 
 impl Pattern {
+    /// The source extent of the pattern, including any written qualifier.
     pub fn span(&self) -> Span {
         match self {
             Pattern::Wildcard(s)
-            | Pattern::Binding(_, s)
+            | Pattern::Binding(_, _, s)
             | Pattern::Literal(_, s)
-            | Pattern::Record(_, _, s)
+            | Pattern::Record(_, _, _, s)
             | Pattern::Array(_, s) => *s,
         }
     }
@@ -427,6 +493,7 @@ impl Pattern {
     /// name. A `Literal` and a `Wildcard` bind nothing; a `Binding` that names a
     /// unit variant is a test rather than a binding, but that is only known once
     /// types are resolved, so it is reported here and filtered by the caller.
+    /// A qualified name is already known to be a variant test and is excluded.
     pub fn bound_names(&self) -> Vec<&str> {
         let mut out = Vec::new();
         self.collect_bound_names(&mut out);
@@ -436,9 +503,10 @@ impl Pattern {
     fn collect_bound_names<'a>(&'a self, out: &mut Vec<&'a str>) {
         match self {
             Pattern::Wildcard(_) | Pattern::Literal(..) => {}
-            Pattern::Binding(name, _) => out.push(name),
+            Pattern::Binding(name, None, _) => out.push(name),
+            Pattern::Binding(_, Some(_), _) => {}
             Pattern::Array(pats, _) => pats.iter().for_each(|p| p.collect_bound_names(out)),
-            Pattern::Record(_, fields, _) => {
+            Pattern::Record(_, _, fields, _) => {
                 for f in fields {
                     match &f.pat {
                         Some(p) => p.collect_bound_names(out),
@@ -458,6 +526,10 @@ pub struct FieldPat {
     pub span: Span,
 }
 
+/// A structural type field: its name, annotation, and the name token's span.
+/// The name span stays independent of the annotation for field diagnostics.
+pub type TypeField = (String, TypeExpr, Span);
+
 #[derive(Clone, Debug)]
 pub enum TypeExpr {
     /// Primitive or user-defined type name.
@@ -475,9 +547,10 @@ pub enum TypeExpr {
     Tuple(Vec<TypeExpr>, Span),
     /// `anonymous { field: T, ... }` -- an inline anonymous structure type
     /// (a structural record with the given fields, no nominal name).
-    Anonymous(Vec<(String, TypeExpr)>, Span),
-    /// `mut(T)` -- a mutable `T`: a place of this type may be mutated (assigned
-    /// to, or have a mutating method called on it). Plain `T` is immutable.
+    /// Each field retains its name token span for diagnostics.
+    Anonymous(Vec<TypeField>, Span),
+    /// `mut(T)` -- a whole parameter annotation requesting a mutable copy.
+    /// Also allowed immediately inside the parameter annotation `ref(mut(T))`.
     Mut(Box<TypeExpr>, Span),
     /// `ref(T)` an immutable reference, or `ref(mut(T))` a mutable reference (the
     /// inner is then a `mut(...)`). A reference parameter borrows the argument
@@ -501,7 +574,8 @@ pub enum TypeExpr {
     /// pins the named fields/slots to the given types. Omitted fields keep
     /// `Base`'s declared type (an unpinned slot is left open). A refinement of a
     /// field whose base type is concrete and does not match is an error.
-    Refine(Box<TypeExpr>, Vec<(String, TypeExpr)>, Span),
+    /// Each entry retains its name token span for diagnostics.
+    Refine(Box<TypeExpr>, Vec<TypeField>, Span),
 }
 
 impl TypeExpr {

@@ -1,0 +1,18 @@
+// Functions, closures, methods, signatures and function types accept whole passing modes.
+type P = { v: int32, read(self, p: ref(P)) -> int32 }
+fun P.read(self, p: ref(P)) -> int32 { return self.v + p.v }
+fun read(p: ref(P)) -> int32 { return p.v }
+fun local(p: mut(P)) -> int32 { p.v += 1
+return p.v }
+fun change(p: ref(mut(P))) { p.v += 2 }
+fun apply(f: (ref(mut(P))) -> void, p: ref(mut(P))) { f(p) }
+fun main() {
+    let p = P { v: 4 }
+    println(read(p))
+    println(local(p))
+    println(p.read(p))
+    let f = (p: ref(mut(P))) -> { p.v += 3 }
+    apply(f, p)
+    change(p)
+    println(p.v)
+}

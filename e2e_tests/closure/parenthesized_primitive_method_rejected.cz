@@ -1,0 +1,2 @@
+// Builtin static members obey the same grouped-callee rule as declared methods.
+fun main() { println((int32.from)(3)) }

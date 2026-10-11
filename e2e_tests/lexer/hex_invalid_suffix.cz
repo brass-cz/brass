@@ -1,0 +1,2 @@
+// A letter beyond the hexadecimal alphabet is an invalid suffix.
+let x = 0xFFg

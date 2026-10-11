@@ -1,0 +1,7 @@
+// Concrete closure checks preserve variant suggestions and captured const notes.
+type Color = Red | Green
+fun main() {
+    const Rde = 1
+    let pick = (color) -> match color { Rde => 1, Green => 2 }
+    let value = pick(Color.Red)
+}

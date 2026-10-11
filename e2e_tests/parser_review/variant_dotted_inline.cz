@@ -1,0 +1,2 @@
+// Inline sum names cannot contain qualification.
+type X = nomod.Thing | Other

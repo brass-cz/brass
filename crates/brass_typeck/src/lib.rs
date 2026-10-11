@@ -724,7 +724,7 @@ fn mentions_decl_only_syntax(te: &TypeExpr) -> bool {
         TypeExpr::Fun(ps, r, _) => {
             ps.iter().any(mentions_decl_only_syntax) || mentions_decl_only_syntax(r)
         }
-        TypeExpr::Anonymous(fs, _) => fs.iter().any(|(_, t)| mentions_decl_only_syntax(t)),
+        TypeExpr::Anonymous(fs, _) => fs.iter().any(|(_, t, _)| mentions_decl_only_syntax(t)),
         TypeExpr::Named(..) | TypeExpr::TypeOf(..) => false,
     }
 }
@@ -787,7 +787,7 @@ fn collect_expr(expr: &Expr, out: &mut Vec<TypeExpr>) {
             }
         }
         Expr::Unary(_, inner, _) | Expr::ErrorProp(inner, _) => collect_expr(inner, out),
-        Expr::TypeTest(subject, te, _) => {
+        Expr::TypeTest(subject, te, _, _) => {
             out.push(te.clone());
             collect_expr(subject, out);
         }
@@ -858,8 +858,8 @@ fn collect_expr(expr: &Expr, out: &mut Vec<TypeExpr>) {
 mod tests {
     use super::{Analysis, analyze, check, context_seed};
     use brass_hir::{Constness, IntKind, LoadedModule, Program, Type, TypedExprKind, lower};
-    use brass_parser::ast::{BinOp, TopLevel};
-    use brass_parser::parse;
+    use brass_parser::ast::{BinOp, Pattern, TopLevel};
+    use brass_parser::{Span, parse};
     use fxhash::FxHashSet as HashSet;
 
     fn errs(src: &str) -> Vec<String> {
@@ -951,6 +951,164 @@ mod tests {
         let (program, lower_errors) = lower(&loaded);
         assert!(lower_errors.is_empty(), "lower errors: {lower_errors:?}");
         program
+    }
+
+    #[test]
+    fn qualified_pattern_errors_do_not_bind_or_cover_variants() {
+        // A typo must fail at the pattern, never become a binding named Typo
+        // or make an otherwise non-exhaustive match exhaustive.
+        let a =
+            analysis("type A = X { v: int32 } | Y\nfun f(a: A) { match a { A.Typo => Typo } }\n");
+        let messages: Vec<_> = a.errors.iter().map(|e| e.message.as_str()).collect();
+        assert!(
+            messages.contains(&"`A` has no variant `Typo`"),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("non-exhaustive")),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("unknown name `Typo`")),
+            "{messages:?}"
+        );
+
+        let src =
+            "type A = X { v: int32 } | Y\nfun f(a: A) { match a { Nope.X { v } => v, _ => 0 } }\n";
+        let a = analysis(src);
+        let error = a
+            .errors
+            .iter()
+            .find(|e| e.message == "unknown type `Nope`")
+            .expect("qualifier diagnostic");
+        assert_eq!(&src[error.span.lo..error.span.hi], "Nope");
+
+        // Bodies are checked even after a rejected pattern. The unknown name
+        // confirms that the qualified typo was never introduced as a binding.
+        for body in [
+            "if let A.Typo = a { Typo } else { 0 }",
+            "for A.Typo in [a] { Typo }",
+        ] {
+            let e = errs(&format!("type A = X | Y\nfun f(a: A) {{ {body} }}\n"));
+            assert!(e.iter().any(|e| e == "`A` has no variant `Typo`"), "{e:?}");
+            assert!(e.iter().any(|e| e.contains("unknown name `Typo`")), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn rejected_pattern_bodies_still_record_nested_calls() {
+        // Call evidence is needed even in bodies whose diagnostics are later
+        // discarded by static dead-branch checking.
+        for body in [
+            "match a { A.Typo => nested(1), _ => 0 }",
+            "if let A.Typo = a { nested(1) } else { 0 }",
+            "for A.Typo in [a] { nested(1) }",
+        ] {
+            for dead in [false, true] {
+                let body = if dead {
+                    format!("if null {{ {body} }}")
+                } else {
+                    body.to_string()
+                };
+                let src = format!(
+                    "type A = X | Y\nfun nested(x: int32) -> int32 {{ return x }}\nfun f(a: A) {{ {body} }}\n"
+                );
+                let a = analysis(&src);
+                let lo = src.find("nested(1)").expect("call site");
+                assert!(
+                    a.typed.expressions.iter().any(|expr| {
+                        matches!(expr.kind, TypedExprKind::Call)
+                            && expr.span.lo == lo
+                            && expr.span.hi == lo + "nested(1)".len()
+                    }),
+                    "body call was not checked: {body}; {:?}",
+                    a.errors
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn module_record_markers_are_not_sum_variant_patterns() {
+        // A same-named variant must not turn the qualified record into a
+        // sum tag test for exhaustiveness or control-flow analysis.
+        let program = module_program(&[(&["main"], "type Collision = | P { x: int32 }\n")]);
+        let record = Pattern::Record("pt.P".into(), None, Vec::new(), Span::new(0, 4));
+        assert!(!crate::exhaustive::pattern_names_sum_variant(
+            &program, &record
+        ));
+    }
+
+    #[test]
+    fn qualified_patterns_check_every_pattern_position() {
+        // Each entry reaches a different pattern-checking path. The nested
+        // case ensures recursive field checking retains the written type.
+        for body in [
+            "match a { B.X { v } => v, _ => 0 }",
+            "if let B.X { v } = a { v } else { 0 }",
+            "let B.X { v } = a",
+            "for B.X { v } in [a] { v }",
+            "let box = Box.Wrap { item: a }\nif let Box.Wrap { item: B.X { v } } = box { v } else { 0 }",
+        ] {
+            let src = format!(
+                "type A = X {{ v: int32 }} | Y\ntype B = X {{ v: int32 }} | Z\ntype Box = | Wrap {{ item: A }}\nfun f(a: A) {{ {body} }}\n"
+            );
+            let e = errs(&src);
+            assert!(
+                e.iter()
+                    .any(|e| e == "pattern `B.X` names `B`, but the matched value has type `A`"),
+                "{body}: {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qualified_unit_pattern_is_not_a_reflection_loop_binding() {
+        // Reflective for-loops expand a binding into field names; a qualified
+        // variant head must still be checked before that special path runs.
+        let e = errs("type A = X | Y\nfun f() { let r = { v: 1 }\nfor A.X in fields(r) { X } }\n");
+        assert!(
+            e.iter()
+                .any(|e| e == "pattern `A.X` names `A`, but the matched value has type `string`"),
+            "{e:?}"
+        );
+        assert!(!e.iter().any(|e| e.contains("unknown name")), "{e:?}");
+    }
+
+    #[test]
+    fn qualified_patterns_use_nominal_identity_across_modules() {
+        // Both declarations display as Shape. Import renaming must not erase
+        // the distinction between their nominal IDs.
+        let e = module_errs(&[
+            (&["left"], "type Shape = X { v: int32 } | Y\n"),
+            (&["right"], "type Shape = X { v: int32 } | Y\n"),
+            (
+                &["main"],
+                "import left.{ Shape as L }\nimport right.{ Shape as R }\nfun f(x: L) { match x { R.X { v } => v, R.Y => 0 } }\n",
+            ),
+        ]);
+        assert!(
+            e.iter()
+                .any(|e| e.contains("pattern `R.X` names `R`, but the matched value has type")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn qualified_pattern_aliases_select_the_underlying_sum() {
+        // Aliases, including module markers and renamed alias imports, name
+        // the same declaration without creating a new nominal identity.
+        let e = module_errs(&[
+            (
+                &["shapes"],
+                "type Shape = X { v: int32 } | Y\ntype Alias = Shape\n",
+            ),
+            (
+                &["main"],
+                "import shapes as shapes\nimport shapes.{ Shape, Alias as Renamed }\nfun f(x: Shape) { match x { shapes.Alias.X { v } => v, Renamed.Y => 0 } }\n",
+            ),
+        ]);
+        assert!(e.is_empty(), "{e:?}");
     }
 
     #[test]
@@ -1491,7 +1649,7 @@ mod tests {
         // Fields are mutable, so an interface field overridden with a structural
         // subtype is unsound and must be rejected.
         let e = errs(
-            "type Named = { name: string }\ntype HasBreed: Named = { name: string  breed: string }\ntype Box = { value: Named }\ntype DogBox: Box = { value: HasBreed }\n",
+            "type Named = { name: string }\ntype HasBreed: Named = { name: string, breed: string }\ntype Box = { value: Named }\ntype DogBox: Box = { value: HasBreed }\n",
         );
         assert!(
             e.iter().any(|m| m.contains("`DogBox` field `value`")),
@@ -1527,7 +1685,7 @@ mod tests {
         // A narrower method parameter than the interface declares is unsound:
         // a caller could pass an Animal the DogConsumer cannot handle.
         let e = errs(
-            "type Animal = { sound: string }\ntype Dog: Animal = { sound: string  breed: string }\ntype Consumer = { consume(self, a: Animal) -> void }\ntype DogConsumer: Consumer = { }\nfun DogConsumer.consume(self, a: Dog) -> void { }\n",
+            "type Animal = { sound: string }\ntype Dog: Animal = { sound: string, breed: string }\ntype Consumer = { consume(self, a: Animal) -> void }\ntype DogConsumer: Consumer = { }\nfun DogConsumer.consume(self, a: Dog) -> void { }\n",
         );
         assert!(
             e.iter()
@@ -1557,7 +1715,7 @@ mod tests {
     // covariant (naive) rule would wrongly accept.
 
     const VARIANCE_BASE: &str =
-        "type Animal = { sound: string }\ntype Dog: Animal = { sound: string  breed: string }\n";
+        "type Animal = { sound: string }\ntype Dog: Animal = { sound: string, breed: string }\n";
 
     #[test]
     fn function_value_parameter_contravariance_accepts_wider_param() {
@@ -4888,10 +5046,10 @@ mod tests {
         // A field may hold a closure whose type names the enclosing type via
         // `self` (`apply: (self, int32) -> int32`). The closure literal is checked
         // against that type, with `self` bound to the record -- including inside a
-        // function, where the HM pass must resolve `self` from the closure's
-        // parameter scope rather than only a method receiver.
+        // function, where the HM pass resolves the closure's receiver parameter
+        // against the enclosing record type.
         let e = errs(
-            "type Calc = {\n    base: int32\n    apply: (self, int32) -> int32\n}\nfun main() {\n    let c = Calc { base: 10, apply: (self, n) -> { return self.base + n } }\n}\n",
+            "type Calc = {\n    base: int32\n    apply: (self, int32) -> int32\n}\nfun main() {\n    let c = Calc { base: 10, apply: (receiver, n) -> { return receiver.base + n } }\n}\n",
         );
         assert!(e.is_empty(), "{e:?}");
     }
@@ -4901,7 +5059,7 @@ mod tests {
         // The closure body is checked against the field's declared return type, so
         // returning an int where `-> string` is required is an error.
         let e = errs(
-            "type Obj = {\n    transform: (self, string) -> string\n}\nfun main() {\n    let o = Obj { transform: (self, s) -> { return 1 } }\n}\n",
+            "type Obj = {\n    transform: (self, string) -> string\n}\nfun main() {\n    let o = Obj { transform: (receiver, s) -> { return 1 } }\n}\n",
         );
         assert!(
             e.iter()

@@ -1,0 +1,2 @@
+// An exponent marker requires digits even at the end of a statement.
+let x = 1e

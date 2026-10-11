@@ -24,10 +24,7 @@
 // which names a concrete instance of `HashMap` rather than a nominal type of its
 // own, and only a nominal type carries methods.
 
-type _TomlTable = HashMap {
-    key: string
-    value: TomlValue
-}
+type _TomlTable = HashMap { key: string, value: TomlValue }
 
 /**
  * A parsed TOML value, one variant per TOML kind. Obtain the document root (a
@@ -49,8 +46,11 @@ type TomlValue =
 /** The string inside a `String`, or an error for any other kind. */
 fun TomlValue.as_string(self) -> string! {
     match self {
-        TomlValue.String { value } => { return value }
-        _ => {}
+        TomlValue.String { value } => {
+            return value
+        },
+        _ => {
+        },
     }
     return error("expected a TOML string")
 }
@@ -58,8 +58,11 @@ fun TomlValue.as_string(self) -> string! {
 /** The integer inside an `Integer`, or an error for any other kind. */
 fun TomlValue.as_integer(self) -> int64! {
     match self {
-        TomlValue.Integer { value } => { return value }
-        _ => {}
+        TomlValue.Integer { value } => {
+            return value
+        },
+        _ => {
+        },
     }
     return error("expected a TOML integer")
 }
@@ -67,8 +70,11 @@ fun TomlValue.as_integer(self) -> int64! {
 /** The number inside a `Float`, or an error for any other kind. */
 fun TomlValue.as_float(self) -> float64! {
     match self {
-        TomlValue.Float { value } => { return value }
-        _ => {}
+        TomlValue.Float { value } => {
+            return value
+        },
+        _ => {
+        },
     }
     return error("expected a TOML float")
 }
@@ -76,8 +82,11 @@ fun TomlValue.as_float(self) -> float64! {
 /** The boolean inside a `Bool`, or an error for any other kind. */
 fun TomlValue.as_bool(self) -> bool! {
     match self {
-        TomlValue.Bool { value } => { return value }
-        _ => {}
+        TomlValue.Bool { value } => {
+            return value
+        },
+        _ => {
+        },
     }
     return error("expected a TOML boolean")
 }
@@ -85,8 +94,11 @@ fun TomlValue.as_bool(self) -> bool! {
 /** The verbatim date/time text inside a `Datetime`, or an error otherwise. */
 fun TomlValue.as_datetime(self) -> string! {
     match self {
-        TomlValue.Datetime { value } => { return value }
-        _ => {}
+        TomlValue.Datetime { value } => {
+            return value
+        },
+        _ => {
+        },
     }
     return error("expected a TOML date-time")
 }
@@ -94,8 +106,11 @@ fun TomlValue.as_datetime(self) -> string! {
 /** Whether this value is a `Table`. */
 fun TomlValue.is_table(self) -> bool {
     match self {
-        TomlValue.Table { values } => { return true }
-        _ => {}
+        TomlValue.Table { values } => {
+            return true
+        },
+        _ => {
+        },
     }
     return false
 }
@@ -108,8 +123,9 @@ fun TomlValue.get(self, key: string) -> TomlValue! {
                 return v
             }
             return error("missing key '{key}'")
-        }
-        _ => {}
+        },
+        _ => {
+        },
     }
     return error("expected a TOML table")
 }
@@ -122,8 +138,9 @@ fun TomlValue.at(self, index: int64) -> TomlValue! {
                 return value[index]
             }
             return error("array index {index} out of range")
-        }
-        _ => {}
+        },
+        _ => {
+        },
     }
     return error("expected a TOML array")
 }
@@ -131,8 +148,11 @@ fun TomlValue.at(self, index: int64) -> TomlValue! {
 /** The elements of an `Array` value, or an error for any other kind. */
 fun TomlValue.as_array(self) -> TomlValue[]! {
     match self {
-        TomlValue.Array { value } => { return value }
-        _ => {}
+        TomlValue.Array { value } => {
+            return value
+        },
+        _ => {
+        },
     }
     return error("expected a TOML array")
 }
@@ -140,8 +160,11 @@ fun TomlValue.as_array(self) -> TomlValue[]! {
 /** The keys of a `Table` value, in the map's (unspecified) slot order. */
 fun TomlValue.keys(self) -> string[]! {
     match self {
-        TomlValue.Table { values } => { return values.keys() }
-        _ => {}
+        TomlValue.Table { values } => {
+            return values.keys()
+        },
+        _ => {
+        },
     }
     return error("expected a TOML table")
 }
@@ -158,24 +181,33 @@ fun TomlValue.keys(self) -> string[]! {
  */
 fun TomlValue.into(self) -> infer! {
     match self {
-        TomlValue.Integer { value } => { return infer.from(value) }
-        TomlValue.Float { value } => { return infer.from(value) }
-        TomlValue.String { value } => { return infer.from(value) }
-        TomlValue.Datetime { value } => { return infer.from(value) }
-        TomlValue.Bool { value } => { return infer.from(value) }
+        TomlValue.Integer { value } => {
+            return infer.from(value)
+        },
+        TomlValue.Float { value } => {
+            return infer.from(value)
+        },
+        TomlValue.String { value } => {
+            return infer.from(value)
+        },
+        TomlValue.Datetime { value } => {
+            return infer.from(value)
+        },
+        TomlValue.Bool { value } => {
+            return infer.from(value)
+        },
         TomlValue.Table { values } => {
             let ret: infer
             for field in fields(ret) {
                 ret[field] = self.get(field)!.into()!
             }
             return ret
-        }
+        },
         TomlValue.Array { value } => {
             return error("cannot decode a TOML array into a scalar or record")
-        }
+        },
     }
 }
-
 
 // ----- serialization -----
 //
@@ -202,8 +234,9 @@ fun TomlValue.stringify(self) -> string {
                 }
             }
             return out
-        }
-        _ => {}
+        },
+        _ => {
+        },
     }
     return _inline(self)
 }
@@ -212,45 +245,59 @@ fun TomlValue.stringify(self) -> string {
 // array as `[a, b]`, a table as `{ k = v }`.
 fun _inline(value: TomlValue) -> string {
     match value {
-        TomlValue.String { value } => { return _quote(value) }
-        TomlValue.Integer { value } => { return "{value}" }
+        TomlValue.String { value } => {
+            return _quote(value)
+        },
+        TomlValue.Integer { value } => {
+            return "{value}"
+        },
         TomlValue.Float { value } => {
             if value != value {
                 return "nan"
             }
             if value - value != 0.0 {
-                if value < 0.0 { return "-inf" }
+                if value < 0.0 {
+                    return "-inf"
+                }
                 return "inf"
             }
             return "{value}"
-        }
+        },
         TomlValue.Bool { value } => {
-            if value { return "true" }
+            if value {
+                return "true"
+            }
             return "false"
-        }
-        TomlValue.Datetime { value } => { return value }
+        },
+        TomlValue.Datetime { value } => {
+            return value
+        },
         TomlValue.Array { value } => {
             let out = "["
             let first = true
             for elem in value {
-                if !first { out = out + ", " }
+                if !first {
+                    out = out + ", "
+                }
                 out = out + _inline(elem)
                 first = false
             }
             return out + "]"
-        }
+        },
         TomlValue.Table { values } => {
             let out = "\{ "
             let first = true
             for k in values.keys() {
-                if !first { out = out + ", " }
+                if !first {
+                    out = out + ", "
+                }
                 if let v = values.get(k) {
                     out = out + _key_str(k) + " = " + _inline(v)
                 }
                 first = false
             }
             return out + " \}"
-        }
+        },
     }
 }
 
@@ -377,16 +424,19 @@ fun TomlValue.parse(text: string) -> TomlValue! {
                     cur._skip_inline_ws()
                 }
                 if !cur._starts_with_here("]]") {
-                    return error("expected ']]' to close an array-of-tables header at offset {cur.pos}")
+                    return error(
+                        "expected ']]' to close an array-of-tables header at offset {cur.pos}",
+                    )
                 }
                 cur.pos += 2
                 const array_path = _path_key(parent_path, part)
                 if state.sealed.contains_key(array_path) ||
-                   state.declared.contains_key(array_path) ||
-                   state.dotted.contains_key(array_path) {
+                    state.declared.contains_key(array_path) ||
+                    state.dotted.contains_key(array_path) {
                     return error("key '{part}' was already defined as a table")
                 }
-                if parent.contains_key(part) && !state.arrays.contains_key(array_path) {
+                if parent.contains_key(part) &&
+                    !state.arrays.contains_key(array_path) {
                     return error("key '{part}' is not an array of tables")
                 }
                 current = _append_array_table(parent, part)!
@@ -422,12 +472,14 @@ fun TomlValue.parse(text: string) -> TomlValue! {
                     cur._skip_inline_ws()
                 }
                 if cur._peek() != "]" {
-                    return error("expected ']' to close a table header at offset {cur.pos}")
+                    return error(
+                        "expected ']' to close a table header at offset {cur.pos}",
+                    )
                 }
                 cur.pos += 1
                 if state.arrays.contains_key(desired) ||
-                   state.declared.contains_key(desired) ||
-                   state.dotted.contains_key(desired) {
+                    state.declared.contains_key(desired) ||
+                    state.dotted.contains_key(desired) {
                     return error("table '{part}' was already defined")
                 }
                 state.declared.set(desired, true)
@@ -464,8 +516,11 @@ fun TomlValue.parse(text: string) -> TomlValue! {
             const value = cur._value()!
             tbl.set(key, value)
             match value {
-                TomlValue.Table { values } => { state.sealed.set(value_path, true) }
-                _ => {}
+                TomlValue.Table { values } => {
+                    state.sealed.set(value_path, true)
+                },
+                _ => {
+                },
             }
         }
         // A statement must end at a line boundary: only whitespace and a comment
@@ -520,18 +575,25 @@ fun _set_latest(state: _ParseState, path: string, value: string) {
 fun _child(parent: _TomlTable, key: string) -> _TomlTable! {
     if let existing = parent.get(key) {
         match existing {
-            TomlValue.Table { values } => { return values }
+            TomlValue.Table { values } => {
+                return values
+            },
             TomlValue.Array { value } => {
                 if len(value) > 0 {
                     const last = value[len(value) - 1]
                     match last {
-                        TomlValue.Table { values } => { return values }
-                        _ => {}
+                        TomlValue.Table { values } => {
+                            return values
+                        },
+                        _ => {
+                        },
                     }
                 }
                 return error("key '{key}' is an array, not a table")
-            }
-            _ => { return error("key '{key}' already holds a non-table value") }
+            },
+            _ => {
+                return error("key '{key}' already holds a non-table value")
+            },
         }
     }
     let t: _TomlTable = HashMap.new()
@@ -546,8 +608,12 @@ fun _append_array_table(parent: _TomlTable, key: string) -> _TomlTable! {
     let arr: TomlValue[] = []
     if let existing = parent.get(key) {
         match existing {
-            TomlValue.Array { value } => { arr = value }
-            _ => { return error("key '{key}' is not an array of tables") }
+            TomlValue.Array { value } => {
+                arr = value
+            },
+            _ => {
+                return error("key '{key}' is not an array of tables")
+            },
         }
     }
     let t: _TomlTable = HashMap.new()
@@ -686,8 +752,11 @@ fun _Cursor._inline_table(self) -> TomlValue! {
         const v = self._value()!
         tbl.set(key, v)
         match v {
-            TomlValue.Table { values } => { sealed.set(value_path, true) }
-            _ => {}
+            TomlValue.Table { values } => {
+                sealed.set(value_path, true)
+            },
+            _ => {
+            },
         }
         self._skip_inline_ws()
         const sep = self._peek()
@@ -696,7 +765,9 @@ fun _Cursor._inline_table(self) -> TomlValue! {
             return TomlValue.Table { values: t }
         }
         if sep != "," {
-            return error("expected ',' or '\}' in inline table at offset {self.pos}")
+            return error(
+                "expected ',' or '\}' in inline table at offset {self.pos}",
+            )
         }
     }
     return error("unterminated inline table")
@@ -717,7 +788,9 @@ fun _Cursor._basic_string(self) -> string! {
             return error("newline in a single-line string at offset {self.pos}")
         }
         if _is_raw_control(c, false) {
-            return error("raw control character in basic string at offset {self.pos}")
+            return error(
+                "raw control character in basic string at offset {self.pos}",
+            )
         }
         if c == "\\" {
             out = out + self._escape()!
@@ -739,7 +812,9 @@ fun _Cursor._literal_string(self) -> string! {
             return out
         }
         if c == "\n" {
-            return error("newline in a single-line literal string at offset {self.pos}")
+            return error(
+                "newline in a single-line literal string at offset {self.pos}",
+            )
         }
         self.pos += len(c)
     }
@@ -769,7 +844,9 @@ fun _Cursor._ml_basic_string(self) -> string! {
         } else {
             self.pos += len(c)
             if _is_raw_control(c, true) {
-                return error("raw control character in basic string at offset {self.pos}")
+                return error(
+                    "raw control character in basic string at offset {self.pos}",
+                )
             }
             out = out + c
         }
@@ -883,19 +960,25 @@ fun _parse_number(raw: string) -> TomlValue! {
         if !_valid_digit_run(_string_slice(raw, 2, len(raw)), 16) {
             return error("invalid hexadecimal integer literal")
         }
-        return TomlValue.Integer { value: _parse_radix(_string_slice(raw, 2, len(raw)), 16)! }
+        return TomlValue.Integer {
+            value: _parse_radix(_string_slice(raw, 2, len(raw)), 16)!,
+        }
     }
     if raw.starts_with("0o") {
         if !_valid_digit_run(_string_slice(raw, 2, len(raw)), 8) {
             return error("invalid octal integer literal")
         }
-        return TomlValue.Integer { value: _parse_radix(_string_slice(raw, 2, len(raw)), 8)! }
+        return TomlValue.Integer {
+            value: _parse_radix(_string_slice(raw, 2, len(raw)), 8)!,
+        }
     }
     if raw.starts_with("0b") {
         if !_valid_digit_run(_string_slice(raw, 2, len(raw)), 2) {
             return error("invalid binary integer literal")
         }
-        return TomlValue.Integer { value: _parse_radix(_string_slice(raw, 2, len(raw)), 2)! }
+        return TomlValue.Integer {
+            value: _parse_radix(_string_slice(raw, 2, len(raw)), 2)!,
+        }
     }
     if !_valid_decimal_underscores(raw) {
         return error("invalid underscore placement in number: {raw}")
@@ -1125,8 +1208,9 @@ fun _is_date(raw: string) -> bool {
     if len(raw) != 10 {
         return false
     }
-    if !_all_digits(raw, 0, 4) || !_all_digits(raw, 5, 2) ||
-       !_all_digits(raw, 8, 2) {
+    if !_all_digits(raw, 0, 4) ||
+        !_all_digits(raw, 5, 2) ||
+        !_all_digits(raw, 8, 2) {
         return false
     }
     if !_string_char_at_eq(raw, 4, "-") || !_string_char_at_eq(raw, 7, "-") {
@@ -1174,13 +1258,17 @@ fun _valid_datetime(raw: string) -> bool {
 }
 
 fun _valid_time(raw: string, allow_offset: bool) -> bool {
-    if len(raw) < 8 || !_string_char_at_eq(raw, 2, ":") ||
-       !_string_char_at_eq(raw, 5, ":") || !_all_digits(raw, 0, 2) ||
-       !_all_digits(raw, 3, 2) || !_all_digits(raw, 6, 2) {
+    if len(raw) < 8 ||
+        !_string_char_at_eq(raw, 2, ":") ||
+        !_string_char_at_eq(raw, 5, ":") ||
+        !_all_digits(raw, 0, 2) ||
+        !_all_digits(raw, 3, 2) ||
+        !_all_digits(raw, 6, 2) {
         return false
     }
-    if _digits_value(raw, 0, 2) > 23 || _digits_value(raw, 3, 2) > 59 ||
-       _digits_value(raw, 6, 2) > 59 {
+    if _digits_value(raw, 0, 2) > 23 ||
+        _digits_value(raw, 3, 2) > 59 ||
+        _digits_value(raw, 6, 2) > 59 {
         return false
     }
     let pos: int64 = 8
@@ -1207,8 +1295,10 @@ fun _valid_time(raw: string, allow_offset: bool) -> bool {
     if marker != "+" && marker != "-" {
         return false
     }
-    if pos + 6 != len(raw) || !_string_char_at_eq(raw, pos + 3, ":") ||
-       !_all_digits(raw, pos + 1, 2) || !_all_digits(raw, pos + 4, 2) {
+    if pos + 6 != len(raw) ||
+        !_string_char_at_eq(raw, pos + 3, ":") ||
+        !_all_digits(raw, pos + 1, 2) ||
+        !_all_digits(raw, pos + 4, 2) {
         return false
     }
     return _digits_value(raw, pos + 1, 2) <= 23 &&
@@ -1286,9 +1376,10 @@ fun _valid_decimal_underscores(s: string) -> bool {
     let i: int64 = 0
     while i < len(s) {
         if _string_char_at_eq(s, i, "_") {
-            if i == 0 || i + 1 >= len(s) ||
-               !_is_digit(_string_slice(s, i - 1, i)) ||
-               !_is_digit(_string_slice(s, i + 1, i + 2)) {
+            if i == 0 ||
+                i + 1 >= len(s) ||
+                !_is_digit(_string_slice(s, i - 1, i)) ||
+                !_is_digit(_string_slice(s, i + 1, i + 2)) {
                 return false
             }
         }
@@ -1298,8 +1389,12 @@ fun _valid_decimal_underscores(s: string) -> bool {
 }
 
 fun _valid_decimal_number(s: string) -> bool {
-    if s == "inf" || s == "+inf" || s == "-inf" ||
-       s == "nan" || s == "+nan" || s == "-nan" {
+    if s == "inf" ||
+        s == "+inf" ||
+        s == "-inf" ||
+        s == "nan" ||
+        s == "+nan" ||
+        s == "-nan" {
         return true
     }
     let pos: int64 = 0
@@ -1328,8 +1423,8 @@ fun _valid_decimal_number(s: string) -> bool {
             return false
         }
     }
-    if pos < len(s) && (_string_char_at_eq(s, pos, "e") ||
-                       _string_char_at_eq(s, pos, "E")) {
+    if pos < len(s) &&
+        (_string_char_at_eq(s, pos, "e") || _string_char_at_eq(s, pos, "E")) {
         is_float = true
         pos += 1
         if _string_char_at_eq(s, pos, "+") || _string_char_at_eq(s, pos, "-") {
@@ -1385,8 +1480,12 @@ fun _hex_digit(value: int64) -> string {
 // type out of the callers' propagation.
 fun _u8(n: int64) -> uint8 {
     match uint8.from(n) {
-        Ok { value } => { return value }
-        Err { error } => { return 0 }
+        Ok { value } => {
+            return value
+        },
+        Err { error } => {
+            return 0
+        },
     }
 }
 
@@ -1396,8 +1495,11 @@ fun _u8(n: int64) -> uint8 {
 // the explicit `error(...)` here pins it to `string`.
 fun _bytes_to_string(bytes: uint8[]) -> string! {
     match _string_from_bytes(bytes) {
-        Ok { value } => { return value }
-        Err { error } => {}
+        Ok { value } => {
+            return value
+        },
+        Err { error } => {
+        },
     }
     return error("invalid UTF-8 byte sequence")
 }

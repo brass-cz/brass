@@ -1,0 +1,2 @@
+// A free function cannot receive self.
+fun f(self) { return 1 }

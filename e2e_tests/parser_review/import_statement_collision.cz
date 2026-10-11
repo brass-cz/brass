@@ -1,0 +1,4 @@
+// Pin the second alias across import statements from the same module.
+import lib.{ helper as h }
+import lib.{ other as h }
+println(h())

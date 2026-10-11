@@ -1,0 +1,3 @@
+// A leading ! negates a value; a type-test negation needs its own parentheses.
+fun main() { let v = true
+if !v: string {} }

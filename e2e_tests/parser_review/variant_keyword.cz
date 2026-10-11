@@ -1,0 +1,2 @@
+// Keywords cannot name inline variants.
+type X = true | Other

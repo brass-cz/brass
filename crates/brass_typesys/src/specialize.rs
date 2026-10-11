@@ -61,7 +61,7 @@ fn span_metrics(b: &Block) -> (usize, usize) {
             Expr::Unary(_, inner, _)
             | Expr::ErrorProp(inner, _)
             | Expr::Field(inner, _, _)
-            | Expr::TypeTest(inner, _, _) => expr(inner, max_shift, max_hi),
+            | Expr::TypeTest(inner, _, _, _) => expr(inner, max_shift, max_hi),
             Expr::Binary(_, left, right, _)
             | Expr::Index(left, right, _)
             | Expr::Range(left, right, _) => {
@@ -265,6 +265,7 @@ fn specialize_one(
     let body = cx.block(&src.body.clone().ok_or("keyed method has no body")?);
     let decl = FunDecl {
         name: mangled_name(&need.method, &need.key),
+        name_span: src.name_span,
         recv: Some(TypeExpr::Named(info.name.clone(), src.span)),
         params: src.params.clone(),
         // The concrete result: `key!` (a fallible decode).
@@ -334,7 +335,7 @@ impl Specializer<'_> {
             // is unreachable; but a non-record key only reaches here in an arm
             // that also folds elsewhere, so this stays a faithful unroll.
             Stmt::For {
-                pat: Pattern::Binding(var, _),
+                pat: Pattern::Binding(var, _, _),
                 iter,
                 body,
                 span,
@@ -454,9 +455,10 @@ impl Specializer<'_> {
                 Expr::Match(Box::new(scrut_e), arms, *span)
             }
             Expr::Block(b, span) => Expr::Block(self.block_in(b, binds), *span),
-            Expr::TypeTest(subject, te, span) => Expr::TypeTest(
+            Expr::TypeTest(subject, te, negated, span) => Expr::TypeTest(
                 Box::new(self.expr(subject, binds)),
                 self.subst_type(te, binds),
+                *negated,
                 *span,
             ),
             Expr::If(c, t, els, span) => Expr::If(
@@ -575,7 +577,7 @@ impl Specializer<'_> {
         // Only the top match on `self` is typed here (the scrutinee is the
         // receiver); nested matches contribute no field types.
         if (matches!(scrut, Expr::SelfExpr(_)) || matches!(scrut, Expr::Ident(n, _) if n == "self"))
-            && let Pattern::Record(type_variant, fields, _) = pat
+            && let Pattern::Record(type_variant, _, fields, _) = pat
         {
             {
                 let variant = type_variant.rsplit('.').next().unwrap_or(type_variant);
@@ -586,7 +588,7 @@ impl Specializer<'_> {
                     for fp in fields {
                         if let Some(fi) = v.fields.iter().find(|fi| fi.name == fp.name) {
                             let name = match &fp.pat {
-                                Some(Pattern::Binding(b, _)) => b.clone(),
+                                Some(Pattern::Binding(b, _, _)) => b.clone(),
                                 _ => fp.name.clone(),
                             };
                             if let Some(t) = &fi.resolved_ty {
@@ -638,7 +640,9 @@ impl Specializer<'_> {
             TypeExpr::Anonymous(fields, span) => TypeExpr::Anonymous(
                 fields
                     .iter()
-                    .map(|(name, ty)| (name.clone(), self.subst_type(ty, binds)))
+                    .map(|(name, ty, name_span)| {
+                        (name.clone(), self.subst_type(ty, binds), *name_span)
+                    })
                     .collect(),
                 *span,
             ),
@@ -651,7 +655,9 @@ impl Specializer<'_> {
                 Box::new(self.subst_type(base, binds)),
                 fields
                     .iter()
-                    .map(|(name, ty)| (name.clone(), self.subst_type(ty, binds)))
+                    .map(|(name, ty, name_span)| {
+                        (name.clone(), self.subst_type(ty, binds), *name_span)
+                    })
                     .collect(),
                 *span,
             ),
@@ -841,9 +847,12 @@ impl RewriteInto<'_> {
                 els.as_ref().map(|els| Box::new(self.expr(els))),
                 *span,
             ),
-            Expr::TypeTest(subject, ty, span) => {
-                Expr::TypeTest(Box::new(self.expr(subject)), self.type_expr(ty), *span)
-            }
+            Expr::TypeTest(subject, ty, negated, span) => Expr::TypeTest(
+                Box::new(self.expr(subject)),
+                self.type_expr(ty),
+                *negated,
+                *span,
+            ),
             Expr::Match(scrutinee, arms, span) => Expr::Match(
                 Box::new(self.expr(scrutinee)),
                 arms.iter()
@@ -862,10 +871,13 @@ impl RewriteInto<'_> {
     fn pattern(&self, pattern: &Pattern) -> Pattern {
         match pattern {
             Pattern::Wildcard(span) => Pattern::Wildcard(*span),
-            Pattern::Binding(name, span) => Pattern::Binding(name.clone(), *span),
+            Pattern::Binding(name, qualifier, span) => {
+                Pattern::Binding(name.clone(), qualifier.clone(), *span)
+            }
             Pattern::Literal(expr, span) => Pattern::Literal(Box::new(self.expr(expr)), *span),
-            Pattern::Record(name, fields, span) => Pattern::Record(
+            Pattern::Record(name, qualifier, fields, span) => Pattern::Record(
                 name.clone(),
+                qualifier.clone(),
                 fields
                     .iter()
                     .map(|field| FieldPat {
@@ -918,7 +930,7 @@ impl RewriteInto<'_> {
             TypeExpr::Anonymous(fields, span) => TypeExpr::Anonymous(
                 fields
                     .iter()
-                    .map(|(name, ty)| (name.clone(), self.type_expr(ty)))
+                    .map(|(name, ty, name_span)| (name.clone(), self.type_expr(ty), *name_span))
                     .collect(),
                 *span,
             ),
@@ -931,7 +943,7 @@ impl RewriteInto<'_> {
                 Box::new(self.type_expr(base)),
                 fields
                     .iter()
-                    .map(|(name, ty)| (name.clone(), self.type_expr(ty)))
+                    .map(|(name, ty, name_span)| (name.clone(), self.type_expr(ty), *name_span))
                     .collect(),
                 *span,
             ),
@@ -1102,6 +1114,7 @@ mod tests {
                     vec![(
                         "value".into(),
                         TypeExpr::Mut(Box::new(TypeExpr::Ref(Box::new(infer()), span)), span),
+                        span,
                     )],
                     span,
                 ),
@@ -1109,6 +1122,7 @@ mod tests {
                     Box::new(Expr::TypeTest(
                         Box::new(Expr::Ident("x".into(), span)),
                         infer(),
+                        false,
                         span,
                     )),
                     span,
@@ -1119,6 +1133,7 @@ mod tests {
                 vec![(
                     "slot".into(),
                     TypeExpr::Fun(vec![infer()], Box::new(infer()), span),
+                    span,
                 )],
                 span,
             )),
@@ -1187,11 +1202,11 @@ mod tests {
                     span,
                 },
                 Stmt::For {
-                    pat: Pattern::Binding("item".into(), span),
+                    pat: Pattern::Binding("item".into(), None, span),
                     iter: Expr::Array(vec![call()], span),
                     body: Block {
                         stmts: vec![Stmt::Let {
-                            pat: Pattern::Binding("f".into(), span),
+                            pat: Pattern::Binding("f".into(), None, span),
                             ty: Some(TypeExpr::TypeOf(Box::new(call()), span)),
                             value: Some(Expr::Closure(
                                 Vec::new(),
@@ -1235,14 +1250,14 @@ mod tests {
             }
             TypeExpr::Tuple(items, _) => items.iter().map(count_infer_types).sum(),
             TypeExpr::Anonymous(fields, _) => {
-                fields.iter().map(|(_, ty)| count_infer_types(ty)).sum()
+                fields.iter().map(|(_, ty, _)| count_infer_types(ty)).sum()
             }
             TypeExpr::TypeOf(expr, _) => count_infer_expr(expr),
             TypeExpr::Refine(base, fields, _) => {
                 count_infer_types(base)
                     + fields
                         .iter()
-                        .map(|(_, ty)| count_infer_types(ty))
+                        .map(|(_, ty, _)| count_infer_types(ty))
                         .sum::<usize>()
             }
             TypeExpr::TypeSlot(_) | TypeExpr::SelfField(..) => 0,
@@ -1251,7 +1266,7 @@ mod tests {
 
     fn count_infer_expr(expr: &Expr) -> usize {
         match expr {
-            Expr::TypeTest(subject, ty, _) => count_infer_expr(subject) + count_infer_types(ty),
+            Expr::TypeTest(subject, ty, _, _) => count_infer_expr(subject) + count_infer_types(ty),
             _ => 0,
         }
     }
@@ -1302,14 +1317,14 @@ mod tests {
                 .sum(),
             TypeExpr::Anonymous(fields, _) => fields
                 .iter()
-                .map(|(_, ty)| count_type_calls(ty, method))
+                .map(|(_, ty, _)| count_type_calls(ty, method))
                 .sum(),
             TypeExpr::TypeOf(expr, _) => count_expr_calls(expr, method),
             TypeExpr::Refine(base, fields, _) => {
                 count_type_calls(base, method)
                     + fields
                         .iter()
-                        .map(|(_, ty)| count_type_calls(ty, method))
+                        .map(|(_, ty, _)| count_type_calls(ty, method))
                         .sum::<usize>()
             }
             TypeExpr::Named(..) | TypeExpr::TypeSlot(_) | TypeExpr::SelfField(..) => 0,
@@ -1326,7 +1341,7 @@ mod tests {
             Expr::Unary(_, inner, _) | Expr::ErrorProp(inner, _) | Expr::Field(inner, _, _) => {
                 count_expr_calls(inner, method)
             }
-            Expr::TypeTest(subject, ty, _) => {
+            Expr::TypeTest(subject, ty, _, _) => {
                 count_expr_calls(subject, method) + count_type_calls(ty, method)
             }
             Expr::Binary(_, left, right, _)

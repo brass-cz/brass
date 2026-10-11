@@ -1,0 +1,24 @@
+// Trailing commas, anonymous parameters, and continuation boundaries compose.
+type A = { value: int32 }
+type B: A, = { value: int32 }
+type Circle = { r: int32, extra: int32 }
+type T = { ignore(self, _: int32, _: string) -> int32 }
+fun T.ignore(self, _: int32, _: string) -> int32 { return 9 }
+fun ignore(_: int32, _: string) -> int32 { return 7 }
+fun anonymous(_, _) { return 10 }
+fun T.generic(self, _, _) { return 11 }
+fun main() {
+    let circle = Circle { r: 3, extra: 4 }
+    let Circle { r, .., } = circle
+    println(anonymous(1, "two"))
+    println(T {}.generic(true, "three"))
+    println(r)
+    println(ignore(1, "unused"))
+    println(T {}.ignore(2, "unused"))
+    println(((_: int32, _: string) -> 8)(1, "unused"))
+    println(((_, _) -> 6)(true, "unused"))
+    let xs = [1, 2, 3,]
+    println(xs.fold(0, (acc, _) -> acc + 1))
+    let b = B { value: 5 }
+    println(b.value)
+}

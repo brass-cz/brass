@@ -50,7 +50,7 @@ pub const MODULE_PATH_CONST: &str = "_PATH";
 /// different directory must report a different `_PATH`.
 pub fn inject_module_path(ast: &mut Module, location: &str, span: Span) {
     let decl = Stmt::Let {
-        pat: Pattern::Binding(MODULE_PATH_CONST.to_string(), span),
+        pat: Pattern::Binding(MODULE_PATH_CONST.to_string(), None, span),
         ty: Some(TypeExpr::Named("string".to_string(), span)),
         value: Some(Expr::Str(vec![StrSeg::Lit(location.to_string())], span)),
         is_const: true,
@@ -454,13 +454,16 @@ fn classify_bare(base: &[String], root: &Path, imp: &mut ImportDecl, search: &Se
         let imported = if imp.explicit_alias {
             let local = imp.alias.take().unwrap_or_else(|| name.clone());
             imp.explicit_alias = false;
+            let span = Span::new(imp.span.hi - local.len(), imp.span.hi);
             ImportedName {
                 remote: name,
                 local,
-                span: imp.span,
+                span,
             }
         } else {
-            ImportedName::plain(name, imp.span)
+            // The last token is the imported local name, not the import head.
+            let span = Span::new(imp.span.hi - name.len(), imp.span.hi);
+            ImportedName::plain(name, span)
         };
         imp.names.push(imported);
         imp.bare = false;

@@ -423,7 +423,7 @@ impl Resolver<'_> {
             TypeExpr::Anonymous(fields, _) => {
                 let resolved = fields
                     .iter()
-                    .map(|(n, ft)| (n.clone(), self.resolve_texpr(owner, module, ft)))
+                    .map(|(n, ft, _)| (n.clone(), self.resolve_texpr(owner, module, ft)))
                     .collect();
                 crate::types::structural_record(resolved)
             }
@@ -523,7 +523,7 @@ impl Resolver<'_> {
         owner: Option<&str>,
         module: &[String],
         base: &TypeExpr,
-        entries: &[(String, TypeExpr)],
+        entries: &[(String, TypeExpr, brass_parser::Span)],
         span: Span,
     ) -> Type {
         let TypeExpr::Named(bname, _) = base else {
@@ -550,7 +550,7 @@ impl Resolver<'_> {
         // Pin map: slot variable / field name -> the type it is fixed to.
         let mut slot_pins: HashMap<u32, Type> = HashMap::default();
         let mut field_pins: HashMap<String, Type> = HashMap::default();
-        for (fname, fte) in entries {
+        for (fname, fte, name_span) in entries {
             let t = self.resolve_texpr(owner, module, fte);
             let slot = self.meta[&bsym].slot_var(fname);
             let is_field = self.meta[&bsym].field(fname).is_some();
@@ -570,7 +570,7 @@ impl Resolver<'_> {
                             declared.display(),
                             t.display()
                         ),
-                        span: fte.span(),
+                        span: *name_span,
                     });
                 }
                 field_pins.insert(fname.clone(), t);
@@ -580,7 +580,7 @@ impl Resolver<'_> {
                         "`{}` has no field or slot `{fname}` to refine",
                         self.meta[&bsym].name
                     ),
-                    span: fte.span(),
+                    span: *name_span,
                 });
             }
         }

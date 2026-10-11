@@ -1,0 +1,11 @@
+// A free function checks its pattern anew for every concrete instance.
+type Single = | Shared { value: int32 }
+type Multiple = | Shared { value: int32 } | Alternative
+fun unwrap(x) {
+    let Shared { value } = x
+    return value
+}
+fun main() {
+    let good_function = unwrap(Single.Shared { value: 1 })
+    let bad_function = unwrap(Multiple.Alternative)
+}

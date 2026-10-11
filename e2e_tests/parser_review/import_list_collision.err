@@ -1,0 +1,2 @@
+`other` is imported twice (`lib.helper` and `lib.other`)
+import_list_collision.cz:2:31: error:

@@ -1,0 +1,2 @@
+// Unknown interfaces are diagnosed at the interface name.
+type U: Nope = {}

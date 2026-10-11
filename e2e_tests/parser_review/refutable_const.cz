@@ -1,0 +1,8 @@
+// Pin total-pattern checking for top-level and local constants.
+const 5 = 5
+fun main() {
+    const true = true
+}
+// A slice variable carries no static length, even in a constant declaration.
+let values = [1, 2]
+const [a, b] = values

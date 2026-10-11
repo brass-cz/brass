@@ -46,8 +46,11 @@ is not writable in source.
 - The default type of a float literal is `float64`.
 - A literal _adapts_ to an annotated type when it fits: `let b: int8 = -128`
   is fine, `let b: int8 = 300` is a compile error (never a silent wrap). A
-  float literal adapts to either float width; an integer literal in a float
-  context becomes a float.
+  float literal adapts to either float width if its value remains finite at
+  that width; rounding (for example, `0.1`) and underflow to zero are allowed.
+  Overflow is an error, including `1e39` in a `float32` context and `1e400`
+  at the default `float64` width. An integer literal in a float context
+  becomes a float.
 - The required type can also come from a container the value flows into: a
   bare integer literal passed to a method of a map whose value type is pinned
   to `int64` (by a first store or a refinement annotation) is checked against
@@ -140,6 +143,15 @@ not annotated:
 | `infer`                   | read-only deep copy                   | rejected; mutating an `infer` parameter is a compile error |
 | _(numeric type)_          | by value                              | n/a; numbers are copied                                    |
 
+`ref(T)`, `ref(mut(T))`, and `mut(T)` are allowed only as a whole
+parameter annotation: on functions, methods, closures, method signatures in
+type bodies, and parameter positions of function types such as
+`(ref(mut(T))) -> void`. Here `T` contains no `ref` or `mut` annotation.
+They are not value types: return types, variable/constant annotations, fields,
+type arguments, and array/nullable/fallible wrappers cannot contain them.
+For example, `ref(T[])` is a parameter annotation, but `ref(T)[]` is invalid.
+Other nesting, including `ref(ref(T))` and `mut(ref(T))`, is invalid.
+
 Details:
 
 - "Mutates" means a field or element store, a growing method (`push`,
@@ -156,7 +168,9 @@ Details:
 
 ### `self`
 
-The `self` receiver is a special case: unannotated `self` is always a
+`self` is permitted only as the first parameter of a method implementation or
+a method signature in a type body. It cannot be a free-function or closure
+parameter. The `self` receiver is a special case: unannotated `self` is always a
 _reference_. A method that only reads `self` receives `ref(Self)`; one that
 mutates it receives `ref(mut(Self))`, so the change is visible to the caller.
 Annotate `self: Self` to work on an owned deep copy instead (mutations stay
@@ -269,6 +283,20 @@ the unselected arm is pruned exactly like the dead arm of a
 [member-presence test](#absent-fields-in-conditions). Nothing is tested at
 run time, and `else if` chains dispatch on the first satisfied test.
 
+The subject is one postfix-level expression: an identifier, literal, `self`,
+field access, call, index, postfix `!`, or a parenthesized expression.
+A binary or prefix subject must be grouped: `(a == b): bool` and `(-x): int32`.
+`if !v: T` is invalid; to negate the test, write `if !(v: T)` with the
+parentheses. These are the only two test forms: a parenthesized test cannot
+be used as a value, inside `&&`/`||`, or as `if (v: T)`.
+
+`if !(v: T) { A } else { B }` has the same behavior as
+`if v: T { B } else { A }`, including compile-time pruning, expression
+results, return types, and fallibility. Without `else`, the body runs only
+when the type test fails. For a negated test, `infer` holes are pinned by
+the `else` arm, where the positive test holds; with no `else` they remain
+unconstrained. Negated tests can also head an `else if`.
+
 A type satisfies the test when it is:
 
 - **the tested type itself** (representation-exact: `int32` does not satisfy
@@ -287,7 +315,7 @@ goes through the ordinary flow rules, views and rebuilds included.)
 
 `infer` in the tested type is a hole:
 
-- A hole constrained by the arm's own use of the subject takes that type:
+- A hole constrained by the matching arm's use of the subject takes that type:
   in `if v: infer { to_bytes(v) }` the hole reads as `string`, because that
   is what `to_bytes` accepts. The pinned type must come out the same for
   every instantiation of the enclosing function -- a test whose holes resolve
@@ -351,6 +379,10 @@ inherited; the constraint is pure satisfaction:
   type.
 
 ## Methods
+
+A method's name must differ from every field name of its record, or every
+field name across all variants of its sum. This applies to method signatures
+in type bodies and implementations written as `fun T.m(...)`.
 
 Methods are implemented outside the type with `fun T.m(...)`, **in the same
 module that declares `T`**. A method whose first parameter is `self` is an
@@ -495,6 +527,9 @@ There is **no explicit type-parameter syntax** (`<T>` does not exist).
 
 ### Type slots and refinements
 
+A refinement list may pin each field or slot only once. Anonymous record
+literals and `anonymous { ... }` types likewise require unique field names.
+
 A record can name its type parameters as **slots** (members declared with the
 `type` keyword, `type slot`) and refer to them elsewhere with `Self.slot`. A
 slot has no runtime storage: it never appears in the layout, in `fields()`, or
@@ -543,6 +578,14 @@ refers back to itself through the `Self.field` chain (`a: Self.b`,
 `b: Self.a`) is a circular unification and is **rejected** by the occurs-check.
 
 ## Match exhaustiveness
+
+An arm after an irrefutable arm is a compile-time error (`unreachable match
+arm`). This includes `_`, a whole-value binding, and total record, tuple,
+fixed-array, or singleton-sum patterns. A bare name that is not a unit variant
+binds a new variable; it does not compare with an existing constant. When such
+a binding makes later arms unreachable, the diagnostic notes an in-scope
+constant with that name or suggests a similarly spelled variant. Use literal
+patterns or explicit comparisons when testing constant values.
 
 A `match` whose scrutinee is a sum type must either name every variant or
 contain a catch-all arm (`_` or a whole-value binding). A variant arm counts

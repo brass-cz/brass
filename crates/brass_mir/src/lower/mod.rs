@@ -756,6 +756,10 @@ impl<'a, 'p> FnLower<'a, 'p> {
                     Some(t) => self.b.fresh_local_typed(Some(p.name.clone()), t),
                     None => self.b.fresh_local(Some(p.name.clone())),
                 };
+                // Anonymous arguments retain their ABI slot but introduce no local name.
+                if p.name == "_" {
+                    return formal;
+                }
                 let value = if copy {
                     self.b.emit(crate::value::Rvalue::Call(
                         crate::value::Callee::Builtin("__deep_copy".into()),
@@ -794,7 +798,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
 fn collect_global_names(pat: &brass_parser::ast::Pattern, out: &mut fxhash::FxHashSet<String>) {
     use brass_parser::ast::Pattern;
     match pat {
-        Pattern::Binding(name, _) => {
+        Pattern::Binding(name, _, _) => {
             out.insert(name.clone());
         }
         Pattern::Array(pats, _) => {
@@ -1341,7 +1345,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
         use crate::value::{Literal, Operand, Place, Projection, Rvalue};
         use brass_parser::ast::Pattern;
         match pat {
-            Pattern::Binding(name, _) => {
+            Pattern::Binding(name, _, _) => {
                 let key = self.ctx.global_symbol(&self.module, name);
                 self.b.push(MirStmt::SetGlobal(key, v));
             }

@@ -1,0 +1,2 @@
+string patterns cannot contain interpolation
+interpolated_pattern.cz:5:22: error:

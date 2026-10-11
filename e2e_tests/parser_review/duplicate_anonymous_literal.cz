@@ -1,0 +1,2 @@
+// Pin the second field token even when its value has a different type.
+let p = { a: 1, a: "s" }

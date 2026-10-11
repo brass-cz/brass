@@ -25,7 +25,7 @@ impl FnLower<'_, '_> {
     pub(crate) fn lower_pattern_cond(&mut self, pat: &Pattern, subj: LocalId) -> Operand {
         match pat {
             Pattern::Wildcard(_) => Operand::Const(Literal::Bool(true)),
-            Pattern::Binding(name, _) => {
+            Pattern::Binding(name, _, _) => {
                 if self.is_variant_name(name) {
                     self.value_matches(subj, name)
                 } else {
@@ -38,7 +38,7 @@ impl FnLower<'_, '_> {
                 self.b
                     .emit(Rvalue::Bin(BinOp::Eq, Operand::Local(subj), lit))
             }
-            Pattern::Record(name, fps, _) => {
+            Pattern::Record(name, _, fps, _) => {
                 // The variant tag test (constant-true for a plain struct), then each
                 // refutable field sub-pattern, guarded so its field is loaded only
                 // when the variant already matched.
@@ -93,13 +93,13 @@ impl FnLower<'_, '_> {
     pub(crate) fn lower_pattern_bind(&mut self, pat: &Pattern, subj: LocalId) {
         match pat {
             Pattern::Wildcard(_) | Pattern::Literal(_, _) => {}
-            Pattern::Binding(name, _) => {
+            Pattern::Binding(name, _, _) => {
                 // A variant name binds nothing; any other name binds the subject.
                 if !self.is_variant_name(name) {
                     self.bind_value(name, Operand::Local(subj));
                 }
             }
-            Pattern::Record(name, fps, _) => {
+            Pattern::Record(name, _, fps, _) => {
                 // A sum-variant pattern (`Variant { field }`) qualifies each field
                 // with its variant (`Variant.field`) so the back end resolves the
                 // field's type and offset in the matched variant -- several variants
@@ -140,9 +140,9 @@ impl FnLower<'_, '_> {
     fn pattern_is_refutable(&self, pat: &Pattern) -> bool {
         match pat {
             Pattern::Wildcard(_) => false,
-            Pattern::Binding(name, _) => self.is_variant_name(name),
+            Pattern::Binding(name, _, _) => self.is_variant_name(name),
             Pattern::Literal(_, _) | Pattern::Array(_, _) => true,
-            Pattern::Record(name, fps, _) => {
+            Pattern::Record(name, _, fps, _) => {
                 self.is_record_variant_name(name)
                     || fps.iter().any(|fp| {
                         fp.pat

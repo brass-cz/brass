@@ -160,7 +160,7 @@ fn resolve_block_binding(
             && let Stmt::Let { pat, value, .. } = stmt
         {
             let direct_value = match pat {
-                Pattern::Binding(_, _) => value.as_ref().map(Expr::span),
+                Pattern::Binding(_, _, _) => value.as_ref().map(Expr::span),
                 _ => None,
             };
             push_pattern_bindings(pat, direct_value, visible);
@@ -178,7 +178,7 @@ fn resolve_stmt_binding(
     match stmt {
         Stmt::Let { pat, value, .. } => {
             let direct_value = match pat {
-                Pattern::Binding(_, _) => value.as_ref().map(Expr::span),
+                Pattern::Binding(_, _, _) => value.as_ref().map(Expr::span),
                 _ => None,
             };
             binding_in_pattern(pat, off, name, direct_value).or_else(|| {
@@ -284,7 +284,7 @@ fn resolve_expr_binding(
             })
             .flatten()
             .or_else(|| current_binding(visible, name)),
-        Expr::Field(receiver, _, _) | Expr::TypeTest(receiver, _, _) => child(receiver)
+        Expr::Field(receiver, _, _) | Expr::TypeTest(receiver, _, _, _) => child(receiver)
             .flatten()
             .or_else(|| current_binding(visible, name)),
         Expr::Array(elements, _) => elements
@@ -367,12 +367,13 @@ fn binding_in_pattern(
     value_span: Option<Span>,
 ) -> Option<LocalBinding> {
     match pattern {
-        Pattern::Binding(binding_name, span) => (binding_name == name && contains(*span, off))
-            .then_some(LocalBinding {
+        Pattern::Binding(binding_name, None, span) => {
+            (binding_name == name && contains(*span, off)).then_some(LocalBinding {
                 span: *span,
                 value_span,
-            }),
-        Pattern::Record(_, fields, _) => fields.iter().find_map(|field| match &field.pat {
+            })
+        }
+        Pattern::Record(_, _, fields, _) => fields.iter().find_map(|field| match &field.pat {
             Some(pattern) => binding_in_pattern(pattern, off, name, None),
             None => (field.name == name && contains(field.span, off)).then_some(LocalBinding {
                 span: field.span,
@@ -382,7 +383,7 @@ fn binding_in_pattern(
         Pattern::Array(patterns, _) => patterns
             .iter()
             .find_map(|pattern| binding_in_pattern(pattern, off, name, None)),
-        Pattern::Wildcard(_) | Pattern::Literal(_, _) => None,
+        Pattern::Wildcard(_) | Pattern::Literal(_, _) | Pattern::Binding(_, Some(_), _) => None,
     }
 }
 
@@ -392,14 +393,14 @@ fn push_pattern_bindings(
     visible: &mut Vec<(String, LocalBinding)>,
 ) {
     match pattern {
-        Pattern::Binding(name, span) => visible.push((
+        Pattern::Binding(name, None, span) => visible.push((
             name.clone(),
             LocalBinding {
                 span: *span,
                 value_span,
             },
         )),
-        Pattern::Record(_, fields, _) => fields.iter().for_each(|field| match &field.pat {
+        Pattern::Record(_, _, fields, _) => fields.iter().for_each(|field| match &field.pat {
             Some(pattern) => push_pattern_bindings(pattern, None, visible),
             None => visible.push((
                 field.name.clone(),
@@ -412,7 +413,7 @@ fn push_pattern_bindings(
         Pattern::Array(patterns, _) => patterns
             .iter()
             .for_each(|pattern| push_pattern_bindings(pattern, None, visible)),
-        Pattern::Wildcard(_) | Pattern::Literal(_, _) => {}
+        Pattern::Wildcard(_) | Pattern::Literal(_, _) | Pattern::Binding(_, Some(_), _) => {}
     }
 }
 
@@ -563,7 +564,9 @@ pub fn call_args_at_span(full: &FullAnalysis, call_span: Span) -> Option<Vec<Typ
             // before the explicit arguments -- otherwise the arguments map to the
             // wrong parameters and the receiver-typed first parameter (e.g.
             // `slice`'s `arr: infer[]`) is never bound.
-            if let Expr::Field(recv, _, _) = callee.as_ref() {
+            if let Expr::Field(recv, _, _) = callee.as_ref()
+                && !callee.span().is_parenthesized()
+            {
                 types.push(arg_type(full, recv.span()));
             }
             types.extend(args.iter().map(|a| arg_type(full, a.expr.span())));
@@ -769,7 +772,7 @@ fn walk_expr(e: &Expr, visit: &mut impl FnMut(&Expr)) {
             }
         }
         Expr::Block(b, _) => walk_block(b, visit),
-        Expr::TypeTest(subject, _, _) => walk_expr(subject, visit),
+        Expr::TypeTest(subject, _, _, _) => walk_expr(subject, visit),
         _ => {}
     }
 }

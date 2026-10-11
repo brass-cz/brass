@@ -62,6 +62,43 @@ pub fn closure_ahead(tokens: &[Token], pos: usize) -> bool {
     matches!(kind_at(tokens, i), TokenKind::Arrow)
 }
 
+/// Lookahead from a type declaration's right-hand side at `pos`: is it
+/// `Name { ... }` whose matching `}` is followed (across newlines) by `|`?
+/// Such a head is the first variant of an inline sum. Its member block is a
+/// variant's (untyped fields and method signatures allowed), not the typed
+/// field list of a `Base { .. }` refinement, which it otherwise resembles.
+pub fn braced_variant_ahead(tokens: &[Token], pos: usize) -> bool {
+    // Include invalid qualified or keyword heads so the variant parser can
+    // diagnose the name itself rather than interpreting it as a type alias.
+    let mut i = pos + 1;
+    while matches!(kind_at(tokens, i), TokenKind::Dot)
+        && matches!(kind_at(tokens, i + 1), TokenKind::Ident(_))
+    {
+        i += 2;
+    }
+    if !matches!(kind_at(tokens, i), TokenKind::LBrace) {
+        return false;
+    }
+    let mut depth = 0usize;
+    loop {
+        match kind_at(tokens, i) {
+            TokenKind::LBrace => depth += 1,
+            TokenKind::RBrace => {
+                depth -= 1;
+                if depth == 0 {
+                    i += 1;
+                    break;
+                }
+            }
+            TokenKind::Eof => return false,
+            _ => {}
+        }
+        i += 1;
+    }
+    let i = next_significant(tokens, i);
+    matches!(kind_at(tokens, i), TokenKind::Pipe)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +111,6 @@ mod tests {
         assert_eq!(next_significant(&tokens, 0), 0);
         assert!(!newline_then(&tokens, 0, &TokenKind::Dot));
         assert!(!closure_ahead(&tokens, 0));
+        assert!(!braced_variant_ahead(&tokens, 0));
     }
 }

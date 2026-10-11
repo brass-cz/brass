@@ -1,0 +1,2 @@
+// Refinement fields require a comma or newline.
+let x: M { key: string value: int32 }

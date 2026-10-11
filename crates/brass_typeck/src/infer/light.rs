@@ -90,7 +90,7 @@ impl<'a> Checker<'a> {
         env: &ScopeStack,
         props: &mut LightProps,
     ) -> Option<bool> {
-        let Expr::TypeTest(subject, te, tspan) = cond else {
+        let Expr::TypeTest(subject, te, negated, tspan) = cond else {
             return None;
         };
         let subject_ty = self.infer_expr_light(subject, env, props);
@@ -106,11 +106,7 @@ impl<'a> Checker<'a> {
                 super::expr::wildcard_open_vars(&resolved)
             }
         };
-        Some(brass_typesys::type_test_accepts(
-            self.program,
-            &pattern,
-            &subject_ty,
-        ))
+        Some(brass_typesys::type_test_accepts(self.program, &pattern, &subject_ty) != *negated)
     }
 
     /// Whether `stmt` holds a type-test `if` chain whose selected arm always
@@ -210,6 +206,7 @@ impl<'a> Checker<'a> {
     fn track_collection_growth(&mut self, expr: &Expr, env: &ScopeStack, props: &mut LightProps) {
         if let Expr::Call(callee, args, _) = expr
             && let Expr::Field(recv, method, _) = callee.as_ref()
+            && !callee.span().is_parenthesized()
             && matches!(method.as_str(), "push" | "insert")
             && let Some(value_arg) = args.last()
         {
@@ -278,16 +275,20 @@ impl<'a> Checker<'a> {
             Expr::Closure(params, body, _) => {
                 let mut inner = env.clone();
                 inner.push(Scope::default());
+                let mut param_types = Vec::with_capacity(params.len());
                 for param in params {
                     let ty = param
                         .ty
                         .as_ref()
                         .and_then(|t| self.resolve_type(t).ok())
                         .unwrap_or_else(|| self.fresh_unknown());
-                    inner
-                        .last_mut()
-                        .expect("closure scope frame")
-                        .insert(param.name.clone(), ty);
+                    param_types.push(ty.clone());
+                    if param.name != "_" {
+                        inner
+                            .last_mut()
+                            .expect("closure scope frame")
+                            .insert(param.name.clone(), ty);
+                    }
                 }
                 // The closure is its OWN callable: its error/null sites shape
                 // the closure's return, never the enclosing function's (the
@@ -303,16 +304,7 @@ impl<'a> Checker<'a> {
                     self.result_from_payloads(Some(ret), &own.errors, false)
                 };
                 let ret = super::precompute::wrap_null_propagated_return(ret, &own.nulls);
-                Type::Fun(
-                    params
-                        .iter()
-                        .map(|p| {
-                            self.lookup(&inner, &p.name)
-                                .unwrap_or_else(|| self.fresh_unknown())
-                        })
-                        .collect(),
-                    Box::new(ret),
-                )
+                Type::Fun(param_types, Box::new(ret))
             }
             Expr::Array(items, _) => {
                 let elem_tys: Vec<Type> = items
@@ -458,7 +450,9 @@ impl<'a> Checker<'a> {
                 return ret;
             }
         }
-        if let Expr::Field(base, method, _) = callee {
+        if let Expr::Field(base, method, _) = callee
+            && !callee.span().is_parenthesized()
+        {
             if let Expr::Ident(tname, _) = &**base
                 && self.lookup(env, tname).is_none()
             {
@@ -820,13 +814,14 @@ impl<'a> Checker<'a> {
 
     pub(super) fn bind_pattern_light(&mut self, pat: &Pattern, ty: &Type, env: &mut ScopeStack) {
         match pat {
-            Pattern::Binding(name, _) if !self.is_unit_variant_name(name) => {
+            Pattern::Binding(name, None, _) if !self.is_unit_variant_name(name) => {
                 env.last_mut()
                     .expect("light scope frame")
                     .insert(name.clone(), ty.clone());
             }
-            Pattern::Record(variant, fields, _) => {
-                let field_types = self.pattern_field_types(ty, variant);
+            Pattern::Record(variant, qualifier, fields, _) => {
+                let ty = self.pattern_scrutinee_type(ty, variant, qualifier.as_ref());
+                let field_types = self.pattern_field_types(&ty, variant);
                 for field in fields {
                     let fty = field_types
                         .get(&field.name)

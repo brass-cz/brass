@@ -1,6 +1,6 @@
 // Variants constructed through a module qualifier can be matched with the
-// same qualified spelling: the pattern's qualifier segments are consumed and
-// the variant is resolved against the scrutinee's type.
+// same qualified spelling: the qualifier names the scrutinee's sum type and
+// the final segment selects one of its declared variants.
 import shapelib
 
 fun main() {

@@ -1,0 +1,5 @@
+// Pin rejection before an interpolated expression can run as a pattern.
+fun side() -> string { println("called")
+    return "x" }
+let line = "x"
+println(match line { "{side()}" => 1, _ => 0 })

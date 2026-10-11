@@ -23,7 +23,16 @@ brass check file.cz
 ```
 
 A normal `brass file.cz` run checks the functions it needs and may leave
-unused functions unchecked for that run. Only `brass check` gives a complete
+unused function bodies unchecked for that run. Declaration and signature
+errors still prevent execution. Called methods follow the same body rules as
+free functions: a rejected body, including an untaken branch, cannot execute,
+and errors retain `brass check`'s diagnostic text and source locations.
+Pattern contracts (irrefutable `let`/`const`/`for`, unique bindings, and
+reachable match arms) follow the same body rules, including in closures and
+each concrete generic instance. Module initializers are always checked.
+Uninstantiated reflective method templates and statically pruned branches
+follow the ordinary checker selection rules.
+Checker warnings are non-fatal. Only `brass check` gives a complete
 whole-program verdict.
 
 ## Syntax essentials
@@ -31,15 +40,29 @@ whole-program verdict.
 - Bindings are `const name = value` or mutable `let name = value`.
 - Comments are `//`, `#`, and nestable `/* ... */`. A leading shebang is a
   `#` comment. `/** ... */` directly above a `fun` or `type` is a doc comment.
-- Newlines separate statements. A line continues after a binary operator or
-  before a leading `.` in a method chain.
+- Each statement, declaration, and import requires a newline, its enclosing
+  block's `}`, or end of file. Semicolons are not separators. A line continues
+  after a binary or assignment operator, before a leading `.`, or before `else`.
+  Type members, refinement entries, and match arms require commas or newlines.
+  Every comma-separated list allows a trailing comma, including interface lists
+  and the `..` at the end of a record pattern.
+- Numeric literals cannot touch an unconsumed letter, digit, or `_`:
+  `0b12`, `0o78`, and `0xFFg` are errors. Exponents require digits after
+  the optional sign (`1e` is an error). `_` separators are allowed, and
+  leading-zero integers such as `0755` are decimal.
+- String text cannot contain raw newlines; use `\n`. Interpolation
+  expressions may span lines. Nested strings follow the same rules and
+  support their own interpolations.
 - Strings use escapes and `{expression}` interpolation. Escape a literal
   opening brace as `\{`.
 - Equality is `==`; `=` is assignment. Compound assignments include `+=`,
   `-=`, `*=`, `/=`, and `%=`.
 - `if` and `match` are expressions. Loops are `while condition` and
   `for item in iterable`; `break` and `continue` are supported.
-- Closures are `(x) -> expression` or `(x) -> { ...; return value }`.
+- Closures are `(x) -> expression` or `(x) -> { return value }`; multiple
+  statements in a block need newlines. `return` requires a function or closure.
+- `_` parameters are anonymous and may repeat; `_` is never a readable value.
+  `self` is allowed only as the first parameter of a method or method signature.
 - Functions and types may be used before their definitions. Top-level
   bindings initialize in textual order and may not be read early.
 - Top-level statements run in module dependency order; `main()` runs last if
@@ -64,7 +87,9 @@ println("{greeting}: {values}")
   `float64`, `bool`, `string`, and `void`. There is no character type; one
   character is a `string`.
 - Integer literals default to `int32`, or `int64` when needed. Float literals
-  default to `float64`. `len` returns `int64`.
+  default to `float64`. Float literals must remain finite at their selected
+  width: `1e400` is invalid, as is `1e39` in a `float32` context. Rounding
+  (such as `0.1`) and underflow to zero remain valid. `len` returns `int64`.
 - `T[]` is a growable array, `T[n]` a fixed-length array, `[T, U]` a tuple,
   and `[lo..hi]` a half-open integer range.
 - `T?` is nullable. Narrow it with `if value`, `if !value { return ... }`, or
@@ -100,6 +125,10 @@ println(double(2.5))   // 5.0
   If its body mutates the parameter, the callee receives a private deep copy.
 - Use `ref(T)` for an explicit immutable reference and `ref(mut(T))` when the
   callee must mutate the caller's value. `mut(T)` is an explicit mutable copy.
+  These three forms are whole parameter annotations only, including closure,
+  method-signature, and function-type parameters. `T` contains no `ref`/`mut`;
+  never put them in returns, fields, variable annotations, type arguments,
+  array elements, or nullable/fallible wrappers.
 - `infer` is a read-only copied value whose type is inferred; `infer[]`
   requires an array with an inferred element type.
 - `self` is a reference, so instance methods can mutate their receiver.
@@ -112,7 +141,12 @@ println(double(2.5))   // 5.0
 ## Records, methods, sums, and interfaces
 
 Record fields live inside `type`; method implementations live outside it.
+Sum variant names are plain undotted identifiers, never `Self` or keywords.
+
 An instance method has `self` first. A method without `self` is static.
+A method signature or implementation cannot share a name with a field of its
+record or any variant of its sum. Anonymous record literals, anonymous record
+types, and refinement lists cannot repeat a field name.
 
 ```brass
 type Account = {
@@ -140,10 +174,12 @@ type Names = Stack { item: string }   // alias pinning the slot
   shorthand for `field: field` (also in `{ ... }` and variant literals).
   Prefer the shorthand whenever the value is the same-named binding.
 - Call methods as `value.method()` or `Type.static_method()`. There is no
-  UFCS.
+  UFCS. `(value.field)(args)` calls a closure-valued field without an implicit
+  receiver. A parenthesized method callee is rejected; method members are
+  presence descriptors, not callable function values.
 - A member written as `name(params) -> Return` inside a type is a required
   method signature, not stored data.
-- Sum types use `type Name = | Variant { fields } | Empty`. Construct a value
+- Sum types use `type Name = Variant { fields } | Empty`. Construct a value
   as `Name.Variant { ... }` and match it as `Variant { ... }`.
 - A match on a sum must cover every variant or use `_`.
 - `type Child: Parent` declares structural conformance. Fields and complete
@@ -182,8 +218,24 @@ bindings, and `_`. `if let pattern = value` selects one pattern. A conditional
 can also probe structural member presence: `if value.method { ... }` asks at
 compile time whether that type provides the member.
 
+- `let`, `const`, and `for` require irrefutable patterns, recursively. Use
+  bindings, `_`, plain records, or braced variants of a singleton sum. Literals,
+  unit-variant names, and multi-variant destructures require `if let` or `match`.
+- Tuple/fixed-array destructures require matching arity. A growable array
+  requires a matching-length literal initializer for declaration destructuring.
+- A name cannot be bound twice within one pattern, including nested fields.
+- String patterns cannot contain interpolation.
+- An arm after an irrefutable match arm is an error. Bare names bind variables;
+  they do not compare with constants. Qualify unit variants to avoid typos
+  becoming catch-all bindings.
+
 `if value: Type { ... } else ...` is a compile-time type test, decided per
-call site of the enclosing generic function; only the selected arm is checked
+call site of the enclosing generic function. The subject must be one postfix
+expression; group binary/prefix expressions, as in `if (a == b): bool`.
+Negate with `if !(value: Type)` (parentheses required), never `if !value: Type`.
+Tests are complete `if`/`else if` heads only, not values or logical operands.
+A negated test swaps the matching and nonmatching arms; `infer` holes are
+pinned by its `else` arm, where the test holds. Only the selected arm is checked
 and compiled. Matching accepts the exact type or a subtype (structural record
 satisfaction, declared sum parents); it never converts (`int32` fails an
 `int64` test, `T` fails a `T?` test). `infer` in the tested type is a hole:
@@ -277,6 +329,8 @@ match load_number("12") {
 ## Modules and packages
 
 - One file is one module; `geometry/vec.cz` is `geometry.vec`.
+- Two imports cannot bind one local name to different targets, even from the
+  same module. Repeating the identical target is allowed.
 - Import names with `import path.{ A, B }` or `import path.Name`. Import a
   module with `import path` and use its last segment as qualifier; rename it
   with `import path as local`.

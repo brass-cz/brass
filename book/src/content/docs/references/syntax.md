@@ -101,7 +101,10 @@ let d = 0o755       // octal (0o / 0O)
 
 There are no type suffixes: the type of a literal is decided by inference
 (see [Type system](/references/types/#literals)). A literal too large for `int64` is a
-lexing error.
+lexing error. A leading zero alone does not select octal: `0755` is decimal
+755. A numeric literal cannot be followed immediately by a letter, digit, or
+`_` that it cannot consume: `0b12`, `0o78`, and `0xFFg` are errors, not
+separate tokens. `_` separators remain allowed.
 
 ### Float literals
 
@@ -109,7 +112,11 @@ A float literal requires a digit after the decimal point (`1.0`, not `1.`),
 and accepts an exponent and `_` separators: `6.02e23`, `1_0.5`. Because a
 float needs a digit after `.`, `42.foo` lexes as the integer `42` followed by
 a field access. There are no float suffixes, and radix prefixes do not apply
-to floats.
+to floats. An exponent marker (`e` or `E`), with an optional sign, must be
+followed by digits (separators are allowed); `1e` and `1e+` are errors.
+A literal that overflows `float64` is a lexing error. A literal used as
+`float32` must also remain finite at that width; rounding such as `0.1` and
+underflow to zero such as `1e-400` are allowed.
 
 ### String literals and interpolation
 
@@ -131,18 +138,24 @@ println("first = {items[0]}, count = {items.len()}")
 ```
 
 There is no character type (a character is a one-character string) and no
-raw or multi-line string form (use `\n`).
+raw or multi-line string form (use `\n`). A raw newline in string text is an
+error reported at that string's opening quote. Newlines are allowed inside
+an interpolation's expression. Strings nested inside interpolations follow
+the same rules, including their own escapes and recursive interpolations.
 
 ### Statements and newlines
 
-Newlines separate statements; there are no semicolons (`;` is not a token). A
-line _continues_ onto the next in these cases:
+Newlines separate statements; there are no semicolons (`;` is not a token). Each
+statement, top-level declaration, and import must end at a newline, the closing
+`}` of its enclosing block, or end of file. A line _continues_ onto the next in
+these cases:
 
 - the line ends with a binary or assignment operator;
 - the next line begins with `.` (method chain);
 - an `else` begins the next line after an `if` block;
 - inside parentheses `()`, brackets `[]`, and the braces of record literals,
-  `match` bodies, and type bodies, newlines are insignificant.
+  newlines within an expression are insignificant. Statement blocks inside
+  brackets still require statement boundaries.
 
 ```brass
 let total = 100 *
@@ -154,10 +167,10 @@ let result = [3, 1, 4]
     .fold(0, (a, b) -> a + b)
 ```
 
-Commas are optional between type members and between match arms (newlines
-separate just as well), and trailing commas are accepted in every
+Type members, refinement entries, and match arms require commas or newlines
+between entries. Trailing commas are accepted in every
 comma-separated list (arguments, parameters, array literals, field lists,
-imports, patterns).
+imports, patterns, and interface lists). A record pattern may end with `..,`.
 
 ## Operators
 
@@ -209,10 +222,20 @@ Notes:
 - **`if` / `else`** is an expression and yields a value; `else if` chains.
   The condition does not take a record literal directly (parenthesize if
   needed).
-- **Type test** `if expr: Type { ... }`: a colon after the condition
-  expression tests its static type (decided at compile time; see
-  [Type tests](/references/types/#type-tests)). The type is parsed like a
-  return type, so the following `{` always opens the arm's block.
+- **Type test** `if subject: Type { ... }` or `if !(subject: Type) { ... }`:
+  tests the subject's static type at compile time (see
+  [Type tests](/references/types/#type-tests)). The subject must be a
+  postfix-level expression (identifier, literal, `self`, field, call, index,
+  postfix `!`, or parenthesized expression). Group a binary or prefix subject:
+  `if (a == b): bool`. Negation requires the complete `!(subject: Type)`
+  form; `if !v: T` is invalid. Tests are only complete `if`/`else if` heads,
+  never values or operands of `&&`/`||`; `if (v: T)` is invalid. In the positive
+  form the type is parsed like a return type, so the following `{` opens the
+  arm's block.
+- **Parenthesized callee** `(e)(args)` evaluates `e` as a value and calls it
+  with the written arguments. A closure-valued field works this way.
+  A method member is not a function value; `(b.g)(3)` is rejected with
+  `` `b.g` is a method; call it as `b.g(...)` ``.
 - **`if let`** `if let PATTERN = expr { ... } else { ... }` matches one
   pattern; on a nullable scrutinee, a bare name pattern binds the non-null
   value.
@@ -273,10 +296,13 @@ break
 continue
 ```
 
-The `for` head takes a single variable name (no destructuring). `break` and
-`continue` are bare; there are no labels.
+The `for` head accepts an irrefutable pattern, including record and tuple
+destructuring. `break` and `continue` are bare; there are no labels.
 
 ### `return`
+
+`return` is valid only inside a function or closure body, including nested
+control-flow blocks. It is an error in module initialization.
 
 `return` with no value returns `void`; `return expr` returns the value. In a
 fallible function a plain value is wrapped in `Result.Ok` automatically (see
@@ -284,7 +310,8 @@ fallible function a plain value is wrapped in `Result.Ok` automatically (see
 
 ## Patterns
 
-Patterns appear in `match` arms, `if let`, and `let` destructuring:
+Patterns appear in `match` arms, `if let`, `let`/`const` declarations, and `for`
+heads:
 
 | Pattern          | Example                                           | Notes                                                                          |
 | ---------------- | ------------------------------------------------- | ------------------------------------------------------------------------------ |
@@ -294,6 +321,34 @@ Patterns appear in `match` arms, `if let`, and `let` destructuring:
 | Variant / record | `Circle { radius }`, `Shape.Circle { radius: r }` | field shorthand binds the field name; `field: subpattern` destructures further |
 | Rest             | `Full { data, .. }`                               | `..` ignores the remaining fields                                              |
 | Array            | `[a, b]`                                          | fixed length; no `..` rest inside arrays                                       |
+
+A variant pattern's type qualifier is optional: `Circle { radius }` and
+`Shape.Circle { radius }` both select a variant. When written, the qualifier
+must name the matched value's sum type and that type must declare the variant.
+Module paths and renamed imports are allowed (`vec.Shape.Circle { radius }`).
+A qualified bare name such as `Shape.Dot` is always a unit-variant test, never
+a binding; a misspelled type or variant is an error. A unit pattern requires a
+variant without fields. For an inferred scrutinee, the qualifier selects its
+sum type. A value converted to a declared parent sum is matched with the
+parent's qualifier; a value still typed as the child uses the child's qualifier.
+A module-qualified record pattern such as `pt.P { x, y }` instead names the
+record type `P` exported by module alias `pt`. Its nominal type must match the
+scrutinee's; if the scrutinee is still inferred, the pattern selects that record
+type. This form also works in `let` and nested field sub-patterns.
+
+Every name may be bound only once within a pattern, including nested fields
+and array elements. Separate arms and separate declarations have separate
+binding scopes. String patterns must be plain literals: interpolation is a
+compile-time error, even when the interpolated expression is constant.
+
+The pattern in `let`, `const`, or `for` must be irrefutable. Bindings, `_`,
+plain records, and braced variants of a sum with exactly one variant are
+allowed, with the same rule applied recursively to sub-patterns. Literals,
+unit-variant names (bare or qualified), and variants of multi-variant sums
+require `if let` or `match`. Tuple and fixed-array destructures must have the
+correct arity. A growable array cannot be destructured in these positions
+unless the declaration's initializer is an array literal of the matching
+length; the same restriction applies to nested patterns.
 
 There are no or-patterns (`|`), no `@` bindings, and no range patterns.
 `match` over a sum type must be exhaustive (see
@@ -309,6 +364,11 @@ fun name(param, other: Type, third: ref(mut(T))) -> ReturnType {
 }
 ```
 
+A parameter named `_` is anonymous: it binds nothing, cannot be read as a value,
+and may appear several times in a parameter list. This applies to functions,
+methods, and closures. `self` is allowed only as the first parameter of a method
+implementation or a method signature in a type body.
+
 Both parameter and return annotations are optional. When written, an annotation
 must resolve to a valid type; an invalid annotation is an error rather than an
 unannotated inference hole. `fun T.m(params)` declares a method of type `T`
@@ -321,9 +381,9 @@ array types (user code cannot).
 
 ```brass norun
 type Name = { members }                  // record
-type Name = | V1 { members } | V2       // sum type
+type Name = V1 { members } | V2         // sum type
 type Name: IfaceA, IfaceB = { members } // with interface constraints
-type Child: Parent = | V1 { .. } | V2   // sum with a declared parent (subtyping)
+type Child: Parent = V1 { .. } | V2     // sum with a declared parent (subtyping)
 type Alias = Base { field: T, ... }     // refinement alias (see below)
 ```
 
@@ -333,13 +393,19 @@ see [Type slots](/references/types/#type-slots-and-refinements); the older
 spelling `name: type` is also accepted), or a **method
 signature** (`name(params) -> Ret` with no body). A method body inside a `type`
 block is a parse error: implementations go outside the type, as `fun T.m(...)`,
-in the same module. Members are separated by commas or newlines.
+in the same module. Members are separated by commas or newlines. A method
+signature or implementation cannot share a name with a record field or a
+field of any variant of its sum type.
+
+Field names must be unique in anonymous record literals, anonymous record
+types, and refinement lists, just as in nominal and variant literals.
 
 Variants of a sum type are `Name` or `Name { members }`, separated by `|`,
 which may start a new line. A leading `|` is optional for a sum with two or
 more variants but **required** for a one-variant sum (`type X = | Only { .. }`),
 so that `type Alias = Base { .. }` reads as a refinement rather than a
-one-variant sum. A right-hand side that is a plain type expression (a
+one-variant sum. Variant names must be plain undotted identifiers, excluding
+`Self` and all keywords, in either spelling. A right-hand side that is a plain type expression (a
 refinement, or any type) declares an **alias**: the name resolves to that type
 and is not a new nominal.
 
@@ -384,16 +450,21 @@ Base forms:
 | `[T, U, ...]`                | tuple                                                                                                        |
 | `(T, U) -> R`                | function/closure type                                                                                        |
 | `Self`                       | the enclosing type, in methods                                                                               |
-| `mut(T)`                     | mutable value (deep copy in parameter position)                                                              |
-| `ref(T)`                     | immutable reference                                                                                          |
-| `ref(mut(T))`                | mutable reference (writes through)                                                                           |
+| `mut(T)`                     | mutable deep-copy parameter only                                                              |
+| `ref(T)`                     | immutable-reference parameter only                                                                                          |
+| `ref(mut(T))`                | mutable-reference parameter only (writes through)                                                                           |
 | `typeof(expr)`               | the static type of `expr` (see [Reflection](/references/reflection/))                                        |
 | `anonymous { name: T, ... }` | inline structural record type                                                                                |
 | `type`                       | a type slot, only as a whole field's type (a type parameter)                                                 |
 | `Self.field`                 | the type of the enclosing type's field/slot named `field`                                                    |
 | `Base { field: T, ... }`     | a refinement pinning `Base`'s slots/fields (see [Type slots](/references/types/#type-slots-and-refinements)) |
 
-Suffixes, applicable repeatedly and in any order:
+`ref(T)`, `ref(mut(T))`, and `mut(T)` are whole parameter annotations only,
+including closure/method parameters and parameters of function types.
+`T` must contain no `ref`/`mut`. They cannot appear in return types, fields,
+variable annotations, type arguments, or inside other type wrappers.
+
+Suffixes on value types, applicable repeatedly and in any order:
 
 | Suffix | Meaning                                               |
 | ------ | ----------------------------------------------------- |
@@ -403,7 +474,8 @@ Suffixes, applicable repeatedly and in any order:
 | `T!`   | Result with success payload `T`                       |
 
 So `int32?[]` is an array of nullable int32, `int32[]?` a nullable array, and
-`infer?[]`, `ref(mut(int32[]))`, `(int32) -> int32?` combine as expected.
+`infer?[]` and `(int32) -> int32?` combine as expected. A parameter may use
+`ref(mut(int32[]))`; `ref(int32)[]` is invalid.
 
 The primitive named types are `int8`, `int16`, `int32`, `int64`, `uint8`,
 `uint16`, `uint32`, `uint64`, `float32`, `float64`, `bool`, `string`, and

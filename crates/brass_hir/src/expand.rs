@@ -33,7 +33,7 @@ pub fn fields_loop_target(stmt: &Stmt) -> Option<(&str, &Expr, &Block)> {
     };
     // A fields-loop names one variable: the field name each expanded copy is
     // substituted with. A destructuring loop variable has no such name.
-    let Pattern::Binding(var, _) = pat else {
+    let Pattern::Binding(var, _, _) = pat else {
         return None;
     };
     let call = match iter {
@@ -281,9 +281,10 @@ impl Expander<'_> {
                 els.as_ref().map(|e| Box::new(self.expr(e))),
                 self.span(*span),
             ),
-            Expr::TypeTest(subject, te, span) => Expr::TypeTest(
+            Expr::TypeTest(subject, te, negated, span) => Expr::TypeTest(
                 Box::new(self.expr(subject)),
                 self.type_expr(te),
+                *negated,
                 self.span(*span),
             ),
             Expr::Match(scrut, arms, span) => Expr::Match(
@@ -304,10 +305,21 @@ impl Expander<'_> {
     fn pattern(&self, p: &Pattern) -> Pattern {
         match p {
             Pattern::Wildcard(span) => Pattern::Wildcard(self.span(*span)),
-            Pattern::Binding(name, span) => Pattern::Binding(name.clone(), self.span(*span)),
-            Pattern::Literal(e, span) => Pattern::Literal(Box::new(self.expr(e)), self.span(*span)),
-            Pattern::Record(name, fields, span) => Pattern::Record(
+            Pattern::Binding(name, qualifier, span) => Pattern::Binding(
                 name.clone(),
+                qualifier.as_ref().map(|q| PatternQualifier {
+                    ty: q.ty.clone(),
+                    span: self.span(q.span),
+                }),
+                self.span(*span),
+            ),
+            Pattern::Literal(e, span) => Pattern::Literal(Box::new(self.expr(e)), self.span(*span)),
+            Pattern::Record(name, qualifier, fields, span) => Pattern::Record(
+                name.clone(),
+                qualifier.as_ref().map(|q| PatternQualifier {
+                    ty: q.ty.clone(),
+                    span: self.span(q.span),
+                }),
                 fields
                     .iter()
                     .map(|f| FieldPat {
@@ -357,7 +369,7 @@ impl Expander<'_> {
             TypeExpr::Anonymous(fields, span) => TypeExpr::Anonymous(
                 fields
                     .iter()
-                    .map(|(n, t)| (n.clone(), self.type_expr(t)))
+                    .map(|(n, t, name_span)| (n.clone(), self.type_expr(t), self.span(*name_span)))
                     .collect(),
                 self.span(*span),
             ),
@@ -376,7 +388,7 @@ impl Expander<'_> {
                 Box::new(self.type_expr(base)),
                 fields
                     .iter()
-                    .map(|(n, t)| (n.clone(), self.type_expr(t)))
+                    .map(|(n, t, name_span)| (n.clone(), self.type_expr(t), self.span(*name_span)))
                     .collect(),
                 self.span(*span),
             ),

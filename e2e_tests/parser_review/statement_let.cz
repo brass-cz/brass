@@ -1,0 +1,2 @@
+// Two declarations on one line require a newline.
+let a = 1 let b = 2

@@ -25,13 +25,37 @@ A normal run reports errors in the code it needs:
 
 - An error in a module initializer, top-level statement, or `main` prevents
   execution from starting.
+- Declaration and signature errors are not ignored for uncalled functions.
+  The up-front checks, including duplicate parameters, unresolved type
+  annotations, and interface conformance, prevent execution from starting.
+  Return contracts that depend on body inference are checked as that body
+  settles, before it can execute. This does not require eagerly inferring
+  every function body.
 - An error in a function reached later stops the run before that function
   executes. Output already produced remains visible and the process exits
   non-zero.
 - The unit is a complete function body. An error in an untaken branch of a
   called function still rejects that function.
-- An uncalled function does not affect the current run. Its check may continue
-  in the background until the program exits.
+- These body rules also apply to instance and static methods, including
+  methods reached through a function compiled during execution. Their source
+  diagnostics are checked before native compilation of the affected batch.
+- An uncalled function's body errors do not affect the current run. Its check
+  may continue in the background until the program exits. Declaration and
+  signature errors are still subject to the checks above.
+- Pattern contracts follow these same body rules: refutable `let`, `const`,
+  and `for` patterns, duplicate bindings, and unreachable match arms reject
+  a needed body before it executes. They do not reject a run that never
+  needs that body. Patterns depending on generic arguments are checked for
+  each concrete instance. Closure bodies are checked within their enclosing
+  body, and module initializers are always needed.
+
+As with other body diagnostics, uninstantiated reflective method templates
+and statically pruned branches follow the checker's selection rules (see
+[type tests](/references/types/#type-tests)).
+
+Errors use the same diagnostic text and source locations as `brass check`.
+Match coverage is checked after the relevant argument types are known, before
+the affected body can execute. Checker warnings remain non-fatal in all modes.
 
 Consequently, a successful run is not a complete whole-program verdict. Use
 `brass check` in CI and whenever all code must be validated.
@@ -41,6 +65,11 @@ whole-program commands accept: a very deep call chain of unannotated returns
 whose inferred type differs from the default integer width. The run fails
 with a defined error naming the function whose return type to annotate;
 annotating it (or running with `--eager`) resolves the program.
+
+A reflective specialization discovered only after execution starts completes
+checking and reports any source errors. If checking succeeds but the running
+session cannot install the specialization, the run stops with a request to
+rerun with `--eager`; it does not replay earlier side effects.
 
 ### Complete checking and compilation
 

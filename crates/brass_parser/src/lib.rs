@@ -103,6 +103,37 @@ mod tests {
         }
     }
 
+    /// Without a leading `|`, a braced first variant followed by `|` still
+    /// starts a sum, and its block takes variant members (an untyped field, a
+    /// method signature), which a `Base { .. }` refinement would reject.
+    #[test]
+    fn inline_sum_with_braced_first_variant() {
+        for src in [
+            "type R = Ok { value } | Err { error }\n",
+            "type R = Ok { value, get(self) -> int32 }\n    | Err { error }\n",
+        ] {
+            let m = module(src);
+            let TopLevel::Type(t) = &m.items[0] else {
+                panic!("expected a type");
+            };
+            let TypeBody::Sum(vs) = &t.body else {
+                panic!("expected a sum: {src}");
+            };
+            let names: Vec<_> = vs.iter().map(|v| v.name.as_str()).collect();
+            assert_eq!(names, vec!["Ok", "Err"], "{src}");
+            let Member::Field(f) = &vs[0].members[0] else {
+                panic!("expected a field");
+            };
+            assert!(f.ty.is_none(), "{src}");
+        }
+        // With no `|` after the braces, the head stays a refinement alias.
+        let m = module("type Counts = HashMap { key: string, value: int32 }\n");
+        let TopLevel::Type(t) = &m.items[0] else {
+            panic!("expected a type");
+        };
+        assert!(matches!(t.body, TypeBody::Alias(TypeExpr::Refine(..))));
+    }
+
     #[test]
     fn interface_constraints() {
         let m = module("type User: Showable, Comparable = {\n    name: string\n}\n");
@@ -138,6 +169,46 @@ mod tests {
                 }
             }
             _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn variant_pattern_qualifiers_and_spans() {
+        // Qualifier spans exclude the variant; the pattern includes its entire
+        // head and fields. A nonzero base also pins source-map offsets.
+        let src = "match x { Shape.Circle { r } => 1, Shape.Dot => 2, vec.Shape.Circle { r } => 3, vec.Shape.Dot => 4, bare => 5, Circle { r } => 6 }";
+        let base = 37;
+        let ast = super::parse_with_base(src, base).expect("parse");
+        let TopLevel::Stmt(Stmt::Expr(Expr::Match(_, arms, _))) = &ast.items[0] else {
+            panic!("expected match");
+        };
+        let mut cursor = 0;
+        for (arm, (head, written)) in arms.iter().zip([
+            ("Shape.Circle { r }", Some("Shape")),
+            ("Shape.Dot", Some("Shape")),
+            ("vec.Shape.Circle { r }", Some("vec.Shape")),
+            ("vec.Shape.Dot", Some("vec.Shape")),
+            ("bare", None),
+            ("Circle { r }", None),
+        ]) {
+            let lo = cursor + src[cursor..].find(head).expect("head");
+            cursor = lo + head.len();
+            assert_eq!(
+                arm.pattern.span(),
+                super::Span::new(base + lo, base + lo + head.len())
+            );
+            let (Pattern::Binding(_, q, _) | Pattern::Record(_, q, _, _)) = &arm.pattern else {
+                panic!("expected named pattern");
+            };
+            assert_eq!(q.as_ref().map(|q| q.ty.as_str()), written);
+            if let Some(q) = q {
+                assert_eq!(q.span, super::Span::new(base + lo, base + lo + q.ty.len()));
+                assert!(
+                    !arm.pattern
+                        .bound_names()
+                        .contains(&head.rsplit('.').next().unwrap())
+                );
+            }
         }
     }
 
@@ -524,7 +595,7 @@ mod tests {
         };
         match &f.body.stmts[0] {
             Stmt::Let {
-                pat: Pattern::Binding(name, _),
+                pat: Pattern::Binding(name, _, _),
                 ..
             } => assert_eq!(name, "as"),
             other => panic!("expected let binding, got {other:?}"),

@@ -1,0 +1,5 @@
+unreachable match arm
+`LIMIT` binds a new name and does not compare with the constant `LIMIT`
+unreachable_constant.cz:4:44: error:
+`LOCAL` binds a new name and does not compare with the constant `LOCAL`
+unreachable_constant.cz:6:35: error:

@@ -180,7 +180,14 @@ fun T.get(self) {
 declares a member `get` on `T` whose function type's `default()` produces
 the declared function, `(value) -> value.x`. In the model, `a.get` denotes
 that function (a member absent from the value is materialized by its type's
-`default()`), and a call `a.get()` applies it to the receiver: `(a.get)(a)`.
+`default()`), and a call `a.get()` applies it to the receiver: `(a.get)(a)`
+in that conceptual model. The implementation does not expose method members
+as callable function values: an uncalled method member is a presence
+descriptor, and `(a.get)(a)` is rejected with a diagnostic asking for
+`a.get(...)`. Parenthesized callees always call values with exactly the
+written arguments; `(a.callback)(x)` calls a closure-valued field without
+inserting `a` as a receiver. A field and a method cannot share a name.
+
 The model implies, and the implementation guarantees:
 
 - A method member may be **absent from a value**: methods never affect

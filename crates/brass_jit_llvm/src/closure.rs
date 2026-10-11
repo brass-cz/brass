@@ -34,11 +34,11 @@ fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
 
 pub fn collect_pat_names(p: &Pattern, out: &mut HashSet<String>) {
     match p {
-        Pattern::Binding(n, _) => {
+        Pattern::Binding(n, _, _) => {
             out.insert(n.clone());
         }
         Pattern::Array(ps, _) => ps.iter().for_each(|p| collect_pat_names(p, out)),
-        Pattern::Record(_, fps, _) => {
+        Pattern::Record(_, _, fps, _) => {
             for fp in fps {
                 match &fp.pat {
                     Some(sub) => collect_pat_names(sub, out),
@@ -227,7 +227,7 @@ fn walk_subexprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
             }
         }
         Expr::Block(b, _) => block_exprs(b, f),
-        Expr::TypeTest(subject, _, _) => f(subject),
+        Expr::TypeTest(subject, _, _, _) => f(subject),
         _ => {}
     }
 }

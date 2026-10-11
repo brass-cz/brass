@@ -36,7 +36,9 @@ type URI = {
 /** Parses an absolute URI. Fails when `s` carries no scheme. */
 fun URI.parse(s: string) -> URI! {
     let uri = URI.parse_reference(s)!
-    if !uri.scheme { return error("URI has no scheme: {s}") }
+    if !uri.scheme {
+        return error("URI has no scheme: {s}")
+    }
     return uri
 }
 
@@ -77,14 +79,18 @@ fun URI.parse_reference(s: string) -> URI! {
     }
 
     // An authority is introduced by "//" and runs to the next "/".
-    let has_authority = pos + 1 < hier_end && cs[pos] == "/" && cs[pos + 1] == "/"
+    let has_authority = pos + 1 < hier_end &&
+        cs[pos] == "/" &&
+        cs[pos + 1] == "/"
     let authority_text = ""
     let path = ""
     if has_authority {
         let auth_start = pos + 2
         let auth_end = hier_end
         let slash = index_of(cs, "/", auth_start, hier_end)
-        if slash { auth_end = slash }
+        if slash {
+            auth_end = slash
+        }
         authority_text = substr(cs, auth_start, auth_end)
         // path-abempty: empty, or rooted at the "/" that ended the authority.
         path = substr(cs, auth_end, hier_end)
@@ -95,13 +101,19 @@ fun URI.parse_reference(s: string) -> URI! {
     validate(path, CharClass.Path)!
     if !has_authority && !scheme && _first_segment_has_colon(path) {
         // path-noscheme: such a colon would read back as a scheme.
-        return error("first path segment of a relative reference may not contain `:`: {s}")
+        return error(
+            "first path segment of a relative reference may not contain `:`: {s}",
+        )
     }
 
     let q = query
-    if q { query = validate(q, CharClass.Query)! }
+    if q {
+        query = validate(q, CharClass.Query)!
+    }
     let f = fragment
-    if f { fragment = validate(f, CharClass.Fragment)! }
+    if f {
+        fragment = validate(f, CharClass.Fragment)!
+    }
 
     // The authority is built straight into the field rather than through a
     // nullable local: the typed back end miscompiles `let a: T? = null; a = T
@@ -115,13 +127,7 @@ fun URI.parse_reference(s: string) -> URI! {
             fragment,
         }
     }
-    return Self {
-        scheme,
-        authority: null,
-        path,
-        query,
-        fragment,
-    }
+    return Self { scheme, authority: null, path, query, fragment }
 }
 
 /** The authority written back as text, or null when the reference has none. */
@@ -130,7 +136,11 @@ fun URI.authority_string(self) -> string? {
     if a {
         // The typed back end cannot dispatch a method on a nullable record even
         // once it is narrowed, so the value is rebuilt as a plain Authority.
-        let authority = Authority { userinfo: a.userinfo, host: a.host, port: a.port }
+        let authority = Authority {
+            userinfo: a.userinfo,
+            host: a.host,
+            port: a.port,
+        }
         return authority.to_string()
     }
     return null
@@ -140,14 +150,22 @@ fun URI.authority_string(self) -> string? {
 fun URI.to_string(self) -> string {
     let out = ""
     let scheme = self.scheme
-    if scheme { out += "{scheme}:" }
+    if scheme {
+        out += "{scheme}:"
+    }
     let authority = self.authority_string()
-    if authority { out += "//{authority}" }
+    if authority {
+        out += "//{authority}"
+    }
     out += self.path
     let query = self.query
-    if query { out += "?{query}" }
+    if query {
+        out += "?{query}"
+    }
     let fragment = self.fragment
-    if fragment { out += "#{fragment}" }
+    if fragment {
+        out += "#{fragment}"
+    }
     return out
 }
 
@@ -161,7 +179,9 @@ fun URI.to_string(self) -> string {
  */
 fun URI.resolve(self, reference: string) -> URI! {
     let base_scheme = self.scheme
-    if !base_scheme { return error("cannot resolve against a relative base") }
+    if !base_scheme {
+        return error("cannot resolve against a relative base")
+    }
     let r = URI.parse_reference(reference)!
 
     // A reference with its own scheme is already absolute; only its path is
@@ -193,7 +213,9 @@ fun URI.resolve(self, reference: string) -> URI! {
     let path = self.path
     let query = r.query
     if len(r.path) == 0 {
-        if !query { query = self.query }
+        if !query {
+            query = self.query
+        }
     } else if r.path.starts_with("/") {
         path = _remove_dot_segments(r.path)
     } else {
@@ -215,12 +237,16 @@ fun _merge_path(base: URI, path: string) -> string {
     let base_path = base.path
     if len(base_path) == 0 {
         let authority = base.authority
-        if authority { return "/{path}" }
+        if authority {
+            return "/{path}"
+        }
         return path
     }
     let cs = base_path.chars()
     let cut = _last_slash(cs)
-    if cut < 0 { return path }
+    if cut < 0 {
+        return path
+    }
     let head = substr(cs, 0, cut + 1)
     return "{head}{path}"
 }
@@ -229,21 +255,31 @@ fun _merge_path(base: URI, path: string) -> string {
 // that would climb above the root is dropped, as the RFC requires -- the result
 // of a resolution is never allowed to escape the authority.
 fun _remove_dot_segments(path: string) -> string {
-    if len(path) == 0 { return path }
+    if len(path) == 0 {
+        return path
+    }
     let absolute = path.starts_with("/")
     let parts = path.split("/")
     let kept: string[] = []
     let i: int64 = 0
-    if absolute { i = 1 }
+    if absolute {
+        i = 1
+    }
     while i < len(parts) {
         let segment = parts[i]
         const last = i + 1 == len(parts)
         i += 1
         if segment == "." {
-            if last { kept.push("") }
+            if last {
+                kept.push("")
+            }
         } else if segment == ".." {
-            if len(kept) > 0 { kept = kept.slice(0, len(kept) - 1) }
-            if last { kept.push("") }
+            if len(kept) > 0 {
+                kept = kept.slice(0, len(kept) - 1)
+            }
+            if last {
+                kept.push("")
+            }
         } else {
             // Empty interior and trailing segments are significant. Only the
             // first empty segment of an absolute path was consumed as its root.
@@ -252,7 +288,9 @@ fun _remove_dot_segments(path: string) -> string {
     }
     let joined = kept.join("/")
     let out = joined
-    if absolute { out = "/{joined}" }
+    if absolute {
+        out = "/{joined}"
+    }
     return out
 }
 
@@ -260,7 +298,9 @@ fun _remove_dot_segments(path: string) -> string {
 fun _last_slash(cs: string[]) -> int64 {
     let i = len(cs) - 1
     while i >= 0 {
-        if cs[i] == "/" { return i }
+        if cs[i] == "/" {
+            return i
+        }
         i -= 1
     }
     let missing: int64 = -1
@@ -279,7 +319,9 @@ fun URI.path_segments(self) -> string[]! {
         path = substr(cs, 1, len(cs))
     }
     let out: string[] = []
-    if len(path) == 0 { return out }
+    if len(path) == 0 {
+        return out
+    }
     for segment in path.split("/") {
         out.push(percent.decode(segment)!)
     }
@@ -290,16 +332,24 @@ fun URI.path_segments(self) -> string[]! {
 fun URI.query_pairs(self) -> QueryPair[]! {
     let none: QueryPair[] = []
     let query = self.query
-    if !query { return none }
+    if !query {
+        return none
+    }
     return QueryPair.parse_all(query)!
 }
 
 fun _is_scheme(cs: string[], colon: int64) -> bool {
-    if colon == 0 { return false }
-    if !is_alpha(cs[0]) { return false }
+    if colon == 0 {
+        return false
+    }
+    if !is_alpha(cs[0]) {
+        return false
+    }
     let i: int64 = 1
     while i < colon {
-        if !is_scheme_char(cs[i]) { return false }
+        if !is_scheme_char(cs[i]) {
+            return false
+        }
         i += 1
     }
     return true
@@ -309,6 +359,8 @@ fun _first_segment_has_colon(path: string) -> bool {
     let cs = path.chars()
     let end = len(cs)
     let slash = index_of(cs, "/", 0, end)
-    if slash { end = slash }
+    if slash {
+        end = slash
+    }
     return index_of(cs, ":", 0, end) != null
 }

@@ -1,0 +1,11 @@
+// Each concrete closure application checks the pattern, even after a valid call.
+type Single = | Shared { value: int32 }
+type Multiple = | Shared { value: int32 } | Alternative
+fun main() {
+    let unwrap = (x) -> {
+        let Shared { value } = x
+        return value
+    }
+    let good = unwrap(Single.Shared { value: 1 })
+    let bad = unwrap(Multiple.Alternative)
+}

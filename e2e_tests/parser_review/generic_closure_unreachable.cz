@@ -1,0 +1,8 @@
+// Totality must be checked for each closure instance, not its first argument.
+type Single = | Shared { value: int32 }
+type Multiple = | Shared { value: int32 } | Alternative
+fun main() {
+    let pick = (x) -> match x { Shared { value } => value, _ => 0 }
+    let good = pick(Multiple.Alternative)
+    let bad = pick(Single.Shared { value: 1 })
+}

@@ -1,0 +1,2 @@
+// Anonymous closure parameters cannot be read.
+let f = (acc, _) -> acc + _

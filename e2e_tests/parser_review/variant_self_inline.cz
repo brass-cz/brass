@@ -1,0 +1,2 @@
+// Self is a type reference, not a variant declaration name.
+type X = Self | Other

@@ -1,0 +1,17 @@
+// Identical fields do not make two named record types nominally equal.
+// Both let and match must reject a module-qualified head of another type.
+import geo.pt
+
+type Other = {
+    x: int32
+    y: int32
+}
+
+fun main() {
+    let other = Other { x: 1, y: 2 }
+    let pt.P { x, y } = other
+    println(x + y)
+    match other {
+        pt.P { x } => println(x),
+    }
+}

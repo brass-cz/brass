@@ -1,0 +1,4 @@
+// Module initialization cannot return before later declarations.
+println("a")
+return 5
+println("b")

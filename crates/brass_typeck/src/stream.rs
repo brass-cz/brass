@@ -123,8 +123,8 @@ impl ChannelDelta {
 pub enum CheckEvent {
     /// The pre-inference static passes (annotation resolution, flow,
     /// definite assignment, HM, ...) finished with these errors. Emitted
-    /// once, before any body event; a consumer that plans to execute should
-    /// treat any error here as fatal.
+    /// before any body event. Consumers attribute diagnostics to
+    /// declarations or bodies and gate execution of the affected code.
     StaticChecked(Vec<TypeError>),
     /// Precompute and the method-body/scheme phase finished: every method
     /// body is checked and body scheduling starts. The delta covers
@@ -138,7 +138,9 @@ pub enum CheckEvent {
     /// re-resolved against the final substitution) and the full, sorted,
     /// deduplicated error set -- the same set `Analysis::errors` carries.
     Finished(ChannelDelta, Vec<TypeError>),
-    /// Append-only specialization completed without restarting analysis.
+    /// Append-only specialization's final verdict without restarting analysis.
+    /// A failed continuation carries its final diagnostics and no generated
+    /// declarations, replacing any provisional errors from the initial pass.
     KeyedReady(
         Vec<brass_hir::GeneratedDecl>,
         Vec<(Span, String)>,
@@ -815,5 +817,41 @@ mod tests {
                 Type::Int(brass_hir::IntKind::I32),
             )
         );
+    }
+
+    #[test]
+    fn unresolved_error_contract_precedes_function_ready() {
+        // A lazy consumer can stop reading after this event; Finished is too late.
+        let program = lower("fun f(c: bool) -> int32! { if c { return f(c)! }\n return 1 }\n");
+        let mut rec = Recorder {
+            requests: vec!["f".to_string()],
+            events: Vec::new(),
+        };
+        analyze_streaming(&program, None, &mut rec);
+        assert!(rec.events.iter().any(|event| matches!(
+            event,
+            CheckEvent::BodyChecked(BodyId::Function(name), delta)
+                if name == "f" && delta.errors.iter().any(|error|
+                    error.message.starts_with("cannot infer the error type of `!`"))
+        )));
+    }
+
+    #[test]
+    fn unresolved_error_contract_precedes_method_context_ready() {
+        // Methods have no individual BodyChecked event; their context must carry the verdict.
+        let program = lower(
+            "type T = {}\n\
+             fun T.f(self, c: bool) -> int32! { if c { return self.f(c)! }\n return 1 }\n",
+        );
+        let mut rec = Recorder {
+            requests: Vec::new(),
+            events: Vec::new(),
+        };
+        analyze_streaming(&program, None, &mut rec);
+        assert!(rec.events.iter().any(|event| matches!(
+            event,
+            CheckEvent::ContextReady(delta) if delta.errors.iter().any(|error|
+                error.message.starts_with("cannot infer the error type of `!`"))
+        )));
     }
 }

@@ -1,0 +1,9 @@
+// A qualified typo is never a binding or a catch-all arm.
+type A = X { v: int32 } | Y
+type B = X { v: int32 } | Z
+
+fun main() {
+    match (A.X { v: 7 }) {
+        A.Typo => println("{Typo}"),
+    }
+}

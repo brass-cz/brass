@@ -134,7 +134,7 @@ fn rewrite_module(
 
 pub(crate) fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
     match pat {
-        Pattern::Binding(name, _) => {
+        Pattern::Binding(name, None, _) => {
             out.insert(name.clone());
         }
         Pattern::Array(pats, _) => {
@@ -142,7 +142,7 @@ pub(crate) fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
                 collect_pattern_names(p, out);
             }
         }
-        Pattern::Record(_, fields, _) => {
+        Pattern::Record(_, _, fields, _) => {
             for f in fields {
                 match &f.pat {
                     Some(p) => collect_pattern_names(p, out),
@@ -152,7 +152,7 @@ pub(crate) fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
                 }
             }
         }
-        Pattern::Wildcard(_) | Pattern::Literal(..) => {}
+        Pattern::Wildcard(_) | Pattern::Literal(..) | Pattern::Binding(_, Some(_), _) => {}
     }
 }
 
@@ -235,6 +235,7 @@ impl Rewriter<'_> {
                 if let Some(v) = value {
                     self.expr(v);
                 }
+                self.pattern(pat);
                 // The binding is visible only after its initializer.
                 let mut names = HashSet::default();
                 collect_pattern_names(pat, &mut names);
@@ -255,6 +256,7 @@ impl Rewriter<'_> {
                 pat, iter, body, ..
             } => {
                 self.expr(iter);
+                self.pattern(pat);
                 self.push();
                 for n in pat.bound_names() {
                     self.bind(n);
@@ -356,7 +358,7 @@ impl Rewriter<'_> {
                     self.expr(fe);
                 }
             }
-            Expr::TypeTest(subject, te, _) => {
+            Expr::TypeTest(subject, te, _, _) => {
                 self.expr(subject);
                 self.ty(te);
             }
@@ -369,6 +371,7 @@ impl Rewriter<'_> {
             }
             Expr::IfLet(pat, scrut, then, els, _) => {
                 self.expr(scrut);
+                self.pattern(pat);
                 self.push();
                 let mut names = HashSet::default();
                 collect_pattern_names(pat, &mut names);
@@ -384,6 +387,7 @@ impl Rewriter<'_> {
             Expr::Match(scrut, arms, _) => {
                 self.expr(scrut);
                 for arm in arms {
+                    self.pattern(&mut arm.pattern);
                     self.push();
                     let mut names = HashSet::default();
                     collect_pattern_names(&arm.pattern, &mut names);
@@ -408,6 +412,60 @@ impl Rewriter<'_> {
             | Expr::Null(_)
             | Expr::Ident(..)
             | Expr::SelfExpr(_) => {}
+        }
+    }
+
+    /// Pattern type paths use the same dotted markers as variant literals.
+    /// Validate before introducing bindings, which may shadow module aliases.
+    fn pattern(&mut self, pat: &mut Pattern) {
+        if let Pattern::Record(name, qualifier, _, span) = pat
+            && let Some(q) = qualifier
+            && self.aliases.contains(&q.ty)
+        {
+            let marker = format!("{}.{name}", q.ty);
+            if self.bound(&q.ty) {
+                self.errors.push(ResolveError {
+                    message: format!("unknown type `{marker}`"),
+                    span: q.span,
+                });
+            } else if self.validate(&q.ty, name, *span) {
+                // Like a qualified record literal, the whole head names a
+                // type. A dotted marker cannot collide with a variant name.
+                *name = marker;
+                *qualifier = None;
+            }
+        }
+        match pat {
+            Pattern::Binding(_, qualifier, _) | Pattern::Record(_, qualifier, _, _) => {
+                if let Some(q) = qualifier
+                    && let Some((alias, name)) = q.ty.split_once('.')
+                {
+                    if self.aliases.contains(alias) && self.bound(alias) {
+                        self.errors.push(ResolveError {
+                            message: format!("unknown type `{}`", q.ty),
+                            span: q.span,
+                        });
+                    } else {
+                        self.validate(alias, name, q.span);
+                    }
+                }
+            }
+            _ => {}
+        }
+        match pat {
+            Pattern::Record(_, _, fields, _) => {
+                for field in fields {
+                    if let Some(pat) = &mut field.pat {
+                        self.pattern(pat);
+                    }
+                }
+            }
+            Pattern::Array(patterns, _) => {
+                for pat in patterns {
+                    self.pattern(pat);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -437,13 +495,13 @@ impl Rewriter<'_> {
                 }
             }
             TypeExpr::Anonymous(fields, _) => {
-                for (_, ft) in fields {
+                for (_, ft, _) in fields {
                     self.ty(ft);
                 }
             }
             TypeExpr::Refine(base, fields, _) => {
                 self.ty(base);
-                for (_, ft) in fields {
+                for (_, ft, _) in fields {
                     self.ty(ft);
                 }
             }
@@ -491,6 +549,121 @@ impl Rewriter<'_> {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pattern_errors(body: &str) -> Vec<ResolveError> {
+        let mut modules = vec![
+            LoadedModule {
+                is_prelude: false,
+                path: vec!["shapes".into()],
+                ast: brass_parser::parse("type Shape = X { v: int32 } | Y\ntype _Hidden = A | B\n")
+                    .expect("library"),
+            },
+            LoadedModule {
+                is_prelude: false,
+                path: vec!["main".into()],
+                ast: brass_parser::parse(&format!(
+                    "import shapes as shapes\nfun f(x) {{ {body} }}\n"
+                ))
+                .expect("main"),
+            },
+        ];
+        resolve_qualified_uses(&mut modules)
+    }
+
+    #[test]
+    fn pattern_qualifiers_obey_module_visibility_and_shadowing() {
+        // Patterns use the same exports and privacy rules as variant literals.
+        for (ty, expected) in [
+            (
+                "shapes.Missing",
+                "module `shapes` has no exported name `Missing`",
+            ),
+            (
+                "shapes._Hidden",
+                "cannot access private name `_Hidden` of module `shapes`",
+            ),
+        ] {
+            let errors = pattern_errors(&format!("match x {{ {ty}.Y => 0, _ => 1 }}"));
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].message, expected);
+        }
+        let errors = pattern_errors("let shapes = 0\nmatch x { shapes.Shape.Y => 0, _ => 1 }");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].message, "unknown type `shapes.Shape`");
+    }
+
+    #[test]
+    fn module_record_patterns_are_validated_and_normalized() {
+        // The whole module-qualified head names a type, as in a record literal.
+        // Preserve its dotted spelling and distinguish it from a sum qualifier.
+        let mut modules = vec![
+            LoadedModule {
+                is_prelude: false,
+                path: vec!["shapes".into()],
+                ast: brass_parser::parse("type P = { x: int32 }\n").expect("library"),
+            },
+            LoadedModule {
+                is_prelude: false,
+                path: vec!["main".into()],
+                ast: brass_parser::parse("import shapes as shapes\nlet shapes.P { x } = p\n")
+                    .expect("main"),
+            },
+        ];
+        let errors = resolve_qualified_uses(&mut modules);
+        assert!(errors.is_empty(), "{errors:?}");
+        let TopLevel::Stmt(Stmt::Let { pat, .. }) = &modules[1].ast.items[0] else {
+            panic!("let pattern");
+        };
+        assert!(
+            matches!(pat, Pattern::Record(name, None, _, _) if name == "shapes.P"),
+            "{pat:?}"
+        );
+        for (body, expected) in [
+            (
+                "let shapes.Missing { x } = p",
+                "module `shapes` has no exported name `Missing`",
+            ),
+            (
+                "let shapes._Hidden { x } = p",
+                "cannot access private name `_Hidden` of module `shapes`",
+            ),
+            (
+                "let shapes = 0\nlet shapes.Shape { x } = p",
+                "unknown type `shapes.Shape`",
+            ),
+        ] {
+            let errors = pattern_errors(body);
+            assert_eq!(errors.len(), 1, "{body}: {errors:?}");
+            assert_eq!(errors[0].message, expected);
+        }
+    }
+
+    #[test]
+    fn pattern_qualifiers_are_visited_before_bindings_in_every_position() {
+        // A field binding may shadow the module alias inside the body, but
+        // cannot shadow the qualifier of the very pattern introducing it.
+        assert!(
+            pattern_errors("match x { shapes.Shape.X { v: shapes } => shapes, _ => 0 }").is_empty()
+        );
+        for body in [
+            "let shapes.Missing.X { v } = x",
+            "if let shapes.Missing.Y = x { 0 } else { 1 }",
+            "for shapes.Missing.Y in x { 0 }",
+            "match x { Box { item: shapes.Missing.Y } => 0, _ => 1 }",
+        ] {
+            let errors = pattern_errors(body);
+            assert_eq!(errors.len(), 1, "{body}: {errors:?}");
+            assert_eq!(
+                errors[0].message,
+                "module `shapes` has no exported name `Missing`"
+            );
         }
     }
 }

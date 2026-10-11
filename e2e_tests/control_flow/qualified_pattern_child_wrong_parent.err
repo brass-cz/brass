@@ -1,0 +1,1 @@
+pattern `Parent.X` names `Parent`, but the matched value has type `Child`

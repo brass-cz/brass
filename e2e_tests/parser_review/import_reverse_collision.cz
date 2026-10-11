@@ -1,0 +1,4 @@
+// Pin source order in the diagnostic when the imports are reversed.
+import lib.{ other as h }
+import lib.{ helper as h }
+println(h())

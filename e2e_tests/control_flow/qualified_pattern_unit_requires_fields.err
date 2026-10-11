@@ -1,0 +1,1 @@
+variant `A.X` has fields; match it with `A.X { ... }`

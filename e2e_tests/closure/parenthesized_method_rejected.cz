@@ -1,0 +1,7 @@
+// Parentheses evaluate the method member as a value, never bind its receiver.
+type B = { v: int32 }
+fun B.g(self, x: int32) -> int32 { return self.v + x }
+fun main() {
+    let b = B { v: 5 }
+    println((b.g)(3))
+}

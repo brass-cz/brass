@@ -344,7 +344,7 @@ impl PlaceSink for ForwardSink<'_> {
             // A method call: the receiver's type is unknown here, so both the
             // receiver and the argument positions are checked by method name
             // across all types (conservative).
-            Expr::Field(recv, m, _) => {
+            Expr::Field(recv, m, _) if !callee.span().is_parenthesized() => {
                 if is_builtin_mutating_method(m) {
                     // A builtin array mutator is a direct write (copy semantics),
                     // not a forwarding escape.
@@ -607,8 +607,8 @@ fn tracked_root<'r>(expr: &Expr, roots: &'r Roots) -> Option<(&'r String, &'r bo
 /// Names bound by a pattern (destructuring binders and shorthand fields).
 fn pattern_names(pat: &Pattern, out: &mut Vec<String>) {
     match pat {
-        Pattern::Binding(name, _) => out.push(name.clone()),
-        Pattern::Record(_, fields, _) => {
+        Pattern::Binding(name, _, _) => out.push(name.clone()),
+        Pattern::Record(_, _, fields, _) => {
             for f in fields {
                 match &f.pat {
                     Some(sub) => pattern_names(sub, out),
@@ -718,6 +718,7 @@ fn scan_expr(expr: &Expr, roots: &Roots, sink: &mut impl PlaceSink) -> bool {
         Expr::Call(callee, args, _) => {
             // A built-in array mutator on a tracked place mutates it.
             if let Expr::Field(recv, m, _) = &**callee
+                && !callee.span().is_parenthesized()
                 && is_builtin_mutating_method(m)
                 && tracked_root(recv, roots).is_some()
                 && sink.write()
@@ -732,7 +733,7 @@ fn scan_expr(expr: &Expr, roots: &Roots, sink: &mut impl PlaceSink) -> bool {
         Expr::Unary(_, inner, _)
         | Expr::ErrorProp(inner, _)
         | Expr::Field(inner, _, _)
-        | Expr::TypeTest(inner, _, _) => scan_expr(inner, roots, sink),
+        | Expr::TypeTest(inner, _, _, _) => scan_expr(inner, roots, sink),
         Expr::Binary(_, left, right, _) | Expr::Range(left, right, _) => {
             scan_expr(left, roots, sink) || scan_expr(right, roots, sink)
         }

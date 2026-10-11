@@ -230,6 +230,53 @@ fn check_error_mode(bin: &str, pp: &Path, expected: &str, eager: bool) {
 }
 
 #[test]
+fn parser_review_diagnostics_precede_execution_in_every_mode() {
+    // Rejected bodies must fail before execution in every mode that checks them.
+    // Uncalled bodies use explicit mode expectations and still fail `check`.
+    let bin = env!("CARGO_BIN_EXE_brass");
+    let mut cases = Vec::new();
+    collect_cases(&e2e_root().join("parser_review"), &mut cases);
+    for path in cases {
+        let Ok(expected) = fs::read_to_string(path.with_extension("err")) else {
+            continue;
+        };
+        let source = fs::read_to_string(&path).expect("read parser review case");
+        let lazy_passes = mode_expectations(&source).is_some_and(|(lazy, _)| lazy);
+        for mode in [Some("check"), Some("--eager"), None] {
+            if mode.is_none() && lazy_passes && cfg!(feature = "jit") {
+                let stdout = fs::read_to_string(path.with_extension("out"))
+                    .expect("lazy success case needs stdout");
+                check_success(bin, &path, &stdout);
+                continue;
+            }
+            let output = support::brass_command(bin)
+                .args(mode)
+                .arg(&path)
+                .output()
+                .expect("run parser review case");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "{} {mode:?}: {stderr}",
+                path.display()
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "{} {mode:?} executed before rejection",
+                path.display()
+            );
+            for message in expected.lines().filter(|line| !line.is_empty()) {
+                assert!(
+                    stderr.contains(message),
+                    "{} {mode:?}: missing {message:?}: {stderr}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn e2e_cases_produce_expected_output() {
     let bin = env!("CARGO_BIN_EXE_brass");
     // The `process/` and `path/` cases import libraries whose native halves

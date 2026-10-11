@@ -1,0 +1,5 @@
+unreachable match arm
+unreachable_total.cz:4:27: error:
+unreachable_total.cz:5:44: error:
+unreachable_total.cz:6:57: error:
+unreachable_total.cz:8:35: error:

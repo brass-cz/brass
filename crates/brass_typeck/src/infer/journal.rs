@@ -79,6 +79,9 @@ pub(super) struct ElaborationMemoEntry {
 
 #[derive(Default)]
 pub(super) struct ElaborationJournalFrame {
+    /// A generic closure owns a lexical environment that this journal cannot
+    /// replay. Re-elaborate such bodies so returned closures retain their checks.
+    pub(super) has_closure_bodies: bool,
     journal: Vec<ElaborationJournalEntry>,
     shapes: Vec<(Type, ShapeConstraint)>,
     journal_seen: Option<FxHashMap<u64, Vec<usize>>>,
@@ -241,6 +244,7 @@ impl Checker<'_> {
             .expect("an elaboration journal frame must be active");
         if let Some(parent) = self.elaboration_journals.last_mut() {
             parent.extend(&frame);
+            parent.has_closure_bodies |= frame.has_closure_bodies;
         }
         frame
     }

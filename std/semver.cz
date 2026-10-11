@@ -79,13 +79,7 @@ fun Version.new(major: int64, minor: int64, patch: int64) -> Version! {
     if major < 0 || minor < 0 || patch < 0 {
         return error("semantic version components must be non-negative")
     }
-    return Self {
-        major,
-        minor,
-        patch,
-        prerelease: null,
-        build: null,
-    }
+    return Self { major, minor, patch, prerelease: null, build: null }
 }
 
 /**
@@ -211,10 +205,10 @@ fun _number(m: Match, name: string) -> int64! {
         match int64.parse(g.text) {
             Ok { value } => {
                 return value
-            }
+            },
             Err { error: e } => {
                 return error("`{name}` does not fit in an int64: {g.text}")
-            }
+            },
         }
     }
     return error("the semver pattern names no group `{name}`")

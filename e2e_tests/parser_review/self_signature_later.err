@@ -1,0 +1,2 @@
+`self` is only allowed as the first parameter of a method
+self_signature_later.cz:2:17:

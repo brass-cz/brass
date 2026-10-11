@@ -302,10 +302,43 @@ impl<'a> Checker<'a> {
         if integer_literal_fits(expr, want) {
             return;
         }
-        if float_literal_fits(expr, want) {
+        if self.check_float_literal(expr, want) {
             return;
         }
         self.expect_assignable(got, want, expr.span());
+    }
+
+    /// Adapt a float literal to its contextual width, allowing rounding and
+    /// underflow but reporting overflow at the literal rather than its binding.
+    fn check_float_literal(&mut self, expr: &Expr, want: &Type) -> bool {
+        let literal = match expr {
+            Expr::Unary(UnaryOp::Neg, inner, _) => inner.as_ref(),
+            other => other,
+        };
+        let Expr::Float(value, span) = literal else {
+            return false;
+        };
+        let mut want = self.resolve(want);
+        loop {
+            match want {
+                Type::Nullable(inner)
+                | Type::Ref(inner)
+                | Type::Mut(inner)
+                | Type::ConstOf(inner) => {
+                    want = self.resolve(&inner);
+                }
+                Type::Float(kind) => {
+                    if kind == FloatKind::F32 && !(*value as f32).is_finite() {
+                        self.errors.push(TypeError {
+                            message: "float literal out of range for float32".into(),
+                            span: *span,
+                        });
+                    }
+                    return true;
+                }
+                _ => return false,
+            }
+        }
     }
 
     /// Commit equality information produced by a write into typed storage.
@@ -620,25 +653,6 @@ pub(super) fn literal_int_value(expr: &Expr) -> Option<i64> {
         },
         _ => None,
     }
-}
-
-/// Whether `expr` is a float LITERAL flowing into a float position. A literal
-/// is the value the programmer wrote against that annotation, so it adapts to
-/// any float width (the store converts) even though a float64 VALUE no longer
-/// narrows implicitly.
-pub(super) fn float_literal_fits(expr: &Expr, want: &Type) -> bool {
-    fn is_float(t: &Type) -> bool {
-        match t {
-            Type::Float(_) => true,
-            Type::Nullable(inner) | Type::Ref(inner) | Type::Mut(inner) | Type::ConstOf(inner) => {
-                is_float(inner)
-            }
-            _ => false,
-        }
-    }
-    let literal = matches!(expr, Expr::Float(..))
-        || matches!(expr, Expr::Unary(UnaryOp::Neg, inner, _) if matches!(**inner, Expr::Float(..)));
-    literal && is_float(want)
 }
 
 fn integer_literal_binary_type(

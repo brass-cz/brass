@@ -1,0 +1,4 @@
+// A comparison cannot be an unparenthesized type-test subject.
+fun main() { let a = 1
+let b = 2
+if a == b: bool {} }

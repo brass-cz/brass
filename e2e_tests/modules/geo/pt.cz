@@ -1,0 +1,5 @@
+// A nominal record exported for module-qualified pattern tests.
+type P = {
+    x: int32
+    y: int32
+}

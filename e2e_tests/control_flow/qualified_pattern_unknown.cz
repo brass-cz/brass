@@ -1,0 +1,10 @@
+// An unknown qualifier is rejected at its type path.
+type A = X { v: int32 } | Y
+type B = X { v: int32 } | Z
+
+fun main() {
+    match (A.X { v: 7 }) {
+        Nope.X { v } => println(v),
+        A.Y => println("y"),
+    }
+}

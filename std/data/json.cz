@@ -10,10 +10,7 @@
 // object members in the map's slot order, not insertion order -- stable for a
 // given input, but not the source document's ordering.
 
-type _JsonObject = HashMap {
-    key: string
-    value: JsonValue
-}
+type _JsonObject = HashMap { key: string, value: JsonValue }
 
 /**
  * A parsed JSON value, one variant per JSON kind. Obtain one with `JsonValue.parse`,
@@ -33,8 +30,11 @@ type JsonValue =
 /** The boolean inside a `Bool`, or an error for any other kind. */
 fun JsonValue.as_bool(self) -> bool! {
     match self {
-        JsonValue.Bool { value } => { return value }
-        _ => {}
+        JsonValue.Bool { value } => {
+            return value
+        },
+        _ => {
+        },
     }
     return error("expected a JSON boolean")
 }
@@ -42,8 +42,11 @@ fun JsonValue.as_bool(self) -> bool! {
 /** The number inside a `Number`, or an error for any other kind. */
 fun JsonValue.as_number(self) -> float64! {
     match self {
-        JsonValue.Number { value } => { return value }
-        _ => {}
+        JsonValue.Number { value } => {
+            return value
+        },
+        _ => {
+        },
     }
     return error("expected a JSON number")
 }
@@ -51,8 +54,11 @@ fun JsonValue.as_number(self) -> float64! {
 /** The string inside a `String`, or an error for any other kind. */
 fun JsonValue.as_string(self) -> string! {
     match self {
-        JsonValue.String { value } => { return value }
-        _ => {}
+        JsonValue.String { value } => {
+            return value
+        },
+        _ => {
+        },
     }
     return error("expected a JSON string")
 }
@@ -60,8 +66,11 @@ fun JsonValue.as_string(self) -> string! {
 /** Whether this value is JSON `null`. */
 fun JsonValue.is_null(self) -> bool {
     match self {
-        JsonValue.Null => { return true }
-        _ => {}
+        JsonValue.Null => {
+            return true
+        },
+        _ => {
+        },
     }
     return false
 }
@@ -74,8 +83,9 @@ fun JsonValue.get(self, key: string) -> JsonValue! {
                 return v
             }
             return error("missing field '{key}'")
-        }
-        _ => {}
+        },
+        _ => {
+        },
     }
     return error("expected a JSON object")
 }
@@ -88,8 +98,9 @@ fun JsonValue.at(self, index: int64) -> JsonValue! {
                 return value[index]
             }
             return error("array index {index} out of range")
-        }
-        _ => {}
+        },
+        _ => {
+        },
     }
     return error("expected a JSON array")
 }
@@ -105,20 +116,28 @@ fun JsonValue.at(self, index: int64) -> JsonValue! {
  */
 fun JsonValue.into(self) -> infer! {
     match self {
-        JsonValue.Number { value } => { return infer.from(value) }
-        JsonValue.String { value } => { return infer.from(value) }
-        JsonValue.Bool { value } => { return infer.from(value) }
-        JsonValue.Null => { return null }
+        JsonValue.Number { value } => {
+            return infer.from(value)
+        },
+        JsonValue.String { value } => {
+            return infer.from(value)
+        },
+        JsonValue.Bool { value } => {
+            return infer.from(value)
+        },
+        JsonValue.Null => {
+            return null
+        },
         JsonValue.Object { values } => {
             let ret: infer
             for field in fields(ret) {
                 ret[field] = self.get(field)!.into()!
             }
             return ret
-        }
+        },
         JsonValue.Array { value } => {
             return error("cannot decode a JSON array into a scalar or record")
-        }
+        },
     }
 }
 
@@ -138,35 +157,47 @@ fun JsonValue.stringify(self) -> string {
 // The recursive renderer. See the note above on why this is not a method.
 fun _render(value: JsonValue) -> string {
     match value {
-        JsonValue.Null => { return "null" }
+        JsonValue.Null => {
+            return "null"
+        },
         JsonValue.Bool { value } => {
-            if value { return "true" }
+            if value {
+                return "true"
+            }
             return "false"
-        }
-        JsonValue.Number { value } => { return "{value}" }
-        JsonValue.String { value } => { return _quote(value) }
+        },
+        JsonValue.Number { value } => {
+            return "{value}"
+        },
+        JsonValue.String { value } => {
+            return _quote(value)
+        },
         JsonValue.Array { value } => {
             let out = "["
             let first = true
             for elem in value {
-                if !first { out = out + "," }
+                if !first {
+                    out = out + ","
+                }
                 out = out + _render(elem)
                 first = false
             }
             return out + "]"
-        }
+        },
         JsonValue.Object { values } => {
             let out = "\{"
             let first = true
             for k in values.keys() {
-                if !first { out = out + "," }
+                if !first {
+                    out = out + ","
+                }
                 if let v = values.get(k) {
                     out = out + _quote(k) + ":" + _render(v)
                 }
                 first = false
             }
             return out + "\}"
-        }
+        },
     }
 }
 
@@ -377,7 +408,9 @@ fun _Cursor._string(self) -> string! {
             }
         } else {
             if _is_control(c) {
-                return error("raw control character in string at offset {self.pos}")
+                return error(
+                    "raw control character in string at offset {self.pos}",
+                )
             }
             out = out + c
         }
@@ -435,8 +468,16 @@ fun _Cursor._number(self) -> JsonValue! {
 }
 
 fun _is_digit(c: string) -> bool {
-    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4" ||
-        c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+    return c == "0" ||
+        c == "1" ||
+        c == "2" ||
+        c == "3" ||
+        c == "4" ||
+        c == "5" ||
+        c == "6" ||
+        c == "7" ||
+        c == "8" ||
+        c == "9"
 }
 
 fun _is_nonzero_digit(c: string) -> bool {
@@ -529,8 +570,12 @@ fun _is_control(c: string) -> bool {
 
 fun _u8(value: int64) -> uint8 {
     match uint8.from(value) {
-        Ok { value } => { return value }
-        Err { error } => { return 0 }
+        Ok { value } => {
+            return value
+        },
+        Err { error } => {
+            return 0
+        },
     }
 }
 
@@ -538,8 +583,12 @@ fun _byte_char(value: int64) -> string {
     let bytes: uint8[] = []
     bytes.push(_u8(value))
     match _string_from_bytes(bytes) {
-        Ok { value } => { return value }
-        Err { error } => { return "" }
+        Ok { value } => {
+            return value
+        },
+        Err { error } => {
+            return ""
+        },
     }
 }
 
@@ -563,8 +612,11 @@ fun _encode_utf8(cp: int64) -> string! {
         return error("unicode code point out of range")
     }
     match _string_from_bytes(bytes) {
-        Ok { value } => { return value }
-        Err { error } => {}
+        Ok { value } => {
+            return value
+        },
+        Err { error } => {
+        },
     }
     return error("invalid UTF-8 encoding")
 }

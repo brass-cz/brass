@@ -710,7 +710,7 @@ fn resolve_inner(
         // are resolved in place.
         TypeExpr::Anonymous(fields, _) => {
             let mut resolved = Vec::with_capacity(fields.len());
-            for (name, fty) in fields {
+            for (name, fty, _) in fields {
                 resolved.push((name.clone(), resolve_inner(fty, nominal_info, alias)?));
             }
             Ok(structural_record(resolved))

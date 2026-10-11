@@ -1,0 +1,43 @@
+import lib.{ helper as h, helper as h }
+import lib.{ helper as h }
+type One = | Only { value: int32 }
+type P = { item: One }
+type Choice = | First { n: int32 } | Second { n: int32 }
+type Wrap = { choice: Choice }
+
+// The concrete scrutinee decides totality when variant names are shared.
+type Multiple = | Shared { value: int32 } | Alternative
+type Single = | Shared { value: int32 }
+fun unwrap(x) {
+    let Shared { value } = x
+    return value
+}
+
+fun maybe_choice() -> Choice? { return Choice.Second { n: 8 } }
+
+fun main() {
+    // A bare if-let narrows its binding before nested match coverage is checked.
+    if let present = maybe_choice() {
+        println(match present { First { n } => n, Second { n } => n })
+    }
+    println(unwrap(Single.Shared { value: 3 }))
+    // Pin recursive total destructuring, plain string patterns and identical imports.
+    let P { item: Only { value } } = P { item: One.Only { value: 7 } }
+    const [a, b] = [1, 2]
+    let [c, d] = [3, "four"]
+    for Only { value: v } in [One.Only { value: 5 }] { println(v) }
+    println(value + a + b + c)
+    println(match d { "four" => h(), _ => 0 })
+    // Repeated field selection is allowed when it binds distinct names.
+    let P { item: left, item: right } = P { item: One.Only { value: 2 } }
+    println(left.value + right.value)
+    // A nested multi-variant test is partial, so the following arm stays reachable.
+    let wrap = Wrap { choice: Choice.Second { n: 8 } }
+    println(match wrap { Wrap { choice: First { n } } => n, _ => 9 })
+    // Names in separate arms and separate declarations do not collide.
+    println(match wrap.choice { First { n } => n, Second { n } => n })
+    // Slice length patterns and literal field patterns remain partial in matches.
+    let slice = [1, 2]
+    println(match slice { [a, b] => a + b, _ => 0 })
+    println(match wrap { Wrap { choice: Second { n: 7 } } => 7, _ => 8 })
+}

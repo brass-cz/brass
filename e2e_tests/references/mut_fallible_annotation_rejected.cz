@@ -1,0 +1,3 @@
+// Passing modes are whole parameter annotations, never stored or nested types.
+fun f(p: mut(int32)!) {}
+fun main() {}

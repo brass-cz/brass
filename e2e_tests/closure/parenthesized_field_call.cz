@@ -1,0 +1,17 @@
+// A grouped field callee calls its closure value with exactly the written arguments.
+type B = { g: (int32) -> int32 }
+type Other = { n: int32 }
+fun Other.g(self, x: int32) -> int32 { return self.n + x }
+fun apply(b) { return ((b.g))(3) }
+fun main() {
+    let b = B { g: (x) -> x + 7 }
+    println((b.g)(3))
+    println(apply(b))
+    // Reflective expansion preserves grouping spans and type-test polarity.
+    for field in fields(b) {
+        if !(b[field]: bool) { println((b[field])(3)) }
+    }
+    let f = (x) -> x + 2
+    println((f)(3))
+    println((0xFF))
+}

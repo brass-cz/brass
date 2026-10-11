@@ -52,7 +52,7 @@ form. The name is resolved per monomorphic instance, so a generic function
 reports each caller's own argument type:
 
 ```brass
-type Shape = | Circle { r: float64 } | Square
+type Shape = Circle { r: float64 } | Square
 println(typeof(Shape.Circle { r: 1.0 }))      // Shape
 
 let xs = [1, 2, 3]

@@ -1,0 +1,7 @@
+// Pin implementations and signatures, including fields in another sum variant.
+type Box = { n: int32 }
+fun Box.n(self) -> int32 { return 100 }
+type Inline = { n: int32, n(self) -> int32 }
+type Shape = | A { n: int32 } | B { n(self) -> int32 }
+type Sum = | C { n: int32 } | D
+fun Sum.n(self) -> int32 { return 100 }

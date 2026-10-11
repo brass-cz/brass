@@ -1,0 +1,1 @@
+float32_argument_overflow.cz:3:9: error: float literal out of range for float32

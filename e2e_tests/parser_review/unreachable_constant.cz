@@ -1,0 +1,7 @@
+// Pin that a constant spelling is a new binding, including the explanatory note.
+const LIMIT = 5
+fun main() {
+    println(match 1 { LIMIT => "at limit", _ => "other" })
+    const LOCAL = 2
+    println(match 1 { LOCAL => 2, _ => 0 })
+}

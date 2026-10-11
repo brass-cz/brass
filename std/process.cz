@@ -60,17 +60,20 @@ fun exit(code: int64) {
  * - `Pipe` opens a pipe reachable through the `Child`'s stream accessors;
  * - `Null` discards it (`/dev/null`).
  */
-type Stdio =
-    | Inherit
-    | Pipe
-    | Null
+type Stdio = Inherit | Pipe | Null
 
 // The mode integer the plugin expects (see `process/src/lib.rs`).
 fun _stdio_mode(s: Stdio) -> int64 {
     match s {
-        Stdio.Inherit => { return 0 }
-        Stdio.Pipe => { return 1 }
-        Stdio.Null => { return 2 }
+        Stdio.Inherit => {
+            return 0
+        },
+        Stdio.Pipe => {
+            return 1
+        },
+        Stdio.Null => {
+            return 2
+        },
     }
 }
 

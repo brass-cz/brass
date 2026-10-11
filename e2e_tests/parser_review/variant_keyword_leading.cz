@@ -1,0 +1,2 @@
+// Keywords cannot name leading-pipe variants.
+type X = | return | Other

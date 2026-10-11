@@ -1,0 +1,11 @@
+// @lazy: pass
+// @eager: fail
+// Uncalled bodies defer pattern diagnostics; whole-program checking rejects them.
+type Shape = | Circle { r: int32 } | Square { s: int32 }
+type Color = Red | Green
+fun bad_let() { let 5 = 5 }
+fun bad_const() { const 0 = 0 }
+fun bad_for() { for Circle { r } in [Shape.Square { s: 4 }] { println(r) } }
+fun bad_bindings() { let [x, x] = [1, 2] }
+fun bad_match(c: Color) { println(match c { Rde => 1, Green => 2 }) }
+fun main() { println("unused bodies stay lazy") }

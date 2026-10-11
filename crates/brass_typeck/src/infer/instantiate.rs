@@ -165,7 +165,7 @@ impl<'a> Checker<'a> {
                 );
             }
             let frame = self.finish_elaboration_journal();
-            if memoizable {
+            if memoizable && !frame.has_closure_bodies {
                 // Recursive return pinning changes the shared solver entry during
                 // this first walk. It is not a journal observation: later hits see
                 // the already-linked entry, just as repeated elaborations do.
@@ -592,7 +592,18 @@ impl<'a> Checker<'a> {
             self.signature_call_frame(signature_params, arg_types, scheme_params, receiver_ty);
         let full_ret = if let Some(body) = &method.body {
             let mut scopes = frame.clone();
-            self.check_block_root(body, &mut scopes, declared_ret.as_ref())
+            let ret = self.check_block_root(body, &mut scopes, declared_ret.as_ref());
+            // The concrete receiver and arguments can reveal a sum that the
+            // open method pass could not identify. Publish its coverage errors
+            // in this call's delta, before a lazy consumer compiles the method.
+            if self.lazy_profile {
+                self.errors.extend(crate::exhaustive::check_block(
+                    self.program,
+                    &self.typed,
+                    body,
+                ));
+            }
+            ret
         } else {
             None
         };
@@ -616,7 +627,7 @@ impl<'a> Checker<'a> {
             let resolved = self.resolve(&ret);
             let memoizable = self.errors.len() == errors_before;
             let frame = self.finish_elaboration_journal();
-            if memoizable {
+            if memoizable && !frame.has_closure_bodies {
                 let entry = self.build_elaboration_memo_entry(&resolved, frame, &memo_key);
                 self.elaboration_memo.insert(memo_key.key, Rc::new(entry));
             }
@@ -670,7 +681,9 @@ impl<'a> Checker<'a> {
                 arg_idx += 1;
                 ty
             };
-            frame.insert(param.name.clone(), ty);
+            if param.name != "_" {
+                frame.insert(param.name.clone(), ty);
+            }
         }
         vec![Scope::shared(self.global_scope()), Scope::new(frame)]
     }

@@ -211,11 +211,11 @@ fn free_expr(e: &Expr, bound: &mut HashSet<String>, free: &mut HashSet<String>) 
 
 fn bound_pat(p: &Pattern, out: &mut HashSet<String>) {
     match p {
-        Pattern::Binding(n, _) => {
+        Pattern::Binding(n, _, _) => {
             out.insert(n.clone());
         }
         Pattern::Array(ps, _) => ps.iter().for_each(|p| bound_pat(p, out)),
-        Pattern::Record(_, fps, _) => {
+        Pattern::Record(_, _, fps, _) => {
             for fp in fps {
                 match &fp.pat {
                     Some(sub) => bound_pat(sub, out),
@@ -277,7 +277,7 @@ fn walk_subexprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
             }
         }
         Expr::Block(b, _) => block_exprs(b, f),
-        Expr::TypeTest(subject, _, _) => f(subject),
+        Expr::TypeTest(subject, _, _, _) => f(subject),
         _ => {}
     }
 }
@@ -383,7 +383,7 @@ fn scan_expr(e: &Expr, props: Props) -> bool {
                 || scan_expr(c, props)
                 || args.iter().any(|a| scan_expr(&a.expr, props))
         }
-        Expr::Unary(_, a, _) | Expr::Field(a, _, _) | Expr::TypeTest(a, _, _) => {
+        Expr::Unary(_, a, _) | Expr::Field(a, _, _) | Expr::TypeTest(a, _, _, _) => {
             scan_expr(a, props)
         }
         Expr::Binary(_, a, b, _) | Expr::Index(a, b, _) | Expr::Range(a, b, _) => {

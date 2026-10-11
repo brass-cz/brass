@@ -1,0 +1,2 @@
+// Contextual float32 overflow is rejected at the literal.
+let f: float32 = 1e39

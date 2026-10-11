@@ -1,0 +1,2 @@
+// Type members require a comma or newline.
+type T = { a: int32 b: string }

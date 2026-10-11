@@ -1,0 +1,15 @@
+// Repeated calls returning generic closures must retain their body checks.
+type Single = | Shared { value: int32 }
+type Multiple = | Shared { value: int32 } | Alternative
+fun make() {
+    return (x) -> {
+        let Shared { value } = x
+        return value
+    }
+}
+fun main() {
+    let first = make()
+    let good = first(Single.Shared { value: 1 })
+    let second = make()
+    let bad = second(Multiple.Alternative)
+}

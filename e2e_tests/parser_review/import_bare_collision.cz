@@ -1,0 +1,4 @@
+// Pin collisions and name-token spans for brace-less renamed imports.
+import lib.helper as h
+import lib.other as h
+println(h())

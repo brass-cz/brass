@@ -101,7 +101,7 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
                         if types.contains_key(&td.name) {
                             errors.push(LowerError {
                                 message: "duplicate type `Result`".to_string(),
-                                span: td.span,
+                                span: td.name_span,
                             });
                             continue;
                         }
@@ -124,7 +124,7 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
                     {
                         errors.push(LowerError {
                             message: format!("duplicate type `{}`", td.name),
-                            span: td.span,
+                            span: td.name_span,
                         });
                         continue;
                     }
@@ -151,7 +151,7 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
                     if functions.contains_key(&symbol) {
                         errors.push(LowerError {
                             message: format!("duplicate function `{}`", f.name),
-                            span: f.span,
+                            span: f.name_span,
                         });
                     } else {
                         functions.insert(
@@ -209,6 +209,16 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
             if qualified != *symbol {
                 symbol_aliases.insert(qualified, symbol.clone());
             }
+        }
+    }
+
+    // Dotted type paths can name aliases as well as nominal declarations.
+    // Unique aliases use a bare storage symbol, so retain the same qualified
+    // indirection that module-marker lookup uses for unique nominal types.
+    for (symbol, module, decl) in &alias_decls {
+        let qualified = crate::hir::qualify(&decl.name, module);
+        if qualified != *symbol {
+            symbol_aliases.insert(qualified, symbol.clone());
         }
     }
 
@@ -273,6 +283,7 @@ pub fn lower_generated_into(
         };
         let method_decl = Method {
             name: generated.decl.name.clone(),
+            name_span: generated.decl.name_span,
             params: generated.decl.params.clone(),
             ret: generated.decl.ret.clone(),
             body: Some(generated.decl.body.clone()),
@@ -421,12 +432,13 @@ fn inject_method_impls(
             if primitive_methods.contains_key(&key) {
                 errors.push(LowerError {
                     message: format!("duplicate method `{}` on `{recv_name}`", f.name),
-                    span: f.span,
+                    span: f.name_span,
                 });
                 continue;
             }
             let decl = FunDecl {
                 name: f.name.clone(),
+                name_span: f.name_span,
                 recv: f.recv.clone(),
                 params,
                 ret: f.ret.clone(),
@@ -470,6 +482,7 @@ fn inject_method_impls(
         };
         let method = Method {
             name: f.name.clone(),
+            name_span: f.name_span,
             params: f.params.clone(),
             ret: f.ret.clone(),
             body: Some(f.body.clone()),
@@ -491,7 +504,10 @@ fn inject_nominal_method(
     method: brass_parser::ast::Method,
     errors: &mut Vec<LowerError>,
 ) {
-    let span = method.span;
+    if method_field_collision(&info.kind, &info.name, &method, errors) {
+        return;
+    }
+    let span = method.name_span;
     let name = method.name.clone();
     let type_name = info.name.clone();
     let method_info = MethodInfo {
@@ -603,10 +619,25 @@ fn type_info(
         // Aliases are diverted before `type_info`; this arm is never reached.
         TypeBody::Alias(_) => unreachable!("alias declarations do not build a TypeInfo"),
     };
+    match &kind {
+        TypeKind::Record { methods, .. } => {
+            for method in methods.values() {
+                method_field_collision(&kind, &td.name, &method.decl, errors);
+            }
+        }
+        TypeKind::Sum { variants } => {
+            for variant in variants {
+                for method in variant.methods.values() {
+                    method_field_collision(&kind, &td.name, &method.decl, errors);
+                }
+            }
+        }
+    }
     TypeInfo {
         name: td.name.clone(),
         id,
         interfaces: td.interfaces.clone(),
+        interface_spans: td.interface_spans.clone(),
         kind,
         module: module.to_vec(),
         span: td.span,
@@ -614,6 +645,31 @@ fn type_info(
         slots,
         doc: td.doc.clone(),
     }
+}
+
+/// Fields and methods share member lookup, so their names must be disjoint.
+fn method_field_collision(
+    kind: &TypeKind,
+    owner: &str,
+    method: &Method,
+    errors: &mut Vec<LowerError>,
+) -> bool {
+    let collision = match kind {
+        TypeKind::Record { fields, .. } => fields.iter().any(|f| f.name == method.name),
+        TypeKind::Sum { variants } => variants
+            .iter()
+            .any(|v| v.fields.iter().any(|f| f.name == method.name)),
+    };
+    if collision {
+        errors.push(LowerError {
+            message: format!(
+                "`{}` is already a field of `{owner}`; a method cannot share its name",
+                method.name
+            ),
+            span: method.name_span,
+        });
+    }
+    collision
 }
 
 fn split_members(
@@ -654,7 +710,7 @@ fn split_members(
                 if !method_names.insert(mt.name.clone()) {
                     errors.push(LowerError {
                         message: format!("duplicate method `{owner}.{}`", mt.name),
-                        span: mt.span,
+                        span: mt.name_span,
                     });
                     continue;
                 }
@@ -707,6 +763,7 @@ fn result_type() -> TypeInfo {
         name: "Result".into(),
         id: RESULT_TYPE_ID,
         interfaces: Vec::new(),
+        interface_spans: Vec::new(),
         kind: TypeKind::Sum {
             variants: vec![
                 VariantInfo {

@@ -68,7 +68,13 @@ fun HashMap.new() {
         states.push(0)
         i += 1
     }
-    return Self { _entries: entries, _states: states, _cap: cap, _count: zero, _tombs: zero }
+    return Self {
+        _entries: entries,
+        _states: states,
+        _cap: cap,
+        _count: zero,
+        _tombs: zero,
+    }
 }
 
 /** A map built from an array of `[key, value]` pairs. */

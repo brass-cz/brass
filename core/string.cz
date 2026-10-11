@@ -171,8 +171,8 @@ fun string.to_lower(self) -> string {
 // Transforming only ASCII bytes preserves every non-ASCII UTF-8 sequence.
 // The byte-to-string conversion therefore cannot fail; matching keeps the
 // public helpers non-fallible without hiding an unchecked propagation.
-fun _string_ascii_case(self: string, lower: bool) -> string {
-    let bytes = _string_bytes(self)
+fun _string_ascii_case(text: string, lower: bool) -> string {
+    let bytes = _string_bytes(text)
     let result = []
     for b in bytes {
         if lower && b >= 65 && b <= 90 {
@@ -185,6 +185,6 @@ fun _string_ascii_case(self: string, lower: bool) -> string {
     }
     return match _string_from_bytes(result) {
         Ok { value } => value,
-        Err { error } => self,
+        Err { error } => text,
     }
 }

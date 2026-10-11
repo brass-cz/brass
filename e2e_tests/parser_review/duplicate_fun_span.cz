@@ -1,0 +1,3 @@
+// Duplicate functions point at the second function name.
+fun f() {}
+fun f() {}

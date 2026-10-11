@@ -6,13 +6,7 @@
 // propagates `Err` to the caller. The compiler resolves those constructs to
 // this declaration; the sum itself is an ordinary two-variant nominal with
 // no special runtime shape (tag 0 = Ok, tag 1 = Err).
-type Result =
-    | Ok {
-        value
-    }
-    | Err {
-        error
-    }
+type Result = Ok { value } | Err { error }
 
 // A source position. A function whose LAST parameter is annotated `Location`
 // receives its caller's position automatically when the call omits it: the
@@ -52,11 +46,21 @@ fun Error.display(self) -> string {
     let i = self.frames.len() - 1
     while i >= 0 {
         let f = self.frames[i]
-        out = out + indent + "[" + f.location.display() + "] unhandled error: " + f.message + "\n"
+        out = out +
+            indent +
+            "[" +
+            f.location.display() +
+            "] unhandled error: " +
+            f.message +
+            "\n"
         indent = indent + "    "
         i = i - 1
     }
-    return out + indent + "[" + self.location.display() + "] unhandled error: {self.value}"
+    return out +
+        indent +
+        "[" +
+        self.location.display() +
+        "] unhandled error: {self.value}"
 }
 
 // Raise an error: wrap the payload with the caller's position. The `loc`
@@ -82,12 +86,12 @@ fun Result.context(self, ctx: string, loc: Location) {
                     error: Error {
                         value: error,
                         location: loc,
-                        frames: [Frame { message: ctx, location: loc }]
-                    }
+                        frames: [Frame { message: ctx, location: loc }],
+                    },
                 }
             }
-        }
-        Ok { value } => self
+        },
+        Ok { value } => self,
     }
 }
 

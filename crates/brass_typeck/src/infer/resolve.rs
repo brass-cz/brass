@@ -38,7 +38,7 @@ impl<'a> Checker<'a> {
             }
             TypeExpr::Anonymous(fields, _) => {
                 let mut resolved = Vec::with_capacity(fields.len());
-                for (name, fty) in fields {
+                for (name, fty, _) in fields {
                     resolved.push((name.clone(), self.resolve_type(fty)?));
                 }
                 Ok(brass_hir::structural_record(resolved))
@@ -73,7 +73,7 @@ impl<'a> Checker<'a> {
     fn resolve_refine_annotation(
         &mut self,
         base: &TypeExpr,
-        entries: &[(String, TypeExpr)],
+        entries: &[(String, TypeExpr, brass_parser::Span)],
     ) -> Result<Type, String> {
         let TypeExpr::Named(bname, _) = base else {
             return Err("a refinement base must be a named record type".into());
@@ -97,7 +97,7 @@ impl<'a> Checker<'a> {
         let mut slot_pins: std::collections::BTreeMap<u32, Type> =
             std::collections::BTreeMap::new();
         let mut field_pins: fxhash::FxHashMap<String, Type> = fxhash::FxHashMap::default();
-        for (fname, fte) in entries {
+        for (fname, fte, name_span) in entries {
             let t = self.resolve_type(fte)?;
             if let Some((_, v)) = slots.iter().find(|(n, _)| n == fname) {
                 slot_pins.insert(*v, t);
@@ -108,15 +108,21 @@ impl<'a> Checker<'a> {
                     && brass_hir::is_fully_known(&t)
                     && *d != t
                 {
-                    return Err(format!(
-                        "refining field `{fname}` of `{name}`: its type is `{}`, not `{}`",
-                        d.display(),
-                        t.display()
-                    ));
+                    self.errors.push(TypeError {
+                        message: format!(
+                            "refining field `{fname}` of `{name}`: its type is `{}`, not `{}`",
+                            d.display(),
+                            t.display()
+                        ),
+                        span: *name_span,
+                    });
                 }
                 field_pins.insert(fname.clone(), t);
             } else {
-                return Err(format!("`{name}` has no field or slot `{fname}` to refine"));
+                self.errors.push(TypeError {
+                    message: format!("`{name}` has no field or slot `{fname}` to refine"),
+                    span: *name_span,
+                });
             }
         }
         // Every slot variable maps to its pin, or a fresh unknown when omitted.

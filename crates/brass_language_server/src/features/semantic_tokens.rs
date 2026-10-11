@@ -475,12 +475,16 @@ mod tests {
 
     #[test]
     fn crlf_is_not_part_of_multiline_token_lengths() {
-        let lengths: Vec<u32> = tokens("\"a\r\nb\"")
+        // A string token can span lines through its interpolation expression;
+        // neither CR nor LF contributes to either line's highlight length.
+        let src = "\"{1\r\n}\"";
+        assert!(lex(src).is_ok());
+        let lengths: Vec<u32> = tokens(src)
             .into_iter()
             .filter(|token| token.token_type == T_STRING)
             .map(|token| token.length)
             .collect();
-        assert_eq!(lengths, vec![2, 2]);
+        assert_eq!(lengths, vec![3, 2]);
     }
 
     /// Nested interpolation comments may contain unmatched braces and quotes;

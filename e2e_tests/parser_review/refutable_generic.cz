@@ -1,0 +1,8 @@
+// A shared variant spelling must still reject a concrete multi-variant sum.
+type Multiple = | Shared { value: int32 } | Alternative
+type Single = | Shared { value: int32 }
+fun unwrap(x) {
+    let Shared { value } = x
+    return value
+}
+fun main() { println(unwrap(Multiple.Alternative)) }

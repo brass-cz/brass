@@ -1,0 +1,2 @@
+// Imports need a boundary before a following item.
+import lib.{ helper } let b = 2

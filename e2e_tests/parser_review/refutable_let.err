@@ -1,0 +1,7 @@
+refutable pattern in `let`; use `if let` or `match`
+refutable_let.cz:6:5: error:
+refutable_let.cz:7:5: error:
+refutable_let.cz:8:5: error:
+refutable_let.cz:9:5: error:
+refutable_let.cz:10:12: error:
+refutable_let.cz:11:9: error:

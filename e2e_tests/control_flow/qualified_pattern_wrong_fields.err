@@ -1,0 +1,1 @@
+pattern `B.X` names `B`, but the matched value has type `A`

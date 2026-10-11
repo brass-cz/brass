@@ -92,6 +92,8 @@ struct Parser {
     syntax_depth: usize,
     /// Bracket nesting depth; when > 0 newlines are skipped automatically.
     depth: usize,
+    /// Whether return statements target an enclosing function or closure.
+    in_function: bool,
     /// When true, a bare `Ident {` is NOT a type literal (used inside `if`,
     /// `while`, `for`, and `match` head expressions).
     no_struct: bool,
@@ -126,6 +128,7 @@ impl Parser {
             base,
             syntax_depth: 0,
             depth: 0,
+            in_function: false,
             no_struct: false,
             ns_save: Vec::new(),
             errors: Vec::new(),
@@ -270,7 +273,7 @@ impl Parser {
             } else {
                 self.parse_top_level().map(|t| items.push(t))
             };
-            if let Err(e) = r {
+            if let Err(e) = r.and_then(|()| self.statement_end(false)) {
                 if !self.record_error(e) {
                     break;
                 }
@@ -279,6 +282,42 @@ impl Parser {
             self.eat_newlines();
         }
         Module { imports, items }
+    }
+
+    /// Require a statement boundary without consuming continuation tokens.
+    fn statement_end(&self, in_block: bool) -> PResult<()> {
+        if self.at_p(TokenKind::Newline)
+            || self.at_p(TokenKind::Eof)
+            || (in_block && self.at_p(TokenKind::RBrace))
+        {
+            Ok(())
+        } else {
+            Err(self.error(format!(
+                "expected a newline after this statement, found {}",
+                describe(self.peek())
+            )))
+        }
+    }
+
+    /// Braced member lists accept commas or newlines, including newlines
+    /// skipped by bracket normalization after the final token of a member.
+    fn member_separator(&mut self) -> PResult<()> {
+        if self.eat(TokenKind::Comma)
+            || self.at_p(TokenKind::RBrace)
+            || self.at_p(TokenKind::Newline)
+            || self
+                .pos
+                .checked_sub(1)
+                .is_some_and(|i| matches!(self.tokens[i].kind, TokenKind::Newline))
+        {
+            self.eat_newlines();
+            Ok(())
+        } else {
+            Err(self.error(format!(
+                "expected a comma or newline, found {}",
+                describe(self.peek())
+            )))
+        }
     }
 
     /// Record a recovered syntax error, keeping source order. At the cap the
@@ -404,7 +443,7 @@ impl Parser {
                 ImportedName {
                     remote: n,
                     local,
-                    span: nspan.merge(lspan),
+                    span: lspan,
                 }
             } else {
                 ImportedName::plain(n, nspan)
@@ -472,13 +511,19 @@ impl Parser {
 
     fn parse_type_decl(&mut self) -> PResult<TypeDecl> {
         let lo = self.expect(TokenKind::Type, "'type'")?.span;
-        let (name, _) = self.ident()?;
+        let (name, name_span) = self.ident()?;
+        let mut interface_spans = Vec::new();
         let mut interfaces = Vec::new();
         if self.eat(TokenKind::Colon) {
             loop {
-                let (n, _) = self.ident()?;
+                let (n, span) = self.ident()?;
                 interfaces.push(n);
+                interface_spans.push(span);
                 if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+                self.eat_newlines();
+                if self.at_p(TokenKind::Eq) {
                     break;
                 }
             }
@@ -487,8 +532,12 @@ impl Parser {
         self.eat_newlines();
         let body = if self.at_p(TokenKind::LBrace) {
             TypeBody::Record(self.parse_member_block()?)
-        } else if self.at_p(TokenKind::Pipe) {
-            // A leading `|` unambiguously marks a sum.
+        } else if self.at_p(TokenKind::Pipe)
+            || self.variant_name_ahead()
+            || crate::newline::braced_variant_ahead(&self.tokens, self.pos)
+        {
+            // A leading `|` unambiguously marks a sum, and so does a braced
+            // head followed by `|` (`type R = Ok { value } | Err { error }`).
             TypeBody::Sum(self.parse_variants()?)
         } else {
             // Ambiguous head: an inline sum (`Red | Green`), a refinement alias
@@ -513,21 +562,21 @@ impl Parser {
         Ok(TypeDecl {
             span: lo.merge(self.tokens[self.pos.saturating_sub(1)].span),
             name,
+            name_span,
             interfaces,
+            interface_spans,
             body,
             doc: None,
         })
     }
 
-    /// Parse `{ field/method ... }`. Members are self-delimiting; newlines
-    /// inside the braces are insignificant.
+    /// Parse a comma- or newline-separated list of fields and signatures.
     fn parse_member_block(&mut self) -> PResult<Vec<Member>> {
         self.open(TokenKind::LBrace, "'{'")?;
         let mut members = Vec::new();
         while !self.at_p(TokenKind::RBrace) && !self.at_p(TokenKind::Eof) {
             members.push(self.parse_member()?);
-            // Members may be separated by commas (inline) or newlines.
-            self.eat(TokenKind::Comma);
+            self.member_separator()?;
         }
         self.close(TokenKind::RBrace, "'}'")?;
         Ok(members)
@@ -551,8 +600,8 @@ impl Parser {
         if self.at_p(TokenKind::LParen) {
             // Method: name(params) [-> type] block
             self.open(TokenKind::LParen, "'('")?;
-            let params = self.parse_param_list(TokenKind::RParen)?;
-            self.close(TokenKind::RParen, "')'")?;
+            let params = self.parse_param_list(TokenKind::RParen, true)?;
+            let params_hi = self.close(TokenKind::RParen, "')'")?;
             let ret = if self.eat(TokenKind::Arrow) {
                 Some(self.parse_return_type()?)
             } else {
@@ -567,9 +616,10 @@ impl Parser {
                      not inside it"
                 )));
             }
-            let hi = ret.as_ref().map(|r| r.span()).unwrap_or(lo);
+            let hi = ret.as_ref().map(|r| r.span()).unwrap_or(params_hi);
             Ok(Member::Method(Method {
                 span: lo.merge(hi),
+                name_span: lo,
                 name,
                 params,
                 ret,
@@ -584,6 +634,27 @@ impl Parser {
             };
             Ok(Member::Field(Field { name, ty, span: lo }))
         }
+    }
+
+    /// A name followed by a pipe is a variant head, including invalid dotted
+    /// or keyword names that need a diagnostic at the head itself.
+    fn variant_name_ahead(&self) -> bool {
+        let mut end = self.pos + 1;
+        while self
+            .tokens
+            .get(end)
+            .is_some_and(|t| t.kind == TokenKind::Dot)
+            && self
+                .tokens
+                .get(end + 1)
+                .is_some_and(|t| matches!(t.kind, TokenKind::Ident(_)))
+        {
+            end += 2;
+        }
+        let end = crate::newline::next_significant(&self.tokens, end);
+        self.tokens
+            .get(end)
+            .is_some_and(|t| t.kind == TokenKind::Pipe)
     }
 
     fn parse_variants(&mut self) -> PResult<Vec<Variant>> {
@@ -604,17 +675,45 @@ impl Parser {
 
     /// Parse one sum variant: a name and an optional `{ member ... }` block.
     fn parse_one_variant(&mut self) -> PResult<Variant> {
-        let (name, lo) = self.ident()?;
+        self.eat_newlines();
+        let lo = self.span();
+        let mut name = match self.peek().clone() {
+            TokenKind::Ident(name) => {
+                self.bump();
+                name
+            }
+            other => return Err(self.error(format!("invalid variant name {}", describe(&other)))),
+        };
+        let mut name_span = lo;
+        while self.eat(TokenKind::Dot) {
+            let (part, span) = self.ident()?;
+            name.push('.');
+            name.push_str(&part);
+            name_span = name_span.merge(span);
+        }
+        Self::check_variant_name(&name, name_span)?;
         let members = if self.at_p(TokenKind::LBrace) {
             self.parse_member_block()?
         } else {
             Vec::new()
         };
         Ok(Variant {
-            span: lo,
+            span: lo.merge(self.tokens[self.pos - 1].span),
             name,
             members,
         })
+    }
+
+    /// Variant declarations cannot use qualified names or keyword type references.
+    fn check_variant_name(name: &str, span: Span) -> PResult<()> {
+        if name.contains('.') || crate::lexer::is_keyword(name) {
+            Err(ParseError {
+                message: format!("invalid variant name `{name}`"),
+                span,
+            })
+        } else {
+            Ok(())
+        }
     }
 
     /// Reinterpret a type expression as a sum variant, used when a `type X = A |
@@ -622,20 +721,24 @@ impl Parser {
     /// (`A`) or a braced form (`A { f: T }`) is a valid variant.
     fn type_to_variant(&self, te: TypeExpr) -> PResult<Variant> {
         match te {
-            TypeExpr::Named(name, span) => Ok(Variant {
-                span,
-                name,
-                members: Vec::new(),
-            }),
+            TypeExpr::Named(name, span) => {
+                Self::check_variant_name(&name, span)?;
+                Ok(Variant {
+                    span,
+                    name,
+                    members: Vec::new(),
+                })
+            }
             TypeExpr::Refine(base, fields, span) => {
-                let TypeExpr::Named(name, _) = *base else {
+                let TypeExpr::Named(name, name_span) = *base else {
                     return Err(self.error("invalid sum variant".to_string()));
                 };
+                Self::check_variant_name(&name, name_span)?;
                 let members = fields
                     .into_iter()
-                    .map(|(fname, fty)| {
+                    .map(|(fname, fty, fspan)| {
                         Member::Field(Field {
-                            span: fty.span(),
+                            span: fspan,
                             name: fname,
                             ty: Some(fty),
                         })
@@ -647,7 +750,10 @@ impl Parser {
                     members,
                 })
             }
-            _ => Err(self.error("expected a sum variant name".to_string())),
+            other => Err(ParseError {
+                message: "expected a sum variant name".into(),
+                span: other.span(),
+            }),
         }
     }
 
@@ -658,29 +764,35 @@ impl Parser {
         // type `T` (an `T[]` receiver is the array type, used by stdlib for
         // primitive-array methods). Without a receiver, `first` is the free
         // function's own name.
-        let (recv, name) = if self.at_p(TokenKind::LBracket) || self.at_p(TokenKind::Dot) {
+        let (recv, name, name_span) = if self.at_p(TokenKind::LBracket) || self.at_p(TokenKind::Dot)
+        {
             let mut recv_ty = TypeExpr::Named(first, first_span);
             if self.eat(TokenKind::LBracket) {
                 let hi = self.expect(TokenKind::RBracket, "']'")?.span;
                 recv_ty = TypeExpr::Array(Box::new(recv_ty), None, first_span.merge(hi));
             }
             self.expect(TokenKind::Dot, "'.'")?;
-            let (m, _) = self.ident()?;
-            (Some(recv_ty), m)
+            let (m, mspan) = self.ident()?;
+            (Some(recv_ty), m, mspan)
         } else {
-            (None, first)
+            (None, first, first_span)
         };
         self.open(TokenKind::LParen, "'('")?;
-        let params = self.parse_param_list(TokenKind::RParen)?;
+        let params = self.parse_param_list(TokenKind::RParen, recv.is_some())?;
         self.close(TokenKind::RParen, "')'")?;
         let ret = if self.eat(TokenKind::Arrow) {
             Some(self.parse_return_type()?)
         } else {
             None
         };
-        let body = self.parse_block()?;
+        let saved_function = self.in_function;
+        self.in_function = true;
+        let body = self.parse_block();
+        self.in_function = saved_function;
+        let body = body?;
         Ok(FunDecl {
             span: lo.merge(body.span),
+            name_span,
             name,
             recv,
             params,
@@ -690,18 +802,23 @@ impl Parser {
         })
     }
 
-    fn parse_param_list(&mut self, end: TokenKind) -> PResult<Vec<Param>> {
+    fn parse_param_list(&mut self, end: TokenKind, method: bool) -> PResult<Vec<Param>> {
         let mut params = Vec::new();
         while !self.at_p(end.clone()) {
             let span = self.span();
             let name = if self.at_p(TokenKind::SelfLower) {
+                if !method || !params.is_empty() {
+                    return Err(self.error(
+                        "`self` is only allowed as the first parameter of a method".into(),
+                    ));
+                }
                 self.bump();
                 "self".to_string()
             } else {
                 self.ident()?.0
             };
             let ty = if self.eat(TokenKind::Colon) {
-                Some(self.parse_type()?)
+                Some(self.parse_parameter_type()?)
             } else {
                 None
             };
@@ -725,7 +842,10 @@ impl Parser {
         self.eat_newlines();
         let mut stmts = Vec::new();
         while !self.at_p(TokenKind::RBrace) && !self.at_p(TokenKind::Eof) {
-            match self.parse_stmt() {
+            match self.parse_stmt().and_then(|stmt| {
+                self.statement_end(true)?;
+                Ok(stmt)
+            }) {
                 Ok(s) => stmts.push(s),
                 // Record and resynchronize to the next statement in this
                 // block, so one bad statement does not hide the rest of the
@@ -880,6 +1000,9 @@ impl Parser {
     }
 
     fn parse_return(&mut self) -> PResult<Stmt> {
+        if !self.in_function {
+            return Err(self.error("`return` outside a function".into()));
+        }
         let lo = self.bump().span;
         let value = if self.at_p(TokenKind::Newline)
             || self.at_p(TokenKind::RBrace)
@@ -1146,6 +1269,17 @@ impl Parser {
         Ok((args, hi))
     }
 
+    fn check_value_name(name: &str, span: Span) -> PResult<()> {
+        if name == "_" {
+            Err(ParseError {
+                message: "`_` is not a value".into(),
+                span,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     fn parse_primary(&mut self) -> PResult<Expr> {
         let span = self.span();
         match self.peek().clone() {
@@ -1187,6 +1321,7 @@ impl Parser {
                 }
             }
             TokenKind::Ident(name) => {
+                Self::check_value_name(&name, span)?;
                 self.bump();
                 if self.at_p(TokenKind::LBrace) && !self.no_struct {
                     let (fields, hi) = self.parse_field_inits()?;
@@ -1202,7 +1337,7 @@ impl Parser {
                 // record literal (a structural record value); otherwise a block.
                 // `no_struct` (an `if`/`while`/`for` header) keeps it a block.
                 if !self.no_struct && self.at_anon_record() {
-                    let (fields, hi) = self.parse_field_inits()?;
+                    let (fields, hi) = self.parse_anonymous_field_inits()?;
                     Ok(Expr::TypeLit(String::new(), fields, span.merge(hi)))
                 } else {
                     let b = self.parse_block()?;
@@ -1217,10 +1352,22 @@ impl Parser {
     }
 
     fn parse_field_inits(&mut self) -> PResult<(Vec<(String, Expr)>, Span)> {
+        self.parse_field_inits_inner(false)
+    }
+
+    fn parse_anonymous_field_inits(&mut self) -> PResult<(Vec<(String, Expr)>, Span)> {
+        self.parse_field_inits_inner(true)
+    }
+
+    fn parse_field_inits_inner(&mut self, anonymous: bool) -> PResult<(Vec<(String, Expr)>, Span)> {
         self.open(TokenKind::LBrace, "'{'")?;
         let mut fields = Vec::new();
+        let mut names = std::collections::HashSet::new();
         while !self.at_p(TokenKind::RBrace) {
             let (name, nspan) = self.ident()?;
+            if anonymous {
+                Self::check_field_name(&mut names, &name, nspan)?;
+            }
             // `name: value`, or the shorthand `name` alone -- sugar for
             // `name: name`, initializing the field from the same-named binding
             // in scope (the pattern side already binds this way:
@@ -1229,6 +1376,7 @@ impl Parser {
             let value = if self.eat(TokenKind::Colon) {
                 self.parse_expr()?
             } else {
+                Self::check_value_name(&name, nspan)?;
                 Expr::Ident(name.clone(), nspan)
             };
             fields.push((name, value));
@@ -1269,23 +1417,30 @@ impl Parser {
     fn parse_paren_or_closure(&mut self) -> PResult<Expr> {
         if self.closure_ahead() {
             let lo = self.open(TokenKind::LParen, "'('")?;
-            let params = self.parse_param_list(TokenKind::RParen)?;
+            let params = self.parse_param_list(TokenKind::RParen, false)?;
             self.close(TokenKind::RParen, "')'")?;
             self.expect(TokenKind::Arrow, "'->'")?;
             self.eat_newlines();
-            let body = if self.at_p(TokenKind::LBrace) {
-                let b = self.parse_block()?;
-                let s = b.span;
-                Expr::Block(b, s)
-            } else {
-                self.parse_expr()?
-            };
+            let saved_function = self.in_function;
+            self.in_function = true;
+            let body = (|| {
+                if self.at_p(TokenKind::LBrace) {
+                    let b = self.parse_block()?;
+                    let s = b.span;
+                    Ok(Expr::Block(b, s))
+                } else {
+                    self.parse_expr()
+                }
+            })();
+            self.in_function = saved_function;
+            let body = body?;
             let span = lo.merge(body.span());
             Ok(Expr::Closure(params, Box::new(body), span))
         } else {
-            self.open(TokenKind::LParen, "'('")?;
-            let e = self.parse_expr()?;
-            self.close(TokenKind::RParen, "')'")?;
+            let lo = self.open(TokenKind::LParen, "'('")?;
+            let mut e = self.parse_expr()?;
+            let hi = self.close(TokenKind::RParen, "')'")?;
+            *e.span_mut() = e.span().with_parentheses(lo.merge(hi));
             Ok(e)
         }
     }
@@ -1306,20 +1461,120 @@ impl Parser {
             let hi = els.as_ref().map(|e| e.span()).unwrap_or(then.span);
             Ok(Expr::IfLet(pat, Box::new(scrut), then, els, lo.merge(hi)))
         } else {
-            let mut cond = self.parse_cond()?;
-            // `if subject: Type { ... }` -- a compile-time type test. The type
-            // is parsed brace-gated (like a return type) so the `{` opens the
-            // arm's block rather than a `Base { .. }` refinement.
-            if self.eat(TokenKind::Colon) {
+            let cond = if self.negated_type_test_ahead() {
+                let bang = self.bump().span;
+                self.open(TokenKind::LParen, "'('")?;
+                let subject = self.parse_expr()?;
+                self.validate_type_test_subject(&subject)?;
+                self.expect(TokenKind::Colon, "':'")?;
                 let te = self.parse_return_type()?;
-                let span = cond.span().merge(te.span());
-                cond = Expr::TypeTest(Box::new(cond), te, span);
-            }
+                let hi = self.close(TokenKind::RParen, "')'")?;
+                Expr::TypeTest(Box::new(subject), te, true, bang.merge(hi))
+            } else {
+                let subject = self.parse_cond()?;
+                if self.eat(TokenKind::Colon) {
+                    self.validate_type_test_subject(&subject)?;
+                    // The next brace belongs to the arm, not a refinement.
+                    let te = self.parse_return_type()?;
+                    let span = subject.span().merge(te.span());
+                    Expr::TypeTest(Box::new(subject), te, false, span)
+                } else {
+                    subject
+                }
+            };
             let then = self.parse_block()?;
             let els = self.parse_else()?;
             let hi = els.as_ref().map(|e| e.span()).unwrap_or(then.span);
             Ok(Expr::If(Box::new(cond), then, els, lo.merge(hi)))
         }
+    }
+
+    /// Recognize only the complete negated head; ordinary `!(value)` remains
+    /// a unary expression and cannot introduce a type test in a larger value.
+    fn negated_type_test_ahead(&self) -> bool {
+        if !self.at_p(TokenKind::Bang)
+            || !matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::LParen)
+            )
+        {
+            return false;
+        }
+        let mut depth = 0usize;
+        for token in &self.tokens[self.pos + 1..] {
+            match token.kind {
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return false;
+                    }
+                }
+                TokenKind::Colon if depth == 1 => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn validate_type_test_subject(&self, subject: &Expr) -> PResult<()> {
+        if subject.span().is_parenthesized()
+            || matches!(
+                subject,
+                Expr::Ident(..)
+                    | Expr::Int(..)
+                    | Expr::Float(..)
+                    | Expr::Str(..)
+                    | Expr::Bool(..)
+                    | Expr::Null(..)
+                    | Expr::SelfExpr(..)
+                    | Expr::Field(..)
+                    | Expr::Call(..)
+                    | Expr::Index(..)
+                    | Expr::ErrorProp(..)
+                    | Expr::Array(..)
+                    | Expr::Range(..)
+                    | Expr::TypeLit(..)
+                    | Expr::VariantLit(..)
+            )
+        {
+            return Ok(());
+        }
+        let span = subject.span();
+        if let Expr::Unary(UnaryOp::Not, inner, _) = subject {
+            let operand = self.type_test_subject_text(inner.span());
+            return Err(ParseError {
+                message: format!("write `!({operand}: T)` to negate a type test"),
+                span: Span::new(span.lo, span.lo + 1),
+            });
+        }
+        let operand = self.type_test_subject_text(span);
+        Err(ParseError {
+            message: format!(
+                "a type test applies to one operand; parenthesize it: `({operand}): T`"
+            ),
+            span,
+        })
+    }
+
+    fn type_test_subject_text(&self, span: Span) -> String {
+        let mut text = String::new();
+        let mut end = span.lo;
+        for token in self
+            .tokens
+            .iter()
+            .filter(|t| t.span.lo >= span.lo && t.span.hi <= span.hi)
+        {
+            if matches!(token.kind, TokenKind::Newline) {
+                continue;
+            }
+            if token.span.lo > end && !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(describe(&token.kind).trim_matches('`'));
+            end = token.span.hi;
+        }
+        text
     }
 
     fn parse_else(&mut self) -> PResult<Option<Box<Expr>>> {
@@ -1356,7 +1611,7 @@ impl Parser {
                 pattern: pat,
                 body,
             });
-            self.eat(TokenKind::Comma);
+            self.member_separator()?;
         }
         let hi = self.close(TokenKind::RBrace, "'}'")?;
         Ok(Expr::Match(Box::new(scrut), arms, lo.merge(hi)))
@@ -1418,20 +1673,29 @@ impl Parser {
                 if name == "_" {
                     return Ok(Pattern::Wildcard(span));
                 }
-                // A qualified variant pattern `T.A { ... }` / `T.A`, possibly
-                // module-qualified (`alias.T.A`): the variant name alone
-                // identifies it (its owning type is resolved later against the
-                // scrutinee), so every qualifier segment is consumed and the
-                // last name kept.
+                // Keep the type path separate from the final variant name:
+                // unrelated sums can declare variants with the same name.
                 let mut name = name;
+                let mut name_span = span;
+                let mut qualifier: Option<PatternQualifier> = None;
                 while self.eat(TokenKind::Dot) {
-                    name = self.ident()?.0;
+                    qualifier = Some(match qualifier {
+                        Some(q) => PatternQualifier {
+                            ty: format!("{}.{name}", q.ty),
+                            span: q.span.merge(name_span),
+                        },
+                        None => PatternQualifier {
+                            ty: name,
+                            span: name_span,
+                        },
+                    });
+                    (name, name_span) = self.ident()?;
                 }
                 if self.at_p(TokenKind::LBrace) {
                     let (fields, hi) = self.parse_field_pats()?;
-                    Ok(Pattern::Record(name, fields, span.merge(hi)))
+                    Ok(Pattern::Record(name, qualifier, fields, span.merge(hi)))
                 } else {
-                    Ok(Pattern::Binding(name, span))
+                    Ok(Pattern::Binding(name, qualifier, span.merge(name_span)))
                 }
             }
             TokenKind::Int(v) => {
@@ -1444,6 +1708,12 @@ impl Parser {
             }
             TokenKind::Str(parts) => {
                 self.bump();
+                if parts.iter().any(|part| matches!(part, StrPart::Interp(..))) {
+                    return Err(ParseError {
+                        message: "string patterns cannot contain interpolation".into(),
+                        span,
+                    });
+                }
                 Ok(Pattern::Literal(
                     Box::new(Expr::Str(self.lower_str(parts, span)?, span)),
                     span,
@@ -1465,11 +1735,11 @@ impl Parser {
                 self.bump();
                 match self.peek().clone() {
                     TokenKind::Int(v) => {
-                        self.bump();
+                        let span = span.merge(self.bump().span);
                         Ok(Pattern::Literal(Box::new(Expr::Int(-v, span)), span))
                     }
                     TokenKind::Float(v) => {
-                        self.bump();
+                        let span = span.merge(self.bump().span);
                         Ok(Pattern::Literal(Box::new(Expr::Float(-v, span)), span))
                     }
                     other => Err(self.error(format!(
@@ -1500,6 +1770,7 @@ impl Parser {
         while !self.at_p(TokenKind::RBrace) {
             // `..` -- match the remaining fields without binding them.
             if self.eat(TokenKind::DotDot) {
+                self.eat(TokenKind::Comma);
                 break;
             }
             let (name, fspan) = self.ident()?;
@@ -1524,14 +1795,33 @@ impl Parser {
     // ----- types -----
 
     fn parse_type(&mut self) -> PResult<TypeExpr> {
-        self.parse_nested_type(true)
+        let ty = self.parse_nested_type(true)?;
+        self.check_passing_modes(&ty, false);
+        Ok(ty)
+    }
+
+    fn parse_parameter_type(&mut self) -> PResult<TypeExpr> {
+        let ty = self.parse_nested_type(true)?;
+        self.check_passing_modes(&ty, true);
+        Ok(ty)
+    }
+
+    /// Report a misplaced `ref`/`mut` without abandoning the enclosing
+    /// declaration: the type itself parsed fine, so the rest of the
+    /// declaration still parses and no cascade errors follow from recovery.
+    fn check_passing_modes(&mut self, ty: &TypeExpr, parameter: bool) {
+        if let Err(e) = validate_passing_modes(ty, parameter, false) {
+            self.record_error(e);
+        }
     }
 
     /// A return type (after `->`) never grabs a `Base { .. }` refinement: the
     /// `{` there begins the function body, not a refinement. Refinements in a
     /// return position are written through a type alias instead.
     fn parse_return_type(&mut self) -> PResult<TypeExpr> {
-        self.parse_nested_type(false)
+        let ty = self.parse_nested_type(false)?;
+        self.check_passing_modes(&ty, false);
+        Ok(ty)
     }
 
     /// Guard every recursive type form with the same budget as expressions and
@@ -1607,7 +1897,7 @@ impl Parser {
             self.open(TokenKind::LBracket, "'['")?;
             let mut elems = Vec::new();
             while !self.at_p(TokenKind::RBracket) {
-                elems.push(self.parse_type()?);
+                elems.push(self.parse_nested_type(true)?);
                 if !self.eat(TokenKind::Comma) {
                     break;
                 }
@@ -1619,14 +1909,14 @@ impl Parser {
             self.open(TokenKind::LParen, "'('")?;
             let mut params = Vec::new();
             while !self.at_p(TokenKind::RParen) {
-                params.push(self.parse_type()?);
+                params.push(self.parse_nested_type(true)?);
                 if !self.eat(TokenKind::Comma) {
                     break;
                 }
             }
             self.close(TokenKind::RParen, "')'")?;
             self.expect(TokenKind::Arrow, "'->'")?;
-            let ret = self.parse_return_type()?;
+            let ret = self.parse_nested_type(false)?;
             let hi = ret.span();
             Ok(TypeExpr::Fun(params, Box::new(ret), span.merge(hi)))
         } else if self.at_p(TokenKind::SelfLower) || self.at_p(TokenKind::SelfUpper) {
@@ -1649,7 +1939,7 @@ impl Parser {
             // specially when applied to a parenthesized type.
             if matches!(name.as_str(), "mut" | "ref") && self.at_p(TokenKind::LParen) {
                 self.open(TokenKind::LParen, "'('")?;
-                let inner = self.parse_type()?;
+                let inner = self.parse_nested_type(true)?;
                 let hi = self.close(TokenKind::RParen, "')'")?;
                 let inner = Box::new(inner);
                 return Ok(if name == "mut" {
@@ -1670,11 +1960,13 @@ impl Parser {
             if name == "anonymous" && self.at_p(TokenKind::LBrace) {
                 self.open(TokenKind::LBrace, "'{'")?;
                 let mut fields = Vec::new();
+                let mut names = std::collections::HashSet::new();
                 while !self.at_p(TokenKind::RBrace) {
-                    let (fname, _) = self.ident()?;
+                    let (fname, fspan) = self.ident()?;
+                    Self::check_field_name(&mut names, &fname, fspan)?;
                     self.expect(TokenKind::Colon, "':'")?;
-                    let fty = self.parse_type()?;
-                    fields.push((fname, fty));
+                    let fty = self.parse_nested_type(true)?;
+                    fields.push((fname, fty, fspan));
                     if !self.eat(TokenKind::Comma) {
                         break;
                     }
@@ -1710,20 +2002,37 @@ impl Parser {
     /// Parse a refinement's `{ field: T, ... }` body (also `Self.field: T`
     /// entries): each pins a base field/slot to a type. Returns the entries and
     /// the closing-brace span.
-    fn parse_refine_fields(&mut self) -> PResult<(Vec<(String, TypeExpr)>, Span)> {
+    fn parse_refine_fields(&mut self) -> PResult<(Vec<TypeField>, Span)> {
         self.open(TokenKind::LBrace, "'{'")?;
         self.eat_newlines();
         let mut fields = Vec::new();
+        let mut names = std::collections::HashSet::new();
         while !self.at_p(TokenKind::RBrace) {
-            let (fname, _) = self.ident()?;
+            let (fname, fspan) = self.ident()?;
+            Self::check_field_name(&mut names, &fname, fspan)?;
             self.expect(TokenKind::Colon, "':'")?;
-            let fty = self.parse_type()?;
-            fields.push((fname, fty));
-            self.eat(TokenKind::Comma);
-            self.eat_newlines();
+            let fty = self.parse_nested_type(true)?;
+            fields.push((fname, fty, fspan));
+            self.member_separator()?;
         }
         let hi = self.close(TokenKind::RBrace, "'}'")?;
         Ok((fields, hi))
+    }
+
+    /// Reject duplicate structural fields while their name tokens are available.
+    fn check_field_name(
+        names: &mut std::collections::HashSet<String>,
+        name: &str,
+        span: Span,
+    ) -> PResult<()> {
+        if names.insert(name.to_string()) {
+            Ok(())
+        } else {
+            Err(ParseError {
+                message: format!("duplicate field `{name}`"),
+                span,
+            })
+        }
     }
 
     // ----- string interpolation -----
@@ -1734,7 +2043,7 @@ impl Parser {
             match part {
                 StrPart::Lit(s) => segs.push(StrSeg::Lit(s)),
                 StrPart::Interp(raw, frag_lo) => {
-                    let e = parse_sub_expr(&raw, self.base + frag_lo)?;
+                    let e = parse_sub_expr(&raw, self.base + frag_lo, self.in_function)?;
                     segs.push(StrSeg::Expr(Box::new(e)));
                 }
             }
@@ -1747,7 +2056,7 @@ impl Parser {
 /// `shift` is the fragment's absolute offset (file base + in-file position of
 /// the byte after the `{`); the fragment is lexed from zero, so every span is
 /// shifted to stay attributable to the real file and line.
-fn parse_sub_expr(raw: &str, shift: usize) -> PResult<Expr> {
+fn parse_sub_expr(raw: &str, shift: usize, in_function: bool) -> PResult<Expr> {
     let reattribute = |s: Span| Span::new(s.lo + shift, s.hi + shift);
     let mut tokens = crate::lexer::lex(raw).map_err(|e| ParseError {
         message: format!("in string interpolation: {}", e.message),
@@ -1758,8 +2067,12 @@ fn parse_sub_expr(raw: &str, shift: usize) -> PResult<Expr> {
     }
     // An interpolation fragment is an expression; no declarations, no docs.
     let mut p = Parser::new(tokens, Vec::new(), shift);
+    p.in_function = in_function;
     p.eat_newlines();
     let e = p.parse_expr()?;
+    if let Some(error) = p.errors.first().cloned() {
+        return Err(error);
+    }
     p.eat_newlines();
     if !p.at_p(TokenKind::Eof) {
         return Err(ParseError {
@@ -1845,4 +2158,58 @@ fn describe(k: &TokenKind) -> String {
         RBrace => "}",
     };
     format!("`{sym}`")
+}
+
+/// Passing modes describe a parameter boundary, never a stored value type.
+/// Once inside a mode, even nested function types cannot introduce another mode.
+fn validate_passing_modes(ty: &TypeExpr, parameter: bool, inside_mode: bool) -> PResult<()> {
+    match ty {
+        TypeExpr::Ref(inner, span) | TypeExpr::Mut(inner, span) => {
+            if !parameter || inside_mode {
+                let name = if matches!(ty, TypeExpr::Ref(..)) {
+                    "ref"
+                } else {
+                    "mut"
+                };
+                return Err(ParseError {
+                    message: format!("`{name}(...)` is only allowed as a parameter's type"),
+                    span: *span,
+                });
+            }
+            let value = if matches!(ty, TypeExpr::Ref(..)) {
+                match &**inner {
+                    TypeExpr::Mut(value, _) => value,
+                    other => other,
+                }
+            } else {
+                inner
+            };
+            validate_passing_modes(value, false, true)
+        }
+        TypeExpr::Array(inner, _, _)
+        | TypeExpr::Nullable(inner, _)
+        | TypeExpr::Fallible(inner, _) => validate_passing_modes(inner, false, inside_mode),
+        TypeExpr::Fun(params, ret, _) => {
+            for param in params {
+                validate_passing_modes(param, true, inside_mode)?;
+            }
+            validate_passing_modes(ret, false, inside_mode)
+        }
+        TypeExpr::Tuple(types, _) => types
+            .iter()
+            .try_for_each(|ty| validate_passing_modes(ty, false, inside_mode)),
+        TypeExpr::Anonymous(fields, _) => fields
+            .iter()
+            .try_for_each(|(_, ty, _)| validate_passing_modes(ty, false, inside_mode)),
+        TypeExpr::Refine(base, fields, _) => {
+            validate_passing_modes(base, false, inside_mode)?;
+            fields
+                .iter()
+                .try_for_each(|(_, ty, _)| validate_passing_modes(ty, false, inside_mode))
+        }
+        TypeExpr::Named(..)
+        | TypeExpr::SelfField(..)
+        | TypeExpr::TypeSlot(..)
+        | TypeExpr::TypeOf(..) => Ok(()),
+    }
 }

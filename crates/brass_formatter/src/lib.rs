@@ -140,11 +140,35 @@ mod tests {
 
     #[test]
     fn grouping_parens_follow_precedence() {
-        // Needed parens survive; redundant ones are dropped.
-        let src = "fun main() {\n    let x = ((a + b)) * c\n    let y = (a * b) + c\n    let z = a - (b - c)\n}\n";
+        // Needed parens survive, doubled ones collapse, and parens the source
+        // wrote around an operator operand stay even where precedence makes
+        // them redundant. Parens around an atom or a call group nothing.
+        let src = "fun main() {\n    let x = ((a + b)) * c\n    let y = (a * b) + c\n    let z = a - (b - c)\n    let w = (a) + (f(b))\n    let v = (a + b) + (-c)\n    let u = ((a && b)) || c\n}\n";
         assert_eq!(
             roundtrip(src),
-            "fun main() {\n    let x = (a + b) * c\n    let y = a * b + c\n    let z = a - (b - c)\n}\n"
+            "fun main() {\n    let x = (a + b) * c\n    let y = (a * b) + c\n    let z = a - (b - c)\n    let w = a + f(b)\n    let v = (a + b) + (-c)\n    let u = (a && b) || c\n}\n"
+        );
+    }
+
+    /// A parenthesized leftmost operand does not make its parent look
+    /// parenthesized: `(a + b) * (c - d)` contains two separate groups,
+    /// neither of which marks the product itself as parenthesized.
+    #[test]
+    fn operand_parens_are_not_mistaken_for_an_outer_group() {
+        let src = "fun main() {\n    let x = (a + b) * (c - d) || e\n}\n";
+        assert_eq!(
+            roundtrip(src),
+            "fun main() {\n    let x = (a + b) * (c - d) || e\n}\n"
+        );
+    }
+
+    /// Kept parens survive a chain that breaks one operand per line.
+    #[test]
+    fn broken_chain_keeps_written_groups() {
+        let src = "fun main() {\n    const alpha_or_digit = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || is_digit\n}\n";
+        assert_eq!(
+            roundtrip(src),
+            "fun main() {\n    const alpha_or_digit = (byte >= 65 && byte <= 90) ||\n        (byte >= 97 && byte <= 122) ||\n        is_digit\n}\n"
         );
     }
 
@@ -196,6 +220,15 @@ mod tests {
         assert!(out.contains("\"tab\\t{a + b} \\{raw}\""), "{out}");
     }
 
+    /// The parser drops a variant pattern's `Type.` qualifier (the scrutinee
+    /// decides the variant); the formatter keeps it as written, in record and
+    /// unit patterns, nested ones, and module-qualified ones.
+    #[test]
+    fn variant_pattern_keeps_its_qualifier() {
+        let src = "fun f(v) {\n    match v {\n        Shape.Circle { radius } => radius,\n        Shape.Point => 0,\n        geo.Shape.Box { inner: Shape.Circle { radius } } => radius,\n        Square { side } => side,\n    }\n}\n";
+        assert_eq!(roundtrip(src), src);
+    }
+
     #[test]
     fn match_arms_get_trailing_commas_and_keep_sugar() {
         let src = "fun f(s, n) {\n    match s {\n        Circle { radius } => radius\n        Point => n += 1\n        _ => 0\n    }\n}\n";
@@ -203,6 +236,15 @@ mod tests {
             roundtrip(src),
             "fun f(s, n) {\n    match s {\n        Circle { radius } => radius,\n        Point => n += 1,\n        _ => 0,\n    }\n}\n"
         );
+    }
+
+    #[test]
+    fn trailing_interface_and_rest_commas_round_trip() {
+        // Accepted trailing commas remain valid and stable after formatting.
+        let src = "type B: A, = { value: int32 }\nfun f(x) { let Circle { r, .., } = x }\n";
+        let formatted = roundtrip(src);
+        assert_eq!(roundtrip(&formatted), formatted);
+        assert!(formatted.contains("Circle { r, .. }"));
     }
 
     #[test]
@@ -239,9 +281,16 @@ mod tests {
 
     #[test]
     fn sum_type_layout() {
-        // Short sums inline; long ones get one leading-pipe line per variant.
-        let short = "type Color = Red | Green | Blue\n";
-        assert_eq!(roundtrip(short), "type Color = | Red | Green | Blue\n");
+        // Short sums inline without a leading `|`, except a one-variant sum,
+        // which needs it to not read as an alias; long ones get one
+        // leading-pipe line per variant.
+        let short = "type Color = | Red | Green | Blue\n";
+        assert_eq!(roundtrip(short), "type Color = Red | Green | Blue\n");
+        let braced = "type Result =\n    | Ok { value }\n    | Err { error }\n";
+        assert_eq!(
+            roundtrip(braced),
+            "type Result = Ok { value } | Err { error }\n"
+        );
         let single = "type Wrap =\n    | Only { value: int32 }\n";
         assert_eq!(roundtrip(single), "type Wrap = | Only { value: int32 }\n");
         let long = "type Shape = Circle { radius: float64 } | Rectangle { width: float64, height: float64 }\n";
@@ -311,5 +360,32 @@ mod tests {
             roundtrip(src),
             "fun main() {\n    register(\n        compute(\n            alpha_value,\n            beta_value,\n            gamma_value,\n            delta_value,\n            epsilon_value,\n        ),\n        name,\n    )\n}\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod expression_boundary_tests {
+    use super::format_source as format;
+
+    #[test]
+    fn grouped_callees_and_negated_tests_roundtrip() {
+        // Source spans preserve value-call syntax and operator grouping without token scans.
+        let src = "fun f(v) {\n    let x = (box.callback)(0xFF)\n    if !(v: string) {\n        println((0xFF))\n    } else if (a == b): bool {\n        println((1.25))\n    }\n}\n";
+        let formatted = format(src).unwrap();
+        assert!(formatted.contains("(box.callback)(0xFF)"));
+        assert!(formatted.contains("if !(v: string)"));
+        assert!(formatted.contains("else if (a == b): bool"));
+        assert!(formatted.contains("println(0xFF)"));
+        assert!(formatted.contains("println(1.25)"));
+        assert_eq!(format(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn broken_grouped_callee_remains_a_value_call() {
+        // Breaking a long argument list must not reintroduce an implicit receiver.
+        let src = "fun f() { (box.callback)(first_very_long_argument, second_very_long_argument, third_very_long_argument) }";
+        let formatted = format(src).unwrap();
+        assert!(formatted.contains("(box.callback)(\n"), "{formatted}");
+        assert_eq!(format(&formatted).unwrap(), formatted);
     }
 }

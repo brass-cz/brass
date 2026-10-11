@@ -40,7 +40,8 @@ import std.path.{ Path }
  */
 type File = {
     _fd: int64
-    _path: string _borrowed: bool
+    _path: string
+    _borrowed: bool
 }
 
 /**
@@ -115,7 +116,9 @@ fun File.size(self) -> int64! {
 fun File.close(self) {
     if self._fd >= 0 {
         fd_close(self._fd, self._borrowed)!
-        if !self._borrowed { self._fd = -1 }
+        if !self._borrowed {
+            self._fd = -1
+        }
     }
 }
 

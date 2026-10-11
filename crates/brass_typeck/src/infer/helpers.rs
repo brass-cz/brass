@@ -75,9 +75,9 @@ pub(super) fn contains_typeof(te: &TypeExpr) -> bool {
         | TypeExpr::Ref(i, _) => contains_typeof(i),
         TypeExpr::Tuple(es, _) => es.iter().any(contains_typeof),
         TypeExpr::Fun(ps, r, _) => ps.iter().any(contains_typeof) || contains_typeof(r),
-        TypeExpr::Anonymous(fs, _) => fs.iter().any(|(_, t)| contains_typeof(t)),
+        TypeExpr::Anonymous(fs, _) => fs.iter().any(|(_, t, _)| contains_typeof(t)),
         TypeExpr::Refine(b, fs, _) => {
-            contains_typeof(b) || fs.iter().any(|(_, t)| contains_typeof(t))
+            contains_typeof(b) || fs.iter().any(|(_, t, _)| contains_typeof(t))
         }
         TypeExpr::Named(..) | TypeExpr::TypeSlot(..) | TypeExpr::SelfField(..) => false,
     }
@@ -496,7 +496,7 @@ fn collect_closure_writes_expr(expr: &Expr, in_closure: bool, acc: &mut HashSet<
                 collect_closure_writes_stmt(s, in_closure, acc);
             }
         }
-        Expr::Unary(_, inner, _) | Expr::ErrorProp(inner, _) | Expr::TypeTest(inner, _, _) => {
+        Expr::Unary(_, inner, _) | Expr::ErrorProp(inner, _) | Expr::TypeTest(inner, _, _, _) => {
             collect_closure_writes_expr(inner, in_closure, acc)
         }
         Expr::Binary(_, a, b, _) | Expr::Range(a, b, _) => {
@@ -597,7 +597,7 @@ pub(super) fn expr_may_branch(e: &Expr) -> bool {
         Expr::Unary(_, inner, _) => expr_may_branch(inner),
         // The test itself is a compile-time constant; only evaluating the
         // subject can branch.
-        Expr::TypeTest(subject, _, _) => expr_may_branch(subject),
+        Expr::TypeTest(subject, _, _, _) => expr_may_branch(subject),
         Expr::Binary(BinOp::And | BinOp::Or, ..) => true,
         Expr::Binary(_, a, b, _) => expr_may_branch(a) || expr_may_branch(b),
         Expr::Call(callee, args, _) => {

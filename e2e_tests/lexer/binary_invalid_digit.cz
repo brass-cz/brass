@@ -1,0 +1,2 @@
+// An invalid radix digit must not become a second statement.
+let x = 0b12

@@ -168,7 +168,7 @@ impl ConstChecker<'_> {
             let bindings = modules.entry(init.path.clone()).or_default();
             for stmt in &init.stmts {
                 let Stmt::Let {
-                    pat: Pattern::Binding(name, _),
+                    pat: Pattern::Binding(name, None, _),
                     ty,
                     value,
                     is_const,
@@ -255,7 +255,7 @@ impl ConstChecker<'_> {
                 let Some(value) = value else {
                     // An uninitialized `let` is never a const and aliases
                     // nothing; it just shadows any outer const of that name.
-                    if let Pattern::Binding(name, _) = pat
+                    if let Pattern::Binding(name, None, _) = pat
                         && let Some(top) = scopes.last_mut()
                     {
                         top.insert(name.clone(), Binding::Mutable);
@@ -263,7 +263,7 @@ impl ConstChecker<'_> {
                     return;
                 };
                 self.check_expr(value, scopes);
-                if let Pattern::Binding(name, _) = pat {
+                if let Pattern::Binding(name, None, _) = pat {
                     let alias = self.const_alias_type(value, scopes);
                     let fn_alias = self.fn_value_symbol(value, scopes);
                     let module = self.current_module.clone();
@@ -341,9 +341,9 @@ impl ConstChecker<'_> {
 
     fn check_expr(&mut self, expr: &Expr, scopes: &mut ConstScopes) {
         match expr {
-            Expr::Unary(_, inner, _) | Expr::ErrorProp(inner, _) | Expr::TypeTest(inner, _, _) => {
-                self.check_expr(inner, scopes)
-            }
+            Expr::Unary(_, inner, _)
+            | Expr::ErrorProp(inner, _)
+            | Expr::TypeTest(inner, _, _, _) => self.check_expr(inner, scopes),
             Expr::Binary(_, left, right, _) | Expr::Range(left, right, _) => {
                 self.check_expr(left, scopes);
                 self.check_expr(right, scopes);
@@ -453,6 +453,9 @@ impl ConstChecker<'_> {
         span: brass_parser::Span,
         scopes: &ConstScopes,
     ) {
+        if callee.span().is_parenthesized() {
+            return;
+        }
         let Expr::Field(receiver, method, _) = callee else {
             return;
         };
@@ -617,6 +620,9 @@ impl ConstChecker<'_> {
         args: &[Arg],
         scopes: &ConstScopes,
     ) {
+        if callee.span().is_parenthesized() {
+            return;
+        }
         let Expr::Field(_, method, _) = callee else {
             return;
         };
@@ -885,7 +891,7 @@ fn rebinds(block: &Block, name: &str) -> bool {
             Expr::Unary(_, inner, _)
             | Expr::ErrorProp(inner, _)
             | Expr::Field(inner, _, _)
-            | Expr::TypeTest(inner, _, _) => in_expr(inner, name, shadowed),
+            | Expr::TypeTest(inner, _, _, _) => in_expr(inner, name, shadowed),
             Expr::Binary(_, left, right, _)
             | Expr::Index(left, right, _)
             | Expr::Range(left, right, _) => {

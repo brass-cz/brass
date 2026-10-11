@@ -1,0 +1,20 @@
+// Separators, ranges, decimal leading zeros, and finite rounding remain valid.
+let x = 0b1_010
+let y = 0o7_7
+let z = 0xF_F
+println(x)
+println(y)
+println(z)
+println(0755)
+println(1.0e-5 > 0.0)
+println(1e-400 == 0.0)
+let rounded: float32 = 0.1
+let tiny: float32 = 1e-50
+let finite: float32 = 3.4028234e38
+println(rounded > 0.0)
+println(tiny == 0.0)
+println(finite > 0.0)
+println(5.debug())
+let count = 0
+for i in [0..2] { count += 1 }
+println(count)

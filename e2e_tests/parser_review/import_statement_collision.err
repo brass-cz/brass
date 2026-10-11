@@ -1,0 +1,2 @@
+`h` is imported twice (`lib.helper` and `lib.other`)
+import_statement_collision.cz:3:23: error:

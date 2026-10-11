@@ -1,0 +1,2 @@
+// Anonymous function parameters bind no readable value.
+fun g(_) { return _ + 1 }

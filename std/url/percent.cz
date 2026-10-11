@@ -36,12 +36,16 @@ fun decode(s: string) -> string! {
     while i < n {
         let c = cs[i]
         if c == "%" {
-            if i + 2 >= n { return error("truncated percent escape at offset {i}") }
+            if i + 2 >= n {
+                return error("truncated percent escape at offset {i}")
+            }
             out.push(_hex_pair(cs[i + 1], cs[i + 2])!)
             i += 3
             continue
         }
-        for b in to_bytes(c) { out.push(b) }
+        for b in to_bytes(c) {
+            out.push(b)
+        }
         i += 1
     }
     return to_text(out)!
@@ -60,7 +64,9 @@ fun encode(s: string, extra: string) -> string {
             out += c
             continue
         }
-        for b in to_bytes(c) { out += _hex_byte(b) }
+        for b in to_bytes(c) {
+            out += _hex_byte(b)
+        }
     }
     return out
 }

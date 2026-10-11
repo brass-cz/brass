@@ -258,7 +258,9 @@ impl<'a> Checker<'a> {
                 return self.fresh_unknown();
             }
         }
-        if let Expr::Field(base, method, _) = callee {
+        if let Expr::Field(base, method, _) = callee
+            && !callee.span().is_parenthesized()
+        {
             if let Some(qualifier) = self.static_qualifier(base, scopes) {
                 // A `typeof(v)` qualifier resolves to v's type NAME; record it at
                 // the inner `typeof(v)` span so MIR routes the static call. The
@@ -507,6 +509,42 @@ impl<'a> Checker<'a> {
                 self.check_expr(&a.expr, scopes);
             }
             return self.fresh_unknown();
+        }
+        if callee.span().is_parenthesized()
+            && let Expr::Field(base, method, _) = callee
+        {
+            let is_method = if let Some(qualifier) = self.static_qualifier(base, scopes) {
+                self.method_for_qualifier(&qualifier, method).is_some()
+                    || self.primitive_static_type(&qualifier, method).is_some()
+                    || (method == "from"
+                        && self
+                            .program
+                            .resolve_type(&self.current_module, &qualifier)
+                            .is_some_and(|info| matches!(info.kind, TypeKind::Record { .. })))
+            } else {
+                let recv_ty = self.check_expr(base, scopes);
+                let resolved = self.resolve(&recv_ty);
+                self.program
+                    .member_presence(brass_hir::peel_modes(&resolved), method)
+                    == Some(true)
+            };
+            if is_method {
+                let receiver = match &**base {
+                    Expr::Ident(name, _) => name.as_str(),
+                    Expr::SelfExpr(_) => "self",
+                    _ => "receiver",
+                };
+                self.errors.push(TypeError {
+                    message: format!(
+                        "`{receiver}.{method}` is a method; call it as `{receiver}.{method}(...)`"
+                    ),
+                    span: callee.span().ungrouped(),
+                });
+                for arg in args {
+                    self.check_expr(&arg.expr, scopes);
+                }
+                return self.fresh_unknown();
+            }
         }
         let callee_ty = self.check_expr(callee, scopes);
         let ret = self.apply_callable(callee_ty, args, span, scopes);
@@ -1022,7 +1060,18 @@ impl<'a> Checker<'a> {
                 let mut subst = Subst::new();
                 for (idx, arg) in args.iter().enumerate() {
                     if let Some(param) = params.get(idx) {
-                        let got = self.check_expr_against(&arg.expr, param, scopes);
+                        let mut expected = self.resolve(param);
+                        if matches!(arg.expr, Expr::Array(..))
+                            && matches!(expected, Type::Array(..) | Type::Slice(..))
+                            && !brass_hir::is_fully_known(&expected)
+                        {
+                            // An open array expectation alone loses the literal's
+                            // element type. Fill its holes from this argument so
+                            // concrete closure-body checking sees the real shape.
+                            let actual = self.check_expr(&arg.expr, scopes);
+                            expected = self.instantiate_annotated_type(&expected, &actual);
+                        }
+                        let got = self.check_expr_against(&arg.expr, &expected, scopes);
                         let _ = subst.unify(param, &got);
                         // Calling through a CONCRETE parameter type pins an open
                         // argument variable persistently: `(x) -> g(x)` with
@@ -1046,6 +1095,7 @@ impl<'a> Checker<'a> {
                         self.check_expr(&arg.expr, scopes);
                     }
                 }
+                self.check_callable_body(&params, &ret, &subst);
                 // Remember what this application instantiated the callable's
                 // open parameter variables to. The instantiation stays in the
                 // LOCAL substitution above, so the sidecar entries mentioning

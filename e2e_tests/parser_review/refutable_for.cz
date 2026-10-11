@@ -1,0 +1,6 @@
+// Pin literal and sum-variant tests in loop heads.
+type Shape = | Circle { r: int32 } | Square { s: int32 }
+for 1 in [2, 3] { println(1) }
+for Circle { r } in [Shape.Square { s: 4 }] { println(r) }
+// An element that is a growable slice needs a refutable matching context.
+for [a, b] in [[1, 2]] { println(a + b) }

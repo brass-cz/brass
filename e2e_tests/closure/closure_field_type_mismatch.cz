@@ -11,6 +11,6 @@ type Obj = {
 fun main() {
     let o = Obj {
         name: "x",
-        transform: (self, s) -> { return 1 }
+        transform: (receiver, s) -> { return 1 }
     }
 }

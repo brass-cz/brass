@@ -1,0 +1,11 @@
+refutable pattern in `let`; use `if let` or `match`
+refutable pattern in `const`; use `if let` or `match`
+refutable pattern in `for`; use `if let` or `match`
+`x` is bound more than once in this pattern
+unreachable match arm
+`Rde` binds a new name; did you mean the variant `Red`?
+unused_patterns.cz:6:21: error:
+unused_patterns.cz:7:25: error:
+unused_patterns.cz:8:21: error:
+unused_patterns.cz:9:30: error:
+unused_patterns.cz:10:55: error:

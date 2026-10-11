@@ -1,0 +1,8 @@
+`n` is already a field of `Box`; a method cannot share its name
+`n` is already a field of `Inline`; a method cannot share its name
+`n` is already a field of `Shape`; a method cannot share its name
+`n` is already a field of `Sum`; a method cannot share its name
+method_field_collision.cz:3:9: error:
+method_field_collision.cz:4:27: error:
+method_field_collision.cz:5:37: error:
+method_field_collision.cz:7:9: error:

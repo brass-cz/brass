@@ -1,0 +1,2 @@
+// Octal digits stop at seven and must not split silently.
+let x = 0o78

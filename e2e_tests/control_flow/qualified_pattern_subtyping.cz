@@ -1,0 +1,17 @@
+// A child uses its own qualifier; after coercion a parent uses the parent's.
+type Parent = X { v: int32 } | Y
+type Child: Parent = X { v: int32 } | Y
+fun parent_value(p: Parent) {
+    match p {
+        Parent.X { v } => println(v),
+        Parent.Y => println("y"),
+    }
+}
+fun main() {
+    let c = Child.X { v: 8 }
+    match c {
+        Child.X { v } => println(v),
+        Child.Y => println("y"),
+    }
+    parent_value(c)
+}

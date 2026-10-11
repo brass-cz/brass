@@ -1,0 +1,3 @@
+// Nested string text follows the same single-line rule.
+let s = "A{ "line1
+line2" }B"

@@ -280,6 +280,8 @@ pub struct TypeInfo {
     pub name: String,
     pub id: i32,
     pub interfaces: Vec<String>,
+    /// Name-token spans corresponding to the implemented interfaces.
+    pub interface_spans: Vec<Span>,
     pub kind: TypeKind,
     pub module: Vec<String>,
     pub span: Span,
@@ -571,6 +573,9 @@ impl Program {
     /// target instance. Consumers that need a refinement's field substitution
     /// must use this instead of following only its nominal declaration.
     pub fn resolve_type_alias(&self, module: &[String], name: &str) -> Option<&TypeAlias> {
+        if let Some(alias) = self.resolve_marker(&self.type_aliases, module, name) {
+            return Some(alias);
+        }
         resolve_qualified(
             &self.type_aliases,
             &self.import_origins,

@@ -1,0 +1,2 @@
+// Pin duplicate structural type fields at the second name.
+type A = anonymous { a: int32, a: string }

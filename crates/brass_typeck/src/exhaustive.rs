@@ -85,8 +85,8 @@ pub(crate) fn pattern_irrefutable(program: &Program, p: &Pattern) -> bool {
         Pattern::Wildcard(_) => true,
         // A bare name is an irrefutable binding unless it names a variant, in
         // which case it is a refutable unit-variant test on the field.
-        Pattern::Binding(n, _) => !is_variant_name(program, n),
-        Pattern::Record(_, fields, _) => fields.iter().all(|f| field_irrefutable(program, f)),
+        Pattern::Binding(n, qualifier, _) => qualifier.is_none() && !is_variant_name(program, n),
+        Pattern::Record(_, _, fields, _) => fields.iter().all(|f| field_irrefutable(program, f)),
         Pattern::Literal(_, _) | Pattern::Array(_, _) => false,
     }
 }
@@ -98,7 +98,10 @@ pub(crate) fn pattern_irrefutable(program: &Program, p: &Pattern) -> bool {
 /// through every arm.
 pub(crate) fn pattern_names_sum_variant(program: &Program, p: &Pattern) -> bool {
     match p {
-        Pattern::Record(n, _, _) | Pattern::Binding(n, _) => is_variant_name(program, n),
+        Pattern::Binding(n, qualifier, _) => qualifier.is_some() || is_variant_name(program, n),
+        // Module-qualified record heads are dotted type markers, not variant
+        // names. A validated braced variant must occur in a sum definition.
+        Pattern::Record(n, _, _, _) => is_variant_name(program, n),
         _ => false,
     }
 }
@@ -154,7 +157,7 @@ impl ExhaustiveVisitor<'_> {
         for a in arms {
             match &a.pattern {
                 Pattern::Wildcard(_) => catch_all = true,
-                Pattern::Record(n, fields, _) => {
+                Pattern::Record(n, _, fields, _) => {
                     // A variant pattern covers the variant only when every field
                     // sub-pattern is irrefutable; a refutable one (e.g. a literal
                     // `Both { left: 1, .. }`) matches only some of the variant's
@@ -166,10 +169,10 @@ impl ExhaustiveVisitor<'_> {
                         covered.insert(variant.to_string());
                     }
                 }
-                Pattern::Binding(n, _) => {
+                Pattern::Binding(n, qualifier, _) => {
                     if let Some(variant) = variant_name(sum, n) {
                         covered.insert(variant.to_string());
-                    } else {
+                    } else if qualifier.is_none() {
                         catch_all = true;
                     }
                 }

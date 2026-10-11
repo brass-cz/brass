@@ -1,0 +1,12 @@
+// A method checks its pattern anew for every concrete instance.
+type Single = | Shared { value: int32 }
+type Multiple = | Shared { value: int32 } | Alternative
+type T = {}
+fun T.unwrap(self, x) {
+    const Shared { value } = x
+    return value
+}
+fun main() {
+    let good = T {}.unwrap(Single.Shared { value: 1 })
+    let bad = T {}.unwrap(Multiple.Alternative)
+}

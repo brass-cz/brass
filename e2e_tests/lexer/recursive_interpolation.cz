@@ -1,0 +1,6 @@
+// Nested interpolations balance quoted braces and permit expression newlines.
+fun id(value: string) -> string { return value }
+println("A{ id("x{ "}" }y") }B")
+println("A{ id("x{
+    "}" // A comment brace must not terminate the interpolation: }
+}y") }B")

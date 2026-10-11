@@ -19,7 +19,9 @@ type QueryPair = {
 fun QueryPair.parse_all(q: string) -> QueryPair[]! {
     let out: QueryPair[] = []
     for item in q.split("&") {
-        if len(item) == 0 { continue }
+        if len(item) == 0 {
+            continue
+        }
         let cs = item.chars()
         let n = len(cs)
         let eq = index_of(cs, "=", 0, n)
@@ -29,10 +31,7 @@ fun QueryPair.parse_all(q: string) -> QueryPair[]! {
             key = substr(cs, 0, eq)
             value = substr(cs, eq + 1, n)
         }
-        out.push(Self {
-            key: _decode_form(key)!,
-            value: _decode_form(value)!,
-        })
+        out.push(Self { key: _decode_form(key)!, value: _decode_form(value)! })
     }
     return out
 }
@@ -41,7 +40,9 @@ fun QueryPair.parse_all(q: string) -> QueryPair[]! {
 fun QueryPair.format_all(pairs: QueryPair[]) -> string {
     let parts: string[] = []
     for p in pairs {
-        parts.push("{percent.encode_component(p.key)}={percent.encode_component(p.value)}")
+        parts.push(
+            "{percent.encode_component(p.key)}={percent.encode_component(p.value)}",
+        )
     }
     return parts.join("&")
 }

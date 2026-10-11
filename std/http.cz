@@ -56,16 +56,22 @@ type _ChunkScan = {
 
 fun _split_once(s: string, delim: string) {
     let parts = s.split(delim)
-    if len(parts) < 2 { error("delimiter not found")! }
+    if len(parts) < 2 {
+        error("delimiter not found")!
+    }
     return [parts[0], parts.slice(1, len(parts)).join(delim)]
 }
 
 // \r\n\r\n (13,10,13,10) in byte array
 fun _find_header_end(data: uint8[]) -> int64? {
-    if len(data) < 4 { return null }
+    if len(data) < 4 {
+        return null
+    }
     for i in [0..len(data) - 3] {
-        if data[i] == 13 && data[i + 1] == 10 &&
-           data[i + 2] == 13 && data[i + 3] == 10 {
+        if data[i] == 13 &&
+            data[i + 1] == 10 &&
+            data[i + 2] == 13 &&
+            data[i + 3] == 10 {
             return i
         }
     }
@@ -75,7 +81,9 @@ fun _find_header_end(data: uint8[]) -> int64? {
 fun _find_header(headers: Header[], name: string) -> string? {
     let lower = name.to_lower()
     for h in headers {
-        if h.name.to_lower() == lower { return h.value }
+        if h.name.to_lower() == lower {
+            return h.value
+        }
     }
     return null
 }
@@ -107,7 +115,9 @@ fun _parse_header_lines(text: string) {
 
 fun _parse_head(text: string, kind: string) {
     const lines = text.split("\r\n")
-    if len(lines) == 0 { error("empty {kind}")! }
+    if len(lines) == 0 {
+        error("empty {kind}")!
+    }
     const header_text = lines.slice(1, len(lines)).join("\r\n")
     return _HttpHead {
         line: lines[0],
@@ -125,8 +135,12 @@ fun _parse_message(raw: string, kind: string) {
 
 fun _parse_status_line(line: string) {
     const parts = line.split(" ")
-    if len(parts) < 2 { error("invalid status line")! }
-    if !_is_http_version(parts[0]) || len(parts[1]) != 3 || !_is_digits(parts[1]) {
+    if len(parts) < 2 {
+        error("invalid status line")!
+    }
+    if !_is_http_version(parts[0]) ||
+        len(parts[1]) != 3 ||
+        !_is_digits(parts[1]) {
         error("invalid status line")!
     }
     let reason = ""
@@ -150,9 +164,21 @@ fun _is_token(s: string) -> bool {
     for b in to_bytes(s) {
         const alpha = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
         const digit = b >= 48 && b <= 57
-        const punct = b == 33 || b == 35 || b == 36 || b == 37 || b == 38 ||
-            b == 39 || b == 42 || b == 43 || b == 45 || b == 46 || b == 94 ||
-            b == 95 || b == 96 || b == 124 || b == 126
+        const punct = b == 33 ||
+            b == 35 ||
+            b == 36 ||
+            b == 37 ||
+            b == 38 ||
+            b == 39 ||
+            b == 42 ||
+            b == 43 ||
+            b == 45 ||
+            b == 46 ||
+            b == 94 ||
+            b == 95 ||
+            b == 96 ||
+            b == 124 ||
+            b == 126
         if !alpha && !digit && !punct {
             return false
         }
@@ -171,9 +197,17 @@ fun _is_field_value(s: string) -> bool {
 
 fun _is_http_version(s: string) -> bool {
     const b = to_bytes(s)
-    return len(b) == 8 && b[0] == 72 && b[1] == 84 && b[2] == 84 &&
-        b[3] == 80 && b[4] == 47 && b[5] >= 48 && b[5] <= 57 &&
-        b[6] == 46 && b[7] >= 48 && b[7] <= 57
+    return len(b) == 8 &&
+        b[0] == 72 &&
+        b[1] == 84 &&
+        b[2] == 84 &&
+        b[3] == 80 &&
+        b[4] == 47 &&
+        b[5] >= 48 &&
+        b[5] <= 57 &&
+        b[6] == 46 &&
+        b[7] >= 48 &&
+        b[7] <= 57
 }
 
 fun _is_request_target(s: string) -> bool {
@@ -200,14 +234,20 @@ fun _is_digits(s: string) -> bool {
     return true
 }
 
-fun _serialize_message(line: string, headers: Header[], body: uint8[]) -> uint8[] {
+fun _serialize_message(
+    line: string,
+    headers: Header[],
+    body: uint8[],
+) -> uint8[] {
     let text = "{line}\r\n"
     for h in headers {
         text = "{text}{h.name}: {h.value}\r\n"
     }
     text = "{text}\r\n"
     let bytes = to_bytes(text)
-    for b in body { bytes.push(b) }
+    for b in body {
+        bytes.push(b)
+    }
     return bytes
 }
 
@@ -217,8 +257,10 @@ fun _serialize_message(line: string, headers: Header[], body: uint8[]) -> uint8[
 fun HttpRequest.parse(raw: string) {
     const message = _parse_message(raw, "request")!
     const parts = message.head.line.split(" ")
-    if len(parts) != 3 || !_is_token(parts[0]) || !_is_request_target(parts[1]) ||
-       !_is_http_version(parts[2]) {
+    if len(parts) != 3 ||
+        !_is_token(parts[0]) ||
+        !_is_request_target(parts[1]) ||
+        !_is_http_version(parts[2]) {
         error("invalid request line")!
     }
     return Self {
@@ -232,7 +274,11 @@ fun HttpRequest.parse(raw: string) {
 
 /** Serializes this request into raw bytes for sending over TCP. */
 fun HttpRequest.serialize(self) -> uint8[] {
-    return _serialize_message("{self.method} {self.path} {self.version}", self.headers, self.body)
+    return _serialize_message(
+        "{self.method} {self.path} {self.version}",
+        self.headers,
+        self.body,
+    )
 }
 
 // --- HttpResponse ---
@@ -249,7 +295,11 @@ fun HttpRequest.serialize(self) -> uint8[] {
 fun HttpResponse.parse(raw: string) {
     const message = _parse_message(raw, "response")!
     const status = _parse_status_line(message.head.line)!
-    const body = _framed_parsed_body(status.status, message.head.headers, message.body)!
+    const body = _framed_parsed_body(
+        status.status,
+        message.head.headers,
+        message.body,
+    )!
     return Self {
         version: status.version,
         status: status.status,
@@ -303,7 +353,9 @@ fun HttpClient.http(host: string, port: int32) {
         host,
         port,
         _default_port: 80,
-        _connect: () -> { return Tcp.connect(host, port) },
+        _connect: () -> {
+            return Tcp.connect(host, port)
+        },
     }
 }
 
@@ -312,7 +364,9 @@ fun HttpClient.https(host: string, port: int32) {
         host,
         port,
         _default_port: 443,
-        _connect: () -> { return TlsStream.connect(host, port) },
+        _connect: () -> {
+            return TlsStream.connect(host, port)
+        },
     }
 }
 
@@ -329,10 +383,16 @@ fun _read_response_open(conn, req: HttpRequest) {
 
     while header_end < 0 {
         let chunk = conn.read(4096)!
-        if len(chunk) == 0 { error("connection closed before headers complete")! }
-        for b in chunk { data.push(b) }
+        if len(chunk) == 0 {
+            error("connection closed before headers complete")!
+        }
+        for b in chunk {
+            data.push(b)
+        }
         let pos = _find_header_end(data)
-        if pos { header_end = pos }
+        if pos {
+            header_end = pos
+        }
     }
 
     let header_bytes = data.slice(0, header_end)
@@ -359,7 +419,10 @@ fun _read_response_open(conn, req: HttpRequest) {
     // headers of the GET it mirrors, so an unsupported coding there is not
     // this exchange's problem.
     if _is_chunked(headers)! {
-        const body = _read_chunked_body(conn, data.slice(body_start, len(data)))!
+        const body = _read_chunked_body(
+            conn,
+            data.slice(body_start, len(data)),
+        )!
         return HttpResponse {
             version: status.version,
             status: status.status,
@@ -372,15 +435,24 @@ fun _read_response_open(conn, req: HttpRequest) {
     if let expected = content_length {
         while len(data) - body_start < expected {
             let chunk = conn.read(4096)!
-            if len(chunk) == 0 { error("connection closed before body complete")! }
-            for b in chunk { data.push(b) }
+            if len(chunk) == 0 {
+                error("connection closed before body complete")!
+            }
+            for b in chunk {
+                data.push(b)
+            }
         }
     } else {
         let reading = true
         while reading {
             const value = conn.read(4096)!
-            if len(value) == 0 { reading = false }
-            else { for b in value { data.push(b) } }
+            if len(value) == 0 {
+                reading = false
+            } else {
+                for b in value {
+                    data.push(b)
+                }
+            }
         }
     }
 
@@ -405,15 +477,17 @@ fun _read_response(conn, req: HttpRequest) {
     match result {
         Err { error } => {
             match conn.close() {
-                Ok { value } => {}
-                Err { error } => {}
+                Ok { value } => {
+                },
+                Err { error } => {
+                },
             }
             return result
-        }
+        },
         Ok { value } => {
             conn.close()!
             return value
-        }
+        },
     }
 }
 
@@ -456,12 +530,18 @@ fun _is_chunked(headers: Header[]) -> bool! {
         if h.name.to_lower() == "transfer-encoding" {
             for raw in h.value.split(",") {
                 const coding = raw.trim().to_lower()
-                if len(coding) > 0 { codings.push(coding) }
+                if len(coding) > 0 {
+                    codings.push(coding)
+                }
             }
         }
     }
-    if len(codings) == 0 { return false }
-    if len(codings) == 1 && codings[0] == "chunked" { return true }
+    if len(codings) == 0 {
+        return false
+    }
+    if len(codings) == 1 && codings[0] == "chunked" {
+        return true
+    }
     const joined = codings.join(", ")
     return error("unsupported Transfer-Encoding: {joined}")
 }
@@ -471,7 +551,9 @@ fun _is_chunked(headers: Header[]) -> bool! {
 fun _find_crlf(data: uint8[], from: int64) -> int64 {
     let i = from
     while i + 1 < len(data) {
-        if data[i] == 13 && data[i + 1] == 10 { return i }
+        if data[i] == 13 && data[i + 1] == 10 {
+            return i
+        }
         i += 1
     }
     return -1
@@ -494,20 +576,32 @@ fun _parse_chunk_size(data: uint8[], from: int64, line_end: int64) -> int64! {
             scanning = false
         } else {
             let digit: int64 = -1
-            if b >= 48 && b <= 57 { digit = b - 48 }
-            if b >= 97 && b <= 102 { digit = b - 87 }
-            if b >= 65 && b <= 70 { digit = b - 55 }
-            if digit < 0 { return error("invalid chunk size") }
+            if b >= 48 && b <= 57 {
+                digit = b - 48
+            }
+            if b >= 97 && b <= 102 {
+                digit = b - 87
+            }
+            if b >= 65 && b <= 70 {
+                digit = b - 55
+            }
+            if digit < 0 {
+                return error("invalid chunk size")
+            }
             digits += 1
             if size > 0 || digit > 0 {
-                if significant >= 13 { return error("chunk size too large") }
+                if significant >= 13 {
+                    return error("chunk size too large")
+                }
                 size = size * 16 + digit
                 significant += 1
             }
             i += 1
         }
     }
-    if digits == 0 { return error("invalid chunk size") }
+    if digits == 0 {
+        return error("invalid chunk size")
+    }
     return size
 }
 
@@ -519,8 +613,12 @@ fun _scan_trailers(data: uint8[], from: int64) -> int64 {
     let scanning = true
     while scanning {
         const line_end = _find_crlf(data, pos)
-        if line_end < 0 { return -1 }
-        if line_end == pos { scanning = false }
+        if line_end < 0 {
+            return -1
+        }
+        if line_end == pos {
+            scanning = false
+        }
         pos = line_end + 2
     }
     return pos
@@ -540,8 +638,9 @@ fun _scan_chunks(data: uint8[]) -> _ChunkScan! {
     let scanning = true
     while scanning {
         const size_end = _find_crlf(data, consumed)
-        if size_end < 0 { scanning = false }
-        else {
+        if size_end < 0 {
+            scanning = false
+        } else {
             const size = _parse_chunk_size(data, consumed, size_end)!
             const chunk_start = size_end + 2
             if size == 0 {
@@ -551,12 +650,18 @@ fun _scan_chunks(data: uint8[]) -> _ChunkScan! {
                 }
                 scanning = false
             } else {
-                if len(data) < chunk_start + size + 2 { scanning = false }
-                else {
-                    if data[chunk_start + size] != 13 || data[chunk_start + size + 1] != 10 {
-                        return error("malformed chunk: no CRLF after chunk data")
+                if len(data) < chunk_start + size + 2 {
+                    scanning = false
+                } else {
+                    if data[chunk_start + size] != 13 ||
+                        data[chunk_start + size + 1] != 10 {
+                        return error(
+                            "malformed chunk: no CRLF after chunk data",
+                        )
                     }
-                    for i in [chunk_start..chunk_start + size] { body.push(data[i]) }
+                    for i in [chunk_start..chunk_start + size] {
+                        body.push(data[i])
+                    }
                     consumed = chunk_start + size + 2
                 }
             }
@@ -571,7 +676,9 @@ fun _scan_chunks(data: uint8[]) -> _ChunkScan! {
 // ignored.
 fun _decode_chunked(data: uint8[]) -> uint8[]! {
     const scan = _scan_chunks(data)!
-    if scan.done { return scan.body }
+    if scan.done {
+        return scan.body
+    }
     return error("truncated chunked body")
 }
 
@@ -586,17 +693,32 @@ fun _read_chunked_body(conn, data: uint8[]) -> uint8[]! {
     let waiting = true
     while waiting {
         const scan = _scan_chunks(data)!
-        for b in scan.body { body.push(b) }
-        if scan.done { return body }
-        if scan.consumed > 0 { data = data.slice(scan.consumed, len(data)) }
+        for b in scan.body {
+            body.push(b)
+        }
+        if scan.done {
+            return body
+        }
+        if scan.consumed > 0 {
+            data = data.slice(scan.consumed, len(data))
+        }
         const chunk = conn.read(4096)!
-        if len(chunk) == 0 { waiting = false }
-        else { for b in chunk { data.push(b) } }
+        if len(chunk) == 0 {
+            waiting = false
+        } else {
+            for b in chunk {
+                data.push(b)
+            }
+        }
     }
     return error("connection closed inside chunked body")
 }
 
-fun _framed_parsed_body(status: int32, headers: Header[], body: uint8[]) -> uint8[]! {
+fun _framed_parsed_body(
+    status: int32,
+    headers: Header[],
+    body: uint8[],
+) -> uint8[]! {
     const content_length = _content_length(headers)!
     if _status_has_no_body(status) {
         let empty: uint8[] = []
@@ -734,8 +856,11 @@ fun fetch(url_str: string) {
 // The redirects that name a new target in `Location`. 300 and 304 are 3xx too,
 // but neither is a hop, so they are deliberately absent.
 fun _is_redirect(status: int32) -> bool {
-    return status == 301 || status == 302 || status == 303 ||
-           status == 307 || status == 308
+    return status == 301 ||
+        status == 302 ||
+        status == 303 ||
+        status == 307 ||
+        status == 308
 }
 
 // One GET of an already-parsed URL. The scheme picks the transport and the
@@ -753,9 +878,13 @@ fun _fetch_uri(uri: URI) {
     const is_https = scheme == "https"
 
     let path = uri.path
-    if len(path) == 0 { path = "/" }
+    if len(path) == 0 {
+        path = "/"
+    }
     let q = uri.query
-    if q { path = "{path}?{q}" }
+    if q {
+        path = "{path}?{q}"
+    }
 
     let auth = uri.authority
     if auth {
@@ -764,9 +893,13 @@ fun _fetch_uri(uri: URI) {
             host = _string_slice(host, 1, len(host) - 1)
         }
         let port = 80
-        if is_https { port = 443 }
+        if is_https {
+            port = 443
+        }
         let p = auth.port
-        if p { port = int32.from(p)! }
+        if p {
+            port = int32.from(p)!
+        }
 
         if is_https {
             let client = HttpClient.https(host, port)

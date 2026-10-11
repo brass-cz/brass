@@ -30,12 +30,18 @@ Three forms:
   _qualified_ by the path's **last segment**: `vec.dot(a, b)`, a type
   position `vec.Vec2`, a record literal `vec.Vec2 { x: 1.0 }`, a static call
   `vec.Vec2.new(...)`, a variant literal `vec.Shape.Circle { r: 1.0 }`, and
-  a match pattern `vec.Shape.Circle { r } =>` (a pattern's qualifier is
-  dropped; the variant resolves against the scrutinee).
+  a match pattern `vec.Shape.Circle { r } =>` (the optional pattern qualifier must
+  name the matched value's sum type and one of its variants).
   The qualifier defaults to the last path segment; `import path as name`
   overrides it (e.g. `import geometry.vec as g` uses `g.dot(..)`). Two
   module imports whose qualifiers collide are rejected; rename one with
   `as` or import names directly.
+
+Two name imports in one module cannot bind the same local name to different
+targets, even inside one braced list or when both targets are in the same
+module. For example, `import lib.{ helper as h, other as h }` is an error.
+Importing the identical target under the same local name more than once is
+allowed. The diagnostic points to the second local name and names both targets.
 
 The two brace-less forms are distinguished by what exists: if the whole path
 names a module, it is a module import; otherwise the last segment is a name

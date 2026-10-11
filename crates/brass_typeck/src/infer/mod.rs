@@ -947,6 +947,7 @@ pub(crate) fn analyze_inner(
     checker.schemes = checker.build_schemes();
     phase("typeck/method-bodies", t);
     if let Some(ctl) = ctl.as_deref_mut() {
+        checker.report_uninferable_method_error_types();
         let delta = flush_delta(&checker, &mut ctl.state, false);
         ctl.sched.emit(stream::CheckEvent::ContextReady(delta));
     }
@@ -1132,6 +1133,7 @@ pub(crate) fn analyze_inner(
                 };
                 let errs = crate::exhaustive::check_block(program, &checker.typed, &f.decl.body);
                 checker.errors.extend(errs);
+                checker.report_uninferable_function_error_type(f);
                 perf.item(symbol.clone(), fn_started.elapsed());
                 if let (Some(args), Some(ret)) = (instance_args, instance_ret) {
                     checker.record_instance_return(symbol.clone(), args, ret);
@@ -1584,6 +1586,16 @@ fn flush_delta(
     delta
 }
 
+/// A closure's source and lexical environment for concrete body checking.
+struct ClosureBody {
+    expr: Expr,
+    scopes: ScopeStack,
+    const_scopes: Vec<HashSet<String>>,
+    module: Vec<String>,
+    self_type: Option<String>,
+    self_variant: Option<(String, String)>,
+}
+
 struct Checker<'a> {
     program: &'a Program,
     errors: Vec<TypeError>,
@@ -1685,6 +1697,10 @@ struct Checker<'a> {
     /// unknown-typed value (a closure parameter) and verified when the variable
     /// is solved at a call site (see `crate::constraint`).
     shape_constraints: HashMap<u32, Vec<ShapeConstraint>>,
+    /// Generic closure definitions and their lexical environment. Callable
+    /// values retain their parameter variables, so applications can check the
+    /// body again with concrete arguments just like a named generic function.
+    closure_bodies: HashMap<Vec<Type>, Rc<ClosureBody>>,
     /// The inference solver: a persistent substitution for variables pinned
     /// across expressions (such as an empty array's element type once a `push`
     /// fixes it) plus variable classification. `resolve` follows the
@@ -2020,6 +2036,7 @@ impl<'a> Checker<'a> {
             elaborations: 0,
             elaboration_budget_reported: false,
             shape_constraints: HashMap::default(),
+            closure_bodies: HashMap::default(),
             solver: {
                 // Fresh variables must not collide with the ids lowering
                 // embedded in the program's resolved types (see
@@ -2483,7 +2500,7 @@ impl<'a> Checker<'a> {
                 // closure that forgot `return`, whose call site would otherwise
                 // fail much later with an opaque unsupported-construct error.
                 // A wildcard (`let _ = f()`) still discards a void result.
-                if let Pattern::Binding(name, span) = pat
+                if let Pattern::Binding(name, None, span) = pat
                     && matches!(self.resolve(&binding_ty), Type::Void)
                 {
                     self.errors.push(TypeError {
@@ -2495,7 +2512,12 @@ impl<'a> Checker<'a> {
                         span: *span,
                     });
                 }
-                self.check_let_pattern_against(&binding_ty, pat, value);
+                self.check_let_pattern_against(
+                    &binding_ty,
+                    pat,
+                    value,
+                    if *is_const { "const" } else { "let" },
+                );
                 self.bind_pattern(pat, &binding_ty, scopes);
                 if *is_const {
                     self.record_expr_type_with(value, &binding_ty, Constness::Const);
@@ -2571,6 +2593,7 @@ impl<'a> Checker<'a> {
                 // destructuring of the wrong arity is a diagnostic here rather than
                 // an out-of-bounds tuple read in the back end.
                 self.check_pattern_against(&item_ty, pat);
+                self.check_irrefutable_pattern(&item_ty, pat, None, "for");
                 self.bind_pattern(pat, &item_ty, scopes);
                 self.check_block(body, scopes);
                 self.const_scopes.pop();
@@ -2668,13 +2691,14 @@ impl<'a> Checker<'a> {
                 return;
             }
         };
-        if !matches!(pat, Pattern::Binding(..)) {
+        if !matches!(pat, Pattern::Binding(_, None, _)) {
             self.errors.push(TypeError {
                 message: "an uninitialized `let` must bind a single name".to_string(),
                 span: te.span(),
             });
             return;
         }
+        self.check_irrefutable_pattern(&binding_ty, pat, None, "let");
         self.bind_pattern(pat, &binding_ty, scopes);
     }
 
@@ -2685,6 +2709,19 @@ impl<'a> Checker<'a> {
     /// (see `brass_hir::expand`). The field list is recorded for MIR
     /// lowering, which unrolls the identical copies.
     fn check_fields_loop(&mut self, s: &Stmt, scopes: &mut ScopeStack) {
+        if let Stmt::For {
+            pat: pat @ Pattern::Binding(_, Some(_), _),
+            ..
+        } = s
+        {
+            // Reflection yields field names, not variants. Validate before
+            // expansion can mistake the qualified head for a loop binding.
+            self.check_pattern_against(&Type::Str, pat);
+            return;
+        }
+        if let Stmt::For { pat, .. } = s {
+            self.check_irrefutable_pattern(&Type::Str, pat, None, "for");
+        }
         let Some((var, arg, body)) = brass_hir::fields_loop_target(s) else {
             return;
         };
@@ -2860,12 +2897,12 @@ impl<'a> Checker<'a> {
 
     fn collect_const_bindings(&self, pat: &Pattern, out: &mut Vec<String>) {
         match pat {
-            Pattern::Binding(name, _) => {
-                if !self.is_unit_variant_name(name) {
+            Pattern::Binding(name, qualifier, _) => {
+                if qualifier.is_none() && !self.is_unit_variant_name(name) {
                     out.push(name.clone());
                 }
             }
-            Pattern::Record(_, fields, _) => {
+            Pattern::Record(_, _, fields, _) => {
                 for field in fields {
                     if let Some(pat) = &field.pat {
                         self.collect_const_bindings(pat, out);

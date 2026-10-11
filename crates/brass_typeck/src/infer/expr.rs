@@ -140,6 +140,70 @@ impl<'a> Checker<'a> {
         got
     }
 
+    /// Retain open closure bodies because their patterns and other operations
+    /// can require concrete argument types before they can be validated.
+    fn remember_closure(&mut self, expr: &Expr, params: &[Type], scopes: &ScopeStack) {
+        let resolved: Vec<_> = params.iter().map(|ty| self.resolve(ty)).collect();
+        if resolved.iter().all(brass_hir::is_fully_known) {
+            return;
+        }
+        if let Some(frame) = self.elaboration_journals.last_mut() {
+            frame.has_closure_bodies = true;
+        }
+        let body = Rc::new(ClosureBody {
+            expr: expr.clone(),
+            scopes: scopes.clone(),
+            const_scopes: self.const_scopes.clone(),
+            module: self.current_module.clone(),
+            self_type: self.self_type.clone(),
+            self_variant: self.self_variant.clone(),
+        });
+        // Body inference may constrain a parameter to a container with open
+        // elements. Both the original variable and its resolved shape can
+        // reach a later application through value lookup.
+        self.closure_bodies.insert(params.to_vec(), body.clone());
+        self.closure_bodies.insert(resolved, body);
+    }
+
+    /// Check a generic closure in its lexical environment at this application's
+    /// argument types. The local substitution preserves polymorphism across
+    /// calls; source diagnostics retain the offending body's original spans.
+    pub(super) fn check_callable_body(&mut self, params: &[Type], ret: &Type, subst: &Subst) {
+        let Some(closure) = self.closure_bodies.get(params).cloned() else {
+            return;
+        };
+        let concrete: Vec<_> = params.iter().map(|ty| subst.resolve_deep(ty)).collect();
+        if !concrete.iter().all(brass_hir::is_fully_known) {
+            return;
+        }
+        let Expr::Closure(decl_params, body, span) = &closure.expr else {
+            unreachable!("only closures have saved callable bodies");
+        };
+        let key = format!("closure:{}", span.lo);
+        if !self.instantiating.insert(key.clone()) {
+            return;
+        }
+        let saved_module = std::mem::replace(&mut self.current_module, closure.module.clone());
+        let saved_self = std::mem::replace(&mut self.self_type, closure.self_type.clone());
+        let saved_variant = std::mem::replace(&mut self.self_variant, closure.self_variant.clone());
+        let saved_consts = std::mem::replace(&mut self.const_scopes, closure.const_scopes.clone());
+        let snapshot = self.solver.snapshot();
+        self.check_closure_against(
+            &closure.expr,
+            decl_params,
+            body,
+            &concrete,
+            &subst.resolve_deep(ret),
+            &mut closure.scopes.clone(),
+        );
+        self.solver.rollback(snapshot);
+        self.const_scopes = saved_consts;
+        self.self_type = saved_self;
+        self.self_variant = saved_variant;
+        self.current_module = saved_module;
+        self.instantiating.remove(&key);
+    }
+
     /// Check a closure literal against an expected function type, binding each
     /// parameter to the expected parameter type and the body to the expected
     /// return. Returns `Type::Fun(param_types, want_ret)`.
@@ -170,7 +234,9 @@ impl<'a> Checker<'a> {
                     .unwrap_or_else(|_| self.fresh_unknown()),
                 None => expected,
             };
-            closure_scope.insert(p.name.clone(), ty.clone());
+            if p.name != "_" {
+                closure_scope.insert(p.name.clone(), ty.clone());
+            }
             param_types.push(ty);
         }
         let mut closure_scopes = scopes.clone();
@@ -246,6 +312,7 @@ impl<'a> Checker<'a> {
                 let _ = self.solver.unify(want_ret, &wrapped);
             }
         }
+        self.remember_closure(expr, &param_types, scopes);
         let ty = Type::Fun(param_types, Box::new(want_ret.clone()));
         self.record_expr_type(expr, &ty);
         ty
@@ -685,15 +752,22 @@ impl<'a> Checker<'a> {
                 // Without this the parameter would get a brand-new unknown,
                 // letting `let s: string = ((x) -> x)(1)` type-check unsoundly.
                 let frame = closure_scopes.last().expect("closure scope frame");
-                let param_types = params
+                let param_types: Vec<_> = params
                     .iter()
                     .map(|p| {
-                        frame
-                            .get(&p.name)
-                            .cloned()
-                            .unwrap_or_else(|| self.fresh_unknown())
+                        if p.name == "_" {
+                            p.ty.as_ref()
+                                .and_then(|t| self.resolve_type(t).ok())
+                                .unwrap_or_else(|| self.fresh_unknown())
+                        } else {
+                            frame
+                                .get(&p.name)
+                                .cloned()
+                                .unwrap_or_else(|| self.fresh_unknown())
+                        }
                     })
                     .collect();
+                self.remember_closure(e, &param_types, scopes);
                 Type::Fun(param_types, Box::new(ret))
             }
             Expr::Array(es, _) => {
@@ -750,16 +824,16 @@ impl<'a> Checker<'a> {
             }
             // A type test outside an `if` condition (the parser does not
             // produce this; hand-built ASTs only): a plain bool value.
-            Expr::TypeTest(subject, _, _) => {
+            Expr::TypeTest(subject, _, _, _) => {
                 self.check_expr(subject, scopes);
                 Type::Bool
             }
             Expr::If(cond, then, els, span) if matches!(&**cond, Expr::TypeTest(..)) => {
-                let Expr::TypeTest(subject, te, tspan) = &**cond else {
+                let Expr::TypeTest(subject, te, negated, tspan) = &**cond else {
                     unreachable!("guarded by the arm pattern");
                 };
                 let _ = span;
-                self.check_type_test_if(subject, te, *tspan, then, els.as_deref(), scopes)
+                self.check_type_test_if(subject, te, *tspan, *negated, then, els.as_deref(), scopes)
             }
             Expr::If(cond, then, els, span) => {
                 let cond_ty = self.check_condition(cond, scopes);
@@ -831,7 +905,7 @@ impl<'a> Checker<'a> {
                 // type (e.g. `if let p = T.from(v)` gives `p: T`), so `p.field` is
                 // valid rather than a nullable-use error.
                 let bind_ty = match (pat, &self.resolve(&scrut_ty)) {
-                    (Pattern::Binding(_, _), Type::Nullable(inner)) => (**inner).clone(),
+                    (Pattern::Binding(_, None, _), Type::Nullable(inner)) => (**inner).clone(),
                     _ => scrut_ty.clone(),
                 };
                 self.bind_pattern(pat, &bind_ty, &mut then_scopes);
@@ -846,6 +920,7 @@ impl<'a> Checker<'a> {
             Expr::Match(scrut, arms, span) => {
                 let scrut_ty = self.check_expr(scrut, scopes);
                 let mut result_ty: Option<Type> = None;
+                self.check_unreachable_arms(&scrut_ty, arms, scopes);
                 for arm in arms {
                     self.check_pattern_against(&scrut_ty, &arm.pattern);
                     let mut arm_scopes = scopes.clone();
@@ -935,7 +1010,8 @@ impl<'a> Checker<'a> {
     /// instance never compiles.
     ///
     /// `infer` holes in the annotation mean "whatever the tested arm
-    /// requires": before deciding, the arm is probed once with the subject
+    /// requires": before deciding, the matching arm (else for a negated test)
+    /// is probed once with the subject
     /// bound to the freshened pattern, so a concrete requirement the arm
     /// places on the subject (`to_bytes(v)` demanding `string`) pins the
     /// hole; a hole nothing pins stays a wildcard that matches any type. The
@@ -953,6 +1029,7 @@ impl<'a> Checker<'a> {
         subject: &Expr,
         te: &brass_parser::ast::TypeExpr,
         test_span: brass_parser::Span,
+        negated: bool,
         then: &Block,
         els: Option<&Expr>,
         scopes: &mut ScopeStack,
@@ -988,7 +1065,13 @@ impl<'a> Checker<'a> {
             self.type_test_holes.extend(hole_ids.iter().copied());
         }
         self.return_values.push(Vec::new());
-        self.check_branch(then, &mut probe_scopes, true);
+        if negated {
+            if let Some(e) = els {
+                self.check_branch_expr(e, &mut probe_scopes, true);
+            }
+        } else {
+            self.check_branch(then, &mut probe_scopes, true);
+        }
         self.return_values.pop();
         for id in &hole_ids {
             self.type_test_holes.remove(id);
@@ -1001,7 +1084,8 @@ impl<'a> Checker<'a> {
 
         if brass_hir::is_fully_known(&subject_ty) {
             self.record_type_test(test_span, &pattern);
-            let matched = brass_typesys::type_test_accepts(self.program, &pattern, &subject_ty);
+            let matched =
+                brass_typesys::type_test_accepts(self.program, &pattern, &subject_ty) != negated;
             // The dead arm is walked (so nested instances still reach
             // monomorphization) but contributes NOTHING to this instance:
             // its errors are discarded and its `return`s are isolated. The
@@ -1040,11 +1124,13 @@ impl<'a> Checker<'a> {
         } else {
             let snap = self.solver.snapshot();
             let mark = self.errors.len();
-            if let Some(e) = els {
-                self.return_values.push(Vec::new());
+            self.return_values.push(Vec::new());
+            if negated {
+                self.check_branch(then, &mut scopes.clone(), true);
+            } else if let Some(e) = els {
                 self.check_branch_expr(e, scopes, true);
-                self.return_values.pop();
             }
+            self.return_values.pop();
             self.errors.truncate(mark);
             self.solver.rollback(snap);
             self.static_divergence = false;

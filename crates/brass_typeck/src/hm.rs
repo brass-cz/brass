@@ -92,11 +92,12 @@ struct Hm<'p> {
     /// so the closure arm resets this and the `ErrorProp` Result arms set it;
     /// a closure whose body raised this way returns `Result<ret, err>`.
     raised: bool,
-    /// Numeric-literal variables to finalize: `(id, default, span)`. A literal
-    /// stays a fresh variable so context can pin its exact kind; afterwards it
+    /// Numeric-literal variables to finalize: `(id, default, span, float_value)`.
+    /// The float value permits a finiteness check after context chooses a width.
+    /// A literal stays a fresh variable so context can pin its exact kind; afterwards it
     /// must have resolved to the right numeric class, or defaults to `default`
     /// (int32/int64 by the literal's magnitude, float64).
-    lit_vars: Vec<(u32, Type, Span)>,
+    lit_vars: Vec<(u32, Type, Span, Option<f64>)>,
     errors: Vec<TypeError>,
 }
 
@@ -393,6 +394,9 @@ impl<'p> Hm<'p> {
     // ----- environment -----
 
     fn bind_mono(&mut self, name: &str, ty: Type) {
+        if name == "_" {
+            return;
+        }
         self.scopes
             .last_mut()
             .expect("a scope is open")
@@ -437,7 +441,7 @@ impl<'p> Hm<'p> {
     fn check_duplicate_params(&mut self, params: &[brass_parser::ast::Param], context: &str) {
         let mut seen = HashSet::default();
         for p in params {
-            if !seen.insert(p.name.as_str()) {
+            if p.name != "_" && !seen.insert(p.name.as_str()) {
                 self.error(
                     format!("duplicate parameter `{}` in {context}", p.name),
                     p.span,
@@ -601,7 +605,7 @@ impl<'p> Hm<'p> {
                 // environment: the HM `let` rule that makes a bound closure
                 // polymorphic. Destructuring patterns bind nothing here (the value
                 // is still inferred above), staged with the other pattern forms.
-                if let Pattern::Binding(name, _) = pat {
+                if let Pattern::Binding(name, None, _) = pat {
                     let env_free = self.env_free();
                     let scheme = self.solver.generalize(&env_free, &bound_ty);
                     self.bind_scheme(name, scheme);
@@ -705,8 +709,8 @@ impl<'p> Hm<'p> {
 
     fn infer_expr(&mut self, expr: &Expr) -> Type {
         match expr {
-            Expr::Int(v, span) => self.literal_var(Type::Int(int_literal_kind(*v)), *span),
-            Expr::Float(_, span) => self.literal_var(Type::Float(FloatKind::F64), *span),
+            Expr::Int(v, span) => self.literal_var(Type::Int(int_literal_kind(*v)), *span, None),
+            Expr::Float(v, span) => self.literal_var(Type::Float(FloatKind::F64), *span, Some(*v)),
             Expr::Bool(_, _) => Type::Bool,
             Expr::Str(segs, _) => {
                 for seg in segs {
@@ -874,7 +878,7 @@ impl<'p> Hm<'p> {
                         }
                     }
                     _ => {
-                        let int_v = self.literal_var(Type::Int(IntKind::I32), *span);
+                        let int_v = self.literal_var(Type::Int(IntKind::I32), *span, None);
                         self.unify(&lo_ty, &int_v, lo.span());
                         self.unify(&hi_ty, &int_v, hi.span());
                         Type::Slice(Box::new(int_v))
@@ -917,7 +921,7 @@ impl<'p> Hm<'p> {
             // The subject of a type test is inferred for reference resolution
             // only; the test constrains nothing (each instance decides it
             // statically) and reads as a plain bool here.
-            Expr::TypeTest(subject, _, _) => {
+            Expr::TypeTest(subject, _, _, _) => {
                 let snap = self.solver.snapshot();
                 self.infer_expr(subject);
                 self.solver.rollback(snap);
@@ -1215,7 +1219,7 @@ impl<'p> Hm<'p> {
                 // A plain binding on a nullable scrutinee narrows to the non-null
                 // type on the then-arm (the value is proven present).
                 let bind_ty = match (pat, &self.solver.resolve(&st)) {
-                    (Pattern::Binding(_, _), Type::Nullable(inner)) => (**inner).clone(),
+                    (Pattern::Binding(_, None, _), Type::Nullable(inner)) => (**inner).clone(),
                     _ => st.clone(),
                 };
                 self.bind_pattern(pat, &bind_ty);
@@ -1245,16 +1249,16 @@ impl<'p> Hm<'p> {
             Type::Unknown(id) => self
                 .lit_vars
                 .iter()
-                .find(|(v, _, _)| v == id)
-                .map(|(_, d, _)| d.clone()),
+                .find(|(v, _, _, _)| v == id)
+                .map(|(_, d, _, _)| d.clone()),
             _ => None,
         }
     }
 
-    fn literal_var(&mut self, default: Type, span: Span) -> Type {
+    fn literal_var(&mut self, default: Type, span: Span, float_value: Option<f64>) -> Type {
         let ty = self.solver.fresh(InferenceVarKind::Source);
         if let Type::Unknown(id) = ty {
-            self.lit_vars.push((id, default, span));
+            self.lit_vars.push((id, default, span, float_value));
         }
         ty
     }
@@ -1522,7 +1526,9 @@ impl<'p> Hm<'p> {
         // Method call `recv.method(args)`: check arguments against the method's
         // signature on the receiver's type, and yield its return type. An unknown
         // method (a builtin like `arr.push`, or a UFCS free function) stays open.
-        if let Expr::Field(base, method, _) = callee {
+        if let Expr::Field(base, method, _) = callee
+            && !callee.span().is_parenthesized()
+        {
             // Built-in numeric/string conversions `Type.from(x)` / `Type.parse(s)`
             // are calls on a primitive type *name*, with fixed source-value
             // contracts. Recognize them before the user-method
@@ -1810,6 +1816,19 @@ impl<'p> Hm<'p> {
     /// user sums look the field up on the variant.
     fn pattern_field_type(&self, scrut: &Type, variant: &str, field: &str) -> Option<Type> {
         let resolved = self.solver.resolve(scrut);
+        if variant.contains('.')
+            && let Type::Record(record) = &resolved
+        {
+            if let Some(ty) = record.substitution.get(field) {
+                return Some(ty.clone());
+            }
+            if let TypeKind::Record { fields, .. } = &self.type_def(&resolved)?.kind {
+                return fields
+                    .iter()
+                    .find(|f| f.name == field)
+                    .and_then(|f| f.resolved_ty.clone());
+            }
+        }
         if let Type::Sum(n) = &resolved
             && let Some((ok, err)) = n.result_payloads()
         {
@@ -1827,15 +1846,31 @@ impl<'p> Hm<'p> {
     /// record/variant and array patterns bind their sub-patterns from the field
     /// and element types.
     fn bind_pattern(&mut self, pat: &Pattern, scrut: &Type) {
+        // Written nominal heads fix open scrutinees before field lookup. A
+        // dotted record marker names the whole type, not a sum's variant.
+        let named = match pat {
+            Pattern::Binding(_, Some(q), _) | Pattern::Record(_, Some(q), _, _) => {
+                Some((&q.ty, true))
+            }
+            Pattern::Record(name, None, _, _) if name.contains('.') => Some((name, false)),
+            _ => None,
+        };
+        if self.solver.resolve(scrut).is_unknown()
+            && let Some((name, sum)) = named
+            && let Some(info) = self.program.resolve_type_or_alias(&self.module, name)
+            && info.is_sum() == sum
+        {
+            let _ = self.solver.unify(scrut, &info.type_ref());
+        }
         match pat {
             Pattern::Wildcard(_) | Pattern::Literal(_, _) => {}
-            Pattern::Binding(name, _) => {
-                if !self.is_variant_name(scrut, name) {
+            Pattern::Binding(name, qualifier, _) => {
+                if qualifier.is_none() && !self.is_variant_name(scrut, name) {
                     let t = self.solver.resolve(scrut);
                     self.bind_mono(name, t);
                 }
             }
-            Pattern::Record(variant, fields, _) => {
+            Pattern::Record(variant, _, fields, _) => {
                 for fp in fields {
                     // An unannotated (dynamic) field binds at a fresh open type per
                     // match, so this pass does not couple independent uses; the
@@ -1886,7 +1921,7 @@ impl<'p> Hm<'p> {
     /// its context is a type error.
     fn finalize_literals(&mut self) {
         let lit_vars = std::mem::take(&mut self.lit_vars);
-        for (id, default, span) in lit_vars {
+        for (id, default, span, float_value) in lit_vars {
             // See through the transparent reference/mutability wrappers: a literal
             // forced to a `ref(mut(int32))` (an array element behind a mutable
             // reference) is still an integer literal at an integer type.
@@ -1899,6 +1934,15 @@ impl<'p> Hm<'p> {
                     other => break other,
                 }
             };
+            // Float literals may round at the inferred width, but must stay finite.
+            if matches!(resolved, Type::Float(FloatKind::F32))
+                && float_value.is_some_and(|value| !(value as f32).is_finite())
+            {
+                self.errors.push(TypeError {
+                    message: "float literal out of range for float32".into(),
+                    span,
+                });
+            }
             let is_int = matches!(default, Type::Int(_));
             match (&resolved, is_int) {
                 (Type::Unknown(_), _) => {
@@ -2017,7 +2061,7 @@ fn expr_constructs_error(e: &Expr) -> bool {
                 || block_constructs_error(then)
                 || els.as_ref().is_some_and(|expr| expr_constructs_error(expr))
         }
-        Expr::TypeTest(subject, _, _) => expr_constructs_error(subject),
+        Expr::TypeTest(subject, _, _, _) => expr_constructs_error(subject),
         Expr::Match(scrut, arms, _) => {
             expr_constructs_error(scrut) || arms.iter().any(|a| expr_constructs_error(&a.body))
         }
@@ -2148,6 +2192,16 @@ mod tests {
         // instead of defaulting to int32, so this is accepted.
         let errs = errors("fun run() {\n  let y: int64 = 5\n}\n");
         assert!(errs.is_empty(), "contextual int literal: {errs:?}");
+    }
+
+    #[test]
+    fn float_literals_stay_finite_at_the_inferred_width() {
+        // Finalization must validate the chosen width even when a literal's
+        // inference variable is constrained only after reading its value.
+        let errs = errors("fun run() -> float32 { return -1e39 }");
+        assert_eq!(errs, vec!["float literal out of range for float32"]);
+        let errs = errors("fun run() -> float32 { return 0.1 }");
+        assert!(errs.is_empty(), "rounding must remain valid: {errs:?}");
     }
 
     #[test]

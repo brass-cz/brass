@@ -1,0 +1,3 @@
+// Pin two different exports bound to the same local name in one list.
+import lib.{ helper as other, other }
+println(other())

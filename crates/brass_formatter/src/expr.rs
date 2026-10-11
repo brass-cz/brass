@@ -14,8 +14,11 @@
 //! `if`/`match`/block expressions never render flat: their bodies always sit
 //! on indented lines of their own.
 //!
-//! The AST records no grouping parentheses, so they are re-inserted from
-//! operator precedence. The `ns` ("no struct") flag mirrors the parser's rule
+//! Source spans retain grouping parentheses; other parentheses are inserted from
+//! operator precedence. Parentheses the source wrote around an operator
+//! expression used as an operand are kept even where precedence makes them
+//! redundant (`(a && b) || c`): they show how the author grouped the
+//! expression. The `ns` ("no struct") flag mirrors the parser's rule
 //! that a bare `Name { ... }` literal in an `if`/`while`/`for`/`match` head
 //! must be parenthesized to not be read as the statement's block.
 
@@ -61,6 +64,11 @@ fn split_chain<'e>(mut e: &'e Expr) -> (&'e Expr, Vec<Link<'e>>) {
                 links.push(Link::Call(args, *span));
                 e = f;
             }
+            Expr::Field(..)
+                if e.span().is_parenthesized() && matches!(links.last(), Some(Link::Call(..))) =>
+            {
+                break;
+            }
             Expr::Field(b, n, _) => {
                 links.push(Link::Field(n));
                 e = b;
@@ -101,10 +109,10 @@ impl<'a> Printer<'a> {
     /// (`if`, `match`, blocks, and anything containing one).
     pub(crate) fn flat_expr(&self, e: &Expr, ns: bool) -> Option<String> {
         Some(match e {
-            Expr::Int(v, s) => self.int_text(*v, *s),
-            Expr::Float(v, s) => self.float_text(*v, *s),
+            Expr::Int(v, s) => self.int_text(*v, s.ungrouped()),
+            Expr::Float(v, s) => self.float_text(*v, s.ungrouped()),
             // String literals (with their interpolations) print verbatim.
-            Expr::Str(_, s) => self.slice(*s).to_string(),
+            Expr::Str(_, s) => self.slice(s.ungrouped()).to_string(),
             Expr::Bool(b, _) => b.to_string(),
             Expr::Null(_) => "null".to_string(),
             Expr::Ident(n, _) => n.clone(),
@@ -125,6 +133,9 @@ impl<'a> Printer<'a> {
             }
             Expr::Call(f, args, _) => {
                 let mut s = self.flat_prec(f, PREC_POSTFIX, ns)?;
+                if matches!(&**f, Expr::Field(..)) && f.span().is_parenthesized() {
+                    s = format!("({s})");
+                }
                 s.push('(');
                 for (i, a) in args.iter().enumerate() {
                     if i > 0 {
@@ -164,15 +175,17 @@ impl<'a> Printer<'a> {
             Expr::VariantLit(t, v, fields, _) => {
                 self.type_lit_flat(&format!("{t}.{v}"), fields, ns)?
             }
-            Expr::TypeTest(subject, te, _) => {
-                format!("{}: {}", self.flat_expr(subject, ns)?, self.type_flat(te))
+            Expr::TypeTest(subject, te, negated, _) => {
+                let subject = self.flat_prec(subject, PREC_POSTFIX, ns)?;
+                let test = format!("{subject}: {}", self.type_flat(te));
+                if *negated { format!("!({test})") } else { test }
             }
             Expr::If(..) | Expr::IfLet(..) | Expr::Match(..) | Expr::Block(..) => return None,
         })
     }
 
     fn flat_prec(&self, e: &Expr, min: u8, ns: bool) -> Option<String> {
-        if prec(e) < min {
+        if prec(e) < min || self.grouped(e) {
             Some(format!("({})", self.flat_expr(e, false)?))
         } else {
             self.flat_expr(e, ns)
@@ -306,10 +319,18 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// Whether `e` is an operator expression the source wrapped in
+    /// parentheses. Parentheses around an atom, a call, or a field access
+    /// group nothing and are not kept here. Callee rendering separately keeps
+    /// parentheses that distinguish a field value call from a method call.
+    fn grouped(&self, e: &Expr) -> bool {
+        matches!(e, Expr::Binary(..) | Expr::Unary(..)) && e.span().is_parenthesized()
+    }
+
     /// Emit an operand, re-inserting its grouping parentheses when its own
-    /// binding strength is below the context's.
+    /// binding strength is below the context's or the source grouped it.
     fn operand_lines(&mut self, head: String, e: &Expr, min_prec: u8, tail: &str, ns: bool) {
-        if prec(e) < min_prec {
+        if prec(e) < min_prec || self.grouped(e) {
             self.expr_lines(format!("{head}("), e, &format!("){tail}"), false);
         } else {
             self.expr_lines(head, e, tail, ns);
@@ -323,7 +344,7 @@ impl<'a> Printer<'a> {
         let p = op.precedence();
         let mut operands = Vec::new();
         let mut ops = Vec::new();
-        collect_operands(e, p, &mut operands, &mut ops);
+        self.collect_operands(e, p, &mut operands, &mut ops);
         // First operand keeps the head; the rest continue one level deeper,
         // each line ending in its operator so the parser reads on.
         for (i, operand) in operands.iter().enumerate() {
@@ -340,6 +361,30 @@ impl<'a> Printer<'a> {
         }
         if operands.len() > 1 {
             self.level -= 1;
+        }
+    }
+
+    /// Flatten the left spine of same-precedence operators in `e` into one
+    /// operand list. A same-precedence right operand came from explicit
+    /// parentheses and keeps them; so does a left operand the source grouped.
+    fn collect_operands<'e>(
+        &self,
+        e: &'e Expr,
+        p: u8,
+        operands: &mut Vec<&'e Expr>,
+        ops: &mut Vec<BinOp>,
+    ) {
+        match e {
+            Expr::Binary(op, l, r, _) if op.precedence() == p => {
+                if self.grouped(l) {
+                    operands.push(l);
+                } else {
+                    self.collect_operands(l, p, operands, ops);
+                }
+                ops.push(*op);
+                operands.push(r);
+            }
+            _ => operands.push(e),
         }
     }
 
@@ -462,7 +507,9 @@ impl<'a> Printer<'a> {
     }
 
     fn postfix_base_text(&self, base: &Expr, ns: bool) -> String {
-        if prec(base) < PREC_POSTFIX {
+        if prec(base) < PREC_POSTFIX
+            || matches!(base, Expr::Field(..)) && base.span().is_parenthesized()
+        {
             format!("({})", self.flat_or_src(base, false))
         } else {
             self.flat_or_src(base, ns)
@@ -649,9 +696,10 @@ impl<'a> Printer<'a> {
     pub(crate) fn pattern_flat(&self, p: &Pattern) -> String {
         match p {
             Pattern::Wildcard(_) => "_".to_string(),
-            Pattern::Binding(n, _) => n.clone(),
+            Pattern::Binding(n, qualifier, _) => Self::pattern_name(qualifier, n),
             Pattern::Literal(e, _) => self.flat_or_src(e, false),
-            Pattern::Record(name, fields, span) => {
+            Pattern::Record(name, qualifier, fields, span) => {
+                let name = Self::pattern_name(qualifier, name);
                 let mut parts: Vec<String> = fields
                     .iter()
                     .map(|f| match &f.pat {
@@ -675,6 +723,14 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// A pattern's name as written, with any `Type.` qualifier.
+    fn pattern_name(qualifier: &Option<PatternQualifier>, name: &str) -> String {
+        match qualifier {
+            Some(q) => format!("{}.{name}", q.ty),
+            None => name.to_string(),
+        }
+    }
+
     /// The AST does not record a record pattern's trailing `..`; recover it
     /// from the source: the last tokens before the pattern's closing brace.
     fn has_rest(&self, span: Span) -> bool {
@@ -685,13 +741,17 @@ impl<'a> Printer<'a> {
             .iter()
             .rev()
             .filter(|token| !matches!(token.kind, TokenKind::Newline | TokenKind::Eof));
-        matches!(
+        if !matches!(
             significant.next().map(|token| &token.kind),
             Some(TokenKind::RBrace)
-        ) && matches!(
-            significant.next().map(|token| &token.kind),
-            Some(TokenKind::DotDot)
-        )
+        ) {
+            return false;
+        }
+        let mut last = significant.next().map(|token| &token.kind);
+        if matches!(last, Some(TokenKind::Comma)) {
+            last = significant.next().map(|token| &token.kind);
+        }
+        matches!(last, Some(TokenKind::DotDot))
     }
 
     // ----- types -----
@@ -738,10 +798,10 @@ impl<'a> Printer<'a> {
         }
     }
 
-    fn type_fields_flat(&self, fields: &[(String, TypeExpr)]) -> String {
+    fn type_fields_flat(&self, fields: &[(String, TypeExpr, brass_parser::Span)]) -> String {
         let parts: Vec<String> = fields
             .iter()
-            .map(|(n, t)| format!("{n}: {}", self.type_flat(t)))
+            .map(|(n, t, _)| format!("{n}: {}", self.type_flat(t)))
             .collect();
         parts.join(", ")
     }
@@ -769,24 +829,11 @@ impl<'a> Printer<'a> {
         };
         self.line(&opener);
         self.level += 1;
-        for (n, t) in fields {
+        for (n, t, _) in fields {
             self.type_lines(format!("{n}: "), t, ",");
         }
         self.level -= 1;
         self.line(&format!("}}{tail}"));
-    }
-}
-
-fn collect_operands<'e>(e: &'e Expr, p: u8, operands: &mut Vec<&'e Expr>, ops: &mut Vec<BinOp>) {
-    match e {
-        // Only the left spine flattens: a same-precedence right operand came
-        // from explicit parentheses and keeps them.
-        Expr::Binary(op, l, r, _) if op.precedence() == p => {
-            collect_operands(l, p, operands, ops);
-            ops.push(*op);
-            operands.push(r);
-        }
-        _ => operands.push(e),
     }
 }
 

@@ -1,0 +1,5 @@
+// A call cannot consume a following unconditional block.
+fun main() {
+    let xs = [1, 2, 3]
+    xs.len() { println("block ran") }
+}

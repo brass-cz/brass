@@ -1,0 +1,3 @@
+// Exports with distinguishable results for import identity checks.
+fun helper() -> int32 { return 1 }
+fun other() -> int32 { return 2 }

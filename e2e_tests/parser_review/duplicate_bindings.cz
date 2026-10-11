@@ -1,0 +1,9 @@
+// Pin second bindings in nested let, const, for, if-let and match patterns.
+type P = { a: int32, b: int32 }
+let [x, x] = [1, 2]
+const [y, y] = [1, 2]
+let P { b: z, b: z } = P { a: 1, b: 2 }
+for [f, f] in [[1, "s"]] { println(f) }
+if let [i, i] = [1, 2] { println(i) }
+println(match (P { a: 1, b: 2 }) { P { a, a } => a })
+let [k, P { a: k }] = [1, P { a: 1, b: 2 }]

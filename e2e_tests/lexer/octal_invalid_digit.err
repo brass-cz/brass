@@ -1,0 +1,1 @@
+octal_invalid_digit.cz:2:12: error: syntax error: invalid digit `8` in octal literal

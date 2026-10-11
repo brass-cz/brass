@@ -1,0 +1,4 @@
+unreachable match arm
+`Rde` binds a new name; did you mean the variant `Red`?
+`Rde` binds a new name and does not compare with the constant `Rde`
+generic_closure_notes.cz:5:51: error:

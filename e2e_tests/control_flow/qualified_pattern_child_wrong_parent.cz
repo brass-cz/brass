@@ -1,0 +1,9 @@
+// A declared relationship does not make a child's nominal variants its parent's.
+type Parent = X { v: int32 } | Y
+type Child: Parent = X { v: int32 } | Y
+fun main() {
+    match (Child.X { v: 8 }) {
+        Parent.X { v } => println(v),
+        _ => println("other"),
+    }
+}

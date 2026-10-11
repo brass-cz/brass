@@ -1,0 +1,3 @@
+// A return annotation selects the width of a negative float literal.
+fun value() -> float32 { return -1e39 }
+println(value())

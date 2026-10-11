@@ -1,0 +1,5 @@
+refutable pattern in `for`; use `if let` or `match`
+refutable_for.cz:3:5: error:
+refutable_for.cz:4:5: error:
+cannot use a fixed-length array pattern in `for` with a growable array; use `if let` or `match`
+refutable_for.cz:6:5: error:

@@ -1,0 +1,10 @@
+// A qualified bare pattern must name a fieldless variant.
+type A = X { v: int32 } | Y
+type B = X { v: int32 } | Z
+
+fun main() {
+    match (A.X { v: 7 }) {
+        A.X => println("x"),
+        A.Y => println("y"),
+    }
+}

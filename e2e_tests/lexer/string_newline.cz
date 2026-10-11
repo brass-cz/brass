@@ -1,0 +1,3 @@
+// Raw text newlines are reported at the opening quote.
+let s = "line1
+line2"

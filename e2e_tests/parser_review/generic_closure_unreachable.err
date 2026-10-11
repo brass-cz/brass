@@ -1,0 +1,2 @@
+unreachable match arm
+generic_closure_unreachable.cz:5:60: error:

@@ -1,0 +1,2 @@
+// A top-level control-flow block is not a function.
+if true { return 5 }

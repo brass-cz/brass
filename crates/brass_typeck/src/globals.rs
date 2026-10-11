@@ -133,7 +133,7 @@ fn collect_expr_refs(
                 out.push((name.clone(), *span));
             }
         }
-        Expr::TypeTest(subject, _, _) => collect_expr_refs(subject, globals, bound, out),
+        Expr::TypeTest(subject, _, _, _) => collect_expr_refs(subject, globals, bound, out),
         Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Null(_) | Expr::SelfExpr(_) => {}
         Expr::Str(segs, _) => {
             for seg in segs {
@@ -218,8 +218,8 @@ fn pattern_names(pat: &Pattern) -> Vec<String> {
 
 fn collect_pattern_names(pat: &Pattern, out: &mut Vec<String>) {
     match pat {
-        Pattern::Binding(name, _) => out.push(name.clone()),
-        Pattern::Record(_, fields, _) => {
+        Pattern::Binding(name, _, _) => out.push(name.clone()),
+        Pattern::Record(_, _, fields, _) => {
             for field in fields {
                 match &field.pat {
                     Some(sub) => collect_pattern_names(sub, out),

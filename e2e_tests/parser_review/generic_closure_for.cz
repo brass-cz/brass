@@ -1,0 +1,10 @@
+// Array-literal arguments retain their concrete elements for closure loop checks.
+type Single = | Shared { value: int32 }
+type Multiple = | Shared { value: int32 } | Alternative
+fun main() {
+    let each = (xs) -> {
+        for Shared { value } in xs {}
+    }
+    each([Single.Shared { value: 1 }])
+    each([Multiple.Alternative])
+}

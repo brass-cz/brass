@@ -1,0 +1,1 @@
+decimal_invalid_suffix.cz:2:11: error: syntax error: invalid suffix `f` on numeric literal

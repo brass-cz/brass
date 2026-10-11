@@ -1,0 +1,3 @@
+// Unknown refinement entries are diagnosed at the field name.
+type M = { type key }
+let m: M { key: string, nonexistent: int32 }

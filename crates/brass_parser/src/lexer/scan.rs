@@ -186,6 +186,18 @@ impl<'a> Lexer<'a> {
                 {
                     self.pos += 1;
                 }
+                if let Some(c) = self.cur().filter(|c| c.is_ascii_digit()) {
+                    let name = match radix {
+                        2 => "binary",
+                        8 => "octal",
+                        _ => "hexadecimal",
+                    };
+                    return Err(self.err(
+                        self.pos,
+                        &format!("invalid digit `{}` in {name} literal", c as char),
+                    ));
+                }
+                self.check_numeric_suffix()?;
                 let digits: String = self.src[digits_start..self.pos]
                     .iter()
                     .filter(|&&b| b != b'_')
@@ -225,23 +237,25 @@ impl<'a> Lexer<'a> {
         }
         // Exponent part.
         if matches!(self.cur(), Some(b'e') | Some(b'E')) {
-            let mut look = self.pos + 1;
-            if matches!(self.src.get(look), Some(b'+') | Some(b'-')) {
-                look += 1;
+            let exponent = self.pos;
+            is_float = true;
+            self.pos += 1;
+            if matches!(self.cur(), Some(b'+') | Some(b'-')) {
+                self.pos += 1;
             }
-            if self
-                .src
-                .get(look)
-                .map(|c| c.is_ascii_digit())
-                .unwrap_or(false)
-            {
-                is_float = true;
-                self.pos = look;
-                while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
-                    self.pos += 1;
-                }
+            let mut has_digit = false;
+            while let Some(c) = self.cur().filter(|c| c.is_ascii_digit() || *c == b'_') {
+                has_digit |= c.is_ascii_digit();
+                self.pos += 1;
+            }
+            if !has_digit {
+                return Err(LexError {
+                    message: "missing digits after the exponent".into(),
+                    span: Span::new(exponent, exponent + 1),
+                });
             }
         }
+        self.check_numeric_suffix()?;
 
         let text: String = self.src[start..self.pos]
             .iter()
@@ -249,10 +263,13 @@ impl<'a> Lexer<'a> {
             .map(|&b| b as char)
             .collect();
         let kind = if is_float {
-            TokenKind::Float(
-                text.parse()
-                    .map_err(|_| self.err(start, "invalid float literal"))?,
-            )
+            let value: f64 = text
+                .parse()
+                .map_err(|_| self.err(start, "invalid float literal"))?;
+            if !value.is_finite() {
+                return Err(self.err(start, "float literal out of range"));
+            }
+            TokenKind::Float(value)
         } else {
             TokenKind::Int(
                 text.parse()
@@ -264,8 +281,31 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
+    /// Keep malformed literals from becoming adjacent expressions.
+    fn check_numeric_suffix(&self) -> Result<(), LexError> {
+        if let Some(c) = self.cur().filter(|&c| is_ident_continue(c)) {
+            return Err(self.err(
+                self.pos,
+                &format!("invalid suffix `{}` on numeric literal", c as char),
+            ));
+        }
+        Ok(())
+    }
+
     /// Lex a string literal with `{expr}` interpolation and escapes.
     fn lex_string(&mut self) -> Result<(), LexError> {
+        let start = self.pos;
+        let parts = self.read_string()?;
+        self.tokens.push(Token::new(
+            TokenKind::Str(parts),
+            Span::new(start, self.pos),
+        ));
+        Ok(())
+    }
+
+    /// Read both outer and nested strings with identical escape and interpolation
+    /// rules. Only interpolation expressions may contain raw newlines.
+    fn read_string(&mut self) -> Result<Vec<StrPart>, LexError> {
         let start = self.pos;
         self.pos += 1; // opening quote
         let mut parts: Vec<StrPart> = Vec::new();
@@ -276,6 +316,12 @@ impl<'a> Lexer<'a> {
             }
             let c = self.src[self.pos];
             match c {
+                b'\n' | b'\r' => {
+                    return Err(LexError {
+                        message: "unterminated string literal".into(),
+                        span: Span::new(start, start + 1),
+                    });
+                }
                 b'"' => {
                     self.pos += 1;
                     break;
@@ -286,6 +332,12 @@ impl<'a> Lexer<'a> {
                         .cur()
                         .ok_or_else(|| self.err(start, "unterminated escape"))?;
                     let resolved = match e {
+                        b'\n' | b'\r' => {
+                            return Err(LexError {
+                                message: "unterminated string literal".into(),
+                                span: Span::new(start, start + 1),
+                            });
+                        }
                         b'n' => '\n',
                         b't' => '\t',
                         b'r' => '\r',
@@ -309,30 +361,25 @@ impl<'a> Lexer<'a> {
                     parts.push(StrPart::Interp(expr, frag_lo));
                 }
                 _ => {
-                    // Copy raw UTF-8 byte; multi-byte chars pass through intact.
-                    cur.push(c as char);
-                    // Fix up multi-byte: if not ASCII, decode the full char.
-                    if c >= 0x80 {
-                        cur.pop();
-                        let s = std::str::from_utf8(&self.src[self.pos..])
-                            .map_err(|_| self.err(self.pos, "invalid utf-8"))?;
-                        let ch = s.chars().next().unwrap();
-                        cur.push(ch);
-                        self.pos += ch.len_utf8();
-                        continue;
+                    // Validate each text run once, rather than the remaining
+                    // source for each character. ASCII delimiters are UTF-8 boundaries.
+                    let text_start = self.pos;
+                    while self
+                        .cur()
+                        .is_some_and(|c| !matches!(c, b'"' | b'\\' | b'{' | b'\n' | b'\r'))
+                    {
+                        self.pos += 1;
                     }
-                    self.pos += 1;
+                    let text = std::str::from_utf8(&self.src[text_start..self.pos])
+                        .map_err(|_| self.err(text_start, "invalid utf-8"))?;
+                    cur.push_str(text);
                 }
             }
         }
         if !cur.is_empty() || parts.is_empty() {
             parts.push(StrPart::Lit(cur));
         }
-        self.tokens.push(Token::new(
-            TokenKind::Str(parts),
-            Span::new(start, self.pos),
-        ));
-        Ok(())
+        Ok(parts)
     }
 
     /// Read the raw source of an interpolated `{expr}`, balancing braces and
@@ -359,7 +406,9 @@ impl<'a> Lexer<'a> {
                     }
                     self.pos += 1;
                 }
-                b'"' => self.skip_nested_string()?,
+                b'"' => {
+                    self.read_string()?;
+                }
                 b'/' if self.peek(1) == Some(b'/') => {
                     while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
                         self.pos += 1;
@@ -403,24 +452,6 @@ impl<'a> Lexer<'a> {
                 span: Span::new(start, self.pos),
             })
         }
-    }
-
-    /// Skip a nested string literal while inside an interpolation, honoring
-    /// escapes so a `\"` does not end it prematurely.
-    fn skip_nested_string(&mut self) -> Result<(), LexError> {
-        let start = self.pos;
-        self.pos += 1;
-        while self.pos < self.src.len() {
-            match self.src[self.pos] {
-                b'\\' => self.pos = (self.pos + 2).min(self.src.len()),
-                b'"' => {
-                    self.pos += 1;
-                    return Ok(());
-                }
-                _ => self.pos += 1,
-            }
-        }
-        Err(self.err(start, "unterminated nested string"))
     }
 
     fn lex_symbol(&mut self) -> Result<(), LexError> {
