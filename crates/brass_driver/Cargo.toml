@@ -19,7 +19,6 @@ brass_mir.workspace = true
 
 clap = { version = "4", features = ["derive"] }
 brass_utils.workspace = true
-brass_cache.workspace = true
 brass_metadata.workspace = true
 tracing.workspace = true
 

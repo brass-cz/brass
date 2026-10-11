@@ -4,6 +4,8 @@
 
 #![cfg(all(feature = "jit", not(target_family = "wasm")))]
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -91,8 +93,7 @@ fn git_dependencies_clone_and_checkout_in_the_cache() {
         "import std.package_manager.resolve.git_clone\nimport std.env.args\n\nconst argv = args()\nprintln(git_clone(argv[1], argv[2])!.to_string())\nprintln(git_clone(argv[1], argv[2])!.to_string())\n",
     )
     .expect("write package-manager program");
-    let output = Command::new(env!("CARGO_BIN_EXE_brass"))
-        .env("BRASS_CACHE", "off")
+    let output = support::brass_command(env!("CARGO_BIN_EXE_brass"))
         .env("BRASS_PACKAGES", std_package_env())
         .env("HOME", &home)
         .arg(&program)
@@ -150,9 +151,8 @@ fn git_dependencies_clone_and_checkout_in_the_cache() {
         "import std.fs.read_file\nimport std.package_manager.manifest.Manifest\nimport std.package_manager.resolve.resolve_deps\n\nconst manifest = Manifest.parse(read_file(\"package.toml\")!)!\nfor [name, path] in resolve_deps(manifest.dependencies)!.pairs() {\n    println(\"{name}={path}\")\n}\n",
     )
     .expect("write path resolver");
-    let resolved = Command::new(env!("CARGO_BIN_EXE_brass"))
+    let resolved = support::brass_command(env!("CARGO_BIN_EXE_brass"))
         .current_dir(&path_root)
-        .env("BRASS_CACHE", "off")
         .env("BRASS_PACKAGES", std_package_env())
         .env("HOME", &home)
         .arg(&resolver)
@@ -188,7 +188,7 @@ fn git_dependencies_clone_and_checkout_in_the_cache() {
     )
     .expect("write czpm launcher");
     let czpm = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_brass"))
+        support::brass_command(env!("CARGO_BIN_EXE_brass"))
             .current_dir(&scaffold)
             .env("BRASS_PACKAGES", std_package_env())
             .env("HOME", &home)
@@ -246,7 +246,7 @@ fn git_dependencies_clone_and_checkout_in_the_cache() {
         exe_dir.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let ran = Command::new(env!("CARGO_BIN_EXE_brass"))
+    let ran = support::brass_command(env!("CARGO_BIN_EXE_brass"))
         .current_dir(&hyphen)
         .env("BRASS_PACKAGES", std_package_env())
         .env("HOME", &home)
@@ -274,7 +274,7 @@ fn git_dependencies_clone_and_checkout_in_the_cache() {
         "[package]\nname = \"my-app\"\nauthors = \"\"\nlicense = \"MIT\"\n\n[dependencies]\nbad-dep = { path = \"nowhere\" }\n",
     )
     .expect("write bad-dependency manifest");
-    let refused = Command::new(env!("CARGO_BIN_EXE_brass"))
+    let refused = support::brass_command(env!("CARGO_BIN_EXE_brass"))
         .current_dir(&hyphen)
         .env("BRASS_PACKAGES", std_package_env())
         .env("HOME", &home)

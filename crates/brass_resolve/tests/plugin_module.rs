@@ -7,7 +7,6 @@ use std::path::PathBuf;
 
 use brass_plugin_host::{PluginFunction, PluginManifest, ValueType, fixture};
 use brass_resolve::plugin::{synthesize_plugin_module, synthesize_source};
-use brass_resolve::{inject_module_path, reinject_plugin_identity};
 
 /// A manifest holding one exported function of `name` taking no arguments and
 /// returning nothing, optionally documented.
@@ -102,27 +101,6 @@ fn fixture_manifest_synthesizes_wrappers() {
 
     // The whole module parses.
     brass_parser::parse(&src).expect("synthesized module parses");
-}
-
-/// A cached synthesized module keeps its spans while its dispatch operand is
-/// normalized to the canonical logical import identity.
-#[test]
-fn synthesized_wrapper_identity_can_be_normalized() {
-    let src =
-        synthesize_source(&manifest_of(&["run"], None), "temporary.process").expect("synthesize");
-    let mut ast = brass_parser::parse(&src).expect("parse synthesized module");
-    inject_module_path(
-        &mut ast,
-        "<plugin:temporary.process>",
-        brass_parser::Span::new(0, 0),
-    );
-
-    reinject_plugin_identity(&mut ast, "plugins.process");
-
-    let ast = format!("{ast:?}");
-    assert!(!ast.contains("temporary.process"), "{ast}");
-    assert!(ast.contains("plugins.process"), "{ast}");
-    assert!(ast.contains("<plugin:plugins.process>"), "{ast}");
 }
 
 /// The resolved library path never enters synthesized source, even when its

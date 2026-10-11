@@ -141,7 +141,7 @@ pub fn resolve_qualified<'a, T>(
 }
 
 /// A parsed source file tagged with its module path.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone)]
 pub struct LoadedModule {
     pub path: Vec<String>,
     pub ast: Module,
@@ -155,9 +155,9 @@ pub struct LoadedModule {
 /// A concrete method synthesized from a reflective `-> infer!` template.
 ///
 /// Generated declarations are kept outside the parsed module graph so adding
-/// one never mutates source ASTs. The cache serializes this append-only payload
-/// and lowers it again after lowering the unchanged modules.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+/// one never mutates source ASTs; they are lowered after the unchanged
+/// modules (see `lower_generated_into`).
+#[derive(Clone, Debug)]
 pub struct GeneratedDecl {
     pub module: Vec<String>,
     pub receiver: String,
@@ -201,7 +201,7 @@ impl From<&Param> for ParamInfo {
 /// `methods` carry types expressed over those ids. A binding or call instantiates
 /// the scheme by renaming `params` to fresh variables. A monomorphic record (no
 /// inferred field, e.g. a fully-annotated `Point`) has an empty `params`.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TypeScheme {
     pub params: Vec<u32>,
     pub fields: Vec<(String, Type)>,
@@ -210,7 +210,7 @@ pub struct TypeScheme {
 
 /// A method's signature within a [`TypeScheme`]: parameter types (including the
 /// leading `self`) and the return type, all expressed over the scheme's `params`.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SchemeMethod {
     pub params: Vec<(String, Type)>,
     pub ret: Type,

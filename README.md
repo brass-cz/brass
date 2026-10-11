@@ -73,7 +73,7 @@ czpm run
 
 ## Learning the language
 
-Read the **[documentation](https://brass-lang.cz)**: a step-by-step tutorial,
+Read the **[documentation](https://brass-cz.org)**: a step-by-step tutorial,
 per-feature guides, language references, and a browser playground, built from
 [`book/`](book/). Every language feature also has a runnable example in
 [`examples/`](examples/), each checked by `cargo test`.

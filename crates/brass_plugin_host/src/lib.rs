@@ -83,8 +83,8 @@ fn plugin_registry() -> &'static Mutex<HashMap<String, PathBuf>> {
 
 /// Register the absolute library currently serving `logical_id`.
 ///
-/// The front end calls this after ordinary import resolution, both for a fresh
-/// module load and when validating a cached module. Re-registering an identity
+/// The front end calls this after ordinary import resolution, on every module
+/// load. Re-registering an identity
 /// replaces its path, which lets a long-lived language server or REPL follow a
 /// project or toolchain that moved between analyses.
 pub fn register_plugin(logical_id: &str, path: &Path) -> Result<(), String> {

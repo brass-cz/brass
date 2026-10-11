@@ -16,9 +16,10 @@ The default command is tuned for short edit-run cycles. Start with
   needed. Use `brass check` to check every function.
 - Native code is compiled when it is needed. Code behind an untaken branch
   may never be compiled during that run.
-- Analysis is cached. A completed check can be reused in full; if background
-  checking stops when the program exits, the next run can resume from the
-  partial result.
+- Checking is never cached: each run checks what it needs from source. Native
+  code is: a group of functions compiled once is reused from the JIT cache
+  until its generated code changes, so a repeated run skips most native
+  compilation. See [JIT cache](/references/performance/#jit-cache).
 
 These details normally require no tuning. The practical commands are:
 
@@ -48,9 +49,7 @@ Reach for it when:
 - you are diagnosing a difference between a default run and `brass check`.
 
 Stay with the default for scripts, command-line tools, I/O-bound programs, and
-large applications that use only a small part of their code in one run. For a
-fast repeated run, `brass check` once and let the full analysis cache carry
-the later runs; see [Caches](#caches).
+large applications that use only a small part of their code in one run.
 
 ## When to use `BRASS_OPT=2`
 
@@ -61,19 +60,9 @@ optimizer's cost per compiled group, and every function runs at full native
 quality from its first call. See the
 [native compilation reference](/references/performance/#native-compilation).
 
-## Caches
-
-Cache files are an implementation aid, not build artifacts you need to
-manage. They are ignored when sources, dependencies, plugins, or the compiler
-change. A repeated run reuses both the analysis and the native code compiled
-by earlier runs, so an unchanged program starts without checking or
-compiling anything. Set `BRASS_CACHE=off` when diagnosing cache behavior or
-comparing cold runs. See
-[Performance and caching](/references/performance/) for cache kinds,
-validation, and timing logs.
-
 ## Measuring
 
 `BRASS_LOG='brass::perf=debug' brass app.cz` prints phase totals and the
-slowest checked or compiled items. Measure before choosing `--eager`; most
+slowest checked or compiled items; see
+[Performance diagnostics](/references/performance/) for the phases. Measure before choosing `--eager`; most
 programs should keep the default.

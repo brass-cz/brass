@@ -22,8 +22,10 @@ use crate::mono::{MonoFunction, MonoProgram};
 /// drives it without knowing the target.
 pub trait RuntimeJit {
     /// Compile one monomorphized instance into the live back end and return its
-    /// callable machine address. Calls inside the body reference other instances
-    /// by symbol; the back end resolves them against its already-compiled code.
+    /// callable implementation address. The back end may register all newly
+    /// discovered instances in `program` as a batch before resolving this body,
+    /// so mutually recursive dependencies are available together. Instances
+    /// already registered by startup or an earlier batch must not be redefined.
     fn compile_instance(
         &mut self,
         program: &MonoProgram,

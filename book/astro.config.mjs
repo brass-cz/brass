@@ -98,7 +98,7 @@ export default defineConfig({
             { label: "Compile-time reflection", slug: "references/reflection" },
             { label: "Concurrency", slug: "references/concurrency" },
             { label: "Execution model", slug: "references/execution" },
-            { label: "Performance & caching", slug: "references/performance" },
+            { label: "Performance diagnostics", slug: "references/performance" },
           ],
         },
         { label: "Playground", link: "/playground/" },

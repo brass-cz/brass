@@ -5,6 +5,9 @@
 //! closures observe each other's writes.
 
 use fxhash::FxHashMap as HashMap;
+use fxhash::FxHashSet as HashSet;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
@@ -20,9 +23,6 @@ use brass_hir::{FloatKind, IntKind, NominalType, Program, Type, TypeKind};
 use brass_mir::{BlockId, ClosureId, LocalId};
 use brass_parser::ast::*;
 
-use crate::jit::objcache::{
-    CapturedObject, GroupMetadata, ModulePathBinding, ObjectCacheSession, ValidatedObjects,
-};
 use crate::jit::orc::{OptTier, OrcContext, OrcJit, OrcModule, lazy_implementation_symbol};
 use crate::layout::Abi;
 use crate::monomorph::*;
@@ -113,41 +113,22 @@ struct MirState<'ctx> {
     /// initializer): auto-frozen after init so the module namespace is shareable
     /// across threads.
     frozen_globals: Vec<String>,
-    /// The execution engine, created at finalize and reused to run code.
-    engine: Option<inkwell::execution_engine::ExecutionEngine<'ctx>>,
-    /// Modules compiled at runtime (deferred monomorphization). Kept alive here
-    /// because the execution engine references them after `add_module`.
-    /// Whether the CURRENT module is a runtime add-on (a lazily compiled
-    /// instance): its globals must DECLARE the startup module's storage --
-    /// an initializer here would define a second, zeroed copy the linker
-    /// happily keeps, and the body would read that instead of the program's
-    /// state.
-    in_runtime_module: bool,
-    runtime_modules: Vec<Module<'ctx>>,
     /// The LLVM signature of every monomorphized instance, keyed by mangled
     /// name and shared by all of a lazy run's function modules (one context
     /// serves them all). Present only in lazy per-function codegen, where
     /// [`LlvmCodegen::instance_fn`] declares referenced instances on demand
     /// instead of `begin_program` declaring all of them into every module.
     lazy_signatures: Option<std::rc::Rc<HashMap<String, FunctionType<'ctx>>>>,
-    /// Unoptimized function-group modules waiting behind ORC call-through
-    /// stubs, keyed by the group's first public symbol. Declared before `orc`
-    /// so they are disposed while its context is live.
-    lazy_modules: HashMap<String, OrcModule>,
-    /// Which group module defines each public symbol: entering any member's
-    /// stub materializes its whole group (see `OrcJit::register_lazy_group`).
-    lazy_groups: HashMap<String, String>,
-    /// Exact ordered public symbols for every lazy group, used to bind captured
-    /// objects to the group shape persisted in the native packfile.
-    lazy_group_symbols: HashMap<String, Vec<String>>,
-    /// Module `_PATH` constants embedded by each lazy group. Most groups carry
-    /// none and therefore remain reusable after the project moves.
-    lazy_group_path_bindings: HashMap<String, Vec<ModulePathBinding>>,
-    /// The warm lazy-run ORC session. Cold deferred-monomorphization runs keep
-    /// using MCJIT until their mutable lowering service is migrated as well.
+    /// Session-owned pending modules and native code. Materializers never borrow
+    /// this compiler, including during a runtime resolver's nested ORC lookup.
     orc: Option<OrcJit>,
+    /// Defined public symbols and whether their bodies have lazy implementation
+    /// names. Declarations alone never reserve a definition across batches.
+    defined: HashMap<String, bool>,
+    /// Helpers reserved by earlier batches, including units still pending in ORC.
+    helpers: Rc<HashSet<String>>,
     lazy_has_main: bool,
-    /// Public symbols whose modules must be materialized before execution:
+    /// Instance symbols whose modules must be materialized before execution:
     /// code a spawned worker thread may enter. Workers cannot run the Rust
     /// materializer (it lives on the main thread), so their whole statically
     /// reachable set is compiled up front; everything else stays lazy.
@@ -159,6 +140,7 @@ struct MirState<'ctx> {
 /// `brass_engine::Codegen` trait to emit typed, fully unboxed code.
 pub struct LlvmCodegen<'ctx, 'p> {
     ctx: &'ctx Context,
+    orc_context: Option<&'ctx OrcContext>,
     module: Module<'ctx>,
     builder: Builder<'ctx>,
     abi: Abi<'ctx>,
@@ -167,7 +149,7 @@ pub struct LlvmCodegen<'ctx, 'p> {
     cur_fn: Option<FunctionValue<'ctx>>,
     /// Per-type recursive destructors (`__drop_*`), memoized by mangled type name.
     /// Emitting one before its body lets self-referential types recurse; the map is
-    /// cleared per module (a destructor can only be called within its own module).
+    /// cleared per module. Lazy groups declare helpers owned by their batch.
     ///
     /// This map and the four below MUST key by `Type::display_full` (the
     /// `_`-members included), never `display`: the user-facing rendering hides
@@ -180,7 +162,7 @@ pub struct LlvmCodegen<'ctx, 'p> {
     /// Per-type recursive `to_string` renderers (`pp_fn_tostr_*`) for records and
     /// sums, memoized by mangled type name. Emitting one before its body lets a
     /// self-referential type recurse through a call; cleared per module like
-    /// destructors (the function is local to the module that defines it).
+    /// destructors.
     to_string_fns: fxhash::FxHashMap<String, FunctionValue<'ctx>>,
     /// Per-record field-wise equality functions (`bool(*Header, *Header)`).
     /// They are registered before their bodies are emitted so nested or
@@ -195,6 +177,12 @@ pub struct LlvmCodegen<'ctx, 'p> {
     /// Per-type cycle-collector trace functions: visit a value's
     /// managed children. Memoized like destructors, cleared per module.
     tracers: fxhash::FxHashMap<String, Option<FunctionValue<'ctx>>>,
+    /// Groups delegate helper emission to this batch-local generator. It has no
+    /// delegate of its own, so recursive helpers use its ordinary local memos.
+    helpers: Option<Rc<RefCell<LlvmCodegen<'ctx, 'p>>>>,
+    /// Some means this module exports helpers; names from earlier batches must
+    /// only be declared. None preserves private glue for whole-module codegen.
+    previous_helpers: Option<Rc<HashSet<String>>>,
     /// Whether to emit region write barriers (set in `begin_program` when the
     /// program uses `with`), so a sequential program pays no barrier cost.
     region_barriers: bool,
@@ -209,6 +197,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     pub fn new_backend(ctx: &'ctx Context, program: &'p Program) -> Self {
         LlvmCodegen {
             ctx,
+            orc_context: None,
             module: ctx.create_module("brass"),
             builder: ctx.create_builder(),
             abi: Abi::new(ctx),
@@ -220,9 +209,46 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             equality_fns: fxhash::FxHashMap::default(),
             deep_copy_fns: fxhash::FxHashMap::default(),
             tracers: fxhash::FxHashMap::default(),
+            helpers: None,
+            previous_helpers: None,
             region_barriers: false,
             mir: MirState::default(),
         }
+    }
+
+    /// Emit directly in the future ORC session's context. The context wrapper
+    /// must outlive this backend; finalization shares its ownership with ORC.
+    /// Use `new_backend` when the caller needs an independent LLVM context.
+    pub fn new_orc_backend(context: &'ctx OrcContext, program: &'p Program) -> Self {
+        let mut backend = Self::new_backend(context.context(), program);
+        backend.orc_context = Some(context);
+        backend
+    }
+
+    /// Declare a batch helper locally with exactly its definition's name and ABI.
+    /// No FunctionValue from another module is used as a call operand.
+    fn declare_helper(&self, helper: FunctionValue<'ctx>) -> FunctionValue<'ctx> {
+        let name = helper.get_name().to_str().expect("helper name is UTF-8");
+        self.module.get_function(name).unwrap_or_else(|| {
+            self.module
+                .add_function(name, helper.get_type(), Some(Linkage::External))
+        })
+    }
+
+    /// Reserve a helper before emitting its body, allowing recursive references.
+    /// The boolean says whether this module owns the definition or just imports it.
+    fn helper_function(&self, name: &str, ty: FunctionType<'ctx>) -> (FunctionValue<'ctx>, bool) {
+        let linkage = if self.previous_helpers.is_some() {
+            Linkage::External
+        } else {
+            Linkage::Private
+        };
+        let function = self.module.add_function(name, ty, Some(linkage));
+        let define = !self
+            .previous_helpers
+            .as_ref()
+            .is_some_and(|names| names.contains(name));
+        (function, define)
     }
 
     /// An `i64` constant.
@@ -369,6 +395,10 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     /// sum). `None` for a type with no traced children (a leaf -- never registered).
     /// Unlike the destructor it does not touch reference counts; the collector does.
     fn get_or_emit_tracer(&mut self, ty: &Type) -> Option<FunctionValue<'ctx>> {
+        if let Some(helpers) = &self.helpers {
+            let helper = helpers.borrow_mut().get_or_emit_tracer(ty);
+            return helper.map(|helper| self.declare_helper(helper));
+        }
         let key = mangle_fn(&format!("trace_{}", ty.display_full()));
         if let Some(t) = self.tracers.get(&key) {
             return *t;
@@ -444,8 +474,11 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             .ctx
             .void_type()
             .fn_type(&[self.abi.ptr().into(), self.abi.ptr().into()], false);
-        let f = self.module.add_function(&key, fty, Some(Linkage::Private));
+        let (f, define) = self.helper_function(&key, fty);
         self.tracers.insert(key, Some(f));
+        if !define {
+            return Some(f);
+        }
 
         let saved = self.builder.get_insert_block();
         let entry = self.ctx.append_basic_block(f, "entry");
@@ -586,6 +619,12 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         &mut self,
         capture_types: &[Type],
     ) -> Option<FunctionValue<'ctx>> {
+        if let Some(helpers) = &self.helpers {
+            let helper = helpers
+                .borrow_mut()
+                .get_or_emit_closure_tracer(capture_types);
+            return helper.map(|helper| self.declare_helper(helper));
+        }
         let (offsets, _) = closure_layout(capture_types);
         let children: Vec<u64> = capture_types
             .iter()
@@ -610,8 +649,11 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             .ctx
             .void_type()
             .fn_type(&[ptrt.into(), ptrt.into()], false);
-        let tracer = self.module.add_function(&key, fty, Some(Linkage::Private));
+        let (tracer, define) = self.helper_function(&key, fty);
         self.tracers.insert(key, Some(tracer));
+        if !define {
+            return Some(tracer);
+        }
         let saved = self.builder.get_insert_block();
         let entry = self.ctx.append_basic_block(tracer, "entry");
         self.builder.position_at_end(entry);
@@ -635,6 +677,10 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     }
 
     fn get_or_emit_destructor(&mut self, ty: &Type) -> FunctionValue<'ctx> {
+        if let Some(helpers) = &self.helpers {
+            let helper = helpers.borrow_mut().get_or_emit_destructor(ty);
+            return self.declare_helper(helper);
+        }
         let key = mangle_fn(&format!("drop_{}", ty.display_full()));
         if let Some(f) = self.destructors.get(&key) {
             return *f;
@@ -643,8 +689,11 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             .ctx
             .void_type()
             .fn_type(&[self.abi.ptr().into()], false);
-        let f = self.module.add_function(&key, fty, Some(Linkage::Private));
+        let (f, define) = self.helper_function(&key, fty);
         self.destructors.insert(key, f);
+        if !define {
+            return f;
+        }
         // Collect each heap field's (type, byte offset, llvm type) before emitting,
         // so the program/abi borrows end before the recursive release calls. Field
         // offsets mirror `record_layout`.
@@ -873,6 +922,10 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     /// before freeing the environment block. Stored at offset 24 of the closure so
     /// it can be invoked knowing only the `Fun` type (which hides capture types).
     fn emit_closure_dtor(&mut self, capture_types: &[Type]) -> FunctionValue<'ctx> {
+        if let Some(helpers) = &self.helpers {
+            let helper = helpers.borrow_mut().emit_closure_dtor(capture_types);
+            return self.declare_helper(helper);
+        }
         let (offsets, _) = closure_layout(capture_types);
         let key = mangle_fn(&format!(
             "clodrop_{}",
@@ -889,8 +942,11 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             .ctx
             .void_type()
             .fn_type(&[self.abi.ptr().into()], false);
-        let f = self.module.add_function(&key, fty, Some(Linkage::Private));
+        let (f, define) = self.helper_function(&key, fty);
         self.destructors.insert(key, f);
+        if !define {
+            return f;
+        }
 
         // Collect managed captures (type, llvm type, offset) before emitting.
         // `is_traced`, not `is_managed_heap`: a captured nullable is a retained
@@ -1088,49 +1144,39 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
 
     /// The JIT machine address of a compiled instance by its instance symbol
     /// (after [`EngineCodegen::finalize`]), for embedding and tests that call a
-    /// non-entry instance directly.
+    /// non-entry instance directly. For lazy groups this looks up the hidden
+    /// implementation, materializing immediately; deferred slots receive the
+    /// body address and never a first-call stub. Unknown instances return None.
     pub fn address_of(&self, instance_symbol: &str) -> Option<usize> {
-        self.mir
-            .engine
-            .as_ref()?
-            .get_function_address(&mangle_fn(instance_symbol))
-            .ok()
+        let public = mangle_fn(instance_symbol);
+        let lazy = *self.mir.defined.get(&public)?;
+        let symbol = if lazy {
+            lazy_implementation_symbol(&public)
+        } else {
+            public
+        };
+        self.mir.orc.as_ref()?.lookup(&symbol).ok()
     }
 
-    /// Run a compiled zero-argument instance returning `i32` (for tests/embedding
-    /// after [`EngineCodegen::finalize`]). Sibling helpers exist for other return
-    /// types.
+    /// Whether an instance already has a definition in this session, without
+    /// triggering materialization. Used to deduplicate runtime batches.
+    pub fn has_instance(&self, symbol: &str) -> bool {
+        self.mir.defined.contains_key(&mangle_fn(symbol))
+    }
+
+    /// Run a zero-argument instance returning i32 after finalization.
     pub fn run_entry_i32(&self, name: &str) -> Option<i32> {
-        let addr = self
-            .mir
-            .engine
-            .as_ref()?
-            .get_function_address(&mangle_fn(name))
-            .ok()?;
-        let f: unsafe extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
-        Some(unsafe { f() })
+        self.address_of(name).map(crate::dispatch::call_i32)
     }
 
+    /// Run a zero-argument instance returning i64 after finalization.
     pub fn run_entry_i64(&self, name: &str) -> Option<i64> {
-        let addr = self
-            .mir
-            .engine
-            .as_ref()?
-            .get_function_address(&mangle_fn(name))
-            .ok()?;
-        let f: unsafe extern "C" fn() -> i64 = unsafe { std::mem::transmute(addr) };
-        Some(unsafe { f() })
+        self.address_of(name).map(crate::dispatch::call_i64)
     }
 
+    /// Run a zero-argument instance returning f64 after finalization.
     pub fn run_entry_f64(&self, name: &str) -> Option<f64> {
-        let addr = self
-            .mir
-            .engine
-            .as_ref()?
-            .get_function_address(&mangle_fn(name))
-            .ok()?;
-        let f: unsafe extern "C" fn() -> f64 = unsafe { std::mem::transmute(addr) };
-        Some(unsafe { f() })
+        self.address_of(name).map(crate::dispatch::call_f64)
     }
 
     /// The printed LLVM type of a compiled instance's function (e.g.
@@ -1192,26 +1238,6 @@ fn is_heap_pointer_type(ty: &Type) -> bool {
             | Type::Tuple(..)
             | Type::Nullable(..)
     )
-}
-
-#[cfg(test)]
-mod managed_global_tests {
-    use super::*;
-
-    #[test]
-    fn every_managed_pointer_shape_is_freezable() {
-        // Global freezing follows the runtime representation through mode wrappers.
-        let managed = [
-            Type::Array(Box::new(Type::Bool), 2),
-            Type::Tuple(vec![Type::Bool, Type::Str]),
-            Type::Fun(Vec::new(), Box::new(Type::Void)),
-            Type::Ref(Box::new(Type::Mut(Box::new(Type::Slice(Box::new(
-                Type::Str,
-            )))))),
-        ];
-        assert!(managed.iter().all(is_heap_pointer_type));
-        assert!(!is_heap_pointer_type(&Type::Int(IntKind::I64)));
-    }
 }
 
 /// The module-level global symbol for a program global of the given name.
@@ -1778,14 +1804,21 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     /// self-referential type terminates); a string/closure is shared with its count
     /// raised. Used to pass a non-reference argument by value.
     fn get_or_emit_deep_copy(&mut self, ty: &Type) -> FunctionValue<'ctx> {
+        if let Some(helpers) = &self.helpers {
+            let helper = helpers.borrow_mut().get_or_emit_deep_copy(ty);
+            return self.declare_helper(helper);
+        }
         let key = mangle_fn(&format!("dcopy_{}", ty.display_full()));
         if let Some(f) = self.deep_copy_fns.get(&key) {
             return *f;
         }
         let ptrt = self.abi.ptr();
         let fty = ptrt.fn_type(&[ptrt.into()], false);
-        let f = self.module.add_function(&key, fty, Some(Linkage::Private));
+        let (f, define) = self.helper_function(&key, fty);
         self.deep_copy_fns.insert(key, f);
+        if !define {
+            return f;
+        }
 
         let saved_block = self.builder.get_insert_block();
         let saved_fn = self.cur_fn;
@@ -1970,13 +2003,20 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     /// emitted so a self-referential type (e.g. a field of its own type) recurses
     /// through the call rather than re-entering code generation.
     fn get_or_emit_to_string(&mut self, ty: &Type) -> FunctionValue<'ctx> {
+        if let Some(helpers) = &self.helpers {
+            let helper = helpers.borrow_mut().get_or_emit_to_string(ty);
+            return self.declare_helper(helper);
+        }
         let key = mangle_fn(&format!("tostr_{}", ty.display_full()));
         if let Some(f) = self.to_string_fns.get(&key) {
             return *f;
         }
         let fty = self.abi.ptr().fn_type(&[self.abi.ptr().into()], false);
-        let f = self.module.add_function(&key, fty, Some(Linkage::Private));
+        let (f, define) = self.helper_function(&key, fty);
         self.to_string_fns.insert(key, f);
+        if !define {
+            return f;
+        }
 
         // Gather the shape up front so the `program` borrow ends before the
         // recursive field renderings below (which borrow `self` mutably).
@@ -2077,6 +2117,10 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     /// identity returns immediately (and terminates comparisons of aliased
     /// cycles); distinct non-null objects compare each declared field.
     fn get_or_emit_record_equality(&mut self, ty: &Type) -> FunctionValue<'ctx> {
+        if let Some(helpers) = &self.helpers {
+            let helper = helpers.borrow_mut().get_or_emit_record_equality(ty);
+            return self.declare_helper(helper);
+        }
         let key = mangle_fn(&format!("eq_{}", ty.display_full()));
         if let Some(f) = self.equality_fns.get(&key) {
             return *f;
@@ -2086,8 +2130,11 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             .ctx
             .bool_type()
             .fn_type(&[ptr.into(), ptr.into()], false);
-        let f = self.module.add_function(&key, fty, Some(Linkage::Private));
+        let (f, define) = self.helper_function(&key, fty);
         self.equality_fns.insert(key, f);
+        if !define {
+            return f;
+        }
         let fields = match ty {
             Type::Record(n) => self.record_field_types(n),
             _ => Vec::new(),
@@ -2354,11 +2401,11 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     /// them. A runtime add-on or lazy function module only DECLARES them (no
     /// initializer): the linker then resolves the reference to the startup
     /// (or support) module's storage, where the program's actual state lives.
-    fn declare_globals(&mut self, program: &MonoProgram) {
+    fn declare_globals(&mut self, program: &MonoProgram, define: bool) {
         for (name, ty) in &program.globals {
             let llty = self.abi.typed_basic(ty);
             let g = self.module.add_global(llty, None, &mangle_global(name));
-            if !self.mir.in_runtime_module {
+            if define {
                 g.set_initializer(&llty.const_zero());
             }
             self.mir.globals.insert(name.clone(), g);
@@ -2366,9 +2413,9 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     }
 
     /// The module-local declaration of a monomorphized instance, or `None`
-    /// when no such instance exists. Eager and runtime modules pre-declare
-    /// every instance in `begin_program`, so this is a cache hit; a lazy
-    /// function module declares an instance the first time its one body
+    /// when no such instance exists. Whole-module callers pre-declare every
+    /// instance in `begin_program`; startup and runtime lazy groups declare
+    /// an instance the first time a body
     /// references it, from the shared per-program signature table.
     fn instance_fn(&mut self, symbol: &str) -> Option<FunctionValue<'ctx>> {
         let name = mangle_fn(symbol);
@@ -2381,254 +2428,225 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         Some(f)
     }
 
-    /// Prepare a warm lazy run as independent, unoptimized function modules.
+    /// Prepare a lazy run as independent, unoptimized function modules.
     /// ORC receives a callable stub for every monomorphized instance; its
     /// tier-selected transform and native code generator do no work for a
     /// module until that stub is entered by executed control flow.
-    pub(crate) fn prepare_lazy_orc(
-        &mut self,
-        context: &OrcContext,
-        program: &MonoProgram,
-        cached_objects: Option<&ValidatedObjects>,
-    ) -> Result<(), String> {
-        if self.mir.engine.is_some() || self.mir.orc.is_some() {
-            return Err("JIT backend was finalized twice".to_string());
-        }
-
-        // Per-program facts every function module shares, computed once: the
-        // LLVM signature of each instance (the single context makes the types
-        // reusable across modules) and whether the program uses `with`.
-        // Modules then declare only the instances their one body references.
-        let mut signatures =
-            HashMap::with_capacity_and_hasher(program.functions.len(), Default::default());
-        for f in &program.functions {
-            let fty = if f.is_closure {
-                self.abi.typed_closure_fn_type(&f.type_args, &f.ret)
-            } else {
-                self.abi.typed_fn_type(&f.type_args, &f.ret)
-            };
-            signatures.insert(mangle_fn(&f.symbol), fty);
-        }
-        let signatures = std::rc::Rc::new(signatures);
-        let region_barriers = brass_engine::program_uses_with(program);
-
-        // Small programs keep one module per function: materialization stays
-        // observable at function granularity (a dead runtime branch is never
-        // optimized or isel'd) and the per-module fixed cost is negligible at
-        // this size. Past the threshold that fixed cost (pipeline setup,
-        // instruction selection, linking per module) dominates wide programs,
-        // so functions are grouped in monomorphization order -- demand order
-        // from the entry roots, so members of a group tend to call each
-        // other. One module (and one materialization) per group amortizes the
-        // fixed cost, and a sparse run still skips every group it never
-        // enters; only within an entered group does a dead branch now pay
-        // compilation it previously deferred.
-        const LAZY_GROUP_THRESHOLD: usize = 32;
-        let tier = OptTier::from_env();
-        let group_size = if program.functions.len() > LAZY_GROUP_THRESHOLD {
-            group_size_for(tier)
-        } else {
-            1
-        };
-        let mut pending =
-            HashMap::with_capacity_and_hasher(program.functions.len(), Default::default());
-        let mut groups =
-            HashMap::with_capacity_and_hasher(program.functions.len(), Default::default());
-        let mut group_symbols =
-            HashMap::with_capacity_and_hasher(program.functions.len(), Default::default());
-        let mut group_path_bindings =
-            HashMap::with_capacity_and_hasher(program.functions.len(), Default::default());
-        let module_paths = crate::jit::objcache::module_path_bindings(program.hir);
-        let mut registrations = Vec::new();
-        let mut perf = brass_utils::PerfLog::start("back/codegen-fn");
-        for chunk in program.functions.chunks(group_size) {
-            let key = mangle_fn(&chunk[0].symbol);
-            let publics: Vec<String> = chunk.iter().map(|f| mangle_fn(&f.symbol)).collect();
-            let path_bindings = crate::jit::objcache::group_path_bindings(chunk, &module_paths);
-            let object = cached_objects
-                .and_then(|objects| objects.matching_object(&key, &publics))
-                .map(<[u8]>::to_vec);
-            if object.is_none() {
-                let module = self.lazy_group_module(
-                    program,
-                    chunk,
-                    signatures.clone(),
-                    region_barriers,
-                    &mut perf,
-                )?;
-                for public in &publics {
-                    groups.insert(public.clone(), key.clone());
-                }
-                pending.insert(key.clone(), module);
-            }
-            group_symbols.insert(key.clone(), publics.clone());
-            group_path_bindings.insert(key, path_bindings);
-            registrations.push((publics, object));
-        }
-        perf.report();
-        self.mir.lazy_modules = pending;
-        self.mir.lazy_groups = groups;
-        self.mir.lazy_group_symbols = group_symbols;
-        self.mir.lazy_group_path_bindings = group_path_bindings;
+    pub fn prepare_lazy_orc(&mut self, program: &MonoProgram) -> Result<(), String> {
+        self.create_orc(OptTier::from_env())?;
+        self.register_batch(program)?;
+        self.mir.lazy_precompile = brass_engine::spawn_precompile(program).unwrap_or_default();
+        // The support module owns globals and the freeze entry; declarations
+        // for functions are unnecessary until a body actually references them.
+        self.declare_globals(program, true);
+        self.mir.init_symbols = program.init_symbols.clone();
+        self.mir.frozen_globals = immutable_heap_globals(program);
         self.mir.lazy_has_main = program.lookup("main").is_some();
-        self.mir.lazy_precompile = brass_engine::spawn_precompile(program)
-            .unwrap_or_default()
-            .iter()
-            .map(|symbol| mangle_fn(symbol))
-            .collect();
-
-        // This support module owns the program globals and the freeze entry.
-        // Function modules declare those globals without initializers.
-        self.begin_program(program);
         self.emit_freeze_globals_fn();
         self.module
             .verify()
-            .map_err(|error| format!("LLVM support module verification failed:\n{error}"))?;
-        let support = std::mem::replace(&mut self.module, self.ctx.create_module("brass_done"));
+            .map_err(|e| format!("LLVM support module verification failed:\n{e}"))?;
+        let jit = self.mir.orc.as_ref().expect("ORC session created");
+        let module = std::mem::replace(&mut self.module, self.ctx.create_module("brass"));
+        jit.add_eager_module(jit.own_module(module)?)
+    }
 
-        // `OrcJit::new` takes context ownership. Store it in `MirState` before
-        // any later fallible operation so pending modules are always destroyed
-        // before their shared context on an early return.
-        self.mir.orc = Some(OrcJit::new(context)?);
-        let jit = self.mir.orc.as_mut().expect("ORC JIT stored");
-        let runtime_symbols = brass_runtime::symbols()
-            .into_iter()
-            .map(|(name, address)| (name.to_string(), address))
-            .chain(std::iter::once((
-                "pp_resolve".to_string(),
-                crate::dispatch::pp_resolve as *const () as usize,
-            )));
-        jit.define_absolute(runtime_symbols)?;
-        jit.add_eager_module(OrcModule::from_inkwell(support))?;
-        // `add_eager_module` registers its materialization unit but does not
-        // compile it immediately. Force the support object through the object
-        // transform while no lazy-group marker is active; otherwise its first
-        // global reference can materialize reentrantly during a group emission
-        // and be mistaken for that group's cached object.
-        jit.lookup(FREEZE_GLOBALS_FN)?;
-        for (publics, object) in registrations {
-            if let Some(object) = object {
-                jit.add_object(&object)?;
-                jit.register_object_group(&publics)?;
-            } else {
-                jit.register_lazy_group(&publics)?;
+    fn create_orc(&mut self, tier: OptTier) -> Result<(), String> {
+        if self.mir.orc.is_some() {
+            return Err("JIT backend was finalized twice".into());
+        }
+        let fallback = self.orc_context.is_none().then(OrcContext::new);
+        let context = self.orc_context.or(fallback.as_ref()).expect("ORC context");
+        let jit = OrcJit::with_cache(context, crate::jit::objcache::ObjectStore::from_env(), tier)?;
+        jit.define_absolute(
+            brass_runtime::symbols()
+                .into_iter()
+                .map(|(name, address)| (name.to_string(), address))
+                .chain(std::iter::once((
+                    "pp_resolve".into(),
+                    crate::dispatch::pp_resolve as *const () as usize,
+                ))),
+        )?;
+        self.mir.orc = Some(jit);
+        Ok(())
+    }
+
+    /// Emit and register every new body before looking up any implementation.
+    /// Signatures are shared, but each module declares only referenced callees.
+    /// Stable input order and module names make identical batches cacheable;
+    /// already defined startup or runtime instances are never defined twice.
+    pub fn register_batch(&mut self, program: &MonoProgram) -> Result<(), String> {
+        let jit = self
+            .mir
+            .orc
+            .as_ref()
+            .ok_or("register_batch called before ORC preparation")?;
+        let signatures: std::rc::Rc<HashMap<String, FunctionType<'ctx>>> = std::rc::Rc::new(
+            program
+                .functions
+                .iter()
+                .map(|f| {
+                    let ty = if f.is_closure {
+                        self.abi.typed_closure_fn_type(&f.type_args, &f.ret)
+                    } else {
+                        self.abi.typed_fn_type(&f.type_args, &f.ret)
+                    };
+                    (mangle_fn(&f.symbol), ty)
+                })
+                .collect(),
+        );
+        let functions: Vec<_> = program
+            .functions
+            .iter()
+            .filter(|f| !self.has_instance(&f.symbol))
+            .collect();
+        // Small programs preserve first-use granularity. Wider batches group
+        // nearby discoveries to amortize LLVM pipeline and linking overhead.
+        let size = if functions.len() > 32 {
+            group_size_for(jit.tier())
+        } else {
+            1
+        };
+        let region_barriers = brass_engine::program_uses_with(program);
+        let mut helper_codegen = Self::new_backend(self.ctx, self.program);
+        helper_codegen.previous_helpers = Some(self.mir.helpers.clone());
+        helper_codegen.region_barriers = region_barriers;
+        // The first new instance fixes this batch's identity independently of
+        // hash-map order or which group ORC happens to materialize first.
+        let helper_name = format!(
+            "brass.helpers.{}",
+            functions.first().map_or("empty", |f| &f.symbol)
+        );
+        helper_codegen.module.set_name(&helper_name);
+        helper_codegen.module.set_source_file_name(&helper_name);
+        let helpers = Rc::new(RefCell::new(helper_codegen));
+        let mut perf = brass_utils::PerfLog::start("back/codegen-fn");
+        let mut groups = Vec::new();
+        for chunk in functions.chunks(size) {
+            let publics: Vec<_> = chunk.iter().map(|f| mangle_fn(&f.symbol)).collect();
+            let module = self.lazy_group_module(
+                program,
+                chunk,
+                signatures.clone(),
+                region_barriers,
+                helpers.clone(),
+                &mut perf,
+            )?;
+            groups.push((publics, module));
+        }
+        perf.report();
+        let helper_codegen = Rc::try_unwrap(helpers)
+            .ok()
+            .expect("batch helper owner")
+            .into_inner();
+        let helper_symbols: Vec<_> = helper_codegen
+            .module
+            .get_functions()
+            .filter(|f| f.count_basic_blocks() != 0)
+            .map(|f| f.get_name().to_string_lossy().into_owned())
+            .collect();
+        if !helper_symbols.is_empty() {
+            helper_codegen
+                .module
+                .verify()
+                .map_err(|e| format!("helper module verification failed:\n{e}"))?;
+            helper_codegen.mark_small_functions_alwaysinline();
+            if tracing::enabled!(target: "brass::ir", tracing::Level::TRACE) {
+                tracing::trace!(target: "brass::ir", "\n{}", helper_codegen.module.print_to_string().to_string());
             }
+            jit.add_helpers(&helper_symbols, jit.own_module(helper_codegen.module)?)?;
+            Rc::make_mut(&mut self.mir.helpers).extend(helper_symbols);
+        }
+        for (publics, module) in groups {
+            jit.add_lazy_group(&publics, module)?;
+            self.mir
+                .defined
+                .extend(publics.into_iter().map(|symbol| (symbol, true)));
         }
         Ok(())
     }
 
-    /// Drain native objects emitted for groups materialized during this run and
-    /// attach the exact public-symbol sequence needed for future validation.
-    pub(crate) fn take_captured_objects(&mut self) -> Vec<CapturedObject> {
-        let Some(jit) = self.mir.orc.as_mut() else {
-            return Vec::new();
-        };
-        jit.take_captured_objects()
-            .into_iter()
-            .filter_map(|(group_key, object)| {
-                let symbols = self.mir.lazy_group_symbols.get(&group_key)?.clone();
-                let path_bindings = self.mir.lazy_group_path_bindings.get(&group_key)?.clone();
-                Some(CapturedObject {
-                    group_key,
-                    symbols,
-                    path_bindings,
-                    object,
-                })
-            })
-            .collect()
-    }
-
-    /// Attach an incremental pack writer before machine code can run. Native
-    /// functions may terminate the process without unwinding back through the
-    /// driver, so the ORC transform publishes each captured group immediately.
-    pub(crate) fn install_object_cache_writer(&mut self, cache: &ObjectCacheSession) {
-        let metadata = self
-            .mir
-            .lazy_group_symbols
-            .iter()
-            .map(|(key, symbols)| {
-                let path_bindings = self
-                    .mir
-                    .lazy_group_path_bindings
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_default();
-                (
-                    key.clone(),
-                    GroupMetadata {
-                        symbols: symbols.clone(),
-                        path_bindings,
-                    },
-                )
-            })
-            .collect();
-        let Some(writer) = cache.writer(metadata) else {
-            return;
-        };
-        if let Some(jit) = self.mir.orc.as_mut() {
-            jit.install_object_cache_writer(writer);
+    /// Materialize the startup worker reachability set before entering JIT code.
+    pub fn precompile_spawn(&self) -> Result<(), String> {
+        for symbol in &self.mir.lazy_precompile {
+            let address = self
+                .address_of(symbol)
+                .ok_or_else(|| format!("worker body `{symbol}` is unavailable"))?;
+            crate::dispatch::prime_resolved(symbol, address);
         }
+        Ok(())
     }
 
-    /// Execute the ORC lazy program: init functions in order, the global freeze
-    /// entry, then `main`. Everything a spawned worker thread may reach is
-    /// materialized before execution because worker threads do not own the
-    /// Rust IR-module queue used by the first-call callback; the rest of the
-    /// program stays demand-driven.
-    pub(crate) fn execute_lazy_orc(&mut self) -> Result<(), String> {
-        let inits = self.mir.init_symbols.clone();
-        let frozen = self.mir.frozen_globals.clone();
-        let has_main = self.mir.lazy_has_main;
-        let precompile = std::mem::take(&mut self.mir.lazy_precompile);
-        let all_groups: Vec<String> = self.mir.lazy_group_symbols.keys().cloned().collect();
-        let mut jit = self
+    /// Conservative closure of the live session for a runtime spawning batch.
+    /// Deferred targets can call previously registered static bodies outside the
+    /// batch, so all registered bodies are materialized before workers start.
+    pub fn materialize_all(&self) -> Result<(), String> {
+        let jit = self.mir.orc.as_ref().ok_or("missing ORC session")?;
+        let mut symbols: Vec<_> = self.mir.defined.iter().collect();
+        symbols.sort_by_key(|(symbol, _)| *symbol);
+        for (symbol, lazy) in symbols {
+            jit.lookup(&if *lazy {
+                lazy_implementation_symbol(symbol)
+            } else {
+                symbol.clone()
+            })?;
+        }
+        Ok(())
+    }
+
+    fn entry_addresses(&self) -> Result<Vec<usize>, String> {
+        self.precompile_spawn()?;
+        let jit = self
             .mir
             .orc
-            .take()
-            .ok_or("execute called before lazy ORC preparation")?;
-        let precompile_all = jit.object_capture_active()
-            && matches!(std::env::var("BRASS_OBJ_PRECOMPILE").as_deref(), Ok("all"));
-        let groups = &self.mir.lazy_groups;
-        let modules = &mut self.mir.lazy_modules;
-        let mut materialize = |request: &crate::jit::orc::LazyFunction| {
-            let key = groups.get(&request.symbol).unwrap_or(&request.symbol);
-            modules
-                .remove(key)
-                .ok_or_else(|| format!("lazy module for `{}` is unavailable", request.symbol))
-        };
-        let result = jit.with_materializer(&mut materialize, |jit| {
-            let call = |jit: &mut OrcJit, symbol: &str| -> Result<(), String> {
-                let address = jit.lookup(symbol)?;
-                // SAFETY: every entry invoked here has the generated `void()`
-                // signature, and the ORC session remains live through the call.
-                let function: unsafe extern "C" fn() = unsafe { std::mem::transmute(address) };
-                unsafe { function() };
-                Ok(())
-            };
+            .as_ref()
+            .ok_or("execute called before finalize")?;
+        let mut symbols: Vec<_> = self.mir.init_symbols.iter().map(|s| mangle_fn(s)).collect();
+        if !self.mir.frozen_globals.is_empty() {
+            symbols.push(FREEZE_GLOBALS_FN.into());
+        }
+        if self.mir.lazy_has_main {
+            symbols.push(mangle_fn("main"));
+        }
+        symbols.iter().map(|s| jit.lookup(s)).collect()
+    }
 
-            for public in &precompile {
-                jit.lookup(&lazy_implementation_symbol(public))?;
+    /// Execute init, freeze, and main with the runtime resolver installed. All
+    /// entry lookups finish first. During native calls only dispatch.rs's scoped
+    /// raw pointer can borrow the compiler; ORC callbacks use independent state.
+    pub fn execute_with_resolver(
+        &mut self,
+        resolve: &mut dyn FnMut(&mut LlvmCodegen<'ctx, 'p>, &str) -> usize,
+    ) -> Result<(), String> {
+        let addresses = self.entry_addresses()?;
+        crate::dispatch::with_deferred_resolver(self, resolve, || {
+            for address in addresses {
+                crate::dispatch::call_void(address);
             }
-            if precompile_all {
-                for public in &all_groups {
-                    jit.lookup(&lazy_implementation_symbol(public))?;
-                }
-            }
-            for symbol in &inits {
-                call(jit, &mangle_fn(symbol))?;
-            }
-            if !frozen.is_empty() {
-                call(jit, FREEZE_GLOBALS_FN)?;
-            }
-            if has_main {
-                call(jit, &mangle_fn("main"))?;
-            }
-            jit.check_reported_errors()
+            brass_runtime::conc::pp_join_all();
         });
-        self.mir.orc = Some(jit);
+        crate::dispatch::clear_resolved();
+        brass_runtime::gc::pp_gc_collect();
+        self.mir
+            .orc
+            .as_ref()
+            .expect("live ORC session")
+            .check_reported_errors()
+    }
+
+    pub(crate) fn execute_lazy_orc(&mut self) -> Result<(), String> {
+        let _resolved_session = crate::dispatch::resolved_session();
+        let addresses = self.entry_addresses()?;
+        for address in addresses {
+            crate::dispatch::call_void(address);
+        }
         brass_runtime::conc::pp_join_all();
         brass_runtime::gc::pp_gc_collect();
-        result
+        self.mir
+            .orc
+            .as_ref()
+            .expect("live ORC session")
+            .check_reported_errors()
     }
 
     /// Emit one lazy GROUP module: the bodies of `functions`, each defined
@@ -2639,17 +2657,18 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
     fn lazy_group_module(
         &self,
         program: &MonoProgram,
-        functions: &[MonoFunction],
+        functions: &[&MonoFunction],
         signatures: std::rc::Rc<HashMap<String, FunctionType<'ctx>>>,
         region_barriers: bool,
+        helpers: Rc<RefCell<LlvmCodegen<'ctx, 'p>>>,
         perf: &mut brass_utils::PerfLog,
     ) -> Result<OrcModule, String> {
         let mut codegen = LlvmCodegen::new_backend(self.ctx, self.program);
         // Globals belong to the support module; this one only references them.
-        codegen.mir.in_runtime_module = true;
         codegen.mir.lazy_signatures = Some(signatures);
         codegen.region_barriers = region_barriers;
-        codegen.declare_globals(program);
+        codegen.helpers = Some(helpers);
+        codegen.declare_globals(program, false);
         for function in functions {
             let started = std::time::Instant::now();
             codegen.codegen_function(program, function);
@@ -2672,217 +2691,37 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             .module
             .verify()
             .map_err(|error| format!("lazy function verification failed:\n{error}"))?;
-        let module = std::mem::replace(
-            &mut codegen.module,
-            self.ctx.create_module("brass_function_done"),
-        );
-        Ok(OrcModule::from_inkwell(module))
+        if tracing::enabled!(target: "brass::ir", tracing::Level::TRACE) {
+            tracing::trace!(target: "brass::ir", "\n{}", codegen.module.print_to_string().to_string());
+        }
+        self.mir
+            .orc
+            .as_ref()
+            .expect("live ORC session")
+            .own_module(codegen.module)
     }
 }
 
-impl<'ctx, 'p> brass_engine::RuntimeJit for LlvmCodegen<'ctx, 'p> {
-    /// Compile one monomorphized instance into the live execution engine and
-    /// return its callable address (deferred monomorphization).
-    ///
-    /// The instance is emitted into a *fresh* module where every other instance
-    /// and global is an external declaration -- the engine resolves those against
-    /// the already-compiled code -- and only this instance gets a body. The module
-    /// is kept alive (the engine references it after `add_module`) and added to the
-    /// running engine. This is the LLVM-specific half of the runtime backend; the
-    /// cache/orchestration lives backend-agnostically in `brass_engine`.
+impl brass_engine::RuntimeJit for LlvmCodegen<'_, '_> {
+    /// Register the complete specialized batch, including newly reached callees,
+    /// then return the requested body address rather than its call-through stub.
     fn compile_instance(
         &mut self,
         program: &MonoProgram,
         f: &MonoFunction,
     ) -> Result<usize, String> {
-        self.emit_instance_module(program, f)?;
-        let engine = self.mir.engine.as_ref().unwrap();
-        let addr = engine
-            .get_function_address(&mangle_fn(&f.symbol))
-            .map_err(|e| format!("runtime instance address unavailable: {e}"))?;
-        Ok(addr as usize)
-    }
-}
-
-impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
-    /// Emit one instance's definition into a fresh module and hand it to the
-    /// live engine WITHOUT resolving an address: an address lookup finalizes
-    /// every added module, and a mutually recursive batch (instance A calling
-    /// B directly) must have BOTH definitions added before either finalizes,
-    /// or the linker fails on the not-yet-added one. Batch emitters call this
-    /// per instance and fetch the one address they need afterwards.
-    pub fn emit_instance_module(
-        &mut self,
-        program: &MonoProgram,
-        f: &MonoFunction,
-    ) -> Result<(), String> {
-        if self.mir.engine.is_none() {
-            return Err("compile_instance called before finalize".to_string());
+        self.register_batch(program)?;
+        if brass_engine::batch_spawns(program) {
+            self.materialize_all()?;
+            for function in &program.functions {
+                let address = self
+                    .address_of(&function.symbol)
+                    .ok_or_else(|| format!("worker body `{}` is unavailable", function.symbol))?;
+                crate::dispatch::prime_resolved(&function.symbol, address);
+            }
         }
-        // Swap in a fresh module + codegen tables so the instance is emitted in
-        // isolation, then restore the persistent state. `begin_program` declares
-        // every instance (and global) into the fresh module; `codegen_function`
-        // defines just this instance's body, leaving the rest external.
-        let fresh = self.ctx.create_module("brass_rt");
-        let saved_module = std::mem::replace(&mut self.module, fresh);
-        let saved_fns = std::mem::take(&mut self.fns);
-        let saved_globals = std::mem::take(&mut self.mir.globals);
-        let saved_inits = std::mem::take(&mut self.mir.init_symbols);
-        let saved_frozen = std::mem::take(&mut self.mir.frozen_globals);
-        let saved_has_main = self.mir.lazy_has_main;
-        // Destructors are per-module (a `__drop_*` can only be called within the
-        // module that defines it); give the fresh module its own memo. The
-        // per-type `to_string` renderers are module-local for the same reason.
-        let saved_destructors = std::mem::take(&mut self.destructors);
-        let saved_to_string_fns = std::mem::take(&mut self.to_string_fns);
-        let saved_equality_fns = std::mem::take(&mut self.equality_fns);
-        let saved_deep_copy_fns = std::mem::take(&mut self.deep_copy_fns);
-        let saved_tracers = std::mem::take(&mut self.tracers);
-
-        self.mir.in_runtime_module = true;
-        self.begin_program(program);
-        self.codegen_function(program, f);
-        self.mir.in_runtime_module = false;
-        let verified = self
-            .module
-            .verify()
-            .map_err(|e| format!("runtime instance verification failed:\n{}", e.to_string()));
-
-        // Debugging aid: dump each runtime module when requested
-        // (BRASS_LOG_TYPE=ir), mirroring `execute`'s dump of the startup
-        // module -- the first thing needed when a lazily compiled instance
-        // misbehaves relative to its eager twin.
-        if tracing::enabled!(target: "brass::ir", tracing::Level::TRACE) {
-            tracing::trace!(target: "brass::ir", "\n{}", self.module.print_to_string().to_string());
-        }
-        let filled = std::mem::replace(&mut self.module, saved_module);
-        self.fns = saved_fns;
-        self.mir.globals = saved_globals;
-        self.mir.init_symbols = saved_inits;
-        self.mir.frozen_globals = saved_frozen;
-        self.mir.lazy_has_main = saved_has_main;
-        self.destructors = saved_destructors;
-        self.to_string_fns = saved_to_string_fns;
-        self.equality_fns = saved_equality_fns;
-        self.deep_copy_fns = saved_deep_copy_fns;
-        self.tracers = saved_tracers;
-        verified?;
-
-        // Keep the module alive and hand it to the live engine.
-        self.mir.runtime_modules.push(filled);
-        let module_ref = self.mir.runtime_modules.last().unwrap();
-        let engine = self.mir.engine.as_ref().unwrap();
-        engine
-            .add_module(module_ref)
-            .map_err(|_| "failed to add runtime module to engine".to_string())?;
-        crate::jit::engine::map_runtime_symbols(engine, module_ref);
-        Ok(())
-    }
-}
-
-impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
-    /// [`brass_engine::Codegen::execute`] with the lazy JIT's runtime
-    /// resolution installed: while the program runs, a deferred call site's
-    /// `pp_resolve` lands in `resolve`, which may compile new instances into
-    /// this backend (through [`compile_instance`]) and returns the callable
-    /// address, or 0 when the instance cannot be supplied -- the site then
-    /// traps, after the resolver reported the real diagnostic.
-    ///
-    /// Entry addresses are fetched before installation and the program runs
-    /// through raw function pointers, so the only live borrow of the backend
-    /// during execution is the one `pp_resolve` re-materializes inside the
-    /// resolver (the same type-erasure discipline as `with_dispatcher`).
-    pub fn execute_deferred(
-        &mut self,
-        resolve: &mut dyn FnMut(&mut LlvmCodegen<'ctx, 'p>, &str) -> usize,
-    ) -> Result<(), String> {
-        if tracing::enabled!(target: "brass::ir", tracing::Level::TRACE) {
-            tracing::trace!(target: "brass::ir", "\n{}", self.module.print_to_string().to_string());
-        }
-        let inits = self.mir.init_symbols.clone();
-        let frozen = self.mir.frozen_globals.clone();
-        let has_main = self.mir.lazy_has_main;
-        let result = (|| -> Result<(), String> {
-            let (init_addrs, freeze_addr, main_addr) = {
-                let engine = self
-                    .mir
-                    .engine
-                    .as_ref()
-                    .ok_or("execute called before finalize")?;
-                let addr_of = |symbol: &str| {
-                    let llvm_symbol = mangle_fn(symbol);
-                    engine
-                        .get_function_address(&llvm_symbol)
-                        .map_err(|error| format!("JIT entry `{symbol}` is unavailable: {error}"))
-                };
-                let init_addrs = inits
-                    .iter()
-                    .map(|symbol| addr_of(symbol))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let freeze_addr = (!frozen.is_empty())
-                    .then(|| {
-                        engine
-                            .get_function_address(FREEZE_GLOBALS_FN)
-                            .map_err(|error| {
-                                format!("JIT entry `{FREEZE_GLOBALS_FN}` is unavailable: {error}")
-                            })
-                    })
-                    .transpose()?;
-                let main_addr = has_main.then(|| addr_of("main")).transpose()?;
-                (init_addrs, freeze_addr, main_addr)
-            };
-            let call = |address: usize| {
-                let f: unsafe extern "C" fn() = unsafe { std::mem::transmute(address) };
-                unsafe { f() };
-            };
-            crate::dispatch::with_deferred_resolver(self, resolve, || {
-                for address in init_addrs {
-                    call(address);
-                }
-                if let Some(address) = freeze_addr {
-                    call(address);
-                }
-                if let Some(address) = main_addr {
-                    call(address);
-                }
-            });
-            Ok(())
-        })();
-        brass_runtime::conc::pp_join_all();
-        crate::dispatch::clear_resolved();
-        brass_runtime::gc::pp_gc_collect();
-        result
-    }
-}
-
-impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
-    /// Finalize the mutable deferred-monomorphization engine at the cold tier.
-    /// Runtime demand adds further modules to this same engine, so its startup
-    /// module uses the O0 tier that ORC applies to first-use materialization.
-    pub fn finalize_deferred(&mut self) -> Result<(), String> {
-        self.finalize_module(OptimizationLevel::None, false)
-    }
-
-    fn finalize_module(
-        &mut self,
-        optimization: OptimizationLevel,
-        optimize_ir: bool,
-    ) -> Result<(), String> {
-        self.emit_freeze_globals_fn();
-        self.module
-            .verify()
-            .map_err(|e| format!("LLVM module verification failed:\n{}", e.to_string()))?;
-        if optimize_ir {
-            self.mark_small_functions_alwaysinline();
-            self.run_optimization_passes();
-        }
-        let engine = self
-            .module
-            .create_jit_execution_engine(optimization)
-            .map_err(|e| format!("failed to create JIT engine: {e}"))?;
-        crate::jit::engine::map_runtime_symbols(&engine, &self.module);
-        self.mir.engine = Some(engine);
-        Ok(())
+        self.address_of(&f.symbol)
+            .ok_or_else(|| format!("runtime instance `{}` is unavailable", f.symbol))
     }
 }
 
@@ -2907,69 +2746,37 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
             let func = self.module.add_function(&name, fty, None);
             self.fns.map.insert(name, func);
         }
-        self.declare_globals(program);
+        self.declare_globals(program, true);
         self.mir.init_symbols = program.init_symbols.clone();
         self.mir.frozen_globals = immutable_heap_globals(program);
         self.mir.lazy_has_main = program.lookup("main").is_some();
     }
 
     fn finalize(&mut self) -> Result<(), String> {
-        // O2-equivalent backend codegen: `Default` is LLVM's `-O2`,
-        // not `Aggressive` (~`-O3`).
-        self.finalize_module(OptimizationLevel::Default, true)
+        self.emit_freeze_globals_fn();
+        self.module
+            .verify()
+            .map_err(|e| format!("LLVM module verification failed:\n{e}"))?;
+        self.mark_small_functions_alwaysinline();
+        self.run_optimization_passes();
+        // Whole-module callers retain their established IR pipeline and O2
+        // instruction selection, independently of the lazy BRASS_OPT setting.
+        self.create_orc(OptTier::O2)?;
+        for f in self
+            .module
+            .get_functions()
+            .filter(|f| f.count_basic_blocks() != 0)
+        {
+            self.mir
+                .defined
+                .insert(f.get_name().to_string_lossy().into_owned(), false);
+        }
+        let jit = self.mir.orc.as_ref().expect("ORC session created");
+        jit.add_optimized_module(jit.copy_module(&self.module)?)
     }
 
     fn execute(&mut self) -> Result<(), String> {
-        // Debugging aid: dump the finalized LLVM module when requested
-        // (BRASS_LOG_TYPE=ir). Guarded so the module is only rendered when
-        // the target is enabled.
-        if tracing::enabled!(target: "brass::ir", tracing::Level::TRACE) {
-            tracing::trace!(target: "brass::ir", "\n{}", self.module.print_to_string().to_string());
-        }
-        let inits = self.mir.init_symbols.clone();
-        let frozen = self.mir.frozen_globals.clone();
-        let has_main = self.mir.lazy_has_main;
-        let engine = self
-            .mir
-            .engine
-            .as_ref()
-            .ok_or("execute called before finalize")?;
-        let call = |symbol: &str| -> Result<(), String> {
-            let llvm_symbol = mangle_fn(symbol);
-            let address = engine
-                .get_function_address(&llvm_symbol)
-                .map_err(|error| format!("JIT entry `{symbol}` is unavailable: {error}"))?;
-            let f: unsafe extern "C" fn() = unsafe { std::mem::transmute(address) };
-            unsafe { f() };
-            Ok(())
-        };
-        let result = (|| -> Result<(), String> {
-            // Module initializers run (in order), populating the globals.
-            for symbol in &inits {
-                call(symbol)?;
-            }
-            // Module init is complete: auto-freeze the namespace's immutable heap
-            // globals before `main` runs.
-            if !frozen.is_empty() {
-                let address = engine
-                    .get_function_address(FREEZE_GLOBALS_FN)
-                    .map_err(|error| {
-                        format!("JIT entry `{FREEZE_GLOBALS_FN}` is unavailable: {error}")
-                    })?;
-                let f: unsafe extern "C" fn() = unsafe { std::mem::transmute(address) };
-                unsafe { f() };
-            }
-            if has_main {
-                call("main")?;
-            }
-            Ok(())
-        })();
-        // Wait for threads `spawn`ed during the run so their work completes and
-        // output is deterministic before the program ends.
-        brass_runtime::conc::pp_join_all();
-        // Reclaim reference cycles that plain reference counting could not free, so a long-running program does not leak them.
-        brass_runtime::gc::pp_gc_collect();
-        result
+        self.execute_lazy_orc()
     }
 
     fn begin_body(&mut self, func: &MonoFunction) {
@@ -4941,4 +4748,24 @@ pub(crate) fn codegen_is_int_cmp(op: BinOp) -> bool {
         op,
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
     )
+}
+
+#[cfg(test)]
+mod managed_global_tests {
+    use super::*;
+
+    #[test]
+    fn every_managed_pointer_shape_is_freezable() {
+        // Global freezing follows the runtime representation through mode wrappers.
+        let managed = [
+            Type::Array(Box::new(Type::Bool), 2),
+            Type::Tuple(vec![Type::Bool, Type::Str]),
+            Type::Fun(Vec::new(), Box::new(Type::Void)),
+            Type::Ref(Box::new(Type::Mut(Box::new(Type::Slice(Box::new(
+                Type::Str,
+            )))))),
+        ];
+        assert!(managed.iter().all(is_heap_pointer_type));
+        assert!(!is_heap_pointer_type(&Type::Int(IntKind::I64)));
+    }
 }

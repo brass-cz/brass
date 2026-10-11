@@ -31,7 +31,7 @@ A normal run reports errors in the code it needs:
 - The unit is a complete function body. An error in an untaken branch of a
   called function still rejects that function.
 - An uncalled function does not affect the current run. Its check may continue
-  in the background and a partial result may be cached for a later run.
+  in the background until the program exits.
 
 Consequently, a successful run is not a complete whole-program verdict. Use
 `brass check` in CI and whenever all code must be validated.
@@ -49,10 +49,6 @@ prints nothing on success. `brass --eager program.cz` performs the same
 complete check before anything runs, then executes the program; native code
 is still optimized and translated on first use, exactly as in a normal run.
 The interpreter and REPL also check eagerly.
-
-A valid full `.czcache` skips checking on an unchanged program. A partial
-cache instead resumes an interrupted background check. Neither changes the
-program's semantics; see [Performance and caching](/references/performance/).
 
 ### Monomorphization and reflection
 
@@ -144,5 +140,5 @@ WebAssembly (it powers the browser playground). An editor setup for Neovim
 ships in `editors/nvim/`.
 
 Start-up time is dominated by type checking; see
-[Performance & caching](/references/performance/) for the timing logs and the
-`.czcache` analysis cache that eliminates it on unchanged programs.
+[Performance diagnostics](/references/performance/) for the timing logs that
+break it down.

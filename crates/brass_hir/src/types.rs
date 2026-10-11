@@ -44,7 +44,7 @@ pub fn structural_record(fields: Vec<(String, Type)>) -> Type {
 /// genuine `Unknown` id.
 pub const INFER_VAR: u32 = u32::MAX;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IntKind {
     I8,
     I16,
@@ -130,7 +130,7 @@ impl IntKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FloatKind {
     F32,
     F64,
@@ -159,7 +159,7 @@ impl FloatKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
     Bool,
     Int(IntKind),
@@ -212,7 +212,7 @@ pub enum PassingMode {
 ///
 /// For the built-in `Result`, `Ok.value` and `Err.error` carry the statically
 /// known payload types.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Substitution {
     entries: BTreeMap<String, Type>,
 }
@@ -241,7 +241,7 @@ impl Substitution {
 
 /// A lowered nominal type reference. `id` is the runtime type id assigned by
 /// HIR lowering; `name` is retained for diagnostics and current lookup tables.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NominalType {
     pub id: i32,
     pub name: String,

@@ -9,20 +9,17 @@
 #   first  -- time until the program's first output line appears (the lazy
 #             pipeline's reason to exist: execution starts before the whole
 #             program is checked/compiled)
-# and does so with a cold compilation cache (BRASS_CACHE=off) and a warm one.
-# Warm means the per-entry analysis cache (`<case>.czcache`, written next to
-# the source file) primed by the warmup run OF THE SAME MODE -- a lazy run
-# persists only the reached-instance partial cache while an eager run writes
-# the full analysis, so the two must not share a priming run. The
-# XDG_CACHE_HOME override isolates the shared context-seed cache (`.czctx`)
-# from the user's real one. Lazy and eager stdout
-# are also compared: a semantic divergence between the pipelines is a bug and
-# is called out in the report.
+# Every run checks the program from source; only native objects persist, in
+# the JIT cache under XDG_CACHE_HOME. Each case/mode cell owns its own cache
+# directory: "cold" empties it before every run (compile and store), "warm"
+# keeps what the cell's warmup run stored (link cached objects). Lazy and eager
+# stdout are also compared: a semantic divergence between the pipelines is a
+# bug and is called out in the report.
 #
 # Usage: perf_tests/run.sh
 #   REPS=5             repetitions per case/mode/cache (default 5)
 #   CASES=regex        run only case files whose name matches (egrep)
-#   CACHE_MODES="cold warm"  which cache states to measure
+#   CACHE_MODES="cold warm"  which JIT-cache states to measure
 #   SKIP_BUILD=1       skip the release build of the driver
 #
 # Results land in perf_tests/results/<timestamp>/ (raw.csv + report.md); the
@@ -50,8 +47,8 @@ RESULTS_DIR=perf_tests/results
 STAMP="$(date +%Y%m%d-%H%M%S)"
 RUN_DIR="$RESULTS_DIR/$STAMP"
 TMP="$RUN_DIR/.tmp"
-WARM_CACHE_DIR="$RUN_DIR/.brass-cache"
-mkdir -p "$TMP" "$WARM_CACHE_DIR"
+JIT_ROOT="$RUN_DIR/.jit-cache"
+mkdir -p "$TMP" "$JIT_ROOT"
 CSV="$RUN_DIR/raw.csv"
 MISMATCHES="$RUN_DIR/mismatches.txt"
 FAILURES="$RUN_DIR/failures.txt"
@@ -69,15 +66,14 @@ ms_between() { # start_epochrealtime end_epochrealtime -> milliseconds
 # the first println as soon as the program emits it.
 run_one() { # file mode(lazy|eager) cache(cold|warm)
     local file=$1 mode=$2 cache=$3
+    local name xdg
+    name=$(basename "$file" .cz)
+    xdg="$JIT_ROOT/$name-$mode-$cache"
+    [[ "$cache" == cold ]] && rm -rf -- "$xdg"
     local -a cmd=(timeout "$RUN_TIMEOUT" "$BRASS")
     [[ "$mode" == eager ]] && cmd+=(--eager)
     cmd+=("$file")
-    local -a envv=(env -u BRASS_LOG -u BRASS_LOG_TYPE)
-    if [[ "$cache" == cold ]]; then
-        envv+=(BRASS_CACHE=off)
-    else
-        envv+=(XDG_CACHE_HOME="$WARM_CACHE_DIR")
-    fi
+    local -a envv=(env -u BRASS_LOG -u BRASS_LOG_TYPE -u BRASS_JIT_CACHE "XDG_CACHE_HOME=$xdg")
     rm -f "$TMP/first" "$TMP/status"
     local t0 t1
     t0=$EPOCHREALTIME
@@ -103,14 +99,9 @@ for file in perf_tests/cases/*.cz; do
     [[ "$name" =~ $CASES_RE ]] || continue
     for cache in $CACHE_MODES; do
         for mode in lazy eager; do
-            # Warm cells are same-mode primed: drop the per-entry cache so the
-            # warmup rewrites it with this mode's own payload; otherwise a
-            # full cache left behind by an eager run (this invocation's or an
-            # older one's) would leak into the lazy cells.
-            [[ "$cache" == warm ]] && rm -f "${file%.cz}.czcache"
-            # Warmup run: primes the OS page cache (and, for warm, the Brass
-            # compilation cache), validates the case, and captures the output
-            # used for the lazy-vs-eager comparison.
+            # Warmup run: primes the OS page cache (and, for warm, this cell's
+            # JIT cache), validates the case, and captures the output used for
+            # the lazy-vs-eager comparison.
             run_one "$file" "$mode" "$cache"
             if [[ "$R_STATUS" != 0 ]]; then
                 echo "  $name/$cache/$mode: FAILED (exit $R_STATUS)"
@@ -156,56 +147,56 @@ CPU=$(lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -1)
     echo "- reps per cell: $REPS (tables show min over reps; mean in parens)"
     echo "- lazy = default pipeline, eager = \`brass --eager\`"
     echo "- total = wall time of the whole run; first = time to first output line"
-    echo "- cold = compilation cache disabled (BRASS_CACHE=off); warm = primed cache"
+    echo "- cold = empty JIT cache before every run; warm = JIT cache primed by the cell's warmup run"
 } > "$REPORT"
 
 for cache in $CACHE_MODES; do
-    {
-        echo
-        if [[ "$cache" == cold ]]; then
-            echo "## Cold cache"
-        else
-            echo "## Warm cache"
-        fi
-        echo
-        echo "| case | eager total | lazy total | lazy/eager | eager first | lazy first |"
-        echo "|------|------------:|-----------:|-----------:|------------:|-----------:|"
-    } >> "$REPORT"
-    awk -F, -v cache="$cache" '
-        NR > 1 && $2 == cache && $7 == "ok" {
-            key = $1 SUBSEP $3
-            if (!(key in tmin) || $5 + 0 < tmin[key]) tmin[key] = $5 + 0
-            tsum[key] += $5; tcnt[key]++
-            if ($6 != "" && (!(key in fmin) || $6 + 0 < fmin[key])) fmin[key] = $6 + 0
-            if (!seen[$1]++) order[++n] = $1
+{
+    echo
+    if [[ "$cache" == cold ]]; then
+        echo "## Cold JIT cache"
+    else
+        echo "## Warm JIT cache"
+    fi
+    echo
+    echo "| case | eager total | lazy total | lazy/eager | eager first | lazy first |"
+    echo "|------|------------:|-----------:|-----------:|------------:|-----------:|"
+} >> "$REPORT"
+awk -F, -v cache="$cache" '
+    NR > 1 && $2 == cache && $7 == "ok" {
+        key = $1 SUBSEP $3
+        if (!(key in tmin) || $5 + 0 < tmin[key]) tmin[key] = $5 + 0
+        tsum[key] += $5; tcnt[key]++
+        if ($6 != "" && (!(key in fmin) || $6 + 0 < fmin[key])) fmin[key] = $6 + 0
+        if (!seen[$1]++) order[++n] = $1
+    }
+    NR > 1 && $2 == cache && $7 == "fail" {
+        failed[$1 SUBSEP $3] = 1
+        if (!seen[$1]++) order[++n] = $1
+    }
+    function cell(key) {
+        if (key in failed) return "FAILED"
+        if (!(key in tcnt)) return "-"
+        return sprintf("%.0f (%.0f)", tmin[key], tsum[key] / tcnt[key])
+    }
+    function fcell(key) {
+        if (key in failed || !(key in fmin)) return "-"
+        return sprintf("%.0f", fmin[key])
+    }
+    END {
+        for (i = 1; i <= n; i++) {
+            c = order[i]
+            ek = c SUBSEP "eager"; lk = c SUBSEP "lazy"
+            ratio = "-"
+            if ((ek in tmin) && (lk in tmin) && tmin[ek] > 0)
+                ratio = sprintf("%.2f", tmin[lk] / tmin[ek])
+            printf "| %s | %s | %s | %s | %s | %s |\n",
+                c, cell(ek), cell(lk), ratio, fcell(ek), fcell(lk)
         }
-        NR > 1 && $2 == cache && $7 == "fail" {
-            failed[$1 SUBSEP $3] = 1
-            if (!seen[$1]++) order[++n] = $1
-        }
-        function cell(key) {
-            if (key in failed) return "FAILED"
-            if (!(key in tcnt)) return "-"
-            return sprintf("%.0f (%.0f)", tmin[key], tsum[key] / tcnt[key])
-        }
-        function fcell(key) {
-            if (key in failed || !(key in fmin)) return "-"
-            return sprintf("%.0f", fmin[key])
-        }
-        END {
-            for (i = 1; i <= n; i++) {
-                c = order[i]
-                ek = c SUBSEP "eager"; lk = c SUBSEP "lazy"
-                ratio = "-"
-                if ((ek in tmin) && (lk in tmin) && tmin[ek] > 0)
-                    ratio = sprintf("%.2f", tmin[lk] / tmin[ek])
-                printf "| %s | %s | %s | %s | %s | %s |\n",
-                    c, cell(ek), cell(lk), ratio, fcell(ek), fcell(lk)
-            }
-        }
-    ' "$CSV" >> "$REPORT"
-    echo >> "$REPORT"
-    echo "(times in ms; lazy/eager < 1 means lazy is faster)" >> "$REPORT"
+    }
+' "$CSV" >> "$REPORT"
+echo >> "$REPORT"
+echo "(times in ms; lazy/eager < 1 means lazy is faster)" >> "$REPORT"
 done
 
 {
@@ -247,10 +238,7 @@ done
     fi
 } >> "$REPORT"
 
-rm -rf "$TMP" "$WARM_CACHE_DIR"
-# Warm runs leave per-entry caches next to the case files; drop them so a
-# later manual `brass` run in cases/ starts from a predictable state.
-rm -f perf_tests/cases/*.czcache
+rm -rf "$TMP" "$JIT_ROOT"
 cp "$REPORT" "$RESULTS_DIR/latest-report.md"
 echo
 echo "== report: $REPORT (copied to $RESULTS_DIR/latest-report.md) =="

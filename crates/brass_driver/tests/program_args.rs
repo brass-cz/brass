@@ -10,8 +10,9 @@
 
 #![cfg(all(feature = "jit", not(target_family = "wasm")))]
 
+mod support;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 fn std_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../std")
@@ -29,8 +30,7 @@ fn std_package_env() -> String {
 /// Run `brass [repl] <program> <args...>` with the `std` package bound and
 /// return its stdout.
 fn run_with_args(mode: Option<&str>, program: &Path, args: &[&str]) -> String {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_brass"));
-    cmd.env("BRASS_CACHE", "off");
+    let mut cmd = support::brass_command(env!("CARGO_BIN_EXE_brass"));
     if let Some(mode) = mode {
         cmd.arg(mode);
     }

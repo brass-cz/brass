@@ -508,31 +508,15 @@ fn install_jit_panic_guard() {
 /// Run a checked program through the default runtime: the LLVM JIT, used when the
 /// JIT back end is available (the `jit` feature on a non-wasm target).
 #[cfg(jit_backend)]
-fn execute(
-    program: &Program,
-    channels: &brass_mir::CheckerChannels<'_>,
-    lazy: bool,
-    object_cache: Option<brass_jit_llvm::jit::objcache::ObjectCacheSession>,
-) -> Result<(), String> {
+fn execute(program: &Program, channels: &brass_mir::CheckerChannels<'_>) -> Result<(), String> {
     install_jit_panic_guard();
-    if lazy {
-        if let Some(cache) = object_cache {
-            return brass_jit_llvm::run_lazy_cached(program, channels, cache);
-        }
-        return brass_jit_llvm::run_lazy(program, channels);
-    }
     brass_jit_llvm::run(program, channels)
 }
 
 /// Run a checked program through the default runtime: the REPL interpreter, used
 /// when the JIT back end is unavailable (no `jit` feature, or a wasm target).
 #[cfg(not(jit_backend))]
-fn execute(
-    program: &Program,
-    channels: &brass_mir::CheckerChannels<'_>,
-    _lazy: bool,
-    _object_cache: Option<()>,
-) -> Result<(), String> {
+fn execute(program: &Program, channels: &brass_mir::CheckerChannels<'_>) -> Result<(), String> {
     brass_repl::run(program, channels, &mut io::stdout())
 }
 
@@ -548,9 +532,22 @@ fn execute_repl(
 /// A program that passed every front-end check, ready to run.
 struct Checked {
     program: Program,
-    /// Serialized full-analysis identity. Present only on a validated disk
-    /// cache hit, where native objects can be soundly bound to this program.
-    analysis_hash: Option<[u8; 20]>,
+    channels: OwnedChannels,
+}
+
+impl Checked {
+    /// Borrow the checker's complete MIR-lowering sidecar.
+    fn channels(&self) -> brass_mir::CheckerChannels<'_> {
+        self.channels.borrow()
+    }
+}
+
+/// The checker outputs MIR lowering consumes, owned: the counterpart of
+/// [`brass_mir::CheckerChannels`]. Every channel is keyed by source span;
+/// lowering is deterministic, so the spans match the HIR rebuilt from the same
+/// module graph on another thread.
+#[derive(Default)]
+struct OwnedChannels {
     /// Checker-resolved aggregate result types that seed MIR locals, keyed by
     /// span (see `brass_typeck::stream::aggregate_result_types`).
     expr_types: HashMap<Span, brass_hir::Type>,
@@ -587,10 +584,8 @@ struct Checked {
     keyed_dispatch: HashMap<Span, String>,
 }
 
-impl Checked {
-    /// Borrow the checker's complete MIR-lowering sidecar without rebuilding
-    /// its field list at each execution boundary.
-    fn channels(&self) -> brass_mir::CheckerChannels<'_> {
+impl OwnedChannels {
+    fn borrow(&self) -> brass_mir::CheckerChannels<'_> {
         brass_mir::CheckerChannels {
             expr_types: &self.expr_types,
             receiver_types: &self.receiver_types,
@@ -622,19 +617,13 @@ fn drive(mode: Mode, file: &str) -> Result<(), u8> {
     // checker thread while this thread compiles and executes the program,
     // demand-first (see [`run_lazy`]). `check`, `repl`, `--eager`, and the
     // interpreter-only builds (including wasm, which cannot spawn threads)
-    // check eagerly on this thread. A cache hit skips checking but keeps the
-    // entry-rooted JIT, so a warm run does not compile unrelated roots.
-    let lazy = cfg!(jit_backend) && matches!(mode, Mode::Run { eager: false });
-    let checked = if lazy {
-        match load_cached(file, &root) {
-            Some(checked) => checked,
-            None => return run_lazy(file.to_string(), main_src, root),
-        }
-    } else {
-        match analyze(file, &main_src, &root) {
-            Ok(c) => c,
-            Err(diagnostics) => return Err(print_diags(diagnostics)),
-        }
+    // check eagerly on this thread.
+    if cfg!(jit_backend) && matches!(mode, Mode::Run { eager: false }) {
+        return run_lazy(file.to_string(), main_src, root);
+    }
+    let checked = match analyze(file, &main_src, &root) {
+        Ok(c) => c,
+        Err(diagnostics) => return Err(print_diags(diagnostics)),
     };
 
     match mode {
@@ -642,22 +631,10 @@ fn drive(mode: Mode, file: &str) -> Result<(), u8> {
         // carries the answer, and anything on stdout is noise an editor or a script
         // has to filter out.
         Mode::Check => Ok(()),
-        Mode::Run { .. } => {
-            #[cfg(jit_backend)]
-            let object_cache = checked.analysis_hash.map(|analysis_hash| {
-                brass_jit_llvm::jit::objcache::ObjectCacheSession::load(
-                    main_path.clone(),
-                    analysis_hash,
-                    &checked.program,
-                )
-            });
-            #[cfg(not(jit_backend))]
-            let object_cache = None;
-            execute(&checked.program, &checked.channels(), lazy, object_cache).map_err(|e| {
-                report_runtime_error(&e);
-                1
-            })
-        }
+        Mode::Run { .. } => execute(&checked.program, &checked.channels()).map_err(|e| {
+            report_runtime_error(&e);
+            1
+        }),
         Mode::Repl => execute_repl(&checked.program, &checked.channels()).map_err(|e| {
             report_runtime_error(&e);
             1
@@ -665,108 +642,18 @@ fn drive(mode: Mode, file: &str) -> Result<(), u8> {
     }
 }
 
-/// The front-end flavor stamped into cache tags: a JIT driver rewrites spawn
-/// bodies (auto-acquire) before caching ASTs; a REPL-only build does not, so
-/// the two must never accept each other's caches.
-#[cfg(jit_backend)]
-const CACHE_FLAVOR: &str = "jit";
-/// The PARTIAL cache's flavor (a stopped lazy run's settled state): its own
-/// tag, so the full-cache loader can never mistake it for a complete
-/// analysis and vice versa.
-#[cfg(jit_backend)]
-const PARTIAL_CACHE_FLAVOR: &str = "jit-partial";
-#[cfg(not(jit_backend))]
-const CACHE_FLAVOR: &str = "repl";
-
-/// Re-anchor each cached module's `_PATH` constant to where the module lives
-/// NOW. The cache's stamps are deliberately location-independent (a moved
-/// project still hits), but `_PATH` is precisely the module's location, so a
-/// hit must refresh it rather than replay the analysis machine's paths.
-fn reanchor_module_paths(
-    modules: &mut [LoadedModule],
-    entry: &Path,
-    root: &Path,
-    search: &brass_resolve::SearchPaths,
-) {
-    for m in modules {
-        // Embedded modules (prelude, nested std) have no location to refresh.
-        // A plugin wrapper's `_PATH` is its stable logical label; its relocated
-        // library is resolved and registered separately by the plugin stamp.
-        if m.is_prelude || m.path.first().is_some_and(|s| s == "core") {
-            continue;
-        }
-        if matches!(m.path.as_slice(), [p] if p == "main") {
-            let loc = std::fs::canonicalize(entry)
-                .unwrap_or_else(|_| entry.to_path_buf())
-                .display()
-                .to_string();
-            brass_resolve::reinject_module_path(&mut m.ast, &loc);
-            continue;
-        }
-        if let Some(brass_resolve::ModuleFile::Source(file)) =
-            brass_resolve::resolve_module_file(root, search, &m.path)
-        {
-            let loc = std::fs::canonicalize(&file)
-                .unwrap_or(file)
-                .display()
-                .to_string();
-            brass_resolve::reinject_module_path(&mut m.ast, &loc);
-        }
-    }
-}
-
-/// The context seed for `ctx` (every module except the entry): from the
-/// shared on-disk store under `key` when caching is enabled, else built by a
-/// context-only run and stored back. A context with diagnostics retains only
-/// modules outside the diagnostic modules' importer closure.
-fn cached_context_seed(
-    key: &Option<[u8; 20]>,
+/// The context seed for `ctx` (every module except the entry): the tables of
+/// a context-only analysis, which the full check then reuses so only the entry
+/// is re-inferred. A context with diagnostics retains only modules outside the
+/// diagnostic modules' importer closure.
+fn context_seed(
     ctx: &[LoadedModule],
     sources: &brass_resolve::SourceMap,
-    module_hashes: Option<&[(String, [u8; 20])]>,
-    prior: Option<&brass_cache::ContextBundle>,
     phase_name: &'static str,
 ) -> Option<brass_typeck::ContextTables> {
-    if let Some(key) = key
-        && brass_cache::enabled()
-        && let Some(seed) = brass_cache::load_context(key)
-    {
-        tracing::debug!(target: "brass::perf", "context seed loaded from disk");
-        return Some(seed);
-    }
     let t = std::time::Instant::now();
     let (ctx_program, ctx_errors) = lower(ctx);
-    // An exact-key miss usually means an EDIT somewhere in the context. The
-    // incremental sidecar of the previous build of this same context retains
-    // unchanged modules and their dependency closure as a partial input seed.
-    let incremental = module_hashes.and_then(|hashes| {
-        let disk = if brass_cache::enabled() {
-            brass_cache::load_context_bundle(&context_identity(CACHE_FLAVOR, hashes))
-        } else {
-            None
-        };
-        let bundle = disk.as_ref().or(prior)?;
-        let keep = clean_context_modules(ctx, hashes, &bundle.module_hashes);
-        if keep.is_empty() {
-            return None;
-        }
-        tracing::debug!(
-            target: "brass::perf",
-            kept = keep.len(),
-            total = ctx.len(),
-            "incremental context rebuild"
-        );
-        let mut partial = bundle.seed.clone();
-        if !partial.retain_modules(&ctx_program, &keep) {
-            tracing::debug!(
-                target: "brass::perf",
-                "incremental context rebuild rejected changed HIR identity"
-            );
-            return None;
-        }
-        Some(partial)
-    });
-    let analysis = brass_typeck::analyze_with(&ctx_program, incremental.as_ref());
+    let analysis = brass_typeck::analyze_with(&ctx_program, None);
     for error in analysis.errors.iter().take(5) {
         tracing::debug!(
             target: "brass::perf",
@@ -787,34 +674,7 @@ fn cached_context_seed(
         diagnostic_spans,
     );
     brass_utils::perf_phase(phase_name, t.elapsed());
-    if let (Some(key), Some(seed), true) = (key, &seed, brass_cache::enabled()) {
-        brass_cache::save_context(key, seed);
-        if let Some(hashes) = module_hashes {
-            brass_cache::save_context_bundle(
-                &context_identity(CACHE_FLAVOR, hashes),
-                &brass_cache::ContextBundle {
-                    module_hashes: hashes.to_vec(),
-                    seed: seed.clone(),
-                },
-            );
-        }
-    }
     seed
-}
-
-/// The context's IDENTITY: the frontend flavor and its module-path list,
-/// contents excluded, so an edited context still finds its own previous
-/// build's sidecar without crossing into a frontend with different rewrites.
-fn context_identity(flavor: &str, module_hashes: &[(String, [u8; 20])]) -> [u8; 20] {
-    let mut paths: Vec<&str> = module_hashes.iter().map(|(p, _)| p.as_str()).collect();
-    paths.sort_unstable();
-    let mut buf = flavor.as_bytes().to_vec();
-    buf.push(0);
-    for p in paths {
-        buf.extend_from_slice(p.as_bytes());
-        buf.push(0);
-    }
-    brass_cache::content_hash(&buf)
 }
 
 /// The source-map base encoded by the `_PATH` declaration injected at the
@@ -828,26 +688,6 @@ fn module_source_base(module: &LoadedModule) -> Option<usize> {
         }) if name == brass_resolve::MODULE_PATH_CONST => Some(span.lo),
         _ => None,
     }
-}
-
-/// Hash each module's own source by its injected source base. Source entries
-/// are discovered before recursive imports while modules are appended after
-/// them, so their vector positions are deliberately unrelated.
-fn context_module_hashes(
-    modules: &[LoadedModule],
-    sources: &brass_resolve::SourceMap,
-) -> Option<Vec<(String, [u8; 20])>> {
-    modules
-        .iter()
-        .map(|module| {
-            let base = module_source_base(module)?;
-            let source = sources.locate(base)?.src;
-            Some((
-                module.path.join("."),
-                brass_cache::content_hash(source.as_bytes()),
-            ))
-        })
-        .collect()
 }
 
 /// Find the loaded module that owns `offset`, independent of module graph
@@ -865,27 +705,6 @@ fn module_path_at(
         .map(|module| module.path.clone())
 }
 
-/// The context modules whose retained tables are still valid: source hash
-/// unchanged since `prior`, and no (transitive) import of a changed module.
-/// The import edges are matched conservatively by PATH TEXT -- an import's
-/// written path may be package-relative, so a dirty module counts as a
-/// target whenever its dotted path could resolve the import -- and a dirty
-/// implicit-prelude module dirties everything (it is visible with no
-/// import). Over-matching only re-infers more than strictly needed.
-fn clean_context_modules(
-    ctx: &[LoadedModule],
-    now: &[(String, [u8; 20])],
-    prior: &[(String, [u8; 20])],
-) -> HashSet<Vec<String>> {
-    let prior_map: HashMap<&str, &[u8; 20]> = prior.iter().map(|(p, h)| (p.as_str(), h)).collect();
-    let dirty: HashSet<String> = now
-        .iter()
-        .filter(|(p, h)| prior_map.get(p.as_str()) != Some(&h))
-        .map(|(p, _)| p.clone())
-        .collect();
-    context_modules_outside_dirty_closure(ctx, dirty)
-}
-
 /// Modules outside `dirty` and every transitive importer of a dirty module.
 /// A dirty implicit-prelude module affects every module without an explicit
 /// import edge, so none can be retained in that case.
@@ -894,8 +713,6 @@ fn context_modules_outside_dirty_closure(
     mut dirty: HashSet<String>,
 ) -> HashSet<Vec<String>> {
     if dirty.is_empty() {
-        // Identical context under a missed exact key (e.g. the entry list
-        // changed): everything is reusable.
         return ctx.iter().map(|m| m.path.clone()).collect();
     }
     if ctx
@@ -980,21 +797,19 @@ fn retain_diagnostic_free_context(
 
 /// A finished front-end analysis in thread-transportable form: the unchanged
 /// module graph, append-only generated declarations, and checker channels.
-/// HIR holds `Rc`, so a checked
-/// `Program` cannot cross the checker-thread boundary; the receiver rebuilds
-/// it from the modules with [`assemble_checked`]. A cache hit reproduces the
-/// same shape from disk (`brass_cache::Payload` stores exactly these parts).
+/// HIR holds `Rc`, so a checked `Program` cannot cross the checker-thread
+/// boundary; the receiver rebuilds it from the modules with
+/// [`assemble_checked`].
 struct AnalyzedProgram {
     modules: Vec<LoadedModule>,
     generated: Vec<brass_hir::GeneratedDecl>,
-    channels: brass_cache::Channels,
+    channels: OwnedChannels,
 }
 
 /// Re-lower an analysis result into an executable [`Checked`] program.
 /// Lowering is deterministic, so the rebuilt HIR carries the same spans and
 /// type ids the channels are keyed by. A clean analysis re-lowers cleanly; an
-/// error here means a stale cache or a driver bug, and the caller decides
-/// whether to fall back or report.
+/// error here means a driver bug.
 fn assemble_checked(analyzed: AnalyzedProgram) -> Result<Checked, Vec<String>> {
     let (mut program, lower_errors) = lower(&analyzed.modules);
     if !lower_errors.is_empty() {
@@ -1009,75 +824,18 @@ fn assemble_checked(analyzed: AnalyzedProgram) -> Result<Checked, Vec<String>> {
             .map(|e| format!("error: {}", e.message))
             .collect());
     }
-    let c = analyzed.channels;
     Ok(Checked {
         program,
-        analysis_hash: None,
-        expr_types: c.expr_types.into_iter().collect(),
-        receiver_types: c.receiver_types.into_iter().collect(),
-        view_args: c.view_args.into_iter().collect(),
-        sum_views: c.sum_views.into_iter().collect(),
-        call_locations: c.call_locations.into_iter().collect(),
-        lift_errs: c.lift_errs.into_iter().collect(),
-        fields_loops: c.fields_loops.into_iter().collect(),
-        type_names: c.type_names.into_iter().collect(),
-        typeof_types: c.typeof_types.into_iter().collect(),
-        null_props: c.null_props.into_iter().collect(),
-        type_tests: c.type_tests.into_iter().collect(),
-        keyed_dispatch: c.keyed_dispatch.into_iter().collect(),
+        channels: analyzed.channels,
     })
 }
 
-/// The analysis-cache probe: on a valid `.czcache` (same compiler, same
-/// resolution environment, every recorded source unchanged) the final module
-/// ASTs are re-lowered -- deterministic and cheap -- and the cached checker
-/// channels are used as-is, skipping type checking entirely. Only an
-/// error-free analysis is ever cached, so a hit implies a clean program; a
-/// re-lowering that nonetheless reports an error treats the cache as stale
-/// (`None`, and the caller runs the full pipeline).
-fn load_cached(main_label: &str, root: &Path) -> Option<Checked> {
-    let entry_path = PathBuf::from(main_label);
-    let search = brass_resolve::SearchPaths::from_env();
-    if !brass_cache::enabled() {
-        return None;
-    }
-    let loaded = brass_cache::load(&entry_path, CACHE_FLAVOR, &search)?;
-    let analysis_hash = loaded.analysis_hash;
-    let mut payload = loaded.payload;
-    let t = std::time::Instant::now();
-    reanchor_module_paths(&mut payload.modules, &entry_path, root, &search);
-    match assemble_checked(AnalyzedProgram {
-        modules: payload.modules,
-        generated: payload.generated,
-        channels: payload.channels,
-    }) {
-        Ok(mut checked) => {
-            checked.analysis_hash = Some(analysis_hash);
-            // The full pipeline's clean-program warnings replay so warm runs
-            // are not silently quieter than cold ones.
-            for w in &payload.warnings {
-                eprintln!("{w}");
-            }
-            brass_utils::perf_phase("front/cache-hit", t.elapsed());
-            Some(checked)
-        }
-        Err(_) => {
-            tracing::debug!(target: "brass::perf", "cache: re-lowering failed, falling back");
-            None
-        }
-    }
-}
-
 /// Parse, resolve the module graph, lower, and statically check `main_src` (a
-/// program whose label is `main_label`, imports resolved relative to `root`):
-/// the cached fast path when it is valid, the full pipeline otherwise, on the
-/// calling thread. Returns the checked program or the rendered diagnostics.
-/// Shared by eager file execution and the interactive REPL, so both report
-/// identical errors.
+/// program whose label is `main_label`, imports resolved relative to `root`)
+/// on the calling thread. Returns the checked program or the rendered
+/// diagnostics. Shared by eager file execution and the interactive REPL, so
+/// both report identical errors.
 fn analyze(main_label: &str, main_src: &str, root: &Path) -> Result<Checked, Vec<String>> {
-    if let Some(checked) = load_cached(main_label, root) {
-        return Ok(checked);
-    }
     assemble_checked(analyze_fresh(main_label, main_src, root, None)?)
 }
 
@@ -1137,10 +895,6 @@ struct ThreadScheduler {
     /// Set by the driver when the program ends: the checker stops at the
     /// next body boundary instead of finishing code nothing will run.
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Whether the stop actually interrupted the queue (an `Interrupted`
-    /// event passed through): a completed analysis stays cacheable as full
-    /// even when the stop arrived moments later.
-    interrupted: std::cell::Cell<bool>,
     /// Set while the driver is settling its entry (gate + start-up demands):
     /// the checker serves only requested bodies, so no demand ever waits for
     /// a definitional pass the queue happened to start first. Cleared when
@@ -1170,9 +924,6 @@ impl brass_typeck::stream::Scheduler for ThreadScheduler {
     }
 
     fn emit(&mut self, event: brass_typeck::stream::CheckEvent) {
-        if matches!(event, brass_typeck::stream::CheckEvent::Interrupted(_)) {
-            self.interrupted.set(true);
-        }
         // A dropped receiver means the consumer stopped listening (it
         // aborted); checking still finishes for the thread's final result.
         let _ = self.events.send(event);
@@ -1180,10 +931,6 @@ impl brass_typeck::stream::Scheduler for ThreadScheduler {
 
     fn stopped(&self) -> bool {
         self.stop.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn interrupted(&self) -> bool {
-        self.interrupted.get()
     }
 
     fn paused(&self) -> bool {
@@ -1232,58 +979,6 @@ impl MergedChannels {
                 self.apply_delta(d);
                 self.keyed_dispatch.extend(dispatch);
             }
-            // The stop-snapshot is bookkeeping for the partial cache, not
-            // channel data (everything in it was already applied as deltas).
-            CheckEvent::Interrupted(_) => {}
-        }
-    }
-
-    /// The prior run's delivered state, verbatim: what its deltas had
-    /// built up by the time it stopped.
-    fn from_snapshot(snap: &brass_typeck::stream::StreamSnapshot) -> Self {
-        MergedChannels {
-            expr_types: snap
-                .expr_flushed
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            receiver_types: snap
-                .receivers_flushed
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            // Contracts are not snapshotted: a resumed run's repeat demand
-            // revives the real instance pass, which re-emits them.
-            instance_returns: HashMap::default(),
-            view_args: snap.view_args.iter().copied().collect(),
-            sum_views: snap
-                .sum_views
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            lift_errs: snap.lift_errs.iter().copied().collect(),
-            fields_loops: snap
-                .fields_loops
-                .iter()
-                .map(|(s, f)| (*s, f.clone()))
-                .collect(),
-            type_names: snap
-                .type_names
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            typeof_types: snap
-                .typeof_types
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            null_props: snap.null_props.iter().copied().collect(),
-            type_tests: snap
-                .type_tests
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            keyed_dispatch: HashMap::default(),
         }
     }
 
@@ -1463,9 +1158,6 @@ struct LazyState {
     needs_eager: bool,
     /// The event channel closed (the checker finished and hung up).
     closed: bool,
-    /// The stop-snapshot a stopped checker handed back, for the partial
-    /// cache (everything it settled; resumes the next run).
-    snapshot: Option<brass_typeck::stream::StreamSnapshot>,
     /// A delta carried channel content since the last MIR revision. Bodies
     /// lowered before it may be missing entries the checker settled later
     /// (a cross-body pinning: an init's array literal fixed by a function's
@@ -1546,7 +1238,6 @@ impl LazyState {
                 self.generated.extend(generated.iter().cloned());
                 self.awaiting_keyed = false;
             }
-            CheckEvent::Interrupted(snapshot) => self.snapshot = Some(snapshot.clone()),
         }
         self.merged.apply(event);
     }
@@ -1797,9 +1488,7 @@ impl LazyState {
 /// is never executed or reported from -- its lazy profile types some calls
 /// from signatures without recording their instances' channel entries or
 /// per-instance diagnostics, so only a genuinely eager analysis is a whole
-/// verdict. The re-run is cache-assisted: a keyed re-pass that completed
-/// eagerly on the checker thread has already persisted the full analysis,
-/// which this load then hits.
+/// verdict.
 #[cfg(jit_backend)]
 #[allow(clippy::too_many_arguments)]
 fn finish_eagerly(
@@ -1820,7 +1509,15 @@ fn finish_eagerly(
     let _ = rt
         .block_on(checker)
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()));
-    run_fresh_eager(label, src, root)
+    tracing::debug!(target: "brass::perf", "lazy: rerunning eagerly");
+    let checked = match analyze(label, src, root) {
+        Ok(c) => c,
+        Err(diags) => return Err(print_diags(diags)),
+    };
+    execute(&checked.program, &checked.channels()).map_err(|e| {
+        report_runtime_error(&e);
+        1
+    })
 }
 
 /// Compile and prime EVERY recorded deferred target, to a fixpoint: called
@@ -1839,19 +1536,36 @@ fn drain_targets_for_spawn(
     sources: &brass_resolve::SourceMap,
     bodies: &BodySpans,
     globals: &[(String, brass_hir::Type)],
-    resume: Option<&Path>,
     lowering: &mut brass_mir::SubsetLowering,
     lazy: &mut LazyState,
     targets: &mut HashMap<String, brass_engine::DeferredSig>,
 ) -> bool {
     loop {
-        let pending: Vec<String> = targets
+        let mut pending: Vec<String> = targets
             .keys()
-            .filter(|symbol| backend.address_of(symbol).is_none())
+            .filter(|symbol| !backend.has_instance(symbol))
             .cloned()
             .collect();
+        pending.sort();
         if pending.is_empty() {
-            return true;
+            // Targets already defined in another batch still need their shared
+            // deferred slots primed. Static bodies can cross batch boundaries,
+            // so close the whole registered session before workers start.
+            let mut symbols: Vec<_> = targets.keys().collect();
+            symbols.sort();
+            for symbol in symbols {
+                let Some(address) = backend.address_of(symbol) else {
+                    return false;
+                };
+                brass_jit_llvm::prime_resolved(symbol, address);
+            }
+            return match backend.materialize_all() {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!("error: worker materialization failed: {error}");
+                    false
+                }
+            };
         }
         for symbol in pending {
             let addr = resolve_deferred(
@@ -1863,7 +1577,6 @@ fn drain_targets_for_spawn(
                 sources,
                 bodies,
                 globals,
-                resume,
                 lowering,
                 lazy,
                 targets,
@@ -1935,7 +1648,6 @@ fn resolve_deferred(
     sources: &brass_resolve::SourceMap,
     bodies: &BodySpans,
     globals: &[(String, brass_hir::Type)],
-    resume: Option<&Path>,
     lowering: &mut brass_mir::SubsetLowering,
     lazy: &mut LazyState,
     targets: &mut HashMap<String, brass_engine::DeferredSig>,
@@ -1953,18 +1665,6 @@ fn resolve_deferred(
     // before the ill-typed code could execute.
     let fatal_exit = |lazy: &mut LazyState, fallback: &str| -> usize {
         exit_if_fatal(lazy, bodies, sources);
-        // A RESUMED run's failure here may only mean the prior run's
-        // snapshot withheld an entry this body needs. Rerunning mid-run
-        // would replay side effects, so: drop the stale partial cache
-        // (the next run starts clean) and fail with the pointer.
-        if let Some(entry) = resume {
-            let _ = std::fs::remove_file(brass_cache::cache_path(entry));
-            eprintln!(
-                "error: the partial analysis cache was insufficient at run time; \
-                 it was discarded -- rerun the program"
-            );
-            std::process::exit(1);
-        }
         eprintln!("{fallback}");
         0
     };
@@ -2018,19 +1718,17 @@ fn resolve_deferred(
                 }
                 targets.extend(mono.deferred.clone());
                 let batch_spawns = brass_engine::batch_spawns(&mono);
-                // Emit every new instance's module BEFORE resolving the one
-                // address: the batch may be mutually recursive, and an
-                // address lookup finalizes all added modules -- each
-                // definition must be in place by then.
+                // Register the entire batch before a lookup can materialize
+                // any mutually recursive bodies. Registration skips definitions
+                // already supplied by startup or an earlier runtime batch.
                 for f in &mono.functions {
-                    if backend.address_of(&f.symbol).is_some() {
-                        continue;
+                    if !backend.has_instance(&f.symbol) {
+                        tracing::debug!(target: "brass::perf", symbol = %f.symbol, "lazy: runtime compile");
                     }
-                    tracing::debug!(target: "brass::perf", symbol = %f.symbol, "lazy: runtime compile");
-                    if let Err(e) = backend.emit_instance_module(&mono, f) {
-                        eprintln!("error: runtime compilation of `{}` failed: {e}", f.symbol);
-                        return 0;
-                    }
+                }
+                if let Err(error) = backend.register_batch(&mono) {
+                    eprintln!("error: runtime compilation of `{symbol}` failed: {error}");
+                    return 0;
                 }
                 drop(mono);
                 let addr = backend.address_of(symbol).unwrap_or(0);
@@ -2050,7 +1748,6 @@ fn resolve_deferred(
                         sources,
                         bodies,
                         globals,
-                        resume,
                         lowering,
                         lazy,
                         targets,
@@ -2174,30 +1871,11 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         Ok(front) => front,
         Err(diags) => return Err(print_diags(diags)),
     };
-    // Once the shared context is warm, let the second streaming run finish its
-    // entry analysis before machine code starts. That completion publishes a
-    // full `.czcache`; the same run can then bind ORC captures to its identity.
-    // The first cold run remains demand-driven while it builds the context.
-    let prime_native_cache = brass_cache::enabled()
-        && front_context_key(&front)
-            .as_ref()
-            .is_some_and(|key| brass_cache::load_context(key).is_some());
-    tracing::debug!(target: "brass::perf", prime_native_cache, "lazy: native cache prime");
     // Lower on this side first. Keyed methods no longer select the eager
     // pipeline merely by being present in the module closure.
     let (mut program, lower_errors) = lower(&front.modules);
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
     let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
-    // A prior stopped run's PARTIAL cache: the checker resumes from it
-    // (settled bodies skip their pass) and this side primes its merged
-    // channel state from the same snapshot. Stamp-validated like the full
-    // cache, so a changed source discards it wholesale.
-    let entry_path = PathBuf::from(&label);
-    let resume = if brass_cache::enabled() {
-        brass_cache::load_partial(&entry_path, PARTIAL_CACHE_FLAVOR, &search)
-    } else {
-        None
-    };
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // The checker starts PAUSED: until execution begins, it serves only the
     // driver's demands, so no demand ever waits behind a definitional pass
@@ -2208,21 +1886,19 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         requests: requests_tx,
     });
     let checker = rt.spawn_blocking({
-        let (label, front) = (label.clone(), front.clone());
+        let front = front.clone();
         let stop = stop.clone();
         let paused = paused.clone();
-        let resume = resume.clone();
         move || {
             let search = brass_resolve::SearchPaths::from_env();
             let mut sched = ThreadScheduler {
                 events: events_tx,
                 requests: requests_rx,
                 stop,
-                interrupted: std::cell::Cell::new(false),
                 paused,
                 requests_closed: false,
             };
-            check_front(&label, front, &search, Some(&mut sched), resume)
+            check_front(front, &search, Some(&mut sched))
         }
     });
     let _checker_cleanup = CheckerCleanup {
@@ -2257,7 +1933,6 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         paused,
         needs_eager: false,
         closed: false,
-        snapshot: None,
         dirty: false,
         function_ranges,
         dirty_functions: HashSet::default(),
@@ -2267,17 +1942,6 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         generated: Vec::new(),
         next_demand_batch: 0,
     };
-    if let Some(snap) = &resume {
-        // The snapshot's channel state stands in for the deltas the prior
-        // run received; the checker's resumed flushes emit only what is new.
-        // Settled-body COUNTERS are not primed: the checker announces every
-        // skipped body immediately, and counting those events keeps one
-        // bookkeeping path.
-        lazy.merged = MergedChannels::from_snapshot(snap);
-        lazy.emit_warnings(&snap.warnings);
-    }
-    let resumed = resume.is_some();
-    let resume_entry: Option<&Path> = resumed.then_some(entry_path.as_path());
     let settled = lazy.wait_gate(program.inits.len(), program.functions.contains_key("main"));
     if lazy.needs_eager {
         return finish_eagerly(
@@ -2325,16 +1989,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
     }
     if !settled {
         // The checker hung up cleanly without settling the entry: nothing
-        // fatal was held, so fall back to the whole-analysis verdict. A
-        // RESUMED checker skipped bodies, so its payload is incomplete --
-        // rerun eagerly instead.
-        if resumed {
-            // Reclaimability: the paused checker thread must exit before `rt`
-            // drops (it joins blocking tasks), and this path abandons it.
-            lazy.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            lazy.resume_background();
-            return run_fresh_eager(&label, &src, &root);
-        }
+        // fatal was held, so fall back to the whole-analysis verdict.
         return finish_eagerly(
             &rt,
             checker,
@@ -2475,51 +2130,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                                 );
                             }
                         }
-                        // A resumed snapshot may under-describe `main`
-                        // itself (its pass was skipped): rerun eagerly
-                        // rather than reject a fine program.
-                        if resumed {
-                            // Reclaimability: the paused checker thread must exit before `rt`
-                            // drops (it joins blocking tasks), and this path abandons it.
-                            lazy.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                            lazy.resume_background();
-                            return run_fresh_eager(&label, &src, &root);
-                        }
                     } else {
-                        if prime_native_cache && !lazy.closed {
-                            lazy.resume_background();
-                            while !lazy.closed && !lazy.needs_eager {
-                                lazy.pump_blocking();
-                            }
-                            if lazy.needs_eager {
-                                return finish_eagerly(
-                                    &rt,
-                                    checker,
-                                    &lazy.stop,
-                                    &lazy.paused,
-                                    lazy.events,
-                                    &label,
-                                    &src,
-                                    &root,
-                                );
-                            }
-                            match judge_fatal(&mut lazy, &bodies, &front.sources) {
-                                FatalVerdict::Clean => {}
-                                FatalVerdict::Fatal(code) => return Err(code),
-                                FatalVerdict::NeedsEager => {
-                                    return finish_eagerly(
-                                        &rt,
-                                        checker,
-                                        &lazy.stop,
-                                        &lazy.paused,
-                                        lazy.events,
-                                        &label,
-                                        &src,
-                                        &root,
-                                    );
-                                }
-                            }
-                        }
                         if lazy.dirty {
                             if lazy.refresh_lowering(&mut built, &program, &tables, &call_locations)
                             {
@@ -2739,15 +2350,6 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                             );
                         }
                     }
-                    // A resumed snapshot may simply lack an entry the prior
-                    // run withheld: rerun eagerly rather than misreport.
-                    if resumed {
-                        // Reclaimability: the paused checker thread must exit before `rt`
-                        // drops (it joins blocking tasks), and this path abandons it.
-                        lazy.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                        lazy.resume_background();
-                        return run_fresh_eager(&label, &src, &root);
-                    }
                     // A rejection against the checker's final state: held
                     // diagnostics elsewhere (a broken method the entry
                     // needs) usually explain it better than the mono error.
@@ -2814,37 +2416,6 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
             );
         }
     }
-    // A warm-context streaming run may have completed and published the full
-    // analysis while settling the entry above. Switch that same run to the
-    // cache-bound ORC path, so its emitted objects carry the just-published
-    // identity. This is also important for programs that call a non-returning
-    // native `exit`: the ORC transform publishes each group before entering it.
-    if prime_native_cache
-        && let Some(loaded) = brass_cache::load(&entry_path, CACHE_FLAVOR, &search)
-    {
-        let analysis_hash = loaded.analysis_hash;
-        let mut payload = loaded.payload;
-        reanchor_module_paths(&mut payload.modules, &entry_path, &root, &search);
-        if let Ok(checked) = assemble_checked(AnalyzedProgram {
-            modules: payload.modules,
-            generated: payload.generated,
-            channels: payload.channels,
-        }) {
-            install_jit_panic_guard();
-            let cache = brass_jit_llvm::jit::objcache::ObjectCacheSession::load(
-                entry_path.clone(),
-                analysis_hash,
-                &checked.program,
-            );
-            let result =
-                brass_jit_llvm::run_lazy_cached(&checked.program, &checked.channels(), cache);
-            stop_checker(&rt, checker, &mut lazy);
-            return result.map_err(|error| {
-                report_runtime_error(&error);
-                1
-            });
-        }
-    }
     install_jit_panic_guard();
     // The deferred runtime: reject an untypeable `main` exactly as `run_mono`
     // would, compile the startup set, then run with the resolver installed --
@@ -2859,13 +2430,11 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         report_runtime_error(&reason);
         return Err(1);
     }
-    use brass_engine::Codegen as _;
     let codegen_started = std::time::Instant::now();
-    let context = inkwell::context::Context::create();
-    let mut backend = brass_jit_llvm::LlvmCodegen::new_backend(&context, &program);
+    let context = brass_jit_llvm::OrcContext::new();
+    let mut backend = brass_jit_llvm::LlvmCodegen::new_orc_backend(&context, &program);
     let _resolved_session = brass_jit_llvm::resolved_session();
-    backend.begin_program(&mono);
-    backend.codegen_program(&mono);
+    let prepared = backend.prepare_lazy_orc(&mono);
     tracing::debug!(
         target: "brass::perf",
         elapsed_ms = codegen_started.elapsed().as_secs_f64() * 1000.0,
@@ -2879,7 +2448,7 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
     // Free the lowering for the resolver's on-demand additions.
     drop(mono);
     let finalize_started = std::time::Instant::now();
-    let finalized = backend.finalize_deferred();
+    let finalized = prepared.and_then(|()| backend.precompile_spawn());
     tracing::debug!(
         target: "brass::perf",
         elapsed_ms = finalize_started.elapsed().as_secs_f64() * 1000.0,
@@ -2901,14 +2470,13 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                     &front.sources,
                     &bodies,
                     &globals,
-                    resume_entry,
                     &mut lowering,
                     &mut lazy,
                     &mut targets,
                 );
             if drained {
                 // Execution begins: from here the background queue fills the
-                // wait on the running program (and grows the partial cache).
+                // wait on the running program.
                 lazy.resume_background();
                 let mut resolve = |backend: &mut brass_jit_llvm::LlvmCodegen, symbol: &str| {
                     resolve_deferred(
@@ -2920,13 +2488,12 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
                         &front.sources,
                         &bodies,
                         &globals,
-                        resume_entry,
                         &mut lowering,
                         &mut lazy,
                         &mut targets,
                     )
                 };
-                backend.execute_deferred(&mut resolve)
+                backend.execute_with_resolver(&mut resolve)
             } else {
                 Err("lazy compilation could not pre-compile the spawned code".to_string())
             }
@@ -2941,9 +2508,8 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
     // The program finished (or failed at runtime); the checker may still be
     // working through code this run never executed, and lazy checking
     // ignores whatever it would find there -- the complete verdict is
-    // `brass check`'s job. Stop it at the next body boundary, persist what
-    // it settled as the partial cache (the next run resumes from it), and
-    // reclaim the thread; held diagnostics are discarded by policy.
+    // `brass check`'s job. Stop it at the next body boundary and reclaim the
+    // thread; held diagnostics are discarded by policy.
     let stop_started = std::time::Instant::now();
     stop_checker(&rt, checker, &mut lazy);
     tracing::debug!(
@@ -2951,7 +2517,6 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         elapsed_ms = stop_started.elapsed().as_secs_f64() * 1000.0,
         "lazy: stop checker"
     );
-    save_partial_cache(&entry_path, &front.sources, &search, &bodies, &mut lazy);
     match result {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -2959,99 +2524,6 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
             Err(1)
         }
     }
-}
-
-/// The last-resort fallback for a RESUMED run whose snapshot proves
-/// insufficient (an entry the prior run withheld as still-open never made
-/// it into the cache, and the skipped body will not re-emit it): rerun the
-/// whole pipeline eagerly, in process. `finish_eagerly` cannot serve here --
-/// a resumed checker skipped bodies, so its final payload is incomplete.
-/// The eager rerun also REPLACES the failing partial cache with a full one,
-/// self-healing the next run.
-#[cfg(jit_backend)]
-fn run_fresh_eager(label: &str, src: &str, root: &Path) -> Result<(), u8> {
-    tracing::debug!(target: "brass::perf", "lazy: resume fell short, rerunning eagerly");
-    let checked = match analyze(label, src, root) {
-        Ok(c) => c,
-        Err(diags) => return Err(print_diags(diags)),
-    };
-    execute(&checked.program, &checked.channels(), false, None).map_err(|e| {
-        report_runtime_error(&e);
-        1
-    })
-}
-
-/// Every relocatable input guard shared by full and partial caches. Source
-/// files retain their origin-relative stamps; plugins retain a logical import
-/// path plus binary hash and are rediscovered by normal resolution on load.
-struct CacheStamps {
-    sources: Vec<brass_cache::FileStamp>,
-    plugins: Vec<brass_cache::PluginStamp>,
-}
-
-/// Stamp every loaded source and plugin for a cache payload. Source text is
-/// the exact text parsed, while plugin bytes come from the library whose
-/// manifest produced the synthesized module. `None` makes the build
-/// uncacheable rather than publishing incomplete guards.
-fn stamp_sources(
-    entry: &Path,
-    sources: &brass_resolve::SourceMap,
-    search: &brass_resolve::SearchPaths,
-) -> Option<CacheStamps> {
-    let roots = brass_cache::StampRoots::new(entry, search);
-    let source_stamps = sources
-        .source_files()
-        .map(|(path, text)| brass_cache::FileStamp::of_text(path, text, &roots))
-        .collect();
-    let plugins = sources
-        .plugins()
-        .map(|(module, library)| brass_cache::PluginStamp::of(module, library))
-        .collect::<Option<Vec<_>>>()?;
-    Some(CacheStamps {
-        sources: source_stamps,
-        plugins,
-    })
-}
-
-/// Persist a stopped run's settled state as the PARTIAL cache, so the next
-/// lazy run resumes checking where this one left off. Bodies owning a held
-/// diagnostic are dropped from the settled set (per body, the cache implies
-/// clean); a keyed restart leaves nothing coherent to save.
-#[cfg(jit_backend)]
-fn save_partial_cache(
-    entry: &Path,
-    sources: &brass_resolve::SourceMap,
-    search: &brass_resolve::SearchPaths,
-    bodies: &BodySpans,
-    lazy: &mut LazyState,
-) {
-    if !brass_cache::enabled() || lazy.needs_eager {
-        return;
-    }
-    let Some(mut snapshot) = lazy.snapshot.take() else {
-        return;
-    };
-    let errored: HashSet<&str> = lazy
-        .held
-        .iter()
-        .filter_map(|e| bodies.owner(e.span))
-        .collect();
-    snapshot
-        .checked
-        .retain(|symbol| !errored.contains(symbol.as_str()));
-    let Some(stamps) = stamp_sources(entry, sources, search) else {
-        return;
-    };
-    brass_cache::save_partial(
-        entry,
-        PARTIAL_CACHE_FLAVOR,
-        &brass_cache::PartialPayload {
-            deps: stamps.sources,
-            packages: brass_cache::package_names(search),
-            plugins: stamps.plugins,
-            snapshot,
-        },
-    );
 }
 
 /// Stop the checker and reclaim its thread. The stop flag is polled at body
@@ -3082,17 +2554,16 @@ fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
         Ok(c) => c,
         Err(diags) => return Err(print_diags(diags)),
     };
-    execute(&checked.program, &checked.channels(), false, None).map_err(|e| {
+    execute(&checked.program, &checked.channels()).map_err(|e| {
         report_runtime_error(&e);
         1
     })
 }
 
 /// The full front-end pipeline on the calling thread: parse, resolve, lower,
-/// and statically check, with no cache probe. Returns the analysis in
-/// thread-transportable form ([`AnalyzedProgram`]); the executable program is
-/// rebuilt from it with [`assemble_checked`]. Persists the analysis to the
-/// cache when possible.
+/// and statically check. Returns the analysis in thread-transportable form
+/// ([`AnalyzedProgram`]); the executable program is rebuilt from it with
+/// [`assemble_checked`].
 ///
 /// With a scheduler, the type check streams its progress through it (see
 /// `brass_typeck::stream`). Keyed continuations append generated declarations
@@ -3105,7 +2576,7 @@ fn analyze_fresh(
 ) -> Result<AnalyzedProgram, Vec<String>> {
     let search = brass_resolve::SearchPaths::from_env();
     let front = front_load(main_label, main_src, root, &search)?;
-    check_front(main_label, front, &search, sched, None)
+    check_front(front, &search, sched)
 }
 
 /// The assembled front end, ready to check: the final module graph
@@ -3117,34 +2588,10 @@ fn analyze_fresh(
 struct FrontEnd {
     modules: Vec<LoadedModule>,
     sources: brass_resolve::SourceMap,
-    /// Byte-offset base the entry source was parsed at (identifies the entry
-    /// in `sources` when hashing the context).
-    entry_base: usize,
-    /// Driver-side clean-program warnings (spawn auto-acquire notes), already
-    /// printed; checker warnings join them after analysis for cache replay.
-    warnings: Vec<String>,
     /// Qualified-use and spawn-ownership diagnostics: not fatal on their own
     /// here -- they abort the analysis together with lowering and type
     /// errors, keeping the eager report order.
     errors: Vec<(String, Span)>,
-}
-
-/// The shared context identity derived from an assembled front end. Kept in one
-/// helper so the streaming driver can recognize a warm context and the checker
-/// thread probes exactly the same key.
-fn front_context_key(front: &FrontEnd) -> Option<[u8; 20]> {
-    let context_end = front.modules.len().checked_sub(1)?;
-    brass_cache::context_key(
-        CACHE_FLAVOR,
-        front.modules[..context_end]
-            .iter()
-            .map(|module| module.path.join(".")),
-        front
-            .sources
-            .entries()
-            .filter(|(base, _)| *base != front.entry_base)
-            .map(|(_, source)| brass_cache::content_hash(source.as_bytes())),
-    )
 }
 
 /// Parse, resolve the module graph, and run the AST rewrites (qualified-use
@@ -3189,76 +2636,44 @@ fn front_load(
     // The pass may reject a `spawn` it cannot analyze; those diagnostics join the
     // analysis errors.
     #[cfg(jit_backend)]
-    let warnings: Vec<String> = {
-        let warnings = report_spawn_ownership(&modules);
-        for w in &warnings {
+    {
+        for w in report_spawn_ownership(&modules) {
             eprintln!("{w}");
         }
         errors.extend(auto_acquire_modules(&mut modules));
-        warnings
-    };
-    #[cfg(not(jit_backend))]
-    let warnings: Vec<String> = Vec::new();
+    }
 
     Ok(FrontEnd {
         modules,
         sources,
-        entry_base: front.entry_base,
-        warnings,
         errors,
     })
 }
 
 /// Statically check an assembled front end and package the result: the check
 /// half of [`analyze_fresh`], and what the lazy runner's checker thread
-/// executes over its copy of the modules. Persists the analysis to the cache
-/// when possible.
+/// executes over its copy of the modules.
 fn check_front(
-    main_label: &str,
     front: FrontEnd,
     search: &brass_resolve::SearchPaths,
     mut sched: Option<&mut dyn brass_typeck::stream::Scheduler>,
-    resume: Option<brass_typeck::stream::StreamSnapshot>,
 ) -> Result<AnalyzedProgram, Vec<String>> {
     let phase = |name: &'static str, at: std::time::Instant| {
         brass_utils::perf_phase(name, at.elapsed());
     };
-    let entry_path = PathBuf::from(main_label);
-    let ctx_key = front_context_key(&front);
     let streaming = sched.is_some();
     let FrontEnd {
         modules,
         sources,
-        entry_base: _,
-        mut warnings,
         errors: front_errors,
     } = front;
 
-    // The context key: module names plus the hash of every source that is not
-    // the entry's. Contents, not ASTs, because the entry's length shifts every
-    // later module's spans -- an AST key would treat each entry edit as a new
-    // context. The front rewrites are deterministic functions of these
-    // sources, so pre-rewrite content identifies the post-rewrite context.
+    // The context seed: the analysis tables of every module EXCEPT the entry
+    // (the last one loaded), reused so the full check below re-infers only the
+    // entry. A context with diagnostics yields no seed (or a partial one) and
+    // the full run reports everything as before.
     let ctx_end = modules.len() - 1;
-
-    // Per-module (dotted path, source hash) pairs for the incremental context
-    // rebuild. Each module is matched to its source through the injected span
-    // base; dependency traversal gives modules and sources different orders.
-    let ctx_module_hashes = context_module_hashes(&modules[..ctx_end], &sources);
-    // The context seed: the analysis tables of every module EXCEPT the entry,
-    // reused so the full check below re-infers only the entry. Looked up in the
-    // shared on-disk store when caching is enabled; rebuilt (and stored) from a
-    // context-only run otherwise -- incrementally when the previous build of
-    // this same context is on disk. A context with diagnostics yields no seed
-    // and the full run reports everything as before.
-    let ctx_seed = cached_context_seed(
-        &ctx_key,
-        &modules[..ctx_end],
-        &sources,
-        ctx_module_hashes.as_deref(),
-        None,
-        "front/context-check",
-    );
+    let ctx_seed = context_seed(&modules[..ctx_end], &sources, "front/context-check");
 
     tracing::debug!(modules = modules.len(), "lowering module graph to HIR");
     let t = std::time::Instant::now();
@@ -3295,7 +2710,7 @@ fn check_front(
     }
     let t = std::time::Instant::now();
     let mut analysis = match sched.as_deref_mut() {
-        Some(s) => brass_typeck::analyze_streaming(&program, ctx_seed.as_ref(), s, resume.as_ref()),
+        Some(s) => brass_typeck::analyze_streaming(&program, ctx_seed.as_ref(), s),
         None => brass_typeck::analyze_with(&program, ctx_seed.as_ref()),
     };
     phase("front/typecheck", t);
@@ -3311,7 +2726,7 @@ fn check_front(
             match specialize_keyed(&mut program, &mut analysis) {
                 Ok((generated, keyed_dispatch)) => {
                     phase("front/keyed-continuation", t);
-                    if let Some(s) = sched.as_deref_mut() {
+                    if let Some(s) = sched {
                         let mut delta = analysis_channel_delta(&analysis, &program);
                         delta.errors.extend(errors.iter().map(|(message, span)| {
                             brass_typeck::TypeError {
@@ -3346,13 +2761,12 @@ fn check_front(
         .collect();
     checker_warnings.sort_by(|a, b| (a.1.lo, &a.0).cmp(&(b.1.lo, &b.0)));
     checker_warnings.dedup();
-    let rendered_warnings = render_warnings(&checker_warnings, &sources);
+    // A streaming consumer prints warnings as their body deltas arrive.
     if !streaming {
-        for warning in &rendered_warnings {
+        for warning in render_warnings(&checker_warnings, &sources) {
             eprintln!("{warning}");
         }
     }
-    warnings.extend(rendered_warnings);
     tracing::debug!(errors = errors.len(), "front-end analysis complete");
     if !errors.is_empty() {
         errors.sort_by(|a, b| (a.1.lo, &a.0).cmp(&(b.1.lo, &b.0)));
@@ -3363,53 +2777,20 @@ fn check_front(
     let expr_types = brass_typeck::stream::aggregate_result_types(&analysis.typed, &program);
     let receiver_types = brass_typeck::stream::method_receiver_types(&analysis.typed, &program);
     let call_locations = call_site_locations(&modules, &sources, search);
-    let channels = brass_cache::Channels {
-        expr_types: expr_types.into_iter().collect(),
-        receiver_types: receiver_types.into_iter().collect(),
-        view_args: analysis.view_args.into_iter().collect(),
-        sum_views: analysis.sum_views.into_iter().collect(),
-        call_locations: call_locations.into_iter().collect(),
-        lift_errs: analysis.lift_errs.into_iter().collect(),
-        fields_loops: analysis.fields_loops.into_iter().collect(),
-        type_names: analysis.type_names.into_iter().collect(),
-        typeof_types: analysis.typeof_types.into_iter().collect(),
-        null_props: analysis.null_props.into_iter().collect(),
-        type_tests: analysis.type_tests.into_iter().collect(),
-        keyed_dispatch: keyed_dispatch.into_iter().collect(),
+    let channels = OwnedChannels {
+        expr_types,
+        receiver_types,
+        view_args: analysis.view_args,
+        sum_views: analysis.sum_views,
+        call_locations,
+        lift_errs: analysis.lift_errs,
+        fields_loops: analysis.fields_loops,
+        type_names: analysis.type_names,
+        typeof_types: analysis.typeof_types,
+        null_props: analysis.null_props,
+        type_tests: analysis.type_tests,
+        keyed_dispatch,
     };
-    // A stopped (lazy-exit) analysis is INCOMPLETE: bodies past the stop
-    // point were never checked, so caching it as a full verdict would replay
-    // missing channels into future runs. Only a run the checker finished may
-    // persist.
-    let stopped = sched.as_deref().is_some_and(|s| s.interrupted());
-    // Persist the clean analysis for the next run. Source stamps use the exact
-    // parsed text; plugin stamps use the logical module path and current binary
-    // contents. The serialized module clone normalizes wrappers to stable
-    // import identities; loading resolves and registers real paths before
-    // lowering. Anything that cannot be stamped makes the build uncacheable.
-    if brass_cache::enabled() && !stopped {
-        let t = std::time::Instant::now();
-        if let Some(stamps) = stamp_sources(&entry_path, &sources, search)
-            && let Some(cached_modules) = brass_cache::modules_for_cache(&modules, &stamps.plugins)
-        {
-            let payload = brass_cache::Payload {
-                deps: stamps.sources,
-                packages: brass_cache::package_names(search),
-                plugins: stamps.plugins,
-                modules: cached_modules,
-                generated: generated.clone(),
-                warnings,
-                channels,
-            };
-            let _ = brass_cache::save(&entry_path, CACHE_FLAVOR, &payload);
-            phase("front/cache-save", t);
-            return Ok(AnalyzedProgram {
-                modules,
-                generated,
-                channels: payload.channels,
-            });
-        }
-    }
     Ok(AnalyzedProgram {
         modules,
         generated,
@@ -3641,8 +3022,7 @@ fn remove_provisional_keyed_diagnostics(
 /// Every call expression's span mapped to its source position (diagnostic
 /// label, 1-based line and column). MIR lowering reads this to fill a
 /// callee's implicit trailing `Location` parameter with the call site;
-/// computing it here keeps source access out of the type-free lowering, and
-/// the map reproduces from the cache (whose ASTs carry the same spans).
+/// computing it here keeps source access out of the type-free lowering.
 fn call_site_locations(
     modules: &[LoadedModule],
     sources: &brass_resolve::SourceMap,
@@ -4114,8 +3494,8 @@ mod tests {
     #[cfg(jit_backend)]
     use super::{CheckerCleanup, CheckerPause, demand_loop_progress};
     use super::{
-        context_identity, context_module_hashes, module_path_at, program_file_index,
-        remove_provisional_keyed_diagnostics, retain_diagnostic_free_context,
+        module_path_at, program_file_index, remove_provisional_keyed_diagnostics,
+        retain_diagnostic_free_context,
     };
     use brass_hir::LoadedModule;
     use brass_parser::Span;
@@ -4228,31 +3608,21 @@ mod tests {
     }
 
     #[test]
-    fn context_hashes_follow_source_bases_not_module_order() {
+    fn module_ownership_follows_source_bases_not_module_order() {
         // Recursive loading records a parent source before its dependency but
-        // appends the dependency module first. Hash ownership follows spans.
+        // appends the dependency module first. Ownership follows spans.
         let mut sources = brass_resolve::SourceMap::default();
         let a = sources.add(None, "a".to_string(), "source a".to_string());
         let b = sources.add(None, "b".to_string(), "source b".to_string());
         let modules = vec![loaded("b", b), loaded("a", a)];
 
-        let hashes = context_module_hashes(&modules, &sources).expect("attributable modules");
-        assert_eq!(hashes[0].0, "b");
-        assert_eq!(hashes[0].1, brass_cache::content_hash(b"source b"));
-        assert_eq!(hashes[1].0, "a");
-        assert_eq!(hashes[1].1, brass_cache::content_hash(b"source a"));
         assert_eq!(
             module_path_at(&modules, &sources, a + 1),
             Some(vec!["a".into()])
         );
-    }
-
-    #[test]
-    fn context_bundle_identity_separates_frontend_flavors() {
-        let modules = vec![("core.io".to_string(), [7; 20])];
-        assert_ne!(
-            context_identity("jit", &modules),
-            context_identity("repl", &modules)
+        assert_eq!(
+            module_path_at(&modules, &sources, b + 1),
+            Some(vec!["b".into()])
         );
     }
 

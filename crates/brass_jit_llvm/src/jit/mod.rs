@@ -10,7 +10,7 @@
 //! [`crate::codegen`].
 
 pub mod engine;
-pub mod objcache;
+pub(crate) mod objcache;
 pub(crate) mod orc;
 
-pub use engine::{run, run_lazy, run_lazy_cached, run_mono};
+pub use engine::{run, run_mono};

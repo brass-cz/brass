@@ -251,8 +251,7 @@ arm.
 ## Compile-time cost
 
 Reflective decoding is specialized at compile time: each `(receiver, method,
-target type)` triple becomes a generated concrete method, and injecting those
-changes the program, so the whole front end type-checks a second time. A
-keyed build costs roughly twice a plain one; the caches described in
-[Performance & caching](/references/performance/) absorb that cost: the
-`.czcache` makes every unchanged build skip both passes entirely.
+target type)` triple becomes a generated concrete method. A continuation pass
+checks only those generated bodies after the main analysis, repeating while
+they request further specializations; the `front/keyed-continuation` phase in
+[Performance diagnostics](/references/performance/) reports its cost.

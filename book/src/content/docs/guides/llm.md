@@ -355,7 +355,7 @@ Ownership is inferred; there is no user-facing move/freeze/cown syntax. Keep
 blocking operations out of a shared acquisition and call `sync()` before
 reading results that tasks mutate.
 
-## Execution, caching, and tools
+## Execution and tools
 
 - `brass file.cz`: demand-driven check, native compile, and run.
 - `brass check file.cz`: complete check without execution; use in CI.
@@ -363,9 +363,8 @@ reading results that tasks mutate.
   native compilation is first-use in both modes.
 - `brass repl`: eager interpreter session. Concurrency is unavailable.
 - `czfmt --write file.cz`: format source. `czls`: language server.
-- `.czcache` may be a full check or a partial normal-run snapshot; file
-  existence alone is not a complete verdict. `BRASS_CACHE=off` disables
-  analysis caches.
+- Every run checks from source; only native code is cached
+  (`$XDG_CACHE_HOME/brass/jit/`, `BRASS_JIT_CACHE=off` disables it).
 
 ## Frequent generation mistakes
 

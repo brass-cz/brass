@@ -1,502 +1,330 @@
-//! Versioned native-object packfiles for lazy ORC groups.
-//!
-//! Each pack is bound to the serialized analysis-cache body that produced the
-//! monomorphized program and to the complete native target identity. Groups
-//! carry their full ordered public-symbol list as an additional structural
-//! guard: a stable first-symbol key alone must never revive an object after the
-//! grouping algorithm or reachable instance set changes. A group also records
-//! the module `_PATH` values its code embeds, so relocating a project only
-//! invalidates the objects whose constants actually changed.
+//! Content-addressed native objects for ORC sessions. Keys describe the exact
+//! input to optimization and instruction selection; storage never depends on
+//! source paths, analysis artifacts, or a separately maintained symbol list.
 
-use std::collections::HashMap;
-use std::ffi::CStr;
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use llvm_sys::core::LLVMDisposeMessage;
-use llvm_sys::target_machine::LLVMGetDefaultTargetTriple;
+use sha2::{Digest, Sha256};
 
-use super::orc::{OptTier, target_cpu_identity};
+use super::orc::OptTier;
 
-const OBJECT_PACK_FORMAT_VERSION: u16 = 2;
-const MODULE_PATH_CONST: &str = "_PATH";
+const MAGIC: &[u8; 8] = b"CZOBJ\0\0\0";
+const FORMAT_VERSION: u32 = 1;
+const HEADER_LEN: usize = 8 + 4 + 8 + 32;
+const DEFAULT_MAX_MB: u64 = 256;
+static STORE: OnceLock<Option<Arc<ObjectStore>>> = OnceLock::new();
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-type CurrentModulePaths = HashMap<Vec<String>, String>;
-type CachedGroups = HashMap<String, CachedObject>;
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct ModulePathBinding {
-    module: Vec<String>,
-    value: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-struct PackedGroup {
-    key: String,
-    symbols: Vec<String>,
-    path_bindings: Vec<ModulePathBinding>,
-    object: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CachedObject {
-    symbols: Vec<String>,
-    path_bindings: Vec<ModulePathBinding>,
-    object: Vec<u8>,
-}
-
-pub(crate) struct GroupMetadata {
-    pub(crate) symbols: Vec<String>,
-    pub(crate) path_bindings: Vec<ModulePathBinding>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-struct ObjectPack {
-    analysis_hash: [u8; 20],
-    triple: String,
-    cpu: String,
-    features: String,
-    groups: Vec<PackedGroup>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct TargetIdentity {
-    triple: String,
-    cpu: String,
-    features: String,
-}
-
-/// Native objects whose header, analysis identity, and target identity have
-/// already been validated. The driver may pass this opaque value into the JIT;
-/// group-level symbol validation remains the code generator's responsibility.
-pub struct ValidatedObjects {
-    groups: CachedGroups,
-}
-
-impl ValidatedObjects {
-    pub(crate) fn matching_object(&self, key: &str, symbols: &[String]) -> Option<&[u8]> {
-        let cached = self.groups.get(key)?;
-        (cached.symbols == symbols).then_some(cached.object.as_slice())
-    }
-}
-
-/// Current logical-module to `_PATH` bindings, read from the injected module
-/// constants after analysis-cache re-anchoring.
-pub(crate) fn module_path_bindings(program: &brass_hir::Program) -> Vec<ModulePathBinding> {
-    use brass_parser::ast::{Expr, Pattern, Stmt, StrSeg};
-
-    let mut bindings: Vec<_> = program
-        .inits
-        .iter()
-        .filter_map(|init| {
-            let value = init.stmts.iter().find_map(|stmt| match stmt {
-                Stmt::Let {
-                    pat: Pattern::Binding(name, _),
-                    value: Some(Expr::Str(segments, _)),
-                    is_const: true,
-                    ..
-                } if name == MODULE_PATH_CONST => match segments.as_slice() {
-                    [StrSeg::Lit(value)] => Some(value.clone()),
-                    _ => None,
-                },
-                _ => None,
-            })?;
-            Some(ModulePathBinding {
-                module: init.path.clone(),
-                value,
-            })
-        })
-        .collect();
-    bindings.sort_by(|left, right| left.module.cmp(&right.module));
-    bindings
-}
-
-/// The `_PATH` constants emitted by this exact lazy group. Module initializer
-/// bodies are the only code that stores those injected globals; groups without
-/// such a store remain location-independent.
-pub(crate) fn group_path_bindings(
-    functions: &[brass_engine::MonoFunction<'_>],
-    module_paths: &[ModulePathBinding],
-) -> Vec<ModulePathBinding> {
-    let globals: HashMap<_, _> = module_paths
-        .iter()
-        .map(|binding| {
-            (
-                brass_hir::qualify(MODULE_PATH_CONST, &binding.module),
-                binding,
-            )
-        })
-        .collect();
-    let mut embedded: HashMap<Vec<String>, ModulePathBinding> = HashMap::new();
-    for function in functions {
-        for statement in function.body.blocks.iter().flat_map(|block| &block.stmts) {
-            if let brass_mir::MirStmt::SetGlobal(name, _) = statement
-                && let Some(binding) = globals.get(name)
-            {
-                embedded.insert(binding.module.clone(), (*binding).clone());
-            }
-        }
-    }
-    let mut embedded: Vec<_> = embedded.into_values().collect();
-    embedded.sort_by(|left, right| left.module.cmp(&right.module));
-    embedded
-}
-
-/// One object emitted during this run, paired with the exact lazy group shape
-/// needed to validate and reload it later.
-pub(crate) struct CapturedObject {
-    pub(crate) group_key: String,
-    pub(crate) symbols: Vec<String>,
-    pub(crate) path_bindings: Vec<ModulePathBinding>,
-    pub(crate) object: Vec<u8>,
-}
-
-/// Per-run native-cache state created by the driver after a full analysis-cache
-/// hit. Construction probes the preferred compatible pack (`O2` before `O0`
-/// for an `O0` run); saving always merges captures into the current tier.
-pub struct ObjectCacheSession {
-    entry: PathBuf,
-    analysis_hash: [u8; 20],
-    module_paths: CurrentModulePaths,
-    objects: Option<ValidatedObjects>,
-}
-
-impl ObjectCacheSession {
-    /// Load compatible native objects for `entry`, bound to `analysis_hash`.
-    /// Missing, stale, mismatched, and corrupted files all produce an empty
-    /// session and fall back to ordinary LLVM compilation group by group.
-    pub fn load(
-        entry: impl Into<PathBuf>,
-        analysis_hash: [u8; 20],
-        program: &brass_hir::Program,
-    ) -> Self {
-        let entry = entry.into();
-        let module_paths = module_path_bindings(program)
-            .into_iter()
-            .map(|binding| (binding.module, binding.value))
-            .collect();
-        let objects = brass_cache::enabled()
-            .then(|| load_preferred(&entry, analysis_hash, OptTier::from_env(), &module_paths))
-            .flatten();
-        Self {
-            entry,
-            analysis_hash,
-            module_paths,
-            objects,
-        }
-    }
-
-    pub(crate) fn objects(&self) -> Option<&ValidatedObjects> {
-        self.objects.as_ref()
-    }
-
-    pub(crate) fn writer(
-        &self,
-        group_metadata: HashMap<String, GroupMetadata>,
-    ) -> Option<ObjectCacheWriter> {
-        if !brass_cache::enabled() {
-            return None;
-        }
-        ObjectCacheWriter::new(
-            self.entry.clone(),
-            self.analysis_hash,
-            OptTier::from_env(),
-            &self.module_paths,
-            group_metadata,
-        )
-    }
-
-    pub(crate) fn save(self, captured: Vec<CapturedObject>) {
-        if brass_cache::enabled() && !captured.is_empty() {
-            save_captures(
-                &self.entry,
-                self.analysis_hash,
-                OptTier::from_env(),
-                &self.module_paths,
-                captured,
-            );
-        }
-    }
-}
-
-/// Incremental publisher used by ORC while JIT code is running. Some native
-/// functions terminate the process and never return to the driver, so each new
-/// object is atomically merged before control enters the linked machine code.
-pub(crate) struct ObjectCacheWriter {
-    entry: PathBuf,
-    analysis_hash: [u8; 20],
-    tier: OptTier,
-    target: TargetIdentity,
-    group_metadata: HashMap<String, GroupMetadata>,
-    groups: CachedGroups,
-}
-
-impl ObjectCacheWriter {
-    fn new(
-        entry: PathBuf,
-        analysis_hash: [u8; 20],
-        tier: OptTier,
-        module_paths: &CurrentModulePaths,
-        group_metadata: HashMap<String, GroupMetadata>,
-    ) -> Option<Self> {
-        let target = target_identity()?;
-        let groups = load_tier(&entry, analysis_hash, tier, &target, module_paths)
-            .map(|objects| objects.groups)
-            .unwrap_or_default();
-        Some(Self {
-            entry,
-            analysis_hash,
-            tier,
-            target,
-            group_metadata,
-            groups,
-        })
-    }
-
-    pub(crate) fn record(&mut self, group_key: &str, object: &[u8]) {
-        let Some(metadata) = self.group_metadata.get(group_key) else {
-            return;
-        };
-        self.groups.insert(
-            group_key.to_string(),
-            CachedObject {
-                symbols: metadata.symbols.clone(),
-                path_bindings: metadata.path_bindings.clone(),
-                object: object.to_vec(),
-            },
-        );
-        write_groups(
-            &self.entry,
-            self.analysis_hash,
-            self.tier,
-            &self.target,
-            &self.groups,
-        );
-    }
-}
-
-fn load_preferred(
-    entry: &Path,
-    analysis_hash: [u8; 20],
-    tier: OptTier,
-    module_paths: &CurrentModulePaths,
-) -> Option<ValidatedObjects> {
-    let target = target_identity()?;
-    let tiers: &[OptTier] = match tier {
-        OptTier::O0 => &[OptTier::O2, OptTier::O0],
-        OptTier::O2 => &[OptTier::O2],
-    };
-    tiers
-        .iter()
-        .find_map(|candidate| load_tier(entry, analysis_hash, *candidate, &target, module_paths))
-}
-
-fn load_tier(
-    entry: &Path,
-    analysis_hash: [u8; 20],
-    tier: OptTier,
-    target: &TargetIdentity,
-    module_paths: &CurrentModulePaths,
-) -> Option<ValidatedObjects> {
-    object_paths(entry, tier)
-        .into_iter()
-        .find_map(|path| load_path(&path, analysis_hash, tier, target, module_paths))
-}
-
-fn load_path(
-    path: &Path,
-    analysis_hash: [u8; 20],
-    tier: OptTier,
-    target: &TargetIdentity,
-    module_paths: &CurrentModulePaths,
-) -> Option<ValidatedObjects> {
-    let bytes = std::fs::read(path).ok()?;
-    let tag = brass_cache::cache_tag(&tier.cache_flavor())?;
-    let body = brass_cache::decode_file(&bytes, &tag)?;
-    let pack: ObjectPack = postcard::from_bytes(body).ok()?;
-    let portable_generic = pack.cpu == "generic" && pack.features.is_empty();
-    if pack.analysis_hash != analysis_hash
-        || pack.triple != target.triple
-        || (!portable_generic && (pack.cpu != target.cpu || pack.features != target.features))
-    {
-        return None;
-    }
-    let groups = pack
-        .groups
-        .into_iter()
-        .filter_map(|group| {
-            if path_bindings_match(&group.path_bindings, module_paths) {
-                Some((
-                    group.key,
-                    CachedObject {
-                        symbols: group.symbols,
-                        path_bindings: group.path_bindings,
-                        object: group.object,
-                    },
-                ))
-            } else {
-                tracing::debug!(
-                    target: "brass::perf",
-                    group = %group.key,
-                    "object cache: _PATH binding mismatch"
-                );
-                None
-            }
-        })
-        .collect();
-    Some(ValidatedObjects { groups })
-}
-
-fn path_bindings_match(bindings: &[ModulePathBinding], current: &CurrentModulePaths) -> bool {
-    bindings
-        .iter()
-        .all(|binding| current.get(&binding.module) == Some(&binding.value))
-}
-
-fn save_captures(
-    entry: &Path,
-    analysis_hash: [u8; 20],
-    tier: OptTier,
-    module_paths: &CurrentModulePaths,
-    captured: Vec<CapturedObject>,
-) {
-    let group_metadata = captured
-        .iter()
-        .map(|capture| {
-            (
-                capture.group_key.clone(),
-                GroupMetadata {
-                    symbols: capture.symbols.clone(),
-                    path_bindings: capture.path_bindings.clone(),
-                },
-            )
-        })
-        .collect();
-    let Some(mut writer) = ObjectCacheWriter::new(
-        entry.to_path_buf(),
-        analysis_hash,
-        tier,
-        module_paths,
-        group_metadata,
-    ) else {
-        return;
-    };
-    for capture in captured {
-        writer.groups.insert(
-            capture.group_key,
-            CachedObject {
-                symbols: capture.symbols,
-                path_bindings: capture.path_bindings,
-                object: capture.object,
-            },
-        );
-    }
-    write_groups(
-        &writer.entry,
-        writer.analysis_hash,
-        writer.tier,
-        &writer.target,
-        &writer.groups,
+/// Disable the process object store before any session is constructed. Integration
+/// test binaries call this before creating backends, protecting the user's cache.
+/// Repeated calls are allowed only when storage was already pinned off.
+#[doc(hidden)]
+pub fn disable_jit_cache_for_tests() {
+    assert!(
+        STORE.get_or_init(|| None).is_none(),
+        "JIT store already enabled"
     );
 }
 
-fn write_groups(
-    entry: &Path,
-    analysis_hash: [u8; 20],
-    tier: OptTier,
-    target: &TargetIdentity,
-    groups: &CachedGroups,
-) {
-    let mut groups: Vec<_> = groups
-        .iter()
-        .map(|(key, cached)| PackedGroup {
-            key: key.clone(),
-            symbols: cached.symbols.clone(),
-            path_bindings: cached.path_bindings.clone(),
-            object: cached.object.clone(),
-        })
-        .collect();
-    groups.sort_by(|left, right| left.key.cmp(&right.key));
-    let pack = ObjectPack {
-        analysis_hash,
-        triple: target.triple.clone(),
-        cpu: target.cpu.clone(),
-        features: target.features.clone(),
-        groups,
-    };
-    let (Ok(body), Some(tag)) = (
-        postcard::to_stdvec(&pack),
-        brass_cache::cache_tag(&tier.cache_flavor()),
-    ) else {
-        return;
-    };
-    let framed = brass_cache::encode_file(&tag, &body);
-    let adjacent = adjacent_path(entry, tier);
-    if brass_cache::write_atomic(&adjacent, &framed) {
-        return;
-    }
-    let Some(fallback) = fallback_path(entry, tier) else {
-        return;
-    };
-    let Some(directory) = fallback.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(directory).is_ok() {
-        let _ = brass_cache::write_atomic(&fallback, &framed);
-    }
+/// The target settings passed to LLJIT, retained with the session so a key
+/// describes the same machine that performs instruction selection.
+pub(super) struct TargetIdentity {
+    pub(super) triple: String,
+    pub(super) cpu: String,
+    pub(super) features: String,
 }
 
-fn object_paths(entry: &Path, tier: OptTier) -> Vec<PathBuf> {
-    let mut paths = vec![adjacent_path(entry, tier)];
-    if let Some(fallback) = fallback_path(entry, tier) {
-        paths.push(fallback);
-    }
-    paths
+/// Shared best-effort storage. Published files are immutable except for their
+/// access timestamps. The eviction flag belongs to the process-wide store,
+/// rather than to a session, to bound directory scans across multiple sessions.
+pub(crate) struct ObjectStore {
+    directory: PathBuf,
+    tag: String,
+    max_bytes: u64,
+    evicted: AtomicBool,
 }
 
-fn adjacent_path(entry: &Path, tier: OptTier) -> PathBuf {
-    entry.with_extension(tier.extension())
-}
-
-fn fallback_path(entry: &Path, tier: OptTier) -> Option<PathBuf> {
-    let identity = entry.canonicalize().unwrap_or_else(|_| entry.to_path_buf());
-    let hash = brass_cache::content_hash(identity.to_string_lossy().as_bytes());
-    let hex: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
-    Some(brass_cache::context_dir()?.join(format!("obj-{hex}.{}", tier.extension())))
-}
-
-fn target_identity() -> Option<TargetIdentity> {
-    let (cpu, features) = target_cpu_identity()?;
-    // SAFETY: LLVM returns an independently allocated, NUL-terminated message
-    // that is copied before being disposed exactly once below.
-    unsafe {
-        let triple = LLVMGetDefaultTargetTriple();
-        if triple.is_null() {
+impl ObjectStore {
+    /// Samples configuration and compiler identity once for the entire process.
+    /// Disabled or unidentifiable builds never create a cache directory.
+    pub(crate) fn from_env() -> Option<Arc<Self>> {
+        // Unit tests must explicitly inject their store; library tests also
+        // construct sessions through higher-level compiler entry points.
+        if cfg!(test) {
             return None;
         }
-        let identity = TargetIdentity {
-            triple: CStr::from_ptr(triple).to_string_lossy().into_owned(),
-            cpu,
-            features,
-        };
-        LLVMDisposeMessage(triple);
-        Some(identity)
+        STORE
+            .get_or_init(|| {
+                Self::configured(|name| std::env::var_os(name), compiler_identity()).map(Arc::new)
+            })
+            .clone()
     }
-}
 
-impl OptTier {
-    fn extension(self) -> &'static str {
-        match self {
-            Self::O0 => "o0.czobj",
-            Self::O2 => "o2.czobj",
+    fn configured(get: impl Fn(&str) -> Option<OsString>, tag: Option<String>) -> Option<Self> {
+        if matches!(
+            get("BRASS_JIT_CACHE").as_deref().and_then(|s| s.to_str()),
+            Some("off" | "0")
+        ) {
+            return None;
+        }
+        let directory = get("XDG_CACHE_HOME")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                get("HOME")
+                    .filter(|path| !path.is_empty())
+                    .map(|home| PathBuf::from(home).join(".cache"))
+            })?
+            .join("brass/jit");
+        let max_mb = get("BRASS_JIT_CACHE_MAX_MB")
+            .and_then(|value| value.to_str()?.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_MAX_MB);
+        Some(Self {
+            directory,
+            tag: tag?,
+            max_bytes: max_mb.saturating_mul(1024 * 1024),
+            evicted: AtomicBool::new(false),
+        })
+    }
+
+    /// Hashes unoptimized bitcode after its final data layout has been set.
+    /// Length prefixes make field boundaries unambiguous even for arbitrary
+    /// LLVM strings. The tier is explicit so an O0 session can prefer O2.
+    pub(super) fn key(&self, target: &TargetIdentity, tier: OptTier, bitcode: &[u8]) -> String {
+        let mut hash = Sha256::new();
+        hash.update(FORMAT_VERSION.to_le_bytes());
+        for field in [
+            self.tag.as_bytes(),
+            target.triple.as_bytes(),
+            target.cpu.as_bytes(),
+            target.features.as_bytes(),
+        ] {
+            hash.update((field.len() as u64).to_le_bytes());
+            hash.update(field);
+        }
+        hash.update([match tier {
+            OptTier::O0 => 0,
+            OptTier::O2 => 2,
+        }]);
+        hash.update(bitcode);
+        hash.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// Returns only fully validated objects and refreshes their recency. Keys
+    /// must come from `key`; rejected files are removed so the next compilation
+    /// can repair them. I/O failure always behaves like an ordinary miss.
+    pub(super) fn load(&self, key: &str, symbol: &str) -> Option<Vec<u8>> {
+        let path = self.directory.join(format!("{key}.czobj"));
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if error.kind() != io::ErrorKind::NotFound {
+                    log_io("read", &path, &error);
+                }
+                return None;
+            }
+        };
+        let Some(payload) = decode(&bytes) else {
+            tracing::debug!(target: "brass::perf", key, "jit cache invalid object");
+            remove(&path);
+            return None;
+        };
+        if let Err(error) = File::open(&path).and_then(|file| file.set_modified(SystemTime::now()))
+        {
+            log_io("touch", &path, &error);
+        }
+        tracing::debug!(target: "brass::perf", symbol, key, "jit cache hit");
+        Some(payload.to_vec())
+    }
+
+    /// Publishes during the object transform, before JIT execution can exit the
+    /// process. A same-directory rename makes every visible object complete;
+    /// concurrent writers for the same content key are interchangeable.
+    pub(super) fn publish(&self, key: &str, symbol: &str, payload: &[u8]) {
+        let path = self.directory.join(format!("{key}.czobj"));
+        if let Err(error) = fs::create_dir_all(&self.directory) {
+            log_io("mkdir", &self.directory, &error);
+            return;
+        }
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp = self.directory.join(format!(
+            ".{key}-{}-{nonce}-{sequence}.tmp",
+            std::process::id()
+        ));
+        let result = (|| -> io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            file.write_all(MAGIC)?;
+            file.write_all(&FORMAT_VERSION.to_le_bytes())?;
+            file.write_all(&(payload.len() as u64).to_le_bytes())?;
+            file.write_all(&Sha256::digest(payload))?;
+            file.write_all(payload)?;
+            drop(file);
+            fs::rename(&temp, &path)
+        })();
+        if let Err(error) = result {
+            log_io("publish", &path, &error);
+            remove(&temp);
+            return;
+        }
+        tracing::debug!(target: "brass::perf", symbol, key, "jit cache store");
+        if !self.evicted.swap(true, Ordering::Relaxed) {
+            self.evict();
         }
     }
 
-    fn cache_flavor(self) -> String {
-        let tier = match self {
-            Self::O0 => "o0",
-            Self::O2 => "o2",
+    fn evict(&self) {
+        let entries = match fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                log_io("scan", &self.directory, &error);
+                return;
+            }
         };
-        format!("obj-v{OBJECT_PACK_FORMAT_VERSION}-{tier}")
+        let mut files = Vec::new();
+        let mut total = 0u64;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    log_io("scan entry", &self.directory, &error);
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "czobj") {
+                continue;
+            }
+            match entry
+                .metadata()
+                .and_then(|metadata| Ok((metadata.len(), metadata.modified()?, metadata.is_file())))
+            {
+                Ok((size, modified, true)) => {
+                    total = total.saturating_add(size);
+                    files.push((modified, path, size));
+                }
+                Ok(_) => {}
+                Err(error) => log_io("stat", &path, &error),
+            }
+        }
+        if total <= self.max_bytes {
+            return;
+        }
+        files.sort_by_key(|(modified, _, _)| *modified);
+        let target = (u128::from(self.max_bytes) * 80 / 100) as u64;
+        for (_, path, size) in files {
+            if total <= target {
+                break;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => total = total.saturating_sub(size),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    total = total.saturating_sub(size)
+                }
+                Err(error) => log_io("evict", &path, &error),
+            }
+        }
+    }
+
+    /// Injects storage and identity without changing the process environment.
+    #[cfg(test)]
+    pub(super) fn isolated(directory: PathBuf, max_bytes: u64) -> Arc<Self> {
+        Arc::new(Self {
+            directory,
+            tag: "test-compiler".into(),
+            max_bytes,
+            evicted: AtomicBool::new(false),
+        })
+    }
+}
+
+fn compiler_identity() -> Option<String> {
+    let tag = brass_metadata::compiler_tag();
+    if brass_metadata::build_channel() != brass_metadata::BuildChannel::Nightly {
+        return Some(tag);
+    }
+    let fingerprint = (|| -> io::Result<_> {
+        let metadata = fs::metadata(std::env::current_exe()?)?;
+        let modified = metadata
+            .modified()?
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?;
+        Ok(format!("{tag}/{}-{}", modified.as_nanos(), metadata.len()))
+    })();
+    match fingerprint {
+        Ok(tag) => Some(tag),
+        Err(error) => {
+            tracing::debug!(target: "brass::perf", %error, "jit cache disabled: executable identity unavailable");
+            None
+        }
+    }
+}
+
+fn decode(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < HEADER_LEN
+        || &bytes[..8] != MAGIC
+        || bytes[8..12] != FORMAT_VERSION.to_le_bytes()
+    {
+        return None;
+    }
+    let length = u64::from_le_bytes(bytes[12..20].try_into().ok()?);
+    let payload = &bytes[HEADER_LEN..];
+    if length != payload.len() as u64 || bytes[20..HEADER_LEN] != Sha256::digest(payload)[..] {
+        return None;
+    }
+    Some(payload)
+}
+
+fn log_io(operation: &str, path: &Path, error: &io::Error) {
+    tracing::debug!(target: "brass::perf", operation, path = %path.display(), %error, "jit cache I/O failure");
+}
+
+fn remove(path: &Path) {
+    if let Err(error) = fs::remove_file(path)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        log_io("remove", path, &error);
+    }
+}
+
+/// Removes isolated test storage even when an assertion unwinds.
+#[cfg(test)]
+pub(super) struct TestDirectory(pub(super) PathBuf);
+
+#[cfg(test)]
+impl TestDirectory {
+    pub(super) fn new() -> Self {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        Self(std::env::temp_dir().join(format!(
+            "brass-objcache-{}-{nonce}-{sequence}",
+            std::process::id()
+        )))
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -504,192 +332,190 @@ impl OptTier {
 mod tests {
     use super::*;
 
-    fn test_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("brass-objcache-{}-{name}", std::process::id()))
-    }
-
-    fn write_pack(path: &Path, tier: OptTier, pack: &ObjectPack) {
-        let body = postcard::to_stdvec(pack).expect("encode pack");
-        let tag = brass_cache::cache_tag(&tier.cache_flavor()).expect("cache tag");
-        std::fs::write(path, brass_cache::encode_file(&tag, &body)).expect("write pack");
-    }
-
-    fn packed_group(key: &str, path_bindings: Vec<ModulePathBinding>) -> PackedGroup {
-        PackedGroup {
-            key: key.into(),
-            symbols: vec![key.into()],
-            path_bindings,
-            object: vec![1, 2, 3],
+    fn target() -> TargetIdentity {
+        TargetIdentity {
+            triple: "test-triple".into(),
+            cpu: "test-cpu".into(),
+            features: "+test".into(),
         }
     }
 
-    fn load_test_pack(
-        path: &Path,
-        analysis_hash: [u8; 20],
-        tier: OptTier,
-        target: &TargetIdentity,
-    ) -> Option<ValidatedObjects> {
-        load_path(path, analysis_hash, tier, target, &HashMap::new())
-    }
-
-    /// A damaged object body is a cache miss at the shared framing boundary,
-    /// before postcard or the linker can observe any of its bytes.
+    /// Every compiler input affects the key, with unambiguous string boundaries.
     #[test]
-    fn corrupted_packfile_is_ignored() {
-        let path = test_path("corrupt.czobj");
-        let target = target_identity().expect("native target");
-        let analysis_hash = [7; 20];
-        let pack = ObjectPack {
-            analysis_hash,
-            triple: target.triple.clone(),
-            cpu: target.cpu.clone(),
-            features: target.features.clone(),
-            groups: vec![packed_group("foo", Vec::new())],
-        };
-        write_pack(&path, OptTier::O0, &pack);
-        let mut bytes = std::fs::read(&path).expect("read pack");
-        *bytes.last_mut().expect("nonempty pack") ^= 0xff;
-        std::fs::write(&path, bytes).expect("corrupt pack");
-
-        assert!(load_test_pack(&path, analysis_hash, OptTier::O0, &target).is_none());
-        let _ = std::fs::remove_file(path);
-    }
-
-    /// Native objects require both this compiler's framed cache tag and the
-    /// exact serialized analysis payload identity. Thus an object containing
-    /// constants from an old wrapper AST cannot outlive that analysis cache.
-    #[test]
-    fn packfile_requires_compiler_and_analysis_identity() {
-        let path = test_path("identity.czobj");
-        let target = target_identity().expect("native target");
-        let analysis_hash = [11; 20];
-        let pack = ObjectPack {
-            analysis_hash,
-            triple: target.triple.clone(),
-            cpu: target.cpu.clone(),
-            features: target.features.clone(),
-            groups: vec![packed_group("foo", Vec::new())],
-        };
-        let body = postcard::to_stdvec(&pack).expect("encode pack");
-        std::fs::write(
-            &path,
-            brass_cache::encode_file("obsolete-compiler/obj-v2-o0", &body),
-        )
-        .expect("write obsolete pack");
-        assert!(load_test_pack(&path, analysis_hash, OptTier::O0, &target).is_none());
-
-        write_pack(&path, OptTier::O0, &pack);
-        assert!(load_test_pack(&path, [12; 20], OptTier::O0, &target).is_none());
-        let _ = std::fs::remove_file(path);
-    }
-
-    /// The object-pack version lives in the framed flavor, so postcard never
-    /// attempts to decode a previous schema as the current `PackedGroup`.
-    #[test]
-    fn old_object_pack_version_is_ignored() {
-        let path = test_path("old-version.czobj");
-        let target = target_identity().expect("native target");
-        let analysis_hash = [13; 20];
-        let pack = ObjectPack {
-            analysis_hash,
-            triple: target.triple.clone(),
-            cpu: target.cpu.clone(),
-            features: target.features.clone(),
-            groups: vec![packed_group("foo", Vec::new())],
-        };
-        let body = postcard::to_stdvec(&pack).expect("encode pack");
-        let old_tag = brass_cache::cache_tag("obj-v1-o0").expect("old cache tag");
-        std::fs::write(&path, brass_cache::encode_file(&old_tag, &body)).expect("write old pack");
-
-        assert!(load_test_pack(&path, analysis_hash, OptTier::O0, &target).is_none());
-        let _ = std::fs::remove_file(path);
-    }
-
-    /// The first symbol is only the lookup key. A changed ordered group shape
-    /// must miss so codegen emits fresh IR for the entire group.
-    #[test]
-    fn mismatched_symbol_list_misses_group() {
-        let objects = ValidatedObjects {
-            groups: HashMap::from([(
-                "foo".to_string(),
-                CachedObject {
-                    symbols: vec!["foo".to_string(), "bar".to_string()],
-                    path_bindings: Vec::new(),
-                    object: vec![1, 2, 3],
-                },
-            )]),
-        };
-        assert!(
-            objects
-                .matching_object("foo", &["foo".to_string(), "baz".to_string()])
-                .is_none()
-        );
-    }
-
-    /// Relocation invalidates only the group that embeds the old `_PATH`;
-    /// groups with no binding remain portable within the same object pack.
-    #[test]
-    fn path_mismatch_drops_only_bound_group() {
-        let path = test_path("path-binding.czobj");
-        let target = target_identity().expect("native target");
-        let analysis_hash = [17; 20];
-        let module = vec!["whereami".to_string()];
-        let pack = ObjectPack {
-            analysis_hash,
-            triple: target.triple.clone(),
-            cpu: target.cpu.clone(),
-            features: target.features.clone(),
-            groups: vec![
-                packed_group(
-                    "bound",
-                    vec![ModulePathBinding {
-                        module: module.clone(),
-                        value: "/old/whereami.cz".into(),
-                    }],
-                ),
-                packed_group("portable", Vec::new()),
-            ],
-        };
-        write_pack(&path, OptTier::O0, &pack);
-        let current = HashMap::from([(module, "/new/whereami.cz".to_string())]);
-
-        let objects = load_path(&path, analysis_hash, OptTier::O0, &target, &current)
-            .expect("compatible pack");
-        assert!(
-            objects
-                .matching_object("bound", &["bound".into()])
-                .is_none()
-        );
-        assert!(
-            objects
-                .matching_object("portable", &["portable".into()])
-                .is_some()
-        );
-        let _ = std::fs::remove_file(path);
-    }
-
-    /// A distribution object deliberately built for LLVM's generic CPU does
-    /// not inherit the packaging machine's feature set and is reusable by a
-    /// different host CPU as long as the complete target triple still matches.
-    #[test]
-    fn generic_pack_accepts_another_cpu_on_the_same_triple() {
-        let path = test_path("generic.czobj");
-        let analysis_hash = [9; 20];
-        let target = TargetIdentity {
-            triple: "test-unknown-linux-gnu".into(),
-            cpu: "different-host".into(),
-            features: "+host-extension".into(),
-        };
-        let pack = ObjectPack {
-            analysis_hash,
-            triple: target.triple.clone(),
-            cpu: "generic".into(),
+    fn key_tracks_all_compiler_inputs() {
+        let directory = TestDirectory::new();
+        let mut store = ObjectStore::isolated(directory.0.clone(), u64::MAX);
+        let base = store.key(&target(), OptTier::O0, b"bitcode");
+        assert_eq!(base.len(), 64);
+        assert!(base.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(base, store.key(&target(), OptTier::O0, b"bitcode"));
+        assert_ne!(base, store.key(&target(), OptTier::O0, b"changed"));
+        assert_ne!(base, store.key(&target(), OptTier::O2, b"bitcode"));
+        for field in 0..3 {
+            let mut changed = target();
+            match field {
+                0 => changed.triple.push('x'),
+                1 => changed.cpu.push('x'),
+                _ => changed.features.push('x'),
+            }
+            assert_ne!(base, store.key(&changed, OptTier::O0, b"bitcode"));
+        }
+        Arc::get_mut(&mut store).unwrap().tag.push('x');
+        assert_ne!(base, store.key(&target(), OptTier::O0, b"bitcode"));
+        let a = TargetIdentity {
+            triple: "ab".into(),
+            cpu: "c".into(),
             features: String::new(),
-            groups: vec![packed_group("foo", Vec::new())],
         };
-        write_pack(&path, OptTier::O2, &pack);
+        let b = TargetIdentity {
+            triple: "a".into(),
+            cpu: "bc".into(),
+            features: String::new(),
+        };
+        assert_ne!(
+            store.key(&a, OptTier::O0, b""),
+            store.key(&b, OptTier::O0, b"")
+        );
+    }
 
-        assert!(load_test_pack(&path, analysis_hash, OptTier::O2, &target).is_some());
-        let _ = std::fs::remove_file(path);
+    /// Framing rejects each damaged field, truncation, and trailing data,
+    /// deletes the rejected entry, and permits immediate replacement.
+    #[test]
+    fn invalid_objects_are_deleted_and_replaceable() {
+        let directory = TestDirectory::new();
+        let store = ObjectStore::isolated(directory.0.clone(), u64::MAX);
+        let key = store.key(&target(), OptTier::O0, b"ir");
+        let path = directory.0.join(format!("{key}.czobj"));
+        store.publish(&key, "test", b"native object");
+        let good = fs::read(&path).unwrap();
+        let mut invalid = Vec::new();
+        for index in [0, 8, 12, 20, HEADER_LEN] {
+            let mut bytes = good.clone();
+            bytes[index] ^= 1;
+            invalid.push(bytes);
+        }
+        invalid.push(good[..HEADER_LEN - 1].to_vec());
+        invalid.push(good[..good.len() - 1].to_vec());
+        invalid.push([good.as_slice(), b"x"].concat());
+        for bytes in invalid {
+            fs::write(&path, bytes).unwrap();
+            assert!(store.load(&key, "test").is_none());
+            assert!(!path.exists());
+            store.publish(&key, "test", b"native object");
+            assert_eq!(store.load(&key, "test").unwrap(), b"native object");
+        }
+    }
+
+    /// Configuration is injectable: both opt-outs, missing directories, and
+    /// unavailable build identity leave the filesystem untouched.
+    #[test]
+    fn disabled_configuration_never_opens_storage() {
+        let directory = TestDirectory::new();
+        for disabled in ["off", "0"] {
+            let store = ObjectStore::configured(
+                |name| match name {
+                    "BRASS_JIT_CACHE" => Some(disabled.into()),
+                    "XDG_CACHE_HOME" => Some(directory.0.as_os_str().to_owned()),
+                    _ => None,
+                },
+                Some("tag".into()),
+            );
+            assert!(store.is_none());
+        }
+        assert!(ObjectStore::configured(|_| None, Some("tag".into())).is_none());
+        assert!(ObjectStore::configured(|_| Some(OsString::new()), Some("tag".into())).is_none());
+        assert!(
+            ObjectStore::configured(|_| Some(directory.0.as_os_str().to_owned()), None).is_none()
+        );
+        assert!(!directory.0.exists());
+    }
+
+    /// XDG takes precedence, HOME supplies the fallback, and caps are in MiB.
+    #[test]
+    fn directory_and_cap_configuration() {
+        let directory = TestDirectory::new();
+        let settings = |name: &str| match name {
+            "HOME" => Some(directory.0.as_os_str().to_owned()),
+            "BRASS_JIT_CACHE_MAX_MB" => Some("2".into()),
+            _ => None,
+        };
+        let fallback = ObjectStore::configured(settings, Some("tag".into())).unwrap();
+        assert_eq!(fallback.directory, directory.0.join(".cache/brass/jit"));
+        assert_eq!(fallback.max_bytes, 2 * 1024 * 1024);
+        let xdg = ObjectStore::configured(
+            |name| {
+                if name == "XDG_CACHE_HOME" {
+                    Some(directory.0.join("xdg").into_os_string())
+                } else {
+                    settings(name)
+                }
+            },
+            Some("tag".into()),
+        )
+        .unwrap();
+        assert_eq!(xdg.directory, directory.0.join("xdg/brass/jit"));
+        assert!(!directory.0.exists());
+    }
+
+    /// Hits protect old entries by refreshing mtime; eviction crosses the
+    /// 80-percent watermark once, and ignores unrelated directory contents.
+    #[test]
+    fn eviction_respects_recency_and_runs_once() {
+        let directory = TestDirectory::new();
+        let seed = ObjectStore::isolated(directory.0.clone(), u64::MAX);
+        let keys: Vec<_> = (0..5)
+            .map(|n| seed.key(&target(), OptTier::O0, &[n]))
+            .collect();
+        let path = |n: usize| directory.0.join(format!("{}.czobj", keys[n]));
+        for (index, key) in keys[..3].iter().enumerate() {
+            seed.publish(key, "test", &[0; 100]);
+            File::open(path(index))
+                .unwrap()
+                .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(index as u64))
+                .unwrap();
+        }
+        fs::write(directory.0.join("unrelated.tmp"), [0; 1000]).unwrap();
+        assert!(seed.load(&keys[0], "test").is_some());
+        assert!(
+            fs::metadata(path(0)).unwrap().modified().unwrap()
+                > UNIX_EPOCH + std::time::Duration::from_secs(2)
+        );
+        let bounded = ObjectStore::isolated(directory.0.clone(), 500);
+        bounded.publish(&keys[3], "test", &[0; 100]);
+        assert!(path(0).exists());
+        assert!(!path(1).exists());
+        assert!(!path(2).exists());
+        assert!(path(3).exists());
+        assert!(directory.0.join("unrelated.tmp").exists());
+        bounded.publish(&keys[4], "test", &[0; 600]);
+        assert!(path(0).exists(), "only the first publish evicts");
+    }
+
+    /// Concurrent publications expose a complete frame and leave no temp files.
+    #[test]
+    fn concurrent_writers_publish_complete_objects() {
+        let directory = TestDirectory::new();
+        let store = ObjectStore::isolated(directory.0.clone(), u64::MAX);
+        let key = store.key(&target(), OptTier::O0, b"ir");
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| store.publish(&key, "test", &[42; 4096]));
+            }
+        });
+        assert_eq!(store.load(&key, "test").unwrap(), [42; 4096]);
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+
+    /// Unusable storage never turns cache operations into compiler errors.
+    #[test]
+    fn io_failures_are_misses() {
+        let directory = TestDirectory::new();
+        fs::create_dir_all(&directory.0).unwrap();
+        let file = directory.0.join("file");
+        fs::write(&file, b"not a directory").unwrap();
+        let store = ObjectStore::isolated(file, u64::MAX);
+        let key = store.key(&target(), OptTier::O0, b"ir");
+        store.publish(&key, "test", b"object");
+        assert!(store.load(&key, "test").is_none());
     }
 }

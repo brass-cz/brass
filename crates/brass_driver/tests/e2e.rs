@@ -14,9 +14,10 @@
 //! back end runs, so that directory is skipped when the `jit` feature is off (the
 //! interpreter rejects concurrency at runtime).
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 fn e2e_root() -> PathBuf {
     // The driver manifest lives at crates/brass_driver; the repo root is two up.
@@ -120,8 +121,7 @@ fn run_case(bin: &str, pp: &Path) -> std::process::Output {
 /// the file, forcing the whole-program check the annotated cases pin per
 /// mode. (An interpreter-only build checks eagerly either way.)
 fn run_case_mode(bin: &str, pp: &Path, eager: bool) -> std::process::Output {
-    let mut cmd = Command::new(bin);
-    cmd.env("BRASS_CACHE", "off");
+    let mut cmd = support::brass_command(bin);
     if eager {
         cmd.arg("--eager");
     }
@@ -318,8 +318,7 @@ fn eager_flag_matches_the_lazy_pipeline() {
     let bin = env!("CARGO_BIN_EXE_brass");
     let pp = e2e_root().join("lazy/demand_chain.cz");
     let lazy = run_case(bin, &pp);
-    let eager = Command::new(bin)
-        .env("BRASS_CACHE", "off")
+    let eager = support::brass_command(bin)
         .arg("--eager")
         .arg(&pp)
         .env("BRASS_PACKAGES", std_package_env())
@@ -337,18 +336,21 @@ fn eager_flag_matches_the_lazy_pipeline() {
     );
 }
 
+/// A checker warning never fails a run, and every mode renders it through the
+/// same formatter. The runs also pin that analysis state is never persisted:
+/// nothing appears beside the entry file, and only native objects may appear
+/// under `XDG_CACHE_HOME`.
 #[test]
-fn checker_warning_is_nonfatal_and_replayed_from_cache() {
+fn checker_warning_is_nonfatal_in_every_mode() {
     let bin = env!("CARGO_BIN_EXE_brass");
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock after epoch")
         .as_nanos();
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "checker_warning_cache-{}-{nonce}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&root).expect("create warning cache directory");
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("checker_warning-{}-{nonce}", std::process::id()));
+    fs::create_dir_all(&root).expect("create warning directory");
+    let cache_home = root.join("xdg-cache");
     let source = root.join("mixed.cz");
     fs::write(
         &source,
@@ -374,14 +376,6 @@ fn checker_warning_is_nonfatal_and_replayed_from_cache() {
         ),
     )
     .expect("write warning program");
-    let run = || {
-        Command::new(bin)
-            .env("BRASS_CACHE", "on")
-            .arg("--eager")
-            .arg(&source)
-            .output()
-            .expect("run warning program")
-    };
     let expected_warning = format!(
         "{}:1:1: warning: `mixed` returns `Result<int32, Error>?`: the body \
          propagates both null ({}:5:9) and errors ({}:3:9), so callers must unwrap two \
@@ -391,25 +385,12 @@ fn checker_warning_is_nonfatal_and_replayed_from_cache() {
         source.display(),
     );
 
-    let cold = run();
-    assert!(
-        cold.status.success(),
-        "cold warning run failed: {}",
-        String::from_utf8_lossy(&cold.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&cold.stdout), "7\n");
-    assert_eq!(String::from_utf8_lossy(&cold.stderr), expected_warning);
-    assert!(
-        source.with_extension("czcache").is_file(),
-        "the clean warning run should populate the cache"
-    );
-
-    let warm = run();
-    assert!(warm.status.success(), "warm warning run failed");
-    assert_eq!(warm.stdout, cold.stdout);
-    assert_eq!(warm.stderr, cold.stderr, "cache replay must be identical");
-
     for (mode, args, expected_stdout) in [
+        (
+            "eager",
+            vec![std::ffi::OsStr::new("--eager"), source.as_os_str()],
+            "7\n",
+        ),
         ("lazy", vec![source.as_os_str()], "7\n"),
         (
             "check",
@@ -422,8 +403,8 @@ fn checker_warning_is_nonfatal_and_replayed_from_cache() {
             "7\n",
         ),
     ] {
-        let output = Command::new(bin)
-            .env("BRASS_CACHE", "off")
+        let output = support::brass_command(bin)
+            .env("XDG_CACHE_HOME", &cache_home)
             .args(args)
             .output()
             .unwrap_or_else(|error| panic!("run {mode} warning program: {error}"));
@@ -439,6 +420,33 @@ fn checker_warning_is_nonfatal_and_replayed_from_cache() {
             "{mode} must use the common warning formatter"
         );
     }
+    let entries: Vec<_> = fs::read_dir(&root)
+        .expect("list warning directory")
+        .map(|entry| entry.expect("directory entry").file_name())
+        .filter(|name| name != "xdg-cache")
+        .collect();
+    assert_eq!(
+        entries,
+        ["mixed.cz"],
+        "runs must not leave artifacts beside the entry"
+    );
+    fn check_cache_tree(root: &Path, dir: &Path) {
+        if !dir.exists() {
+            return;
+        }
+        for entry in fs::read_dir(dir).expect("list cache directory") {
+            let path = entry.expect("cache entry").path();
+            let relative = path.strip_prefix(root).unwrap();
+            if path.is_dir() {
+                assert!(relative == Path::new("brass") || relative == Path::new("brass/jit"));
+                check_cache_tree(root, &path);
+            } else {
+                assert_eq!(relative.parent(), Some(Path::new("brass/jit")));
+                assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("czobj"));
+            }
+        }
+    }
+    check_cache_tree(&cache_home, &cache_home);
 }
 
 /// The interpreter's call-depth guard must fire before the host stack
@@ -454,8 +462,7 @@ fn repl_deep_recursion_hits_the_depth_guard() {
         "fun f(n: int64) -> int64 {\n    if n == 0 { return 0 }\n    return f(n - 1)\n}\nprintln(f(20000))\n",
     )
     .expect("write recursion case");
-    let out = Command::new(bin)
-        .env("BRASS_CACHE", "off")
+    let out = support::brass_command(bin)
         .arg("repl")
         .arg(&pp)
         .output()

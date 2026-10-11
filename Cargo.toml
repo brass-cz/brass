@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/brass_utils",
-    "crates/brass_cache",
     "crates/brass_typesys",
     "crates/brass_parser",
     "crates/brass_hir",
@@ -40,7 +39,6 @@ members = [
 # remains outside the default set because it is only the LLVM-downloader / `./x`
 # runner and is built explicitly with `-p bootstrap`.
 default-members = [
-    "crates/brass_cache",
     "crates/brass_utils",
     "crates/brass_typesys",
     "crates/brass_parser",
@@ -66,8 +64,6 @@ authors = ["Yuki Okamoto <cord@x56.cx>"]
 [workspace.dependencies]
 brass_metadata = { path = "crates/brass_metadata" }
 brass_utils = { path = "crates/brass_utils" }
-brass_cache = { path = "crates/brass_cache" }
-serde = { version = "1", features = ["derive"] }
 brass_typesys = { path = "crates/brass_typesys" }
 brass_parser = { path = "crates/brass_parser" }
 brass_hir = { path = "crates/brass_hir" }

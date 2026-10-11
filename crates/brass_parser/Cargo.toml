@@ -8,4 +8,3 @@ path = "src/lib.rs"
 
 [dependencies]
 fxhash.workspace = true
-serde.workspace = true

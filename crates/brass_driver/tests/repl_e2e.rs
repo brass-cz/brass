@@ -9,10 +9,12 @@
 //! interactive session over stdin (definitions, statements, and an echoed bare
 //! expression).
 
+mod support;
+
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 fn repo_root() -> String {
     // The driver manifest lives at crates/brass_driver; the repo root is two up.
@@ -23,8 +25,7 @@ fn repo_root() -> String {
 /// `"run"` uses the default runtime via a bare file argument (no subcommand);
 /// any other mode (e.g. `"repl"`) is passed as the subcommand.
 fn run_mode(mode: &str, path: &str) -> (bool, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_brass"));
-    cmd.env("BRASS_CACHE", "off");
+    let mut cmd = support::brass_command(env!("CARGO_BIN_EXE_brass"));
     if mode != "run" {
         cmd.arg(mode);
     }
@@ -171,8 +172,7 @@ fn interactive_repl_executes_statements_and_echoes_expressions() {
     // a function definition then a call to it, and a bare expression that is echoed
     // by the REPL wrapping it in `println`. Prompts go to stderr, so stdout is
     // exactly the three printed results.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_brass"))
-        .env("BRASS_CACHE", "off")
+    let mut child = support::brass_command(env!("CARGO_BIN_EXE_brass"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -201,8 +201,7 @@ fn interactive_repl_executes_statements_and_echoes_expressions() {
 fn interactive_repl_does_not_repeat_prior_input_effects() {
     // The first statement consumes one following line. Checking and executing
     // the next statement must not run that input operation again.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_brass"))
-        .env("BRASS_CACHE", "off")
+    let mut child = support::brass_command(env!("CARGO_BIN_EXE_brass"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

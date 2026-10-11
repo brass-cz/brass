@@ -1,13 +1,15 @@
 ---
-title: "Performance and caching"
-description: "Timing diagnostics, analysis caches, cache validity, and native compilation modes."
+title: "Performance diagnostics"
+description: "Timing diagnostics and native compilation modes."
 ---
 
 Brass minimizes the delay before a normal run starts. Checking and native
-compilation are demand-driven, while reusable analysis is cached. These
-mechanisms do not change language semantics; they only change when work is
-performed. See the [performance guide](/guides/performance/) for choosing a
-command and [Execution model](/references/execution/) for checking guarantees.
+compilation are demand-driven. These mechanisms do not change language
+semantics; they only change when work is performed. Every run checks the
+program from its sources; both default and `--eager` runs can reuse native
+objects as described below. See the [performance guide](/guides/performance/)
+for choosing a command and [Execution model](/references/execution/) for
+checking guarantees.
 
 ## Timing logs
 
@@ -24,94 +26,41 @@ enables trace-level per-item events and is substantially more verbose.
 | Phase                                                         | Work measured                                                          |
 | ------------------------------------------------------------- | ---------------------------------------------------------------------- |
 | `front/parse-stdlib`, `front/load-modules`, `front/lower-hir` | parsing, imports, and HIR lowering                                     |
+| `front/context-check`                                         | checking every imported module (the context) before the entry          |
 | `typeck/*`                                                    | type inference and function, method, and initializer checks            |
-| `front/keyed-repass`                                          | the additional front-end pass required by reflective `-> infer!` calls |
+| `front/keyed-continuation`                                    | checking the methods generated for reflective `-> infer!` calls        |
 | `back/lower-mir`, `back/monomorphize`                         | MIR lowering and concrete function instances                           |
 | `back/codegen-fn`, `back/codegen`, `back/finalize`            | native-code preparation and JIT finalization                           |
-| `back/orc-materialize`                                        | first-use native compilation during a demand-driven run                |
-| `front/cache-hit`, `front/cache-save`                         | analysis cache loading and saving                                      |
+| `back/orc-materialize`                                        | first-use native compilation                                           |
 
 Function and method events include their names. Start with phase totals, then
 inspect per-item output only for the phase that dominates.
 
-## Cache overview
+Analysis files (`.czcache` and `.czctx`) from older releases are unused and
+can be deleted. Old per-entry `.czobj` files beside entry files are unused too.
 
-Brass uses two analysis-cache locations and one native-code cache:
+## JIT cache
 
-| Cache      | Location                   | Purpose                                                            |
-| ---------- | -------------------------- | ------------------------------------------------------------------ |
-| `.czcache` | beside the entry file      | Reuse a complete check, or resume a partially completed normal run |
-| `.czctx`   | the user's cache directory | Reuse checked dependencies when only the entry file changes        |
-| `.czobj`   | beside the entry file      | Reuse compiled native code for groups earlier runs materialized    |
+`brass` and `brass --eager` store native objects in `$XDG_CACHE_HOME/brass/jit/`,
+falling back to `$HOME/.cache/brass/jit/`. Each `<key>.czobj` file is keyed by SHA-256
+of the exact LLVM bitcode, compiler identity, target triple, CPU features and
+optimization tier. Source changes that alter a group's compiler input produce
+a different key. A cached O2 object can also serve an O0 session. Checking and
+IR generation still run; a hit skips optimization and native code generation.
+Runtime-resolved instances in a default run use the same cache. Objects are
+published during compilation, so they survive a native process exit.
 
-`BRASS_CACHE=off` disables cache reads and writes. Cache operations are
-best-effort: an unavailable or read-only cache location does not prevent a
-program from running or being checked.
-
-## Entry analysis cache (`.czcache`)
-
-For `app.cz`, the entry cache is `app.czcache`. It can contain one of two
-kinds of result:
-
-- A **full cache** records an error-free complete check. `brass check`, an
-  eager run, or a normal run whose background checker finishes can produce
-  it. An unchanged program skips checking entirely when this cache is valid.
-- A **partial cache** records the settled portion of a normal run whose
-  background checker had not finished when the program exited. The next
-  normal run resumes from that point; it does not treat the program as fully
-  checked.
-
-Both kinds use the same filename and are distinguished internally. Therefore
-the existence of `.czcache` alone does not prove that the whole program was
-checked. The command result remains the authority: use `brass check` when a
-complete verdict is required.
-
-### Validity
-
-An entry cache is used only when all inputs still identify the same program:
-
-- the compiler version, release identity, and cache format (currently version
-  8) match;
-- the entry and every loaded source have the recorded contents;
-- package names resolve consistently;
-- imported native plugins still resolve and have the recorded contents.
-
-Source contents are checked rather than modification times. Moving an
-unchanged project or toolchain can therefore preserve a valid cache, while a
-changed dependency invalidates it. Any mismatch is handled silently by
-checking again. Cache files are not stable interchange formats and have no
-cross-version compatibility guarantee.
-
-A release build's compiler identity is stable across installations. A nightly
-or other unstamped working-tree build additionally keys every cache on the
-running executable's modification time and byte length, so rebuilding the
-compiler cannot reuse artifacts produced by the previous binary.
-
-## Context cache (`.czctx`)
-
-The context cache accelerates the common case where the entry file changes
-but its imports do not. A program's context is every module except the entry:
-embedded `core`, imported `std` modules, and project dependencies.
-
-Brass stores the context's inferred schemes and checked bodies under the user
-cache directory (`$XDG_CACHE_HOME/brass` or `~/.cache/brass`). Its key includes
-the compiler identity and the names and contents of every context module; the
-entry contents are deliberately excluded. A valid seed lets the checker
-validate only the changed entry against the saved context.
-
-Reflective programs keep specialization-sensitive context entries separate.
-A context with diagnostics is not cached, and a top-level name collision that
-would change stored symbols causes a normal full check instead.
-
-The language server uses the same context-cache mechanism and on-disk store,
-so editor checks also benefit when dependencies remain unchanged. It may read
-a valid full `.czcache` for a buffer that exactly matches the file on disk,
-but it does not write entry caches because the driver performs additional
-execution-specific rewrites.
+The default size cap is 256 MiB. Set `BRASS_JIT_CACHE_MAX_MB` to override it;
+after the first object is stored in a process, an over-cap cache is trimmed
+to 80% of the cap by removing the least recently used objects. Hits refresh
+file modification times. Set `BRASS_JIT_CACHE=off` (or `0`) to disable reads
+and writes. Cache I/O failures are ignored, and invalid objects are recompiled.
+`BRASS_LOG=brass::perf=debug` includes `jit cache hit` and `jit cache store`
+events with the group's first symbol and key.
 
 ## Native compilation
 
-During a normal native run:
+During both default and `--eager` native runs:
 
 - monomorphization begins at module initializers and `main`;
 - a reachable concrete function is optimized and translated on first use;
@@ -130,27 +79,9 @@ never runs.
 First-use compilation runs at the lowest optimization level: the default run
 is tuned for start-up latency, and translating a group without the optimizer
 takes a few milliseconds where the optimized pipeline takes hundreds. Set
-`BRASS_OPT=2` to compile every group with the full optimizing pipeline
-instead -- the right trade for a long-running or compute-bound program whose
+`BRASS_OPT=2` to compile every group, including runtime-resolved batches,
+with the full optimizing pipeline instead -- the right trade for a long-running or compute-bound program whose
 first execution of each hot function matters more than its start-up.
-
-### Native object cache (`.czobj`)
-
-The machine code a run materializes is saved next to the entry as
-`<entry>.o0.czobj` (or `.o2.czobj` under `BRASS_OPT=2`) and bound to the
-exact analysis result that produced it: the file records the analysis
-payload's hash, the compile target's identity, and every group's symbol
-list. Each group also records the module `_PATH` values its machine code
-embeds. After relocation, only groups whose embedded paths changed are dropped;
-the rest of the pack remains reusable. A later run whose analysis cache hits
-loads the matching groups as prebuilt objects -- no IR generation,
-optimization, or instruction selection -- and any mismatch simply recompiles
-that group. A `.o2.czobj`
-is preferred even in a default-tier session, since a prebuilt object skips
-the compiler entirely regardless of how it was optimized. Distributed
-toolchains ship these artifacts for the bundled tools, built with
-`BRASS_JIT_CPU=generic` so one packfile serves every host of the same
-architecture.
 
 `--eager` uses the same first-use native compilation. Its difference is when
 checking happens, not what native code is produced: the complete check (and

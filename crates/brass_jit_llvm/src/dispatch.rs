@@ -156,7 +156,9 @@ pub(crate) fn clear_resolved() {
 /// closure (which owns the checker channels and the growing MIR program).
 /// Split so the closure receives the backend re-materialized -- the two
 /// live in one slot precisely because `pp_resolve` is entered from JIT
-/// code while `execute_deferred` holds the backend.
+/// code while `execute_with_resolver` installs the backend. ORC lookup may invoke
+/// materializers, but those access only session-owned pending IR. No native
+/// entry is called while the resolver holds its temporary exclusive borrow.
 struct DeferredSlot {
     backend: *mut (),
     resolve: *mut (),
@@ -191,6 +193,25 @@ pub(crate) fn with_deferred_resolver<'ctx, 'p, R>(
     body()
 }
 
+// These entry helpers are crate-private: callers supply addresses looked up
+// from generated functions with the indicated zero-argument ABI.
+pub(crate) fn call_void(address: usize) {
+    // SAFETY: the caller selects a generated void() entry in a live session.
+    unsafe { std::mem::transmute::<usize, extern "C" fn()>(address)() }
+}
+pub(crate) fn call_i32(address: usize) -> i32 {
+    // SAFETY: run_entry_i32 selects an i32() entry in a live session.
+    unsafe { std::mem::transmute::<usize, extern "C" fn() -> i32>(address)() }
+}
+pub(crate) fn call_i64(address: usize) -> i64 {
+    // SAFETY: run_entry_i64 selects an i64() entry in a live session.
+    unsafe { std::mem::transmute::<usize, extern "C" fn() -> i64>(address)() }
+}
+pub(crate) fn call_f64(address: usize) -> f64 {
+    // SAFETY: run_entry_f64 selects an f64() entry in a live session.
+    unsafe { std::mem::transmute::<usize, extern "C" fn() -> f64>(address)() }
+}
+
 /// The dispatch trampoline generated code calls: resolve-or-
 /// compile the consumer named by `[name_ptr, name_len]` for the runtime type
 /// named by `[type_ptr, type_len]`, returning its callable address (0 if no
@@ -206,6 +227,9 @@ pub unsafe extern "C" fn pp_resolve(
     type_ptr: *const u8,
     type_len: usize,
 ) -> usize {
+    // SAFETY: installed scoped slots outlive this call. Execution releases all
+    // compiler borrows before entering native code; resolver callbacks do not
+    // execute native entries. ORC materializers use only their own session state.
     unsafe {
         // The lazy JIT's sites pass the instance symbol with an empty type
         // string. Already-resolved targets answer from the cross-thread

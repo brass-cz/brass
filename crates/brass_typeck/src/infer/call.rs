@@ -174,12 +174,7 @@ impl<'a> Checker<'a> {
                 // annotated: such a body is instantiation-independent and its
                 // own pass records its channels. A SEEDED (context) body has
                 // no dedicated pass -- this call-site elaboration is a source
-                // of its channel entries, and skipping it would leave a
-                // COMPLETED lazy analysis un-cacheable as a full verdict (a
-                // deferred, never-executed instance would have no entries for
-                // the cache-hit eager run that monomorphizes it); the
-                // demanded-instance machinery covers executed seeded code,
-                // not that cache contract, so seeded calls keep elaborating.
+                // of its channel entries -- so seeded calls keep elaborating.
                 let skip_elaboration = self.lazy_profile
                     && !self.keyed_tainted.contains(&symbol)
                     && !self.seeded_module(&module)

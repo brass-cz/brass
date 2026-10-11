@@ -2,9 +2,10 @@
 //! driver's file-system module loader, which the per-crate unit tests cannot
 //! reach: missing module files, private module files, and import-name checking.
 
+mod support;
+
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 /// Create an isolated module tree under the test binary's temp dir and return
 /// the path to its `main.cz`. `files` is a list of (relative path, source).
@@ -21,8 +22,7 @@ fn setup(case: &str, files: &[(&str, &str)]) -> PathBuf {
 
 /// Run `brass check <main>` and return (success, combined output).
 fn check(main: &PathBuf) -> (bool, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_brass"))
-        .env("BRASS_CACHE", "off")
+    let out = support::brass_command(env!("CARGO_BIN_EXE_brass"))
         .arg("check")
         .arg(main)
         .output()
@@ -259,8 +259,7 @@ fn a_module_can_call_its_own_private_helper() {
 
 /// Run `brass <main>` and return (success, combined output).
 fn run(main: &PathBuf) -> (bool, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_brass"))
-        .env("BRASS_CACHE", "off")
+    let out = support::brass_command(env!("CARGO_BIN_EXE_brass"))
         .arg(main)
         .output()
         .expect("spawn brass");
@@ -321,8 +320,7 @@ fn same_global_name_in_two_modules_gets_its_own_slot() {
     let (ok, out) = run(&main);
     assert!(ok, "expected success, got: {out}");
     assert_eq!(out, expected, "JIT global slots collided");
-    let out = Command::new(env!("CARGO_BIN_EXE_brass"))
-        .env("BRASS_CACHE", "off")
+    let out = support::brass_command(env!("CARGO_BIN_EXE_brass"))
         .arg("repl")
         .arg(&main)
         .output()
@@ -1013,8 +1011,7 @@ fn setup_tree(case: &str, files: &[(&str, &str)]) -> PathBuf {
 /// Run `brass [check] <main>` with the given environment variables set and
 /// return (success, combined output).
 fn with_env(main: &PathBuf, envs: &[(&str, &str)], mode: &str) -> (bool, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_brass"));
-    cmd.env("BRASS_CACHE", "off");
+    let mut cmd = support::brass_command(env!("CARGO_BIN_EXE_brass"));
     if mode == "check" {
         cmd.arg("check");
     }
@@ -1393,7 +1390,7 @@ fn distributed_binary_binds_its_sibling_std_dir() {
     // fork and exec, and executing `bin` then fails ETXTBSY until that child
     // execs. Transient by construction, so spin briefly.
     let out = (0..50)
-        .find_map(|_| match Command::new(&bin).arg(&main).output() {
+        .find_map(|_| match support::brass_command(&bin).arg(&main).output() {
             Ok(out) => Some(out),
             Err(e) if e.raw_os_error() == Some(26) => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1417,7 +1414,7 @@ fn distributed_binary_binds_its_sibling_std_dir() {
             "fun greet() -> string { return \"explicit\" }\n",
         )],
     );
-    let out = Command::new(&bin)
+    let out = support::brass_command(&bin)
         .arg(&main)
         .env("BRASS_PACKAGES", format!("std={}", other.display()))
         .output()
@@ -1599,249 +1596,6 @@ fn static_call_resolves_when_an_alias_shares_the_type_name() {
     assert_eq!(out, "1\n", "{out}");
 }
 
-/// The `.czcache` life cycle: a clean run writes it next to the entry file; the
-/// next run reuses it (and still prints the same output); editing a DEPENDENCY
-/// invalidates it, and the changed program's output proves the rebuild really
-/// happened rather than the stale cache answering.
-#[test]
-fn czcache_reuses_and_invalidates_on_dependency_change() {
-    let main = setup(
-        "czcache_cycle",
-        &[
-            ("lib/util.cz", "fun answer() -> int32 { return 40 }\n"),
-            (
-                "main.cz",
-                "import lib.util.{ answer }\nfun main() { println(answer()) }\n",
-            ),
-        ],
-    );
-    let cache = main.with_extension("czcache");
-    let run_cached = |main: &PathBuf| {
-        let out = Command::new(env!("CARGO_BIN_EXE_brass"))
-            .arg(main)
-            .output()
-            .expect("spawn brass");
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-        )
-    };
-
-    let (ok, out) = run_cached(&main);
-    assert!(ok, "cold run: {out}");
-    assert_eq!(out, "40\n");
-    assert!(cache.is_file(), "a clean run writes the cache");
-
-    let (ok, out) = run_cached(&main);
-    assert!(ok, "warm run: {out}");
-    assert_eq!(out, "40\n", "the cached run answers identically");
-
-    // Edit the dependency. The edit keeps the file's size, so it is the content
-    // hash -- not the length, and no longer the mtime -- that has to catch it.
-    fs::write(
-        main.parent().unwrap().join("lib/util.cz"),
-        "fun answer() -> int32 { return 42 }\n",
-    )
-    .unwrap();
-    let (ok, out) = run_cached(&main);
-    assert!(ok, "run after dependency edit: {out}");
-    assert_eq!(out, "42\n", "the edited dependency must be recompiled");
-}
-
-/// A source file is keyed by its contents, so a rewrite that changes nothing --
-/// which moves the mtime -- keeps the cache. This is what lets a `.czcache` be
-/// distributed: unpacking a release archive gives every library file a fresh
-/// mtime, and an mtime key would reject the shipped cache on every machine.
-#[test]
-fn czcache_survives_a_rewrite_with_identical_contents() {
-    let util = "fun answer() -> int32 { return 40 }\n";
-    let main = setup(
-        "czcache_identical_rewrite",
-        &[
-            ("lib/util.cz", util),
-            (
-                "main.cz",
-                "import lib.util.{ answer }\nfun main() { println(answer()) }\n",
-            ),
-        ],
-    );
-    // The perf log is the only place a hit is visible: a hit and a miss agree on
-    // the program's output, which is the point of the cache.
-    // `--eager` so the FULL cache write cannot race the lazy stop-at-exit.
-    let run_logged = || {
-        let out = Command::new(env!("CARGO_BIN_EXE_brass"))
-            .arg("--eager")
-            .arg(&main)
-            .env("BRASS_LOG", "brass::perf=debug")
-            .output()
-            .expect("spawn brass");
-        assert!(out.status.success());
-        (
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
-    };
-
-    run_logged();
-
-    // Same bytes, new mtime -- the state a freshly unpacked file is in.
-    fs::write(main.parent().unwrap().join("lib/util.cz"), util).unwrap();
-    let (out, log) = run_logged();
-    assert_eq!(out, "40\n");
-    assert!(
-        log.contains("cache-hit"),
-        "an unchanged file must stay cached across a rewrite:\n{log}"
-    );
-}
-
-/// A `.czcache` survives the project MOVING: stamps name sources relative to
-/// the roots they were resolved under (entry directory, include roots), never
-/// by machine path, so copying the whole tree -- project and include root both
-/// -- to a different location still hits. This is the property that lets a
-/// release ship caches alongside its libraries.
-#[test]
-fn czcache_survives_relocation() {
-    let main = setup(
-        "czcache_relocate",
-        &[
-            ("libs/util.cz", "fun answer() -> int32 { return 7 }\n"),
-            (
-                "app/main.cz",
-                "import util.{ answer }\nfun main() { println(answer()) }\n",
-            ),
-        ],
-    );
-    let root = main.parent().unwrap().to_path_buf();
-    let entry = root.join("app/main.cz");
-    let run_at = |root: &PathBuf| {
-        let out = Command::new(env!("CARGO_BIN_EXE_brass"))
-            .arg(root.join("app/main.cz"))
-            .env("BRASS_INCLUDE", root.join("libs"))
-            .env("BRASS_LOG", "brass::perf=debug")
-            .output()
-            .expect("spawn brass");
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
-    };
-
-    let (ok, out, err) = run_at(&root);
-    assert!(ok, "cold run: {out} {err}");
-    assert_eq!(out, "7\n");
-    assert!(entry.with_extension("czcache").is_file());
-
-    // Copy everything somewhere else; nothing at the old location is touched.
-    let moved = root.with_file_name("czcache_relocate_moved");
-    let _ = fs::remove_dir_all(&moved);
-    copy_tree(&root, &moved);
-    let (ok, out, err) = run_at(&moved);
-    assert!(ok, "relocated run: {err}");
-    assert_eq!(out, "7\n");
-    assert!(
-        err.contains("front/cache-hit"),
-        "the moved project must reuse its cache: {err}"
-    );
-    // An edit at the NEW location misses -- content, not location, is the key.
-    fs::write(
-        moved.join("libs/util.cz"),
-        "fun answer() -> int32 { return 8 }\n",
-    )
-    .unwrap();
-    let (ok, out, err) = run_at(&moved);
-    assert!(ok, "edited relocated run: {err}");
-    assert_eq!(out, "8\n", "the edit must be recompiled");
-}
-
-/// Two entries share one cache path (`app` and `app.cz` both map to
-/// `app.czcache`), so a hit requires the entry ITSELF to be the recorded one:
-/// running the extensionless sibling must execute its own program, never the
-/// cached neighbor's.
-/// A LAZY run persists a cache too: the full payload when its checker
-/// finished first, the partial (resume) payload when the exit stopped it.
-/// Either way the file exists, and a rerun -- resumed or replayed -- prints
-/// the same output. (Which flavor wins is a benign race; both are pinned
-/// valid by the reruns.)
-#[test]
-fn lazy_runs_persist_and_reuse_a_cache() {
-    let main = setup(
-        "lazy_cache_reuse",
-        &[(
-            "main.cz",
-            "fun greet(n: int32) -> int32 { return n + 1 }\nfun main() { println(greet(41)) }\n",
-        )],
-    );
-    let run = || {
-        let out = Command::new(env!("CARGO_BIN_EXE_brass"))
-            .arg(&main)
-            .output()
-            .expect("spawn brass");
-        assert!(
-            out.status.success(),
-            "stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    };
-    let first = run();
-    assert_eq!(first, "42\n");
-    assert!(main.with_extension("czcache").is_file());
-    assert_eq!(run(), first);
-    assert_eq!(run(), first);
-}
-
-/// A full analysis cache skips the checker, but the default run must retain
-/// entry-rooted JIT reachability: an unrelated zero-argument function is not
-/// another compilation root merely because its signature needs no arguments.
-#[test]
-fn cached_lazy_run_compiles_only_entry_reachable_functions() {
-    let main = setup(
-        "cached_lazy_reachability",
-        &[(
-            "main.cz",
-            "fun selected() -> int64 { return 42 }\n\
-             fun skipped() -> int64 { return 141 }\n\
-             fun main() { println(selected()) }\n",
-        )],
-    );
-
-    // Produce a complete cache deterministically before exercising the lazy
-    // cache-hit path; a short lazy first run may instead save a partial cache.
-    let checked = Command::new(env!("CARGO_BIN_EXE_brass"))
-        .arg("check")
-        .arg(&main)
-        .output()
-        .expect("check program");
-    assert!(
-        checked.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&checked.stderr)
-    );
-
-    let out = Command::new(env!("CARGO_BIN_EXE_brass"))
-        .arg(&main)
-        .env("BRASS_LOG", "brass::perf=trace")
-        .output()
-        .expect("run cached program");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "stderr: {stderr}");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
-    assert!(stderr.contains("front/cache-hit"), "stderr: {stderr}");
-    let compiled: Vec<&str> = stderr
-        .lines()
-        .filter(|line| line.contains("back/codegen-fn:"))
-        .collect();
-    assert!(
-        compiled.iter().any(|line| line.contains("selected")),
-        "entry-reachable function was not compiled: {stderr}"
-    );
-    assert!(
-        compiled.iter().all(|line| !line.contains("skipped")),
-        "unreachable zero-argument function was compiled: {stderr}"
-    );
-}
-
 /// A zero-argument demand is still a concrete function instance. Its inferred
 /// return contract must keep an unexecuted runtime branch out of the startup
 /// compilation set just like a parameterized function's contract does.
@@ -1862,9 +1616,8 @@ fn fresh_lazy_run_defers_unannotated_zero_argument_function() {
         )],
     );
 
-    let out = Command::new(env!("CARGO_BIN_EXE_brass"))
+    let out = support::brass_command(env!("CARGO_BIN_EXE_brass"))
         .arg(&main)
-        .env("BRASS_CACHE", "off")
         .env("BRASS_LOG", "brass::perf=trace")
         .output()
         .expect("run fresh lazy program");
@@ -1904,9 +1657,8 @@ fn fresh_lazy_runtime_resolution_keeps_nested_unannotated_call_deferred() {
         )],
     );
 
-    let out = Command::new(env!("CARGO_BIN_EXE_brass"))
+    let out = support::brass_command(env!("CARGO_BIN_EXE_brass"))
         .arg(&main)
-        .env("BRASS_CACHE", "off")
         .env("BRASS_LOG", "brass::perf=debug")
         .output()
         .expect("run fresh lazy program");
@@ -1928,12 +1680,12 @@ fn fresh_lazy_runtime_resolution_keeps_nested_unannotated_call_deferred() {
     );
 }
 
-/// Static reachability includes both arms of a runtime branch, but ORC should
+/// An eager run emits IR for both arms of a runtime branch, but ORC should
 /// optimize and emit native code only for the arm that execution enters.
 #[test]
-fn cached_lazy_run_materializes_only_the_executed_branch() {
+fn eager_run_materializes_only_the_executed_branch() {
     let main = setup(
-        "cached_lazy_runtime_branch",
+        "eager_runtime_branch",
         &[(
             "main.cz",
             "fun selected() -> int64 { return 42 }\n\
@@ -1948,22 +1700,12 @@ fn cached_lazy_run_materializes_only_the_executed_branch() {
         )],
     );
 
-    let checked = Command::new(env!("CARGO_BIN_EXE_brass"))
-        .arg("check")
-        .arg(&main)
-        .output()
-        .expect("check program");
-    assert!(
-        checked.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&checked.stderr)
-    );
-
-    let out = Command::new(env!("CARGO_BIN_EXE_brass"))
+    let out = support::brass_command(env!("CARGO_BIN_EXE_brass"))
+        .arg("--eager")
         .arg(&main)
         .env("BRASS_LOG", "brass::perf=trace")
         .output()
-        .expect("run cached program");
+        .expect("run eager program");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stderr: {stderr}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
@@ -1985,14 +1727,14 @@ fn cached_lazy_run_materializes_only_the_executed_branch() {
     );
 }
 
-/// A spawning program precompiles exactly what its workers can statically
-/// reach (spawned closures and their call graphs, before the spawn runs);
-/// main-thread-only code keeps demand-driven materialization, so a dead main
-/// branch is still never compiled.
+/// A spawning eager program precompiles exactly what its workers can
+/// statically reach (spawned closures and their call graphs, before the spawn
+/// runs); main-thread-only code keeps demand-driven materialization, so a dead
+/// main branch is still never compiled.
 #[test]
-fn cached_lazy_spawn_precompiles_only_worker_reachable_code() {
+fn eager_spawn_precompiles_only_worker_reachable_code() {
     let main = setup(
-        "cached_lazy_spawn_reachability",
+        "eager_spawn_reachability",
         &[(
             "main.cz",
             "fun worker_task() -> int64 { return 7 }\n\
@@ -2011,22 +1753,12 @@ fn cached_lazy_spawn_precompiles_only_worker_reachable_code() {
         )],
     );
 
-    let checked = Command::new(env!("CARGO_BIN_EXE_brass"))
-        .arg("check")
-        .arg(&main)
-        .output()
-        .expect("check program");
-    assert!(
-        checked.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&checked.stderr)
-    );
-
-    let out = Command::new(env!("CARGO_BIN_EXE_brass"))
+    let out = support::brass_command(env!("CARGO_BIN_EXE_brass"))
+        .arg("--eager")
         .arg(&main)
         .env("BRASS_LOG", "brass::perf=trace")
         .output()
-        .expect("run cached program");
+        .expect("run eager program");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stderr: {stderr}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "107\n42\n");
@@ -2052,247 +1784,4 @@ fn cached_lazy_spawn_precompiles_only_worker_reachable_code() {
             .all(|line| !line.contains("pp_fn_main_5f_skipped")),
         "main-only dead branch was materialized despite the spawn: {stderr}"
     );
-}
-
-#[test]
-fn czcache_is_entry_specific() {
-    let main = setup(
-        "czcache_entry_identity",
-        &[
-            ("app.cz", "fun main() { println(\"from app.cz\") }\n"),
-            ("app", "fun main() { println(\"from app\") }\n"),
-            ("main.cz", "fun main() {}\n"),
-        ],
-    );
-    let root = main.parent().unwrap().to_path_buf();
-    // `--eager`: a lazy run stops the checker when the program ends, so
-    // whether the FULL cache gets written races the (tiny) program. The
-    // cache-identity property under test is mode-independent.
-    let run = |entry: &PathBuf| {
-        let out = Command::new(env!("CARGO_BIN_EXE_brass"))
-            .arg("--eager")
-            .arg(entry)
-            .output()
-            .expect("spawn brass");
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-        )
-    };
-
-    let (ok, out) = run(&root.join("app.cz"));
-    assert!(ok, "cold run: {out}");
-    assert_eq!(out, "from app.cz\n");
-    assert!(root.join("app.czcache").is_file());
-
-    let (ok, out) = run(&root.join("app"));
-    assert!(ok, "sibling run: {out}");
-    assert_eq!(
-        out, "from app\n",
-        "the extensionless sibling must not revive app.cz's cached program"
-    );
-}
-
-/// A newly declared `BRASS_PACKAGES` name captures an import's first segment
-/// BEFORE any file search, re-routing the import while every stamped file is
-/// untouched; the recorded name set must catch it and recompile.
-#[test]
-fn czcache_misses_when_package_names_change() {
-    let main = setup(
-        "czcache_pkg_rebind",
-        &[
-            ("util/helpers.cz", "fun answer() -> int32 { return 1 }\n"),
-            (
-                "main.cz",
-                "import util.helpers.{ answer }\nfun main() { println(answer()) }\n",
-            ),
-            (
-                "dep/util/helpers.cz",
-                "fun answer() -> int32 { return 2 }\n",
-            ),
-        ],
-    );
-    let root = main.parent().unwrap().to_path_buf();
-    let run = |packages: Option<String>| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_brass"));
-        cmd.arg(&main);
-        if let Some(p) = packages {
-            cmd.env("BRASS_PACKAGES", p);
-        }
-        let out = cmd.output().expect("spawn brass");
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-        )
-    };
-
-    let (ok, out) = run(None);
-    assert!(ok, "cold run: {out}");
-    assert_eq!(out, "1\n", "no package declared: the local file answers");
-
-    let (ok, out) = run(Some(format!("util={}", root.join("dep").display())));
-    assert!(ok, "package-bound run: {out}");
-    assert_eq!(
-        out, "2\n",
-        "declaring the package re-routes the import; the cache must not answer with the local file"
-    );
-}
-
-/// `_PATH` is the one thing relocated analysis and native caches must NOT
-/// replay: it IS the module's location. Warming the native cache before each
-/// move pins the combination that previously escaped a single suite run.
-#[test]
-fn czcache_reanchors_module_path_on_relocation() {
-    let main = setup(
-        "czcache_path_reanchor",
-        &[
-            (
-                "whereami.cz",
-                "fun where_am_i() -> string { return _PATH }\n",
-            ),
-            (
-                "main.cz",
-                "import whereami.{ where_am_i }\nfun main() { println(where_am_i()) }\n",
-            ),
-        ],
-    );
-    let root = main.parent().unwrap().to_path_buf();
-    let user_cache = root.with_file_name("czcache_path_reanchor_user_cache");
-    let _ = fs::remove_dir_all(&user_cache);
-    let run_at = |root: &PathBuf| {
-        let out = Command::new(env!("CARGO_BIN_EXE_brass"))
-            .arg(root.join("main.cz"))
-            .env("BRASS_LOG", "brass::perf=debug")
-            .env("XDG_CACHE_HOME", &user_cache)
-            .output()
-            .expect("spawn brass");
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
-    };
-
-    let (ok, out, err) = run_at(&root);
-    assert!(ok, "cold run: {out} {err}");
-    assert!(out.contains("whereami.cz"), "{out}");
-    let (ok, out, err) = run_at(&root);
-    assert!(ok, "warm run: {out} {err}");
-    assert!(root.join("main.o0.czobj").is_file());
-
-    let moved = root.with_file_name("czcache_path_reanchor_moved");
-    let _ = fs::remove_dir_all(&moved);
-    copy_tree(&root, &moved);
-    let (ok, out, err) = run_at(&moved);
-    assert!(ok, "relocated run: {err}");
-    assert!(
-        err.contains("front/cache-hit"),
-        "the moved project must reuse its cache: {err}"
-    );
-    assert!(
-        err.contains("object cache: _PATH binding mismatch"),
-        "the moved native pack must reject its path-bound group: {err}"
-    );
-    let moved_canon = moved.canonicalize().unwrap();
-    assert!(
-        out.contains(&moved_canon.display().to_string()),
-        "_PATH must point at the module's NEW location, got: {out}"
-    );
-
-    // Copying the rewritten pack through another relocation ensures a stale
-    // path-bound group is replaced without sacrificing the rest of the pack.
-    let moved_again = root.with_file_name("czcache_path_reanchor_moved_again");
-    let _ = fs::remove_dir_all(&moved_again);
-    copy_tree(&moved, &moved_again);
-    let (ok, out, err) = run_at(&moved_again);
-    assert!(ok, "second relocated run: {err}");
-    assert!(err.contains("front/cache-hit"), "{err}");
-    assert!(
-        err.contains("object cache: _PATH binding mismatch"),
-        "{err}"
-    );
-    let moved_again_canon = moved_again.canonicalize().unwrap();
-    assert!(
-        out.contains(&moved_again_canon.display().to_string()),
-        "_PATH must follow every relocation, got: {out}"
-    );
-}
-
-/// Recursive copy for the relocation test (no external crates).
-fn copy_tree(from: &PathBuf, to: &PathBuf) {
-    fs::create_dir_all(to).unwrap();
-    for entry in fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let src = entry.path();
-        let dst = to.join(entry.file_name());
-        if src.is_dir() {
-            copy_tree(&src, &dst);
-        } else {
-            fs::copy(&src, &dst).unwrap();
-        }
-    }
-}
-
-/// The context seed: after a cold run stores the context's inference tables
-/// (everything except the entry), an ENTRY edit re-infers only the entry --
-/// and must still see the edit, not the cached program. The seed store is
-/// isolated via XDG_CACHE_HOME so the test cannot touch the user's.
-#[test]
-fn context_seed_survives_entry_edits() {
-    let main = setup(
-        "ctx_seed_entry_edit",
-        &[
-            (
-                "lib/util.cz",
-                "fun double(v: int32) -> int32 { return v * 2 }\n",
-            ),
-            (
-                "main.cz",
-                "import lib.util.{ double }\nfun main() { println(double(3)) }\n",
-            ),
-        ],
-    );
-    let cache_home = main.parent().unwrap().join("xdg-cache");
-    let run = |main: &PathBuf| {
-        let out = Command::new(env!("CARGO_BIN_EXE_brass"))
-            .arg(main)
-            .env("XDG_CACHE_HOME", &cache_home)
-            .output()
-            .expect("spawn brass");
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
-    };
-
-    let (ok, out, err) = run(&main);
-    assert!(ok, "cold: {err}");
-    assert_eq!(out, "6\n");
-    let seeds = cache_home.join("brass");
-    assert!(
-        seeds.is_dir() && fs::read_dir(&seeds).unwrap().next().is_some(),
-        "the cold run stores a context seed"
-    );
-
-    // Edit the ENTRY: the context seed still applies, and the result reflects
-    // the edit (the entry really was re-checked, only the context was not).
-    fs::write(
-        &main,
-        "import lib.util.{ double }\nfun main() { println(double(5)) }\n",
-    )
-    .unwrap();
-    let (ok, out, err) = run(&main);
-    assert!(ok, "entry edit: {err}");
-    assert_eq!(out, "10\n");
-
-    // Edit the CONTEXT: the seed is stale by key, so the change is honored too.
-    fs::write(
-        main.parent().unwrap().join("lib/util.cz"),
-        "fun double(v: int32) -> int32 { return v * 3 }\n",
-    )
-    .unwrap();
-    let (ok, out, err) = run(&main);
-    assert!(ok, "context edit: {err}");
-    assert_eq!(out, "15\n");
 }

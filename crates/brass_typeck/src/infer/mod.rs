@@ -192,7 +192,7 @@ pub fn check(program: &Program) -> Vec<TypeError> {
 /// VARIABLE ids are not portable -- a consuming run mints its own -- so
 /// [`ContextTables::remapped`] renumbers every open variable into the consumer's
 /// namespace first, one map across all tables so linked entries stay linked.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ContextTables {
     pub schemes: HashMap<String, TypeScheme>,
     pub function_returns: HashMap<String, Type>,
@@ -218,7 +218,7 @@ pub struct ContextTables {
 }
 
 /// The parts of HIR identity embedded in context table keys and values.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct ContextProgramIdentity {
     functions: std::collections::BTreeMap<String, Vec<String>>,
     types: std::collections::BTreeMap<String, (Vec<String>, i32)>,
@@ -1013,15 +1013,6 @@ pub(crate) fn analyze_inner(
             let t = std::time::Instant::now();
             checker.const_scopes = vec![HashSet::default()];
             for (i, init) in program.inits.iter().enumerate() {
-                // A resumed run's snapshot settled the leading inits: their
-                // delivered state was seeded, so announce and move on.
-                if i < ctl.skip_inits {
-                    ctl.sched.emit(stream::CheckEvent::BodyChecked(
-                        stream::BodyId::Init(i),
-                        stream::ChannelDelta::default(),
-                    ));
-                    continue;
-                }
                 check_init_body(&mut checker, init);
                 let errs = crate::exhaustive::check_stmts(program, &checker.typed, &init.stmts);
                 checker.errors.extend(errs);
@@ -1086,14 +1077,7 @@ pub(crate) fn analyze_inner(
                 for request in requests.into_iter().rev() {
                     let fresh = !done.contains(&request.symbol)
                         && program.functions.contains_key(&request.symbol);
-                    // A request naming a snapshot-settled body means the
-                    // consumer found its cached state insufficient, so the
-                    // real pass runs after all.
-                    let revived = !fresh && ctl.skip_fns.remove(&request.symbol);
-                    if revived {
-                        done.remove(&request.symbol);
-                    }
-                    if fresh || revived {
+                    if fresh {
                         demanded_at.insert(request.symbol.clone(), request.type_args);
                         priority.insert(request.symbol.clone());
                         queue.push_front((request.symbol, Some(request.batch)));
@@ -1130,15 +1114,11 @@ pub(crate) fn analyze_inner(
                         && args.iter().all(brass_hir::is_fully_known)
                         && !args.iter().any(contains_structural_record)
                 });
-                if instance_args.is_none()
-                    && (checker.seeded_module(&f.module) || ctl.skip_fns.contains(&symbol))
-                {
+                if instance_args.is_none() && checker.seeded_module(&f.module) {
                     // A seeded (context) body is settled without a check of
                     // its own -- callers re-elaborate it at their call sites
                     // -- but the event must still go out: a consumer waiting
                     // on a context function would otherwise wait forever.
-                    // A resume-snapshot body is settled the same way: its
-                    // delivered state was seeded from the prior run.
                     emit_function_checked(&checker, ctl, &queue, batch, symbol);
                     continue;
                 }
@@ -1160,16 +1140,6 @@ pub(crate) fn analyze_inner(
             }
             perf.report();
             checker.in_entry_main = false;
-            // A stopped run hands its settled state back for the partial
-            // cache: what this run checked resumes the next one.
-            if ctl.sched.stopped() {
-                let snapshot = ctl.state.snapshot(
-                    done.into_iter().collect(),
-                    program.inits.len(),
-                    &checker.fields_loops,
-                );
-                ctl.sched.emit(stream::CheckEvent::Interrupted(snapshot));
-            }
         }
     }
     let t = std::time::Instant::now();
@@ -1601,8 +1571,7 @@ fn flush_delta(
     delta.errors = checker.errors[state.errors_seen..].to_vec();
     state.errors_seen = checker.errors.len();
     // Warnings can be rediscovered by call-site and dedicated-body checks, so
-    // flush by value instead of by prefix. The same delivered set survives a
-    // partial-cache resume, where the fresh checker vector starts at zero.
+    // flush by value instead of by prefix.
     delta.warnings = checker
         .warnings
         .iter()

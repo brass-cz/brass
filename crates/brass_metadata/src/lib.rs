@@ -1,9 +1,8 @@
 //! The identity of a compiler build: the workspace version, the release
 //! channel, and the git commit it was built from.
 //!
-//! Every binary in the tree reports its version through [`version_string`], and
-//! the analysis cache keys its files on [`compiler_tag`], so that all of them
-//! agree on what "this compiler" is. Nothing else should read
+//! Every binary in the tree reports its version through [`version_string`], so
+//! that all of them agree on what "this compiler" is. Nothing else should read
 //! `CARGO_PKG_VERSION` directly: a per-crate version would drift from the one
 //! the user sees, and a version alone cannot distinguish two builds of the same
 //! release.
@@ -65,6 +64,13 @@ fn short_commit() -> &'static str {
     COMMIT_HASH.get(..7).unwrap_or(COMMIT_HASH)
 }
 
+/// Machine-readable compiler identity, including the full commit. Artifact
+/// consumers compare this tag for equality; unstamped working-tree builds
+/// additionally need a fingerprint of the running executable.
+pub fn compiler_tag() -> String {
+    format!("{}@{}-{}", PACKAGE_VERSION, build_channel(), COMMIT_HASH)
+}
+
 /// The version every Brass binary reports, e.g. `0.1.0 (nightly 8314ac1)`.
 /// The channel and commit are part of it because the version alone identifies a
 /// release, not a build: pre-release builds share the version of the release
@@ -82,14 +88,4 @@ pub fn version_string() -> &'static str {
             short_commit()
         )
     })
-}
-
-/// Compiler identity tag
-///
-/// Unlike [`version_string`] this is not written for a human to read: it carries
-/// the full commit and is meant to be compared for equality, by consumers that
-/// must not reuse an artifact produced by a different compiler (the `.czcache`
-/// header).
-pub fn compiler_tag() -> String {
-    format!("{}@{}-{}", PACKAGE_VERSION, build_channel(), COMMIT_HASH,)
 }

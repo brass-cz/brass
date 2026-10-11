@@ -1,5 +1,5 @@
 import std.env
-import std.fs.{ create_dir, read_file, write_file }
+import std.fs.{ create_dir, read_file }
 import std.path.Path
 import std.process.{ Command, Stdio, exit }
 
@@ -195,19 +195,6 @@ license = \"MIT\"
 
     _write_new(source_path, "println(\"Hello, {name}!\")")!
 
-    const ignore_path = path.join(".gitignore")
-    if ignore_path.exists() {
-        let ignore = read_file(ignore_path)!
-        if !_has_line(ignore, "*.czcache") {
-            if len(ignore) > 0 && !ignore.ends_with("\n") {
-                ignore += "\n"
-            }
-            write_file(ignore_path, ignore + "*.czcache\n")!
-        }
-    } else {
-        _write_new(ignore_path, "*.czcache\n")!
-    }
-
     // Sub-modules live under the package's identifier-shaped directory.
     println("Package {name} created at {path.to_string()}!")
     exit(0)
@@ -253,15 +240,6 @@ fun _write_new(path: Path, content: string) {
     if code != 0 {
         return error("cannot create {path.to_string()}: destination already exists")
     }
-}
-
-fun _has_line(text: string, expected: string) -> bool {
-    for line in text.split("\n") {
-        if line.trim() == expected {
-            return true
-        }
-    }
-    return false
 }
 
 fun run_brass(args: string[], deps: string) {

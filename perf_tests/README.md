@@ -12,20 +12,16 @@ perf_tests/run.sh
 ```
 
 The script release-builds the driver (`./x cargo build --release -p
-brass_driver`), runs every program in `cases/` under both pipelines with a
-cold compilation cache (`BRASS_CACHE=off`) and a warm one, and writes
+brass_driver`), runs every program in `cases/` under both pipelines, and writes
 `results/<timestamp>/report.md` (also copied to `results/latest-report.md`).
-Warm cells are same-mode primed: the per-entry analysis cache
-(`<case>.czcache`, written next to the source) is reset and then primed by a
-warmup run of the measured mode, because the two modes persist different
-payloads -- an eager run writes the full analysis, while a lazy run persists
-only the instances the execution actually reached (a partial cache the next
-lazy run resumes from, re-checking the rest in the background). The
-`XDG_CACHE_HOME` override isolates the shared context-seed cache (`.czctx`)
-from the user's real one. Two metrics per run: **total** wall time and
-**first** (time to the first output line -- every case prints `begin` as its
-first statement, so this captures how soon execution starts). Lazy and eager
-stdout are compared; any divergence is listed in the report as a bug.
+Every run checks the case from source; only native objects persist, in the
+JIT cache under `XDG_CACHE_HOME`. Each case/mode cell gets its own cache
+directory: **cold** empties it before every run (the run compiles and stores
+its objects), **warm** keeps what the cell's warmup run stored (the run links
+cached objects instead of compiling). Two metrics per run: **total** wall
+time and **first** (time to the first output line -- every case prints `begin`
+as its first statement, so this captures how soon execution starts). Lazy and
+eager stdout are compared; any divergence is listed in the report as a bug.
 
 Knobs (environment variables): `REPS` (default 5), `CASES=<regex>` to filter
 case files, `CACHE_MODES="cold warm"`, `SKIP_BUILD=1`, `RUN_TIMEOUT` seconds.
@@ -46,7 +42,7 @@ groups:
   `08_recursion`, `11_closures_hot` (code quality, call/stub indirection)
 - concurrency: `10_spawn_tasks` (spawn-reachable precompile)
 
-`check_bench.sh` times `brass check` alone (cold) over the checker-dominated
+`check_bench.sh` times `brass check` alone over the checker-dominated
 cases plus the real czpm closure, isolating the front end from back-end
 changes.
 

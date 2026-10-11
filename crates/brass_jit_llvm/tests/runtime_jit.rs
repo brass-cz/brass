@@ -29,6 +29,7 @@ fn compiles_and_runs_an_instance_after_finalize() {
     let mir = brass_mir::lower_program(&program);
     let mono = brass_engine::monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     // Declare every instance, then finalize -- no bodies are emitted statically.
@@ -92,6 +93,7 @@ fn on_demand_monomorphize_and_compile_for_a_runtime_type() {
     assert_eq!(f.ret, Type::Int(IntKind::I32), "p.age is int32");
 
     // Compile the on-demand instance into a live engine.
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     backend.begin_program(&mono);
@@ -134,6 +136,7 @@ fn deferred_monomorphization_end_to_end() {
         .expect("specialize get_age for Person");
     let inst = instance_symbol(&get_age, &[person]);
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     backend.begin_program(&mono);
@@ -198,6 +201,7 @@ fn brass_program_triggers_deferred_dispatch() {
         .expect("run_it");
     let run_it_inst = instance_symbol(&run_it, &[person]);
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     // The engine that runs the program (compiles `run_it`, whose body calls
     // `__rt_dispatch` -> `pp_resolve`).
@@ -228,4 +232,49 @@ fn brass_program_triggers_deferred_dispatch() {
         result, 42,
         "a Brass program triggered deferred compilation + dispatch of get_age"
     );
+}
+
+/// A runtime specialization includes its new callees, skips a startup definition,
+/// and can be submitted twice without redefining symbols or changing addresses.
+#[test]
+fn runtime_batch_keeps_startup_definitions_and_registers_callees() {
+    let src = "fun seed() -> int32 { return 10 }\n\
+               fun helper() -> int32 { return 7 }\n\
+               fun answer() -> int32 { return seed() + helper() }\n\
+               fun main() { let value = answer() }\n";
+    let ast = brass_parser::parse(src).expect("parse");
+    let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+        is_prelude: false,
+        path: vec!["main".into()],
+        ast,
+    }]);
+    assert!(errors.is_empty(), "{errors:?}");
+    let mir = brass_mir::lower_program(&program);
+    let mono = brass_engine::monomorphize(&mir, &program).expect("monomorphize");
+    brass_jit_llvm::disable_jit_cache_for_tests();
+    let ctx = Context::create();
+    let mut backend = LlvmCodegen::new_backend(&ctx, &program);
+    backend.begin_program(&mono);
+    let seed = mono
+        .functions
+        .iter()
+        .find(|f| f.symbol == "seed")
+        .expect("seed");
+    backend.codegen_function(&mono, seed);
+    backend.finalize().expect("finalize startup");
+    let seed_address = backend.address_of(&seed.symbol).expect("startup address");
+    let answer = mono
+        .functions
+        .iter()
+        .find(|f| f.symbol == "answer")
+        .expect("answer");
+    let first = backend
+        .compile_instance(&mono, answer)
+        .expect("register batch");
+    let second = backend
+        .compile_instance(&mono, answer)
+        .expect("repeat batch");
+    assert_eq!(first, second);
+    assert_eq!(backend.address_of(&seed.symbol), Some(seed_address));
+    assert_eq!(backend.run_entry_i32(&answer.symbol), Some(17));
 }

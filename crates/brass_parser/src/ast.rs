@@ -7,7 +7,7 @@
 use crate::lexer::Span;
 
 /// One parsed source file.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Module {
     pub imports: Vec<ImportDecl>,
     pub items: Vec<TopLevel>,
@@ -15,7 +15,7 @@ pub struct Module {
 
 /// One name in an import's braced list; `local` differs from `remote` when an
 /// `as` rename is present (`import m.{ X as Y }` -> remote "X", local "Y").
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct ImportedName {
     /// The name as it exists in the target module.
     pub remote: String,
@@ -34,7 +34,7 @@ impl ImportedName {
     }
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct ImportDecl {
     /// Dotted module path, e.g. `math.vector` -> ["math", "vector"].
     pub path: Vec<String>,
@@ -54,7 +54,7 @@ pub struct ImportDecl {
     pub span: Span,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub enum TopLevel {
     Type(TypeDecl),
     Fun(FunDecl),
@@ -63,7 +63,7 @@ pub enum TopLevel {
 
 /// A `type` declaration. `interfaces` holds the enforced interface names from
 /// `type B: A, C = ...`; the body is either a record or a sum type.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct TypeDecl {
     pub name: String,
     pub interfaces: Vec<String>,
@@ -74,7 +74,7 @@ pub struct TypeDecl {
     pub doc: Option<String>,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub enum TypeBody {
     Record(Vec<Member>),
     Sum(Vec<Variant>),
@@ -85,27 +85,27 @@ pub enum TypeBody {
     Alias(TypeExpr),
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Variant {
     pub name: String,
     pub members: Vec<Member>,
     pub span: Span,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub enum Member {
     Field(Field),
     Method(Method),
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Field {
     pub name: String,
     pub ty: Option<TypeExpr>,
     pub span: Span,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Method {
     pub name: String,
     pub params: Vec<Param>,
@@ -118,7 +118,7 @@ pub struct Method {
     pub doc: Option<String>,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct FunDecl {
     pub name: String,
     /// `Some(T)` when this is a method implementation `fun T.m(...)`: `T` is the
@@ -134,20 +134,20 @@ pub struct FunDecl {
     pub doc: Option<String>,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Param {
     pub name: String,
     pub ty: Option<TypeExpr>,
     pub span: Span,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
     pub span: Span,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub enum Stmt {
     Let {
         pat: Pattern,
@@ -200,7 +200,7 @@ impl Stmt {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssignOp {
     Eq,
     Add,
@@ -224,7 +224,7 @@ impl AssignOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BinOp {
     Add,
     Sub,
@@ -291,7 +291,7 @@ impl BinOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnaryOp {
     Neg,
     Not,
@@ -310,19 +310,19 @@ impl UnaryOp {
 }
 
 /// A segment of a string literal: literal text or an interpolated expression.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub enum StrSeg {
     Lit(String),
     Expr(Box<Expr>),
 }
 
 /// A call argument.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Arg {
     pub expr: Expr,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub enum Expr {
     Int(i64, Span),
     Float(f64, Span),
@@ -392,14 +392,14 @@ impl Expr {
     }
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct MatchArm {
     pub pattern: Pattern,
     pub body: Expr,
     pub span: Span,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub enum Pattern {
     Wildcard(Span),
     /// A bare name: a binding, or a unit variant when it names one (resolved
@@ -450,7 +450,7 @@ impl Pattern {
     }
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct FieldPat {
     pub name: String,
     /// `None` means shorthand `{ name }` binding the field to its own name.
@@ -458,7 +458,7 @@ pub struct FieldPat {
     pub span: Span,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub enum TypeExpr {
     /// Primitive or user-defined type name.
     Named(String, Span),

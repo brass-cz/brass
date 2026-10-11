@@ -29,7 +29,7 @@ use brass_hir::{MethodInfo, NominalInfo, Program, TypeKind, TypedProgram, resolv
 use brass_parser::Span;
 use brass_parser::ast::*;
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TypeError {
     pub message: String,
     pub span: Span,
@@ -179,16 +179,7 @@ impl<'a> AnalysisModules<'a> {
 /// context has any diagnostic: only a clean context's tables may stand in for
 /// re-checking it.
 pub fn context_seed(program: &Program) -> Option<ContextTables> {
-    context_seed_with(program, None)
-}
-
-/// [`context_seed`] over a PARTIAL prior seed (see
-/// [`infer::ContextTables::retain_modules`]): the covered modules skip their
-/// passes and only the rest re-infer; the returned tables span the whole
-/// context again (the checker's tables union the seed with the new passes),
-/// with `covered` cleared back to full.
-pub fn context_seed_with(program: &Program, seed: Option<&ContextTables>) -> Option<ContextTables> {
-    let analysis = analyze_with(program, seed);
+    let analysis = analyze_with(program, None);
     if !analysis.errors.is_empty() {
         for e in analysis.errors.iter().take(5) {
             tracing::debug!(
@@ -214,7 +205,7 @@ pub fn analyze(program: &Program) -> Analysis {
 /// context also defines: the collision qualifies the context's storage symbols
 /// in the combined program, detaching every seeded table key.
 pub fn analyze_with(program: &Program, seed: Option<&ContextTables>) -> Analysis {
-    analyze_impl(program, seed, None, None)
+    analyze_impl(program, seed, None)
 }
 
 /// Continue a completed analysis by checking only append-only generated keyed
@@ -258,23 +249,18 @@ pub fn analyze_generated(
 /// delta of checker channels recorded in its window (see [`stream`]). The
 /// returned `Analysis` is equivalent to the eager one; the event stream is
 /// an incremental view of it, ending with [`stream::CheckEvent::Finished`].
-/// `resume` seeds the run with a prior stopped run's snapshot: its settled
-/// bodies are skipped (announced immediately), and the flush bookkeeping
-/// starts from what that run already delivered, so only new work streams.
 pub fn analyze_streaming(
     program: &Program,
     seed: Option<&ContextTables>,
     sched: &mut dyn stream::Scheduler,
-    resume: Option<&stream::StreamSnapshot>,
 ) -> Analysis {
-    analyze_impl(program, seed, Some(sched), resume)
+    analyze_impl(program, seed, Some(sched))
 }
 
 fn analyze_impl(
     program: &Program,
     seed: Option<&ContextTables>,
     sched: Option<&mut dyn stream::Scheduler>,
-    resume: Option<&stream::StreamSnapshot>,
 ) -> Analysis {
     let entry_declares =
         |name: &str| {
@@ -306,11 +292,7 @@ fn analyze_impl(
     // verdict before any body event: an error here is fatal to execution.
     let mut ctl = sched.map(|sched| stream::StreamCtl {
         sched,
-        state: resume.map_or_else(Default::default, stream::FlushState::from_snapshot),
-        skip_fns: resume.map_or_else(Default::default, |snap| {
-            snap.checked.iter().cloned().collect()
-        }),
-        skip_inits: resume.map_or(0, |snap| snap.inits_checked),
+        state: stream::FlushState::default(),
     });
     if let Some(ctl) = &mut ctl {
         ctl.sched

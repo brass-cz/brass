@@ -7,14 +7,13 @@
 
 /// A byte-offset source span. `lo`/`hi` are byte indices into the source,
 /// usable for slicing and for computing line/column on demand.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Span {
     pub lo: usize,
     pub hi: usize,
     /// Source coordinates retained by synthetic span shifts. Keeping this
     /// provenance in the span makes diagnostic restoration independent of any
     /// assumed maximum source-map offset.
-    #[serde(default)]
     source: Option<(usize, usize)>,
 }
 

@@ -76,9 +76,8 @@ What this means in practice:
   already produced stands and the run exits non-zero. The unit is the whole
   function: an error anywhere in a function the run calls counts, even in a
   branch execution would never take.
-- Unused code may continue checking in the background. A stopped check can be
-  resumed from the analysis cache on a later run, but its diagnostics never
-  change the current run's outcome.
+- Unused code may continue checking in the background until the program
+  exits, but its diagnostics never change the current run's outcome.
 - `brass --eager hello.cz` runs with the check-everything-first behavior
   (identical to `brass check` followed by the run). The REPL and the
   interpreter back end always check eagerly.

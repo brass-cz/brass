@@ -10,6 +10,7 @@ std/**/*.so
 std/**/*.dylib
 std/**/*.dll
 
-# On-disk analysis caches written next to entry files.
+# Analysis and native-object caches older toolchains wrote next to entry files.
 *.czcache
 *.czcache.tmp
+*.czobj

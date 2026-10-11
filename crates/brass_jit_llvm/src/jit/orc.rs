@@ -3,9 +3,10 @@
 //! LLVM's C API does not expose `LLLazyJIT`, but it does expose the lower-level
 //! pieces it is built from: custom materialization units, lazy reexports, and
 //! indirect stubs. This module combines those pieces so Brass can generate one
-//! function module only when its call-through stub is entered for the first
+//! function group only when its call-through stub is entered for the first
 //! time. All raw ownership transfer is kept in this module; callers deal in
-//! owning [`OrcModule`] values and ordinary Rust callbacks.
+//! owning [`OrcModule`] values. Pending IR belongs to the session, so runtime
+//! registration and materialization never borrow the compiler reentrantly.
 
 use fxhash::FxHashMap as HashMap;
 use std::cell::{Cell, RefCell};
@@ -13,21 +14,25 @@ use std::ffi::{CStr, CString, c_void};
 use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
-use std::sync::OnceLock;
+use std::rc::Rc;
+use std::sync::{Arc, OnceLock};
+
+use super::objcache::{ObjectStore, TargetIdentity};
 
 use inkwell::module::Module;
 use inkwell::targets::{InitializationConfig, Target};
+use llvm_sys::bit_writer::LLVMWriteBitcodeToMemoryBuffer;
 use llvm_sys::core::{
-    LLVMCreateMemoryBufferWithMemoryRangeCopy, LLVMDisposeMessage, LLVMDisposeModule,
-    LLVMGetBufferSize, LLVMGetBufferStart, LLVMSetDataLayout,
+    LLVMCreateMemoryBufferWithMemoryRangeCopy, LLVMDisposeMemoryBuffer, LLVMDisposeMessage,
+    LLVMDisposeModule, LLVMGetBufferSize, LLVMGetBufferStart, LLVMSetDataLayout,
 };
 use llvm_sys::error::{LLVMDisposeErrorMessage, LLVMErrorRef, LLVMGetErrorMessage};
 use llvm_sys::orc2::lljit::{
-    LLVMOrcCreateLLJIT, LLVMOrcCreateLLJITBuilder, LLVMOrcDisposeLLJIT, LLVMOrcLLJITAddObjectFile,
+    LLVMOrcCreateLLJIT, LLVMOrcCreateLLJITBuilder, LLVMOrcDisposeLLJIT,
     LLVMOrcLLJITBuilderSetJITTargetMachineBuilder, LLVMOrcLLJITGetDataLayoutStr,
     LLVMOrcLLJITGetExecutionSession, LLVMOrcLLJITGetIRTransformLayer, LLVMOrcLLJITGetMainJITDylib,
-    LLVMOrcLLJITGetObjTransformLayer, LLVMOrcLLJITGetTripleString, LLVMOrcLLJITLookup,
-    LLVMOrcLLJITMangleAndIntern, LLVMOrcLLJITRef,
+    LLVMOrcLLJITGetObjLinkingLayer, LLVMOrcLLJITGetObjTransformLayer, LLVMOrcLLJITGetTripleString,
+    LLVMOrcLLJITLookup, LLVMOrcLLJITMangleAndIntern, LLVMOrcLLJITRef,
 };
 use llvm_sys::orc2::{
     LLVMJITEvaluatedSymbol, LLVMJITSymbolFlags, LLVMJITSymbolGenericFlags, LLVMOrcAbsoluteSymbols,
@@ -44,7 +49,7 @@ use llvm_sys::orc2::{
     LLVMOrcLazyCallThroughManagerRef, LLVMOrcLazyReexports,
     LLVMOrcMaterializationResponsibilityFailMaterialization,
     LLVMOrcMaterializationResponsibilityGetRequestedSymbols,
-    LLVMOrcMaterializationResponsibilityRef, LLVMOrcMaterializationUnitRef,
+    LLVMOrcMaterializationResponsibilityRef, LLVMOrcMaterializationUnitRef, LLVMOrcObjectLayerEmit,
     LLVMOrcObjectTransformLayerSetTransform, LLVMOrcSymbolStringPoolEntryStr,
     LLVMOrcThreadSafeContextRef, LLVMOrcThreadSafeModuleWithModuleDo,
 };
@@ -55,8 +60,6 @@ use llvm_sys::target_machine::{
 use llvm_sys::transforms::pass_builder::{
     LLVMCreatePassBuilderOptions, LLVMDisposePassBuilderOptions, LLVMRunPasses,
 };
-
-use super::objcache::ObjectCacheWriter;
 
 type Materializer<'a> = dyn FnMut(&LazyFunction) -> Result<OrcModule, String> + 'a;
 
@@ -82,15 +85,8 @@ impl OptTier {
     }
 }
 
-/// The CPU identity used for both instruction selection and native-object
-/// cache tagging. Release packaging sets `BRASS_JIT_CPU=generic`, which also
-/// clears target features so the generated objects stay portable within the
-/// target architecture instead of inheriting the packaging host's extensions.
-pub(super) fn target_cpu_identity() -> Option<(String, String)> {
-    if let Some(cpu) = std::env::var_os("BRASS_JIT_CPU") {
-        return Some((cpu.to_string_lossy().into_owned(), String::new()));
-    }
-
+/// The host CPU name and feature string instruction selection targets.
+fn target_cpu_identity() -> Option<(String, String)> {
     // SAFETY: LLVM returns independently allocated, NUL-terminated messages;
     // each is copied before being disposed exactly once below.
     unsafe {
@@ -115,42 +111,60 @@ pub(super) fn target_cpu_identity() -> Option<(String, String)> {
     }
 }
 
-/// Owns an LLVM context until it is transferred to ORC. This wrapper makes
-/// context ownership explicit across fallible JIT construction: ordinary Rust
-/// drops it before a transfer, while the ORC session drops it afterwards.
-pub(crate) struct OrcContext {
-    context: ManuallyDrop<inkwell::context::Context>,
+/// Keeps a context alive for both code generation and one ORC session. The
+/// shared owner releases it only after the backend and this wrapper are gone.
+pub struct OrcContext {
+    owner: Rc<ContextOwner>,
     transferred: Cell<bool>,
 }
 
+struct ContextOwner {
+    context: ManuallyDrop<inkwell::context::Context>,
+    thread_safe: LLVMOrcThreadSafeContextRef,
+}
+
 impl OrcContext {
-    pub(crate) fn new() -> Self {
+    /// Allocate the context used by a single backend and its ORC session.
+    /// Keep this wrapper alive until the backend has been dropped.
+    pub fn new() -> Self {
+        let context = ManuallyDrop::new(inkwell::context::Context::create());
+        // SAFETY: the new thread-safe wrapper takes ownership of this context;
+        // ContextOwner disposes that wrapper after its last Rust owner drops.
+        let thread_safe =
+            unsafe { LLVMOrcCreateNewThreadSafeContextFromLLVMContext(context.raw()) };
         Self {
-            context: ManuallyDrop::new(inkwell::context::Context::create()),
+            owner: Rc::new(ContextOwner {
+                context,
+                thread_safe,
+            }),
             transferred: Cell::new(false),
         }
     }
 
     pub(crate) fn context(&self) -> &inkwell::context::Context {
-        &self.context
+        &self.owner.context
     }
 
-    fn transfer(&self) -> Result<llvm_sys::prelude::LLVMContextRef, String> {
+    fn transfer(&self) -> Result<Rc<ContextOwner>, String> {
         if self.transferred.replace(true) {
             Err("LLVM context was transferred to ORC twice".to_string())
         } else {
-            Ok(self.context.raw())
+            Ok(self.owner.clone())
         }
     }
 }
 
-impl Drop for OrcContext {
+impl Default for OrcContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for ContextOwner {
     fn drop(&mut self) {
-        if !self.transferred.get() {
-            // SAFETY: no ORC session accepted the context, so this wrapper
-            // remains its sole owner.
-            unsafe { ManuallyDrop::drop(&mut self.context) };
-        }
+        // SAFETY: the last Rust owner releases its one thread-safe wrapper.
+        // LLVM modules retain their own shared references until disposed.
+        unsafe { LLVMOrcDisposeThreadSafeContext(self.thread_safe) };
     }
 }
 
@@ -160,7 +174,6 @@ impl Drop for OrcContext {
 pub(crate) struct LazyFunction {
     pub(crate) symbol: String,
     pub(crate) implementation: String,
-    group_key: String,
 }
 
 pub(crate) fn lazy_implementation_symbol(symbol: &str) -> String {
@@ -168,8 +181,7 @@ pub(crate) fn lazy_implementation_symbol(symbol: &str) -> String {
 }
 
 /// An LLVM module whose raw allocation is owned by Rust until it is transferred
-/// to ORC. Consuming an Inkwell module is the only public construction path, so
-/// the module cannot be dropped by both wrappers.
+/// to ORC. Modules emitted in the session context transfer without serialization.
 pub(crate) struct OrcModule {
     raw: Option<llvm_sys::prelude::LLVMModuleRef>,
 }
@@ -197,21 +209,35 @@ impl Drop for OrcModule {
     }
 }
 
+/// Main-thread state shared by lookup and synchronous LLVM callbacks. Each
+/// RefCell borrow ends before an LLVM call that may materialize dependencies.
+/// JIT -> pp_resolve -> driver -> ORC lookup can therefore run while the driver
+/// owns LlvmCodegen: materialization needs only this independent allocation.
 struct MaterializerState {
     jit: LLVMOrcLLJITRef,
     context: LLVMOrcThreadSafeContextRef,
+    raw_context: llvm_sys::prelude::LLVMContextRef,
     data_layout: CString,
-    requests: HashMap<String, LazyFunction>,
-    callback: *mut (),
-    capture: Box<RefCell<CaptureState>>,
-    errors: Vec<String>,
+    requests: RefCell<HashMap<String, (LazyFunction, String)>>,
+    pending: RefCell<HashMap<String, OrcModule>>,
+    target: TargetIdentity,
+    capture: Box<ObjectCapture>,
+    callback: Cell<*mut ()>,
+    errors: RefCell<Vec<String>>,
 }
 
-#[derive(Default)]
-struct CaptureState {
-    current_group: Option<String>,
-    captured: Vec<(String, Vec<u8>)>,
-    writer: Option<ObjectCacheWriter>,
+/// A separate allocation lets LLVM's synchronous transform callbacks access
+/// capture state without borrowing the materializer currently emitting IR.
+/// Taking the marker at capture time excludes support objects linked later.
+struct ObjectCapture {
+    store: Option<Arc<ObjectStore>>,
+    current: RefCell<Option<(String, String)>>,
+    tier: OptTier,
+    preoptimized: RefCell<fxhash::FxHashSet<usize>>,
+    #[cfg(test)]
+    optimized: Cell<usize>,
+    #[cfg(test)]
+    captured: Cell<usize>,
 }
 
 /// Session errors mirrored for [`materialization_failed`], which is entered
@@ -237,16 +263,16 @@ extern "C" fn materialization_failed() -> ! {
 }
 
 impl MaterializerState {
-    fn push_error(&mut self, error: impl Into<String>) {
+    fn push_error(&self, error: impl Into<String>) {
         let error = error.into();
         if let Ok(mut mirror) = FATAL_ERRORS.lock() {
             mirror.push(error.clone());
         }
-        self.errors.push(error);
+        self.errors.borrow_mut().push(error);
     }
 
     fn transfer_to_thread_safe_module(
-        &mut self,
+        &self,
         mut module: OrcModule,
     ) -> llvm_sys::orc2::LLVMOrcThreadSafeModuleRef {
         let raw = module.take_raw();
@@ -259,7 +285,46 @@ impl MaterializerState {
         }
     }
 
-    fn materialize(&mut self, responsibility: LLVMOrcMaterializationResponsibilityRef) {
+    fn lookup_object(&self, module: &OrcModule, symbol: &str) -> CacheLookup {
+        let Some(store) = &self.capture.store else {
+            return CacheLookup::Miss(None);
+        };
+        // SAFETY: Rust still owns this module. Bitcode is copied into hashes
+        // before the independent serialization buffer is disposed. The layout
+        // matches the one used when transferring a miss to the IR layer.
+        let (optimized_key, session_key) = unsafe {
+            let raw = module.raw.expect("live ORC module");
+            LLVMSetDataLayout(raw, self.data_layout.as_ptr());
+            let buffer = LLVMWriteBitcodeToMemoryBuffer(raw);
+            if buffer.is_null() {
+                tracing::debug!(target: "brass::perf", symbol, "jit cache bitcode unavailable");
+                return CacheLookup::Miss(None);
+            }
+            let bitcode = std::slice::from_raw_parts(
+                LLVMGetBufferStart(buffer).cast(),
+                LLVMGetBufferSize(buffer),
+            );
+            let optimized = store.key(&self.target, OptTier::O2, bitcode);
+            let session = match self.capture.tier {
+                OptTier::O0 => store.key(&self.target, OptTier::O0, bitcode),
+                OptTier::O2 => optimized.clone(),
+            };
+            LLVMDisposeMemoryBuffer(buffer);
+            (optimized, session)
+        };
+        let object = store.load(&optimized_key, symbol).or_else(|| {
+            (self.capture.tier != OptTier::O2)
+                .then(|| store.load(&session_key, symbol))
+                .flatten()
+        });
+        if let Some(object) = object {
+            CacheLookup::Hit(object)
+        } else {
+            CacheLookup::Miss(Some(session_key))
+        }
+    }
+
+    fn materialize(&self, responsibility: LLVMOrcMaterializationResponsibilityRef) {
         let mut count = 0;
         // SAFETY: `responsibility` is supplied by ORC for this callback. The
         // returned array remains valid until disposed below.
@@ -282,26 +347,29 @@ impl MaterializerState {
             };
             let request = self
                 .requests
+                .borrow()
                 .get(&name)
                 .cloned()
                 .ok_or_else(|| format!("unregistered lazy implementation `{name}`"));
-            request.and_then(|request| {
-                if self.callback.is_null() {
+            request.and_then(|(request, first_symbol)| {
+                tracing::trace!(target: "brass::perf", symbol = %request.symbol,
+                    "back/orc-materialize");
+                // Release the queue borrow before emission can re-enter ORC.
+                let pending = self.pending.borrow_mut().remove(&first_symbol);
+                if let Some(module) = pending {
+                    return Ok((module, first_symbol));
+                }
+                if self.callback.get().is_null() {
                     return Err(format!(
-                        "lazy implementation `{}` was called without a materializer",
+                        "lazy module for `{}` is unavailable",
                         request.symbol
                     ));
                 }
-                // SAFETY: `with_materializer` installs a pointer to a live
-                // callback for the duration of JIT execution and restores the
-                // previous slot before returning.
-                let callback = unsafe { &mut *(self.callback as *mut &mut Materializer<'static>) };
-                tracing::trace!(
-                    target: "brass::perf",
-                    symbol = %request.symbol,
-                    "back/orc-materialize"
-                );
-                callback(&request).map(|module| (request.group_key.clone(), module))
+                // SAFETY: the test-only callback is scoped by with_materializer;
+                // production materialization exclusively consumes pending modules.
+                let callback =
+                    unsafe { &mut *(self.callback.get() as *mut &mut Materializer<'static>) };
+                callback(&request).map(|module| (module, first_symbol))
             })
         };
         // SAFETY: ownership of the requested-symbol array belongs to this
@@ -309,21 +377,42 @@ impl MaterializerState {
         unsafe { LLVMOrcDisposeSymbols(symbols) };
 
         match result {
-            Ok((group_key, module)) => {
+            Ok((module, symbol)) => {
+                let key = match self.lookup_object(&module, &symbol) {
+                    CacheLookup::Hit(object) => {
+                        // The object replaces the whole group, so its IR can
+                        // be dropped before linking begins.
+                        drop(module);
+                        // SAFETY: the buffer copies the validated object.
+                        // ObjectLayerEmit owns buffer and responsibility. The
+                        // linking layer bypasses capture on cache hits.
+                        unsafe {
+                            let buffer = LLVMCreateMemoryBufferWithMemoryRangeCopy(
+                                object.as_ptr().cast(),
+                                object.len(),
+                                c"cached-object".as_ptr(),
+                            );
+                            LLVMOrcObjectLayerEmit(
+                                LLVMOrcLLJITGetObjLinkingLayer(self.jit),
+                                responsibility,
+                                buffer,
+                            );
+                        }
+                        return;
+                    }
+                    CacheLookup::Miss(key) => key,
+                };
+                *self.capture.current.borrow_mut() = key.map(|key| (key, symbol));
                 let module = self.transfer_to_thread_safe_module(module);
                 // SAFETY: ORC takes ownership of both the responsibility and
                 // module when the transform layer is asked to emit them.
-                {
-                    let mut capture = self.capture.borrow_mut();
-                    debug_assert!(capture.current_group.is_none());
-                    capture.current_group = Some(group_key.clone());
-                }
                 unsafe {
                     let layer = LLVMOrcLLJITGetIRTransformLayer(self.jit);
                     LLVMOrcIRTransformLayerEmit(layer, responsibility, module);
                 }
-                let emitted_group = self.capture.borrow_mut().current_group.take();
-                debug_assert_eq!(emitted_group.as_deref(), Some(group_key.as_str()));
+                // Emission is synchronous. A failed compilation may not have
+                // reached the object transform, so clear its marker as well.
+                self.capture.current.borrow_mut().take();
             }
             Err(error) => {
                 self.push_error(error);
@@ -338,6 +427,38 @@ impl MaterializerState {
     }
 }
 
+enum CacheLookup {
+    Hit(Vec<u8>),
+    Miss(Option<String>),
+}
+
+extern "C" fn capture_object(
+    context: *mut c_void,
+    buffer: *mut llvm_sys::prelude::LLVMMemoryBufferRef,
+) -> LLVMErrorRef {
+    // C callbacks cannot unwind. A cache failure must leave LLVM's original
+    // buffer untouched so native emission continues normally.
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the boxed capture state lives until LLJIT is disposed; LLVM
+        // owns the live buffer throughout this synchronous callback.
+        let capture = unsafe { &*(context as *const ObjectCapture) };
+        let current = capture.current.borrow_mut().take();
+        if let (Some(store), Some((key, symbol))) = (&capture.store, current) {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    LLVMGetBufferStart(*buffer).cast(),
+                    LLVMGetBufferSize(*buffer),
+                )
+            };
+            let object = bytes.to_vec();
+            #[cfg(test)]
+            capture.captured.set(capture.captured.get() + 1);
+            store.publish(&key, &symbol, &object);
+        }
+    }));
+    ptr::null_mut()
+}
+
 extern "C" fn materialize_callback(
     context: *mut c_void,
     responsibility: LLVMOrcMaterializationResponsibilityRef,
@@ -347,13 +468,13 @@ extern "C" fn materialize_callback(
     let result = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: every custom materialization unit is registered with the
         // stable boxed `MaterializerState` pointer owned by `OrcJit`.
-        unsafe { (&mut *(context as *mut MaterializerState)).materialize(responsibility) };
+        unsafe { (&*(context as *const MaterializerState)).materialize(responsibility) };
     }));
     if result.is_err() {
         // SAFETY: same state and responsibility invariants as above. The panic
         // happened before the callback completed, so fail the responsibility.
         unsafe {
-            let state = &mut *(context as *mut MaterializerState);
+            let state = &*(context as *const MaterializerState);
             state.push_error("lazy materializer panicked");
             LLVMOrcMaterializationResponsibilityFailMaterialization(responsibility);
             LLVMOrcDisposeMaterializationResponsibility(responsibility);
@@ -374,26 +495,33 @@ extern "C" fn error_reporter(context: *mut c_void, error: LLVMErrorRef) {
     // SAFETY: ORC calls this with the boxed state installed in the execution
     // session and transfers ownership of `error` to the reporter.
     unsafe {
-        let state = &mut *(context as *mut MaterializerState);
+        let state = &*(context as *const MaterializerState);
         state.push_error(take_error(error));
     }
 }
 
 extern "C" fn optimize_transform(
-    _context: *mut c_void,
+    context: *mut c_void,
     module: *mut llvm_sys::orc2::LLVMOrcThreadSafeModuleRef,
     _responsibility: LLVMOrcMaterializationResponsibilityRef,
 ) -> LLVMErrorRef {
     // SAFETY: ORC supplies a live ThreadSafeModule slot. The nested callback
     // runs under that module's context lock.
-    unsafe { LLVMOrcThreadSafeModuleWithModuleDo(*module, optimize_module, ptr::null_mut()) }
+    unsafe { LLVMOrcThreadSafeModuleWithModuleDo(*module, optimize_module, context) }
 }
 
 extern "C" fn optimize_module(
-    _context: *mut c_void,
+    context: *mut c_void,
     module: llvm_sys::prelude::LLVMModuleRef,
 ) -> LLVMErrorRef {
-    let pipeline: &[u8] = match OptTier::from_env() {
+    // SAFETY: both transforms share the session's stable capture allocation.
+    let capture = unsafe { &*(context as *const ObjectCapture) };
+    if capture.preoptimized.borrow_mut().remove(&(module as usize)) {
+        return ptr::null_mut();
+    }
+    #[cfg(test)]
+    capture.optimized.set(capture.optimized.get() + 1);
+    let pipeline: &[u8] = match capture.tier {
         OptTier::O0 => b"default<O0>\0",
         OptTier::O2 => b"default<O2>\0",
     };
@@ -409,51 +537,17 @@ extern "C" fn optimize_module(
     }
 }
 
-extern "C" fn capture_object(
-    context: *mut c_void,
-    object: *mut llvm_sys::prelude::LLVMMemoryBufferRef,
-) -> LLVMErrorRef {
-    // ORC invokes object transforms synchronously in this session. The support
-    // module and cached objects arrive with no current group marker and are
-    // deliberately ignored; only IR emitted by `materialize` is copied.
-    let result = catch_unwind(AssertUnwindSafe(|| unsafe {
-        let capture = &*(context as *const RefCell<CaptureState>);
-        let Some(group_key) = capture.borrow().current_group.clone() else {
-            return;
-        };
-        if object.is_null() || (*object).is_null() {
-            return;
-        }
-        let size = LLVMGetBufferSize(*object);
-        let start = LLVMGetBufferStart(*object).cast::<u8>();
-        let bytes = if size == 0 {
-            Vec::new()
-        } else {
-            if start.is_null() {
-                return;
-            }
-            std::slice::from_raw_parts(start, size).to_vec()
-        };
-        let mut capture = capture.borrow_mut();
-        if let Some(writer) = capture.writer.as_mut() {
-            writer.record(&group_key, &bytes);
-        }
-        capture.captured.push((group_key, bytes));
-    }));
-    debug_assert!(result.is_ok(), "ORC object capture panicked");
-    ptr::null_mut()
-}
-
 /// A single-threaded ORC session supporting per-function lazy materialization.
 ///
-/// The supplied [`OrcContext`] is transferred to ORC. The JIT releases it after
-/// all pending modules have been destroyed.
+/// The supplied [`OrcContext`] is shared with ORC. The JIT releases its reference
+/// after all pending modules have been destroyed.
 pub(crate) struct OrcJit {
     jit: LLVMOrcLLJITRef,
     dylib: LLVMOrcJITDylibRef,
     stubs: LLVMOrcIndirectStubsManagerRef,
     call_through: LLVMOrcLazyCallThroughManagerRef,
     state: Box<MaterializerState>,
+    _context: Rc<ContextOwner>,
 }
 
 /// Owns the helpers created before an [`OrcJit`] has all of its required
@@ -498,11 +592,25 @@ impl Drop for OrcConstruction {
 }
 
 impl OrcJit {
+    /// Creates an ORC session with process-wide cache configuration and tier.
+    /// The store is independent of the caller's checking or IR preparation path.
+    #[cfg(test)]
     pub(crate) fn new(context: &OrcContext) -> Result<Self, String> {
+        Self::with_cache(context, ObjectStore::from_env(), OptTier::from_env())
+    }
+
+    pub(crate) fn with_cache(
+        context: &OrcContext,
+        store: Option<Arc<ObjectStore>>,
+        tier: OptTier,
+    ) -> Result<Self, String> {
         Target::initialize_native(&InitializationConfig::default())
             .map_err(|error| format!("failed to initialize native LLVM target: {error}"))?;
 
-        let jit = create_jit(OptTier::from_env())?;
+        let (cpu, features) = target_cpu_identity()
+            .ok_or_else(|| "failed to read LLVM target CPU identity".to_string())?;
+        tracing::debug!(target: "brass::perf", ?tier, "JIT session tier");
+        let jit = create_jit(tier, &cpu, &features)?;
         let mut construction = OrcConstruction {
             jit,
             stubs: ptr::null_mut(),
@@ -538,19 +646,33 @@ impl OrcJit {
         };
         call_through_result?;
 
-        let raw_context = context.transfer()?;
-        // SAFETY: `OrcContext::transfer` gives this thread-safe wrapper sole
-        // ownership of the raw context.
-        let thread_safe_context =
-            unsafe { LLVMOrcCreateNewThreadSafeContextFromLLVMContext(raw_context) };
-        let mut state = Box::new(MaterializerState {
+        let context = context.transfer()?;
+        let raw_context = context.context.raw();
+        let thread_safe_context = context.thread_safe;
+        let state = Box::new(MaterializerState {
             jit,
             context: thread_safe_context,
+            raw_context,
             data_layout,
-            requests: HashMap::default(),
-            callback: ptr::null_mut(),
-            capture: Box::new(RefCell::new(CaptureState::default())),
-            errors: Vec::new(),
+            requests: RefCell::default(),
+            pending: RefCell::default(),
+            target: TargetIdentity {
+                triple: triple.to_string_lossy().into_owned(),
+                cpu,
+                features,
+            },
+            capture: Box::new(ObjectCapture {
+                store,
+                current: RefCell::new(None),
+                tier,
+                preoptimized: RefCell::default(),
+                #[cfg(test)]
+                optimized: Cell::new(0),
+                #[cfg(test)]
+                captured: Cell::new(0),
+            }),
+            callback: Cell::new(ptr::null_mut()),
+            errors: RefCell::default(),
         });
         // SAFETY: `state` is boxed and remains at this address until after the
         // execution session is disposed in `Drop`.
@@ -558,17 +680,17 @@ impl OrcJit {
             LLVMOrcExecutionSessionSetErrorReporter(
                 execution_session,
                 error_reporter,
-                state.as_mut() as *mut MaterializerState as *mut c_void,
+                state.as_ref() as *const MaterializerState as *mut c_void,
             );
             LLVMOrcIRTransformLayerSetTransform(
                 LLVMOrcLLJITGetIRTransformLayer(jit),
                 optimize_transform,
-                ptr::null_mut(),
+                state.capture.as_ref() as *const ObjectCapture as *mut c_void,
             );
             LLVMOrcObjectTransformLayerSetTransform(
                 LLVMOrcLLJITGetObjTransformLayer(jit),
                 capture_object,
-                state.capture.as_ref() as *const RefCell<CaptureState> as *mut c_void,
+                state.capture.as_ref() as *const ObjectCapture as *mut c_void,
             );
         }
 
@@ -579,10 +701,87 @@ impl OrcJit {
             stubs,
             call_through,
             state,
+            _context: context,
         })
     }
 
-    pub(crate) fn add_eager_module(&mut self, module: OrcModule) -> Result<(), String> {
+    /// Copy IR into the session-owned context. Codegen may keep borrowing its
+    /// original context and module after finalization; ORC owns this copy alone.
+    pub(crate) fn copy_module(&self, module: &Module<'_>) -> Result<OrcModule, String> {
+        let mut raw = ptr::null_mut();
+        // SAFETY: both contexts and the serialization buffer are live. Parsing
+        // creates a fresh module owned by OrcModule in the session's context.
+        unsafe {
+            let context = self.state.raw_context;
+            let copied = LLVMWriteBitcodeToMemoryBuffer(module.as_mut_ptr());
+            let failed =
+                llvm_sys::bit_reader::LLVMParseBitcodeInContext2(context, copied, &mut raw);
+            LLVMDisposeMemoryBuffer(copied);
+            if failed != 0 {
+                return Err("failed to import JIT bitcode".into());
+            }
+        }
+        Ok(OrcModule { raw: Some(raw) })
+    }
+
+    /// Transfer a session-context module directly. EngineCodegen callers with
+    /// an independent context instead import a copy before dropping the original.
+    pub(crate) fn own_module(&self, module: Module<'_>) -> Result<OrcModule, String> {
+        // SAFETY: the owned module is live and its context is compared only for
+        // identity with the context retained by this session.
+        if unsafe { llvm_sys::core::LLVMGetModuleContext(module.as_mut_ptr()) }
+            == self.state.raw_context
+        {
+            Ok(OrcModule::from_inkwell(module))
+        } else {
+            self.copy_module(&module)
+        }
+    }
+
+    /// Register helper definitions themselves, without call-through aliases.
+    /// Their unit uses the same pending queue, content key, and materialization
+    /// path as groups. Linking a group may synchronously materialize this unit;
+    /// the group's capture marker has already been taken by its own object.
+    pub(crate) fn add_helpers(&self, symbols: &[String], module: OrcModule) -> Result<(), String> {
+        let first = symbols.first().ok_or("empty helper module")?;
+        self.state
+            .pending
+            .borrow_mut()
+            .insert(first.clone(), module);
+        self.register_implementations(symbols, false)
+    }
+
+    /// Own a prepared group before registering its stubs. The materializer only
+    /// accesses this session's state, never the compiler or driver resolver.
+    pub(crate) fn add_lazy_group(
+        &self,
+        symbols: &[String],
+        module: OrcModule,
+    ) -> Result<(), String> {
+        let first = symbols.first().ok_or("empty lazy group")?;
+        self.state
+            .pending
+            .borrow_mut()
+            .insert(first.clone(), module);
+        self.register_lazy_group(symbols)
+    }
+
+    pub(crate) fn tier(&self) -> OptTier {
+        self.state.capture.tier
+    }
+
+    /// Whole-module EngineCodegen already ran its established IR passes. Skip
+    /// the transform once for this copy while retaining O2 instruction selection.
+    pub(crate) fn add_optimized_module(&self, module: OrcModule) -> Result<(), String> {
+        self.state
+            .capture
+            .preoptimized
+            .borrow_mut()
+            .insert(module.raw.expect("live ORC module") as usize);
+        self.add_eager_module(module)
+    }
+
+    pub(crate) fn add_eager_module(&self, module: OrcModule) -> Result<(), String> {
         let thread_safe = self.state.transfer_to_thread_safe_module(module);
         // SAFETY: the module and dylib belong to this JIT. LLJIT consumes the
         // thread-safe module on every return path.
@@ -597,29 +796,8 @@ impl OrcJit {
         }
     }
 
-    /// Add a copied relocatable object to LLJIT. The C API consumes the memory
-    /// buffer on every return path, including errors, so this method never
-    /// disposes it after calling `LLVMOrcLLJITAddObjectFile`.
-    pub(crate) fn add_object(&mut self, bytes: &[u8]) -> Result<(), String> {
-        let name = c"brass-cache-object";
-        // SAFETY: LLVM copies `bytes` and the identifier into a newly owned
-        // MemoryBuffer. LLJIT then takes ownership regardless of its result.
-        let buffer = unsafe {
-            LLVMCreateMemoryBufferWithMemoryRangeCopy(
-                bytes.as_ptr().cast(),
-                bytes.len(),
-                name.as_ptr(),
-            )
-        };
-        if buffer.is_null() {
-            return Err("failed to copy cached LLVM object".to_string());
-        }
-        // SAFETY: the live LLJIT and dylib own the buffer after this call.
-        unsafe { check_error(LLVMOrcLLJITAddObjectFile(self.jit, self.dylib, buffer)) }
-    }
-
     pub(crate) fn define_absolute(
-        &mut self,
+        &self,
         symbols: impl IntoIterator<Item = (String, usize)>,
     ) -> Result<(), String> {
         let mut pairs = symbols
@@ -648,12 +826,11 @@ impl OrcJit {
     /// Production callers always register groups; the single-symbol form
     /// remains as the minimal harness for the materialization tests.
     #[cfg(test)]
-    pub(crate) fn register_lazy(&mut self, symbol: &str) -> Result<LazyFunction, String> {
+    pub(crate) fn register_lazy(&self, symbol: &str) -> Result<LazyFunction, String> {
         self.register_lazy_group(std::slice::from_ref(&symbol.to_string()))?;
         Ok(LazyFunction {
             symbol: symbol.to_string(),
             implementation: lazy_implementation_symbol(symbol),
-            group_key: symbol.to_string(),
         })
     }
 
@@ -665,16 +842,27 @@ impl OrcJit {
     /// group at once, amortizing the per-module fixed cost (pass-pipeline
     /// setup, instruction selection, linking) that dominates when many small
     /// functions materialize individually.
-    pub(crate) fn register_lazy_group(&mut self, symbols: &[String]) -> Result<(), String> {
+    pub(crate) fn register_lazy_group(&self, symbols: &[String]) -> Result<(), String> {
         if symbols.is_empty() {
             return Ok(());
         }
+        self.register_implementations(symbols, true)?;
+
+        self.register_aliases(symbols)
+    }
+
+    /// Claim either hidden group implementations or directly callable helpers.
+    /// The input order fixes the unit's identity and the pending-module key.
+    fn register_implementations(&self, symbols: &[String], lazy: bool) -> Result<(), String> {
         let mut provided = Vec::with_capacity(symbols.len());
         for symbol in symbols {
             let request = LazyFunction {
                 symbol: symbol.clone(),
-                implementation: lazy_implementation_symbol(symbol),
-                group_key: symbols[0].clone(),
+                implementation: if lazy {
+                    lazy_implementation_symbol(symbol)
+                } else {
+                    symbol.clone()
+                },
             };
             let impl_name = c_string(&request.implementation)?;
             // SAFETY: this retained entry is consumed by the custom unit below.
@@ -686,20 +874,24 @@ impl OrcJit {
                     .to_string_lossy()
                     .into_owned()
             };
-            self.state.requests.insert(linker_name, request);
+            self.state
+                .requests
+                .borrow_mut()
+                .insert(linker_name, (request, symbols[0].clone()));
             provided.push(LLVMOrcCSymbolFlagsMapPair {
                 Name: impl_entry,
                 Flags: callable_flags(),
             });
         }
-        let unit_name = c_string(&format!("lazy:{}+{}", symbols[0], symbols.len() - 1))?;
+        let kind = if lazy { "lazy" } else { "helpers" };
+        let unit_name = c_string(&format!("{kind}:{}+{}", symbols[0], symbols.len() - 1))?;
         // SAFETY: the unit takes ownership of every retained entry in
         // `provided`; the callback context points at stable boxed state owned
         // by this JIT.
         let implementation_unit = unsafe {
             LLVMOrcCreateCustomMaterializationUnit(
                 unit_name.as_ptr(),
-                self.state.as_mut() as *mut MaterializerState as *mut c_void,
+                self.state.as_ref() as *const MaterializerState as *mut c_void,
                 provided.as_mut_ptr(),
                 provided.len(),
                 ptr::null_mut(),
@@ -708,18 +900,10 @@ impl OrcJit {
                 destroy_callback,
             )
         };
-        self.define(implementation_unit)?;
-
-        self.register_object_group(symbols)
+        self.define(implementation_unit)
     }
 
-    /// Register only the lazy-reexport aliases for a group already defined by
-    /// an object-file materialization unit. Unlike `register_lazy_group`, this
-    /// does not install a Rust custom materializer or add request bookkeeping.
-    pub(crate) fn register_object_group(&mut self, symbols: &[String]) -> Result<(), String> {
-        if symbols.is_empty() {
-            return Ok(());
-        }
+    fn register_aliases(&self, symbols: &[String]) -> Result<(), String> {
         let mut aliases = Vec::with_capacity(symbols.len());
         for symbol in symbols {
             let public_name = c_string(symbol)?;
@@ -749,24 +933,7 @@ impl OrcJit {
         self.define(aliases)
     }
 
-    /// Drain every lazy-group object emitted since the previous call.
-    pub(crate) fn take_captured_objects(&mut self) -> Vec<(String, Vec<u8>)> {
-        std::mem::take(&mut self.state.capture.borrow_mut().captured)
-    }
-
-    /// Publish each captured object immediately as well as retaining it for the
-    /// ordinary post-run drain. This covers JIT code that terminates the process
-    /// through a native function and therefore never returns to the driver.
-    pub(crate) fn install_object_cache_writer(&mut self, writer: ObjectCacheWriter) {
-        self.state.capture.borrow_mut().writer = Some(writer);
-    }
-
-    /// Whether emitted objects are being published to a cache session.
-    pub(crate) fn object_capture_active(&self) -> bool {
-        self.state.capture.borrow().writer.is_some()
-    }
-
-    pub(crate) fn lookup(&mut self, symbol: &str) -> Result<usize, String> {
+    pub(crate) fn lookup(&self, symbol: &str) -> Result<usize, String> {
         let symbol = c_string(symbol)?;
         let mut address = 0;
         // SAFETY: `symbol` is an unmangled LLVM IR name and `address` is valid
@@ -778,26 +945,28 @@ impl OrcJit {
         Ok(address as usize)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_materializer<R>(
-        &mut self,
+        &self,
         materializer: &mut Materializer<'_>,
-        body: impl FnOnce(&mut Self) -> R,
+        body: impl FnOnce(&Self) -> R,
     ) -> R {
         let mut materializer = materializer;
         // The guard restores the previous slot even when `body` unwinds, so a
         // panicking run never leaves a pointer to the dead `materializer`
         // borrow installed on the session.
         let _restore = CallbackRestore {
-            slot: &mut self.state.callback,
-            previous: self.state.callback,
+            slot: &self.state.callback,
+            previous: self.state.callback.get(),
         };
-        self.state.callback =
-            &mut materializer as *mut &mut Materializer<'_> as *mut c_void as *mut ();
+        self.state
+            .callback
+            .set(&mut materializer as *mut &mut Materializer<'_> as *mut c_void as *mut ());
         body(self)
     }
 
-    pub(crate) fn check_reported_errors(&mut self) -> Result<(), String> {
-        if self.state.errors.is_empty() {
+    pub(crate) fn check_reported_errors(&self) -> Result<(), String> {
+        if self.state.errors.borrow().is_empty() {
             Ok(())
         } else {
             // These errors reach the caller, so the fatal mirror no longer
@@ -805,11 +974,11 @@ impl OrcJit {
             if let Ok(mut mirror) = FATAL_ERRORS.lock() {
                 mirror.clear();
             }
-            Err(std::mem::take(&mut self.state.errors).join("\n"))
+            Err(std::mem::take(&mut *self.state.errors.borrow_mut()).join("\n"))
         }
     }
 
-    fn define(&mut self, unit: LLVMOrcMaterializationUnitRef) -> Result<(), String> {
+    fn define(&self, unit: LLVMOrcMaterializationUnitRef) -> Result<(), String> {
         if unit.is_null() {
             return Err("LLVM ORC returned a null materialization unit".to_string());
         }
@@ -828,13 +997,11 @@ impl OrcJit {
 }
 
 /// Configures LLJIT's target machine for the selected optimization tier.
-/// PIC keeps cached objects relinkable across processes while remaining
-/// suitable for in-process materialization.
-fn create_jit(tier: OptTier) -> Result<LLVMOrcLLJITRef, String> {
-    let (cpu, features) = target_cpu_identity()
-        .ok_or_else(|| "failed to read LLVM target CPU identity".to_string())?;
-    let cpu = c_string(&cpu)?;
-    let features = c_string(&features)?;
+fn create_jit(tier: OptTier, cpu: &str, features: &str) -> Result<LLVMOrcLLJITRef, String> {
+    let cpu = c_string(cpu)?;
+    let features = c_string(features)?;
+    // SAFETY: LLVM owns each returned handle until explicitly transferred or
+    // disposed below; the builder consumes its target machine and configuration.
     unsafe {
         let triple = LLVMGetDefaultTargetTriple();
         if triple.is_null() {
@@ -884,9 +1051,12 @@ fn create_jit(tier: OptTier) -> Result<LLVMOrcLLJITRef, String> {
 
 impl Drop for OrcJit {
     fn drop(&mut self) {
+        self.state.pending.get_mut().clear();
         // LLVM's C example destroys the call-through helpers before LLJIT, then
         // releases the local thread-safe-context reference after LLJIT has
         // dropped every module that shares it.
+        // SAFETY: these handles are owned solely by this session. Pending Rust
+        // modules were dropped above before releasing their context.
         unsafe {
             LLVMOrcDisposeIndirectStubsManager(self.stubs);
             LLVMOrcDisposeLazyCallThroughManager(self.call_through);
@@ -894,24 +1064,22 @@ impl Drop for OrcJit {
             if !error.is_null() {
                 self.state.push_error(take_error(error));
             }
-            LLVMOrcDisposeThreadSafeContext(self.state.context);
         }
     }
 }
 
 /// Restores the materializer-callback slot of a [`MaterializerState`] on drop,
 /// so [`OrcJit::with_materializer`] unwinds cleanly.
-struct CallbackRestore {
-    slot: *mut *mut (),
+#[cfg(test)]
+struct CallbackRestore<'a> {
+    slot: &'a Cell<*mut ()>,
     previous: *mut (),
 }
 
-impl Drop for CallbackRestore {
+#[cfg(test)]
+impl Drop for CallbackRestore<'_> {
     fn drop(&mut self) {
-        // SAFETY: `slot` points into the boxed `MaterializerState`, which the
-        // guard's owner (`with_materializer`) borrows for longer than the
-        // guard lives.
-        unsafe { *self.slot = self.previous };
+        self.slot.set(self.previous);
     }
 }
 
@@ -970,12 +1138,195 @@ mod tests {
         OrcModule::from_inkwell(module)
     }
 
+    fn run_cached_group(store: Arc<ObjectStore>, tier: OptTier) -> (i32, usize, usize) {
+        let context = OrcContext::new();
+        let jit = OrcJit::with_cache(&context, Some(store), tier).unwrap();
+        jit.register_lazy_group(&["foo".into(), "bar".into()])
+            .unwrap();
+        // The eager support module must never acquire the lazy group's marker.
+        jit.add_eager_module(constant_module(context.context(), "support", 7))
+            .unwrap();
+        jit.lookup("support").unwrap();
+        let before = jit.state.capture.optimized.get();
+        let mut materialize = |_: &LazyFunction| {
+            let module = context.context().create_module("cached-group");
+            let ty = context.context().i32_type().fn_type(&[], false);
+            for (name, value) in [("foo", 11), ("bar", 22)] {
+                let function = module.add_function(&lazy_implementation_symbol(name), ty, None);
+                let builder = context.context().create_builder();
+                builder.position_at_end(context.context().append_basic_block(function, "entry"));
+                builder
+                    .build_return(Some(&context.context().i32_type().const_int(value, false)))
+                    .unwrap();
+            }
+            Ok(OrcModule::from_inkwell(module))
+        };
+        let result = jit.with_materializer(&mut materialize, |jit| {
+            // SAFETY: these functions were emitted with the matching C ABI.
+            let foo: unsafe extern "C" fn() -> i32 =
+                unsafe { std::mem::transmute(jit.lookup("foo").unwrap()) };
+            let bar: unsafe extern "C" fn() -> i32 =
+                unsafe { std::mem::transmute(jit.lookup("bar").unwrap()) };
+            unsafe { foo() + bar() }
+        });
+        jit.check_reported_errors().unwrap();
+        assert!(jit.state.capture.current.borrow().is_none());
+        (
+            result,
+            jit.state.capture.optimized.get() - before,
+            jit.state.capture.captured.get(),
+        )
+    }
+
+    /// A fresh session links a whole cached group without optimization or
+    /// instruction selection; corrupt payloads are removed and recompiled.
+    #[test]
+    fn native_group_cache_reuses_and_repairs_objects() {
+        let directory = super::super::objcache::TestDirectory::new();
+        let store = ObjectStore::isolated(directory.0.clone(), u64::MAX);
+        assert_eq!(run_cached_group(store.clone(), OptTier::O0), (33, 1, 1));
+        assert_eq!(run_cached_group(store.clone(), OptTier::O0), (33, 0, 0));
+        let paths: Vec<_> = std::fs::read_dir(&directory.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(paths.len(), 1, "only the lazy group is captured");
+        let path = &paths[0];
+        let good = std::fs::read(path).unwrap();
+        let mut corrupt = good.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        std::fs::write(path, corrupt).unwrap();
+        let key = path.file_stem().unwrap().to_str().unwrap();
+        assert!(store.load(key, "foo").is_none());
+        assert!(!path.exists());
+        assert_eq!(run_cached_group(store.clone(), OptTier::O0), (33, 1, 1));
+        assert_eq!(std::fs::read(path).unwrap(), good);
+        assert_eq!(run_cached_group(store, OptTier::O0), (33, 0, 0));
+    }
+
+    /// Runs a lazy group whose body calls `support`, a function defined by an
+    /// eager module that has not been materialized yet, so linking the group's
+    /// object materializes the support module reentrantly. Returns the result
+    /// and how many objects this session captured.
+    fn run_group_with_reentrant_support(
+        store: Arc<ObjectStore>,
+        helper: Option<u64>,
+    ) -> (i32, usize) {
+        let context = OrcContext::new();
+        let jit = OrcJit::with_cache(&context, Some(store), OptTier::O0).unwrap();
+        jit.register_lazy_group(&["caller".into()]).unwrap();
+        if let Some(value) = helper {
+            jit.add_helpers(
+                &["support".into()],
+                constant_module(context.context(), "support", value),
+            )
+            .unwrap();
+        } else {
+            jit.add_eager_module(constant_module(context.context(), "support", 7))
+                .unwrap();
+        }
+        let mut materialize = |request: &LazyFunction| {
+            let ctx = context.context();
+            let module = ctx.create_module("reentrant-group");
+            let ty = ctx.i32_type().fn_type(&[], false);
+            let support = module.add_function("support", ty, None);
+            let caller = module.add_function(&request.implementation, ty, None);
+            let builder = ctx.create_builder();
+            builder.position_at_end(ctx.append_basic_block(caller, "entry"));
+            let value = builder
+                .build_call(support, &[], "support")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_basic()
+                .into_int_value();
+            let sum = builder
+                .build_int_add(value, ctx.i32_type().const_int(30, false), "sum")
+                .unwrap();
+            builder.build_return(Some(&sum)).unwrap();
+            Ok(OrcModule::from_inkwell(module))
+        };
+        let result = jit.with_materializer(&mut materialize, |jit| {
+            // SAFETY: `caller` was emitted with this exact C ABI.
+            let caller: unsafe extern "C" fn() -> i32 =
+                unsafe { std::mem::transmute(jit.lookup("caller").unwrap()) };
+            unsafe { caller() }
+        });
+        jit.check_reported_errors().unwrap();
+        (result, jit.state.capture.captured.get())
+    }
+
+    /// The capture marker belongs to the group's own object: a module that is
+    /// first compiled while the group's object is being linked must not be
+    /// stored under the group's key. A second session therefore links the
+    /// cached group object and still resolves `support` from its own module.
+    #[test]
+    fn native_group_cache_ignores_reentrant_dependency_objects() {
+        let directory = super::super::objcache::TestDirectory::new();
+        let store = ObjectStore::isolated(directory.0.clone(), u64::MAX);
+        assert_eq!(
+            run_group_with_reentrant_support(store.clone(), None),
+            (37, 1)
+        );
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 1);
+        assert_eq!(run_group_with_reentrant_support(store, None), (37, 0));
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+
+    /// A direct helper materializes while its caller's object links, and both
+    /// objects get their own keys. Changing only helper bitcode must reuse the
+    /// caller while replacing the helper, including when the caller is a hit.
+    #[test]
+    fn direct_helpers_cache_their_own_bitcode_during_reentrant_linking() {
+        let directory = super::super::objcache::TestDirectory::new();
+        let store = ObjectStore::isolated(directory.0.clone(), u64::MAX);
+        assert_eq!(
+            run_group_with_reentrant_support(store.clone(), Some(7)),
+            (37, 2)
+        );
+        assert_eq!(
+            run_group_with_reentrant_support(store.clone(), Some(7)),
+            (37, 0)
+        );
+        assert_eq!(
+            run_group_with_reentrant_support(store.clone(), Some(8)),
+            (38, 1)
+        );
+        assert_eq!(run_group_with_reentrant_support(store, Some(8)), (38, 0));
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 3);
+    }
+
+    /// O2 sessions never use O0 objects; O0 sessions prefer O2 even when an O0
+    /// entry exists (the unused O0 file's mtime is left untouched).
+    #[test]
+    fn native_group_cache_prefers_o2() {
+        let directory = super::super::objcache::TestDirectory::new();
+        let store = ObjectStore::isolated(directory.0.clone(), u64::MAX);
+        assert_eq!(run_cached_group(store.clone(), OptTier::O0), (33, 1, 1));
+        let o0 = std::fs::read_dir(&directory.0)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(run_cached_group(store.clone(), OptTier::O2), (33, 1, 1));
+        assert_eq!(run_cached_group(store.clone(), OptTier::O2), (33, 0, 0));
+        std::fs::File::open(&o0)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        assert_eq!(run_cached_group(store, OptTier::O0), (33, 0, 0));
+        assert_eq!(
+            std::fs::metadata(o0).unwrap().modified().unwrap(),
+            std::time::UNIX_EPOCH
+        );
+    }
+
     /// A lazy alias materializes only the body selected by executed control
     /// flow. Repeated calls use the patched stub without invoking Rust again.
     #[test]
     fn lazy_reexport_materializes_on_first_call() {
         let context = OrcContext::new();
-        let mut jit = OrcJit::new(&context).expect("ORC JIT");
+        let jit = OrcJit::new(&context).expect("ORC JIT");
         let foo = jit.register_lazy("foo").expect("foo stub");
         jit.register_lazy("bar").expect("bar stub");
 
@@ -1055,7 +1406,7 @@ mod tests {
     #[test]
     fn lazy_group_materializes_once_for_all_members() {
         let context = OrcContext::new();
-        let mut jit = OrcJit::new(&context).expect("ORC JIT");
+        let jit = OrcJit::new(&context).expect("ORC JIT");
         jit.register_lazy_group(&["foo".to_string(), "bar".to_string()])
             .expect("group stubs");
 
@@ -1133,52 +1484,71 @@ mod tests {
         jit.check_reported_errors().expect("no asynchronous errors");
     }
 
-    /// A tiny lazy body captured by the object transform can be loaded into a
-    /// fresh LLJIT process-equivalent session and reached through aliases alone,
-    /// without installing a custom IR materializer in the second session.
+    /// Typed ABI arithmetic remains callable through ORC with unboxed i32
+    /// arguments, including signed values.
     #[test]
-    fn captured_object_reloads_in_fresh_jit() {
-        let object = {
-            let context = OrcContext::new();
-            let mut jit = OrcJit::new(&context).expect("capture JIT");
-            jit.register_lazy("answer").expect("answer stub");
-            let mut materialize = |request: &LazyFunction| {
-                Ok(constant_module(
-                    context.context(),
-                    &request.implementation,
-                    42,
-                ))
-            };
-            let value = jit.with_materializer(&mut materialize, |jit| {
-                let address = jit.lookup("answer").expect("answer address");
-                // SAFETY: the generated constant function has this exact ABI.
-                let answer: unsafe extern "C" fn() -> i32 = unsafe { std::mem::transmute(address) };
-                unsafe { answer() }
-            });
-            assert_eq!(value, 42);
-            let captured = jit.take_captured_objects();
-            assert_eq!(captured.len(), 1);
-            assert_eq!(captured[0].0, "answer");
-            captured.into_iter().next().expect("captured object").1
-        };
-
+    fn typed_int32_function_jits_and_runs() {
         let context = OrcContext::new();
-        let mut jit = OrcJit::new(&context).expect("reload JIT");
-        jit.add_object(&object).expect("cached object");
-        jit.register_object_group(&["answer".to_string()])
-            .expect("answer alias");
-        let address = jit.lookup("answer").expect("cached answer address");
-        // SAFETY: the cached object defines the same generated constant ABI.
-        let answer: unsafe extern "C" fn() -> i32 = unsafe { std::mem::transmute(address) };
-        assert_eq!(unsafe { answer() }, 42);
-        jit.check_reported_errors().expect("no asynchronous errors");
+        let ctx = context.context();
+        let module = ctx.create_module("typed_add");
+        let abi = crate::layout::Abi::new(ctx);
+        let i32t = brass_hir::Type::Int(brass_hir::IntKind::I32);
+        let f = module.add_function(
+            "add_i32",
+            abi.typed_fn_type(&[i32t.clone(), i32t.clone()], &i32t),
+            None,
+        );
+        let builder = ctx.create_builder();
+        builder.position_at_end(ctx.append_basic_block(f, "entry"));
+        let sum = builder
+            .build_int_add(
+                f.get_nth_param(0).unwrap().into_int_value(),
+                f.get_nth_param(1).unwrap().into_int_value(),
+                "sum",
+            )
+            .unwrap();
+        builder.build_return(Some(&sum)).unwrap();
+        let jit = OrcJit::new(&context).expect("ORC JIT");
+        jit.add_eager_module(OrcModule::from_inkwell(module))
+            .expect("add module");
+        // SAFETY: the function above has precisely the i32(i32, i32) C ABI.
+        let add: extern "C" fn(i32, i32) -> i32 =
+            unsafe { std::mem::transmute(jit.lookup("add_i32").unwrap()) };
+        assert_eq!(add(2, 3), 5);
+        assert_eq!(add(-1, 41), 40);
+    }
+
+    /// A session accepts a pending group after native startup code has already
+    /// executed. Looking up its implementation immediately consumes that group.
+    #[test]
+    fn session_runs_a_group_registered_after_startup() {
+        let context = OrcContext::new();
+        let jit = OrcJit::new(&context).expect("ORC JIT");
+        jit.add_eager_module(constant_module(context.context(), "seed", 7))
+            .unwrap();
+        // SAFETY: constant_module emits the i32() C ABI and jit remains live.
+        let seed: extern "C" fn() -> i32 =
+            unsafe { std::mem::transmute(jit.lookup("seed").unwrap()) };
+        assert_eq!(seed(), 7);
+        let body = lazy_implementation_symbol("answer");
+        jit.add_lazy_group(
+            &["answer".into()],
+            constant_module(context.context(), &body, 42),
+        )
+        .unwrap();
+        // SAFETY: the newly registered body also has the i32() C ABI.
+        let answer: extern "C" fn() -> i32 =
+            unsafe { std::mem::transmute(jit.lookup(&body).unwrap()) };
+        assert!(jit.state.pending.borrow().is_empty());
+        assert_eq!(answer(), 42);
+        assert_eq!(seed(), 7);
     }
 
     /// A rejected second context transfer leaves the first ORC session usable.
     #[test]
     fn repeated_context_transfer_is_rejected_cleanly() {
         let context = OrcContext::new();
-        let mut jit = OrcJit::new(&context).expect("first ORC JIT");
+        let jit = OrcJit::new(&context).expect("first ORC JIT");
         assert!(OrcJit::new(&context).is_err());
 
         let module = constant_module(context.context(), "answer", 42);

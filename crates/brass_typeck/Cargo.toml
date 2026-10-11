@@ -14,4 +14,3 @@ brass_typesys.workspace = true
 brass_solver.workspace = true
 tracing.workspace = true
 brass_utils.workspace = true
-serde.workspace = true

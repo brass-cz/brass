@@ -144,11 +144,6 @@ pub enum CheckEvent {
         Vec<(Span, String)>,
         ChannelDelta,
     ),
-    /// The consumer's stop request was honored at a body boundary: the
-    /// snapshot is everything this run settled, for the caller to persist
-    /// as a partial cache and resume from next time. Emitted only on a
-    /// stopped run, just before the stream closes.
-    Interrupted(StreamSnapshot),
 }
 
 /// A priority request: check function `symbol` next. `type_args` are the
@@ -189,14 +184,6 @@ pub trait Scheduler {
     fn stopped(&self) -> bool {
         false
     }
-    /// Whether the analysis WAS actually interrupted (it saw the stop at a
-    /// body boundary and emitted [`CheckEvent::Interrupted`]). Distinct from
-    /// [`Scheduler::stopped`]: a stop requested after the queue completed
-    /// interrupts nothing, and that run's analysis IS a full verdict -- only
-    /// an interrupted one must not be cached as complete.
-    fn interrupted(&self) -> bool {
-        false
-    }
     /// Whether the consumer is still settling its entry (the lazy driver's
     /// gate and start-up demands). While paused, the streaming run serves
     /// only priority-requested bodies and holds the rest of the queue: a
@@ -215,13 +202,6 @@ pub trait Scheduler {
 pub(crate) struct StreamCtl<'s> {
     pub(crate) sched: &'s mut dyn Scheduler,
     pub(crate) state: FlushState,
-    /// Bodies a RESUMED run may skip: a prior run's stop-snapshot settled
-    /// them, and `state` was seeded with everything their passes delivered,
-    /// so they are announced as immediately settled (like seeded bodies).
-    /// A priority request naming one forces its real pass instead.
-    pub(crate) skip_fns: fxhash::FxHashSet<String>,
-    /// How many leading module initializers the snapshot settled.
-    pub(crate) skip_inits: usize,
 }
 
 /// The channel state already delivered to the consumer, kept by the
@@ -247,176 +227,6 @@ pub(crate) struct FlushState {
     pub(crate) type_tests: HashMap<Span, Type>,
     pub(crate) instance_returns: HashMap<(String, Vec<Type>), Type>,
     pub(crate) keyed_calls: fxhash::FxHashSet<Span>,
-}
-
-/// Everything a stopped streaming run had settled, in serializable form:
-/// the flush bookkeeping (so a resumed run's deltas diff against what the
-/// prior run already delivered, poison markers included) plus which bodies
-/// completed. The lazy driver persists this as the PARTIAL analysis cache
-/// and both seeds the next checker run with it ([`crate::analyze_streaming`]
-/// `resume`) and primes its own merged channel state from it.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct StreamSnapshot {
-    /// Function symbols whose dedicated pass completed (seeded and skipped
-    /// bodies included -- "settled", not "worked on").
-    pub checked: Vec<String>,
-    /// Leading module initializers settled (all of them, once the entry
-    /// gate has passed).
-    pub inits_checked: usize,
-    /// [`AggState::per_span`]: the expr-seed agreement history. `None`
-    /// marks a poisoned span -- losing it would let a revived seed
-    /// miscompile a second instantiation.
-    pub agg: Vec<(Span, Option<(Type, bool)>)>,
-    pub expr_flushed: Vec<(Span, Type)>,
-    /// Method-receiver agreement history and the receiver map already emitted.
-    #[serde(default)]
-    pub receivers: Vec<(Span, Option<Type>)>,
-    #[serde(default)]
-    pub receivers_flushed: Vec<(Span, Type)>,
-    pub view_args: Vec<Span>,
-    pub lift_errs: Vec<Span>,
-    pub null_props: Vec<Span>,
-    pub fields_loops: Vec<(Span, Vec<String>)>,
-    pub sum_views: Vec<(Span, Type)>,
-    pub type_names: Vec<(Span, String)>,
-    pub typeof_types: Vec<(Span, Type)>,
-    /// Warnings already delivered before an interrupted run stopped. A resumed
-    /// consumer replays these immediately while the checker suppresses them
-    /// from later deltas.
-    pub warnings: Vec<TypeError>,
-    /// Settled type-test patterns (may be absent in snapshots written by
-    /// older builds; missing entries just re-derive on the next run).
-    #[serde(default)]
-    pub type_tests: Vec<(Span, Type)>,
-}
-
-impl FlushState {
-    /// Capture the delivered-state bookkeeping for a stop-snapshot.
-    /// `fields` is the checker's full fields-loop table: the flush state
-    /// tracks only WHICH spans were delivered, but a resumed consumer needs
-    /// the field lists themselves back.
-    pub(crate) fn snapshot(
-        &self,
-        checked: Vec<String>,
-        inits_checked: usize,
-        fields: &HashMap<Span, Vec<String>>,
-    ) -> StreamSnapshot {
-        StreamSnapshot {
-            checked,
-            inits_checked,
-            agg: self
-                .agg
-                .per_span
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            expr_flushed: self
-                .expr_flushed
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            receivers: self
-                .receivers
-                .per_span
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            receivers_flushed: self
-                .receivers_flushed
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            view_args: self.view_args.iter().copied().collect(),
-            lift_errs: self.lift_errs.iter().copied().collect(),
-            null_props: self.null_props.iter().copied().collect(),
-            fields_loops: self
-                .fields_loops
-                .iter()
-                .filter_map(|s| fields.get(s).map(|f| (*s, f.clone())))
-                .collect(),
-            sum_views: self
-                .sum_views
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            type_names: self
-                .type_names
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            typeof_types: self
-                .typeof_types
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            warnings: self.warnings_flushed.clone(),
-            type_tests: self
-                .type_tests
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-        }
-    }
-
-    /// Rebuild the delivered-state bookkeeping from a prior run's snapshot,
-    /// so this run's flushes emit only what that run had NOT delivered. The
-    /// typed/error cursors start at zero: this run's checker vectors are
-    /// fresh.
-    pub(crate) fn from_snapshot(snap: &StreamSnapshot) -> FlushState {
-        FlushState {
-            typed_seen: 0,
-            errors_seen: 0,
-            warnings_flushed: snap.warnings.clone(),
-            agg: AggState {
-                per_span: snap.agg.iter().map(|(s, t)| (*s, t.clone())).collect(),
-            },
-            expr_flushed: snap
-                .expr_flushed
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            receivers: ReceiverState {
-                per_span: snap
-                    .receivers
-                    .iter()
-                    .map(|(s, t)| (*s, t.clone()))
-                    .collect(),
-            },
-            receivers_flushed: snap
-                .receivers_flushed
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            view_args: snap.view_args.iter().copied().collect(),
-            lift_errs: snap.lift_errs.iter().copied().collect(),
-            null_props: snap.null_props.iter().copied().collect(),
-            fields_loops: snap.fields_loops.iter().map(|(s, _)| *s).collect(),
-            sum_views: snap
-                .sum_views
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            type_names: snap
-                .type_names
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            typeof_types: snap
-                .typeof_types
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            type_tests: snap
-                .type_tests
-                .iter()
-                .map(|(s, t)| (*s, t.clone()))
-                .collect(),
-            // Contracts are deliberately not snapshotted. A resumed run
-            // re-elaborates a demanded instance before deferring it again.
-            instance_returns: HashMap::default(),
-            keyed_calls: fxhash::FxHashSet::default(),
-        }
-    }
 }
 
 /// Resolve aggregate-producing expression spans to checker-resolved instance
@@ -852,7 +662,6 @@ mod tests {
                     m.final_errors = Some(errors.clone());
                 }
                 CheckEvent::KeyedReady(_, _, d) => m.apply(d),
-                CheckEvent::Interrupted(_) => unreachable!("stop in an unstopped analysis"),
             }
         }
         m
@@ -867,7 +676,7 @@ mod tests {
             requests: Vec::new(),
             events: Vec::new(),
         };
-        let streamed = analyze_streaming(&program, None, &mut rec, None);
+        let streamed = analyze_streaming(&program, None, &mut rec);
         assert_eq!(streamed.errors, eager.errors, "errors diverge for {src}");
         let m = merge(&rec.events);
         assert_eq!(
@@ -937,57 +746,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_roundtrips_the_flush_state() {
-        // A resumed run must diff against EXACTLY what the stopped run had
-        // delivered: the snapshot -> state -> snapshot cycle loses nothing
-        // (cursors excepted -- the new run's vectors are fresh).
-        let program = lower(
-            "fun make(c: int32) {\n\
-                 if c == 1 { error(\"a\")! } else if c == 2 { null! }\n\
-                 return 1\n\
-             }\n\
-             fun main() { let result = make(0) }\n",
-        );
-        let mut rec = Recorder {
-            requests: Vec::new(),
-            events: Vec::new(),
-        };
-        analyze_streaming(&program, None, &mut rec, None);
-        let mut state = FlushState::default();
-        // Rebuild a plausible delivered state from the recorded stream.
-        let merged = merge(&rec.events);
-        state.expr_flushed = merged.expr_types.clone();
-        state.receivers_flushed = merged.receiver_types.clone();
-        state.sum_views = merged.sum_views.clone();
-        state.view_args = merged.view_args.clone();
-        state.warnings_flushed = merged.warnings.clone();
-        let fields: HashMap<Span, Vec<String>> = HashMap::default();
-        let snap = state.snapshot(vec!["make".into(), "main".into()], 1, &fields);
-        let back = FlushState::from_snapshot(&snap);
-        assert_eq!(back.expr_flushed, state.expr_flushed);
-        assert_eq!(back.receivers_flushed, state.receivers_flushed);
-        assert_eq!(back.sum_views, state.sum_views);
-        assert_eq!(back.view_args, state.view_args);
-        assert_eq!(back.warnings_flushed, state.warnings_flushed);
-        assert!(
-            !snap.warnings.is_empty(),
-            "the fixture must carry a warning"
-        );
-        assert_eq!(snap.checked, vec!["make".to_string(), "main".to_string()]);
-        assert_eq!(snap.inits_checked, 1);
-
-        let mut resumed_rec = Recorder {
-            requests: Vec::new(),
-            events: Vec::new(),
-        };
-        let resumed = analyze_streaming(&program, None, &mut resumed_rec, Some(&snap));
-        assert_eq!(
-            resumed.warnings, snap.warnings,
-            "a completed resume must retain warnings from skipped bodies"
-        );
-    }
-
-    #[test]
     fn inits_and_main_precede_functions_and_requests_jump_the_queue() {
         let program = lower(
             "fun a_one() -> int32 { return 1 }\n\
@@ -999,7 +757,7 @@ mod tests {
             requests: vec!["z_two".to_string()],
             events: Vec::new(),
         };
-        analyze_streaming(&program, None, &mut rec, None);
+        analyze_streaming(&program, None, &mut rec);
         let mut bodies = Vec::new();
         for e in &rec.events {
             if let CheckEvent::BodyChecked(id, _) = e {
@@ -1032,7 +790,7 @@ mod tests {
             events: Vec::new(),
         };
 
-        analyze_streaming(&program, None, &mut rec, None);
+        analyze_streaming(&program, None, &mut rec);
 
         // An empty argument list is a concrete zero-argument instance, not a
         // request for the open definitional pass. Its resolved return is the

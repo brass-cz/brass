@@ -83,6 +83,7 @@ fn engine_jits_unboxed_typed_instances() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -138,6 +139,7 @@ fun use_flt() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -197,6 +199,7 @@ fun fdemo() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -260,6 +263,7 @@ fun demo_mutate() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -308,6 +312,7 @@ fun rect_area() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -356,6 +361,7 @@ fun nested_field() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -398,6 +404,7 @@ fun text_len() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -445,6 +452,7 @@ fun eq_len() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -498,6 +506,7 @@ fun sum_loop() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -552,6 +561,7 @@ fun count_built() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -605,6 +615,7 @@ fun pop_empty_is_null() -> int32 {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -661,6 +672,7 @@ fun rendered_len() -> int64 {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -705,6 +717,7 @@ fun adder() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -750,6 +763,7 @@ fun via_run() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -790,6 +804,7 @@ fun main() {
     // `main` is in the typed subset (print is typed I/O), so it is compiled.
     assert!(mono.lookup("main").is_some(), "main should monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     // Runs main (writing to stdout) entirely unboxed.
@@ -849,6 +864,7 @@ fun unwrap_or_zero() -> int32 {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -902,6 +918,7 @@ fun err_val() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -960,6 +977,7 @@ fun err_case() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1011,6 +1029,7 @@ fun byte_overflow() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1076,6 +1095,7 @@ fun result() -> int32 {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     // Runs the init (total = 0) and `main` (spawns both threads), then joins them.
@@ -1115,6 +1135,7 @@ fun scaled() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     // Engine::run executes the init body, initializing the globals.
@@ -1152,6 +1173,7 @@ fn sync_makes_spawned_results_observable() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1184,6 +1206,7 @@ fn rc_reclaims_string_temporaries() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1222,6 +1245,7 @@ fn rc_reclaims_loop_string_temporaries() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1262,6 +1286,7 @@ fn rc_balances_string_interpolation() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1308,6 +1333,7 @@ fn rc_reclaims_record_temporaries() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1343,6 +1369,7 @@ fn rc_recursive_destructor_releases_record_fields() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1382,6 +1409,7 @@ fn rc_reclaims_array_and_sum() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1430,6 +1458,7 @@ fn rc_releases_overwritten_field_element_and_global() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1466,6 +1495,7 @@ fn rc_recursive_array_releases_string_elements() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1501,6 +1531,7 @@ fn rc_recursive_sum_releases_variant_fields() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1538,6 +1569,7 @@ fn rc_reclaims_spawned_closures() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1574,6 +1606,7 @@ fn rc_spawned_closure_releases_heap_capture() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1607,6 +1640,7 @@ fn array_renders_as_bracketed_list() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1639,6 +1673,7 @@ fn trailing_nullable_param_is_optional() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1672,6 +1707,7 @@ fn captured_mutated_local_is_a_shared_cell() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1703,6 +1739,7 @@ fn cycle_collector_reclaims_record_cycle() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     let before = brass_runtime::mem::pp_live_blocks();
@@ -1735,6 +1772,7 @@ fn cycle_collector_reclaims_two_node_cycle() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     let before = brass_runtime::mem::pp_live_blocks();
@@ -1767,6 +1805,7 @@ fn cycle_collector_reclaims_data_owned_by_cycle() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     let before = brass_runtime::mem::pp_live_blocks();
@@ -1802,6 +1841,7 @@ fn full_width_numbers_render() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1826,6 +1866,7 @@ fn rc_recursive_tuple_releases_managed_elements() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1857,6 +1898,7 @@ fn aggregate_rendering_releases_intermediate_strings() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1891,6 +1933,7 @@ fn cycle_collector_reclaims_sum_cycle() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
+    brass_jit_llvm::disable_jit_cache_for_tests();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     let before = brass_runtime::mem::pp_live_blocks();

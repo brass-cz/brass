@@ -3,9 +3,10 @@
 
 #![cfg(not(target_family = "wasm"))]
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// The test program: every supported value shape crosses the plugin boundary
 /// (including arrays, in both directions and nested), plus the fallible
@@ -70,7 +71,7 @@ fn project_dir(name: &str) -> PathBuf {
 
 fn run(args: &[&str], dir: &Path) -> (bool, String, String) {
     let bin = env!("CARGO_BIN_EXE_brass");
-    let out = Command::new(bin)
+    let out = support::brass_command(bin)
         .args(args)
         .arg(dir.join("main.cz"))
         .output()
@@ -142,99 +143,22 @@ fn missing_logical_plugin_registration_is_fatal_on_both_backends() {
     }
 }
 
-/// A rebuilt plugin library must invalidate the analysis cache: the cached
-/// wrapper module (and the signatures the program was checked against) came
-/// from the OLD manifest, so a swapped library has to force fresh resolution
-/// instead of the stale wrapper marshalling against the new native code.
+/// The release layout discovers `std` from the running binary, native plugin
+/// libraries included: `bin/brass` resolves `std.mathx` to the library in the
+/// sibling `std/` directory with no environment setup.
 #[test]
-fn analysis_cache_misses_when_the_plugin_library_changes() {
-    let (dir, target) = project_dir_with(
-        "plugin_cache_swap",
-        "import plugins.mathx.{ repeat }\nprintln(repeat(\"ha\", 2))\n",
-    );
-    let (ok, out, err) = run(&[], &dir);
-    assert!(ok, "cold run: {out}\n{err}");
-    assert_eq!(out, "ha ha\n");
-    assert!(
-        dir.join("main.czcache").is_file(),
-        "a clean run writes the cache"
-    );
-    let (ok, out, _) = run(&[], &dir);
-    assert!(ok && out == "ha ha\n", "warm run: {out}");
-
-    // Swap in the alternative build, whose manifest lacks `repeat`.
-    let alt = brass_plugin_host::fixture::build_altlib();
-    fs::copy(&alt, &target).expect("swap the plugin library");
-    let (ok, stdout, stderr) = run(&[], &dir);
-    assert!(
-        !ok,
-        "the swapped library must be re-resolved, not served stale; stdout:\n{stdout}"
-    );
-    assert!(
-        stderr.contains("repeat"),
-        "the new manifest lacks `repeat`: {stderr}"
-    );
-}
-
-/// A plugin-backed cache stores the canonical import and binary hash, not the
-/// packing machine's library path. Moving the complete program therefore hits
-/// the cache and dispatches through the library at its new location.
-#[test]
-fn analysis_cache_reanchors_a_relocated_plugin() {
-    let (dir, plugin) = project_dir_with(
-        "plugin_cache_relocate",
-        "import plugins.mathx.{ add }\nprintln(add(40, 2))\n",
-    );
-    let cache = dir.join("main.czcache");
-    let _ = fs::remove_file(&cache);
-
-    // Eager checking deterministically publishes a complete cache.
-    let (ok, stdout, stderr) = run(&["--eager"], &dir);
-    assert!(ok, "cold run failed: {stdout}\n{stderr}");
-    assert_eq!(stdout, "42\n");
-    let plugin = plugin.canonicalize().expect("canonical plugin path");
-    let cache_bytes = fs::read(&cache).expect("read generated cache");
-    assert!(
-        !cache_bytes
-            .windows(plugin.as_os_str().as_encoded_bytes().len())
-            .any(|window| window == plugin.as_os_str().as_encoded_bytes()),
-        "cache embeds the packing location {}",
-        plugin.display()
-    );
-
-    // Rename rather than copy so the old absolute path cannot accidentally
-    // satisfy a stale wrapper or stamp.
-    let moved = dir.with_file_name("plugin_cache_relocate_moved");
-    let _ = fs::remove_dir_all(&moved);
-    fs::rename(&dir, &moved).expect("move plugin program");
-    let out = Command::new(env!("CARGO_BIN_EXE_brass"))
-        .arg(moved.join("main.cz"))
-        .env("BRASS_LOG", "brass::perf=debug")
-        .output()
-        .expect("run moved program");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "moved run failed: {stderr}");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
-    assert!(stderr.contains("front/cache-hit"), "cache missed: {stderr}");
-}
-
-/// The release layout discovers `std` from the running binary. A cache packed
-/// beside that binary must repeat the same resolution after the entire
-/// toolchain is installed elsewhere.
-#[test]
-fn distributed_plugin_cache_survives_installation() {
-    let dist = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("plugin_cache_distribution");
-    let original = dist.join("packed");
-    let installed = dist.join("installed");
+fn distributed_std_plugin_resolves_beside_the_binary() {
+    let dist = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("plugin_distribution");
     let _ = fs::remove_dir_all(&dist);
-    fs::create_dir_all(original.join("bin")).expect("create distribution bin");
-    fs::create_dir_all(original.join("std")).expect("create distribution std");
-    fs::copy(env!("CARGO_BIN_EXE_brass"), original.join("bin/brass"))
-        .expect("copy distributed driver");
-    let entry = original.join("bin/czpm");
-    fs::write(&entry, "import std.mathx.{ add }\nprintln(add(40, 2))\n")
-        .expect("write distributed entry");
-    let plugin = original.join("std").join(format!(
+    fs::create_dir_all(dist.join("bin")).expect("create distribution bin");
+    fs::create_dir_all(dist.join("std")).expect("create distribution std");
+    fs::copy(env!("CARGO_BIN_EXE_brass"), dist.join("bin/brass")).expect("copy distributed driver");
+    fs::write(
+        dist.join("bin/czpm"),
+        "import std.mathx.{ add }\nprintln(add(40, 2))\n",
+    )
+    .expect("write distributed entry");
+    let plugin = dist.join("std").join(format!(
         "{}mathx{}",
         std::env::consts::DLL_PREFIX,
         std::env::consts::DLL_SUFFIX
@@ -242,66 +166,40 @@ fn distributed_plugin_cache_survives_installation() {
     fs::copy(brass_plugin_host::fixture::build_testlib(), &plugin)
         .expect("copy distributed plugin");
 
-    let run_at = |root: &Path, eager: bool| -> std::process::Output {
-        // A parallel test can briefly inherit the just-closed copy handle
-        // between fork and exec on Linux; retry only that transient ETXTBSY.
-        for _ in 0..50 {
-            let mut command = Command::new(root.join("bin/brass"));
-            if eager {
-                command.arg("--eager");
-            }
-            match command
-                .arg(root.join("bin/czpm"))
-                .env("BRASS_LOG", "brass::perf=debug")
+    // A parallel test can briefly inherit the just-closed copy handle between
+    // fork and exec on Linux; retry only that transient ETXTBSY.
+    let out = (0..50)
+        .find_map(|_| {
+            match support::brass_command(dist.join("bin/brass"))
+                .arg(dist.join("bin/czpm"))
                 .output()
             {
-                Ok(output) => return output,
+                Ok(output) => Some(output),
                 Err(error) if error.raw_os_error() == Some(26) => {
                     std::thread::sleep(std::time::Duration::from_millis(20));
+                    None
                 }
                 Err(error) => panic!("run distributed driver: {error}"),
             }
-        }
-        panic!("distributed driver remained busy")
-    };
-
-    let out = run_at(&original, true);
+        })
+        .expect("distributed driver remained busy");
     assert!(
         out.status.success(),
-        "packed run failed: {}",
+        "distributed run failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
-    let plugin = plugin.canonicalize().expect("canonical packed plugin");
-    let cache = fs::read(entry.with_extension("czcache")).expect("read packed cache");
-    assert!(
-        !cache
-            .windows(plugin.as_os_str().as_encoded_bytes().len())
-            .any(|window| window == plugin.as_os_str().as_encoded_bytes()),
-        "distributed cache embeds {}",
-        plugin.display()
-    );
-
-    // Installation removes the packing location, so a hit can only succeed by
-    // resolving `std.mathx` relative to the installed binary.
-    fs::rename(&original, &installed).expect("install distribution");
-    let out = run_at(&installed, false);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "installed run failed: {stderr}");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
-    assert!(stderr.contains("front/cache-hit"), "cache missed: {stderr}");
 }
 
-/// Resolution is authoritative on every hit. A source module introduced at
-/// the same import path outranks the cached plugin and forces fresh analysis.
+/// A source module introduced at a plugin's import path outranks the plugin
+/// library on the next run.
 #[test]
-fn analysis_cache_misses_when_source_shadows_plugin() {
+fn source_module_shadows_plugin_at_the_same_path() {
     let (dir, _) = project_dir_with(
-        "plugin_cache_source_shadow",
+        "plugin_source_shadow",
         "import plugins.mathx.{ add }\nprintln(add(40, 2))\n",
     );
     let _ = fs::remove_file(dir.join("plugins/mathx.cz"));
-    let _ = fs::remove_file(dir.join("main.czcache"));
     let (ok, stdout, stderr) = run(&["--eager"], &dir);
     assert!(ok, "cold run failed: {stdout}\n{stderr}");
     assert_eq!(stdout, "42\n");
@@ -313,5 +211,5 @@ fn analysis_cache_misses_when_source_shadows_plugin() {
     .expect("add shadowing source module");
     let (ok, stdout, stderr) = run(&["--eager"], &dir);
     assert!(ok, "shadowed run failed: {stdout}\n{stderr}");
-    assert_eq!(stdout, "99\n", "the cached plugin must not remain selected");
+    assert_eq!(stdout, "99\n", "the source module must outrank the plugin");
 }

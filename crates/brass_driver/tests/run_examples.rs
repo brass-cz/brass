@@ -4,7 +4,7 @@
 //! that still exercise runtime features outside that subset type-check but do not
 //! run in this test.
 
-use std::process::Command;
+mod support;
 
 /// Examples the typed back end runs end to end.
 const RUNNABLE: &[&str] = &[
@@ -48,8 +48,7 @@ fn runnable_examples_run_successfully() {
     let root = repo_root();
     for ex in RUNNABLE {
         let path = format!("{root}/{ex}");
-        let out = Command::new(bin)
-            .env("BRASS_CACHE", "off")
+        let out = support::brass_command(bin)
             .arg(&path)
             .env("BRASS_PACKAGES", format!("std={root}"))
             .output()
@@ -70,8 +69,7 @@ fn all_examples_typecheck() {
     let root = repo_root();
     for ex in all_examples() {
         let path = format!("{root}/{ex}");
-        let out = Command::new(bin)
-            .env("BRASS_CACHE", "off")
+        let out = support::brass_command(bin)
             .arg("check")
             .arg(&path)
             .env("BRASS_PACKAGES", format!("std={root}"))

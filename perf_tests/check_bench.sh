@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Front-end-only benchmark: times `brass check` (whole analysis, no JIT, no
-# execution) with a cold cache over the checker-shaped regression cases plus
+# execution) over the checker-shaped regression cases plus
 # the real czpm closure. `run.sh` measures end-to-end pipelines; this script
 # isolates the type-checking share so a checker regression cannot hide behind
 # back-end wins (or the reverse).
@@ -24,8 +24,7 @@ if [[ "$SKIP_BUILD" != "1" ]]; then
 fi
 
 # The czpm closure needs an entry file; synthesize the same three-line
-# launcher the distribution installs, next to a scratch dir so its cache
-# artifacts (suppressed anyway by BRASS_CACHE=off) never touch the repo.
+# launcher the distribution installs in a scratch dir outside the repo.
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
 cat > "$SCRATCH/czpm.cz" <<'EOF'
@@ -38,7 +37,7 @@ measure() {
     local label="$1" file="$2" packages="$3"
     local best="" sum=0 t
     for _ in $(seq "$REPS"); do
-        t=$(env BRASS_CACHE=off BRASS_PACKAGES="$packages" sh -c \
+        t=$(env BRASS_PACKAGES="$packages" sh -c \
             'start=$(date +%s.%N); '"$BRASS"' check '"$file"' >/dev/null 2>&1; end=$(date +%s.%N); echo "$end - $start" | bc')
         sum=$(echo "$sum + $t" | bc)
         if [[ -z "$best" ]] || (( $(echo "$t < $best" | bc) )); then

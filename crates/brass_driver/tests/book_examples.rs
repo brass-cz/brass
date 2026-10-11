@@ -2,8 +2,9 @@
 //! type-correct program. Multi-file, native-only, and intentionally incomplete
 //! examples opt out with the `norun` fence flag.
 
+mod support;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 struct Example {
     source_path: PathBuf,
@@ -201,8 +202,7 @@ fn runnable_book_fences_typecheck() {
     for (index, example) in examples.iter().enumerate() {
         let program = scratch.join(format!("example-{index}.cz"));
         std::fs::write(&program, &example.code).expect("write book example");
-        let output = Command::new(env!("CARGO_BIN_EXE_brass"))
-            .env("BRASS_CACHE", "off")
+        let output = support::brass_command(env!("CARGO_BIN_EXE_brass"))
             .env("BRASS_PACKAGES", &std_packages)
             .args(["check", program.to_str().expect("UTF-8 temporary path")])
             .output()

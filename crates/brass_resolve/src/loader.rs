@@ -114,8 +114,7 @@ struct SourceEntry {
     /// `None` for an embedded core module (no file on disk).
     path: Option<PathBuf>,
     /// The canonical import path when this entry is a synthesized native
-    /// plugin module. Its library path is deliberately separate: caches can
-    /// re-resolve the import on another machine instead of persisting it.
+    /// plugin module (its library is `path`).
     plugin_module: Option<Vec<String>>,
     /// Display name for diagnostics: the file path, or `<core/name>` for an
     /// embedded core module.
@@ -169,43 +168,14 @@ impl SourceMap {
     }
 
     /// Locate the file containing global byte offset `off`.
-    /// Every on-disk file this map read, in load order. Embedded sources (the
-    /// prelude) carry no path and are skipped. The analysis cache stamps these
-    /// to decide reuse.
-    pub fn file_paths(&self) -> impl Iterator<Item = &std::path::Path> {
-        self.entries.iter().filter_map(|e| e.path.as_deref())
-    }
-
-    /// Every source in load order, as `(base, text)`. The analysis cache hashes
-    /// these to identify a module set by content.
+    /// Every source in load order, as `(base, text)`.
     pub fn entries(&self) -> impl Iterator<Item = (usize, &str)> {
         self.entries.iter().map(|e| (e.base, e.src.as_str()))
     }
 
-    /// Every on-disk file with the text that was parsed FOR it, in load order.
-    /// The analysis cache stamps sources from this text (not a re-read of the
-    /// file, which races an editor saving during the analysis); note that a
-    /// native plugin library's entry pairs the library path with its
-    /// synthesized WRAPPER text, so such entries are stamped from the file.
-    pub fn sourced(&self) -> impl Iterator<Item = (&std::path::Path, &str)> {
-        self.entries
-            .iter()
-            .filter_map(|e| Some((e.path.as_deref()?, e.src.as_str())))
-    }
-
-    /// Parsed source files, excluding synthesized native plugin modules.
-    /// Analysis caches stamp these from `src`; plugins have their own logical
-    /// module identity and binary-content stamp.
-    pub fn source_files(&self) -> impl Iterator<Item = (&std::path::Path, &str)> {
-        self.entries
-            .iter()
-            .filter(|e| e.plugin_module.is_none())
-            .filter_map(|e| Some((e.path.as_deref()?, e.src.as_str())))
-    }
-
-    /// Native plugin modules as `(canonical import path, loaded library)`.
-    /// The import path is the relocatable identity; the file path names the
-    /// exact library whose manifest produced the synthesized source.
+    /// Native plugin modules as `(canonical import path, loaded library)`:
+    /// the logical identity the synthesized source dispatches through, and the
+    /// exact library whose manifest produced that source.
     pub fn plugins(&self) -> impl Iterator<Item = (&[String], &Path)> {
         self.entries.iter().filter_map(|e| {
             Some((
@@ -357,140 +327,6 @@ fn find_module_file(root: &Path, search: &SearchPaths, segs: &[String]) -> Optio
     std::iter::once(root)
         .chain(search.includes.iter().map(PathBuf::as_path))
         .find_map(|r| module_file_under(r, segs))
-}
-
-/// [`find_module_file`] for callers outside the loader: what file currently
-/// serves module path `segs` from `root`. The analysis cache uses this on a
-/// hit to re-anchor each cached module's `_PATH` constant to where the module
-/// lives NOW -- the stamps are location-independent, but `_PATH` is exactly
-/// the module's location.
-pub fn resolve_module_file(
-    root: &Path,
-    search: &SearchPaths,
-    segs: &[String],
-) -> Option<ModuleFile> {
-    find_module_file(root, search, segs)
-}
-
-/// Replace the value of the `_PATH` constant [`inject_module_path`] planted in
-/// `ast`, keeping its span (span-keyed channels must keep matching). Used when
-/// a cached module AST is reused from a different location than it was
-/// analyzed at.
-pub fn reinject_module_path(ast: &mut Module, location: &str) {
-    for item in &mut ast.items {
-        if let TopLevel::Stmt(Stmt::Let {
-            pat: Pattern::Binding(name, _),
-            value: Some(Expr::Str(segs, _)),
-            is_const: true,
-            ..
-        }) = item
-            && name == MODULE_PATH_CONST
-        {
-            *segs = vec![StrSeg::Lit(location.to_string())];
-            return;
-        }
-    }
-}
-
-/// Replace the logical identity operand in every synthesized plugin forwarding
-/// call, preserving all spans and therefore every cached checker channel keyed
-/// by them. The caller has already identified `ast` as a plugin module;
-/// ordinary source modules are never rewritten by this operation.
-pub fn reinject_plugin_identity(ast: &mut Module, logical_id: &str) {
-    reinject_module_path(ast, &format!("<plugin:{logical_id}>"));
-    for item in &mut ast.items {
-        if let TopLevel::Fun(fun) = item {
-            reinject_plugin_identity_block(&mut fun.body, logical_id);
-        }
-    }
-}
-
-fn reinject_plugin_identity_block(block: &mut brass_parser::ast::Block, logical_id: &str) {
-    for stmt in &mut block.stmts {
-        match stmt {
-            Stmt::Let {
-                value: Some(value), ..
-            } => reinject_plugin_identity_expr(value, logical_id),
-            Stmt::Assign { target, value, .. } => {
-                reinject_plugin_identity_expr(target, logical_id);
-                reinject_plugin_identity_expr(value, logical_id);
-            }
-            Stmt::Expr(expr) | Stmt::Return(Some(expr), _) => {
-                reinject_plugin_identity_expr(expr, logical_id)
-            }
-            Stmt::While { cond, body, .. } => {
-                reinject_plugin_identity_expr(cond, logical_id);
-                reinject_plugin_identity_block(body, logical_id);
-            }
-            Stmt::For { iter, body, .. } => {
-                reinject_plugin_identity_expr(iter, logical_id);
-                reinject_plugin_identity_block(body, logical_id);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn reinject_plugin_identity_expr(expr: &mut Expr, logical_id: &str) {
-    match expr {
-        Expr::Call(callee, args, _) => {
-            if let Expr::Ident(name, _) = &**callee
-                && brass_hir::plugin_builtin_return(name).is_some()
-                && let Some(brass_parser::ast::Arg {
-                    expr: Expr::Str(segments, _),
-                }) = args.first_mut()
-            {
-                *segments = vec![StrSeg::Lit(logical_id.to_string())];
-            }
-            reinject_plugin_identity_expr(callee, logical_id);
-            for arg in args {
-                reinject_plugin_identity_expr(&mut arg.expr, logical_id);
-            }
-        }
-        Expr::Field(base, _, _) | Expr::Unary(_, base, _) | Expr::ErrorProp(base, _) => {
-            reinject_plugin_identity_expr(base, logical_id)
-        }
-        Expr::Binary(_, left, right, _)
-        | Expr::Index(left, right, _)
-        | Expr::Range(left, right, _) => {
-            reinject_plugin_identity_expr(left, logical_id);
-            reinject_plugin_identity_expr(right, logical_id);
-        }
-        Expr::Array(items, _) => items
-            .iter_mut()
-            .for_each(|item| reinject_plugin_identity_expr(item, logical_id)),
-        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => fields
-            .iter_mut()
-            .for_each(|(_, value)| reinject_plugin_identity_expr(value, logical_id)),
-        Expr::Str(segments, _) => segments.iter_mut().for_each(|segment| {
-            if let StrSeg::Expr(expr) = segment {
-                reinject_plugin_identity_expr(expr, logical_id);
-            }
-        }),
-        Expr::If(cond, then, otherwise, _) => {
-            reinject_plugin_identity_expr(cond, logical_id);
-            reinject_plugin_identity_block(then, logical_id);
-            if let Some(otherwise) = otherwise {
-                reinject_plugin_identity_expr(otherwise, logical_id);
-            }
-        }
-        Expr::IfLet(_, scrutinee, then, otherwise, _) => {
-            reinject_plugin_identity_expr(scrutinee, logical_id);
-            reinject_plugin_identity_block(then, logical_id);
-            if let Some(otherwise) = otherwise {
-                reinject_plugin_identity_expr(otherwise, logical_id);
-            }
-        }
-        Expr::Match(scrutinee, arms, _) => {
-            reinject_plugin_identity_expr(scrutinee, logical_id);
-            for arm in arms {
-                reinject_plugin_identity_expr(&mut arm.body, logical_id);
-            }
-        }
-        Expr::Block(block, _) => reinject_plugin_identity_block(block, logical_id),
-        Expr::Closure(_, body, _) => reinject_plugin_identity_expr(body, logical_id),
-        _ => {}
-    }
 }
 
 /// The source text serving module path `segs` as seen from `root`: the `.cz`

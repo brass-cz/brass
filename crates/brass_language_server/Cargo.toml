@@ -11,7 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 fxhash.workspace = true
-brass_cache.workspace = true
 brass_metadata.workspace = true
 brass_parser.workspace = true
 brass_hir.workspace = true
