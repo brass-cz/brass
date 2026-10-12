@@ -449,7 +449,7 @@ impl<'a> Checker<'a> {
         let Some(info) = self.program.type_by_id(nominal.id) else {
             return Vec::new();
         };
-        let Some(scheme) = self.schemes.get(&info.name) else {
+        let Some(scheme) = self.schemes.get(&info.symbol) else {
             return Vec::new();
         };
         let Some(scheme_method) = scheme.methods.get(method) else {
@@ -470,7 +470,7 @@ impl<'a> Checker<'a> {
     pub(super) fn scheme_method_return(&self, recv_ty: &Type, method: &str) -> Option<Type> {
         let nominal = self.scheme_receiver_record(recv_ty)?;
         let info = self.program.type_by_id(nominal.id)?;
-        let scheme = self.schemes.get(&info.name)?;
+        let scheme = self.schemes.get(&info.symbol)?;
         let scheme_method = scheme.methods.get(method)?;
         let map = scheme_instance_map(scheme, &nominal, |ty| self.resolve(ty));
         // Instantiating a `?`-wrapped scheme return with a nullable value type
@@ -819,7 +819,10 @@ impl<'a> Checker<'a> {
                                 .or_else(|| have_method.signature.ret_ty.clone())
                                 .or_else(|| {
                                     self.method_returns
-                                        .get(&(have.name().to_string(), method_name.clone()))
+                                        .get(&(
+                                            self.program.type_by_id(have.id)?.symbol.clone(),
+                                            method_name.clone(),
+                                        ))
                                         .cloned()
                                 });
                             if let Some(have_ret) = have_ret {

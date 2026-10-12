@@ -1,0 +1,29 @@
+// User error-related names keep their methods while fallibility uses prelude identities.
+type Error = { code: int32 }
+fun Error.display(self) { return self.code }
+type Location = { line: int32 }
+fun Location.display(self) { return self.line }
+type Frame = { value: string }
+fun Frame.display(self) { return self.value }
+fun fail() -> int32! { return error("failure")! }
+// Propagation and nullable context synthesize records in the user's module.
+fun raw() -> int32! { return Result.Err { error: "raw" } }
+fun lifted() -> int32! { return raw()! }
+fun main() {
+    println(Error { code: 7 }.display())
+    println(Location { line: 8 }.display())
+    println(Frame { value: "user frame" }.display())
+    match fail().context("outer") {
+        Ok { value } => println(value)
+        Err { error } => println(error.display().ends_with("failure"))
+    }
+    match lifted() {
+        Ok { value } => println(value)
+        Err { error } => println(error.display().ends_with("raw"))
+    }
+    let absent: int32? = null
+    match absent.context("absent") {
+        Ok { value } => println(value)
+        Err { error } => println(error.display().ends_with("absent"))
+    }
+}

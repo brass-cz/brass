@@ -187,7 +187,7 @@ pub fn check(program: &Program) -> Vec<TypeError> {
 /// of being re-derived, which is where a library-heavy program spends almost
 /// all of its inference time.
 ///
-/// The tables are span-free by construction (keyed by symbol, type name, or
+/// The tables are span-free by construction (keyed by symbol or
 /// module path), so they survive the entry file changing size. Inference
 /// VARIABLE ids are not portable -- a consuming run mints its own -- so
 /// [`ContextTables::remapped`] renumbers every open variable into the consumer's
@@ -375,7 +375,10 @@ impl ContextTables {
         let ty_kept = |name: &String| {
             program
                 .types
-                .get(name)
+                .get(
+                    name.split_once('.')
+                        .map_or(name.as_str(), |(symbol, _)| symbol),
+                )
                 .is_some_and(|t| keep.contains(&t.module))
         };
         self.function_returns.retain(|sym, _| fn_kept(sym));
@@ -394,7 +397,7 @@ pub struct Inference {
     pub warnings: Vec<TypeError>,
     pub typed: TypedProgram,
     /// Per record-type generalized scheme (its inferred type parameters and the
-    /// field/method signatures over them), keyed by the type's source name. Read
+    /// field/method signatures over them), keyed by the type's storage symbol. Read
     /// by the language server to render a method generically; see `build_schemes`.
     pub schemes: HashMap<String, TypeScheme>,
     /// Spans of anonymous structural arguments that passed the callee-row check
@@ -438,7 +441,7 @@ pub struct Inference {
     /// so this is the only record of what the checker settled on; the language
     /// server renders it.
     pub function_returns: HashMap<String, Type>,
-    /// The same for methods, keyed by (type name, method name). Covers both an
+    /// The same for methods, keyed by (type symbol, method name). Covers both an
     /// unannotated return and the open Err payload of a `T!` one.
     pub method_returns: HashMap<(String, String), Type>,
     /// Unambiguous display-only closure-parameter instantiations, var id ->
@@ -622,12 +625,16 @@ fn check_method_bodies(checker: &mut Checker, program: &Program, schemes_only: b
                         let mut scopes = checker.signature_scopes(&m.signature.params);
                         let ret = m.signature.ret_ty.clone();
                         checker.current_co_method =
-                            Some((t.name.clone(), m.signature.name.clone()));
-                        let full =
-                            checker.check_block_with_self(body, &mut scopes, ret.as_ref(), &t.name);
+                            Some((t.symbol.clone(), m.signature.name.clone()));
+                        let full = checker.check_block_with_self(
+                            body,
+                            &mut scopes,
+                            ret.as_ref(),
+                            &t.symbol,
+                        );
                         checker.current_co_method = None;
                         perf.item(
-                            format!("{}.{}", t.name, m.signature.name),
+                            format!("{}.{}", t.symbol, m.signature.name),
                             m_started.elapsed(),
                         );
                         // Keep the return the full check reconciled here, in the
@@ -635,7 +642,7 @@ fn check_method_bodies(checker: &mut Checker, program: &Program, schemes_only: b
                         // (see `co_method_returns`). A propagating body's shape
                         // (`Result`/`?`) only the light assembly builds, so it
                         // keeps its precomputed type.
-                        let key = (t.name.clone(), m.signature.name.clone());
+                        let key = (t.symbol.clone(), m.signature.name.clone());
                         if let Some(inferred) = checker.method_returns.get(&key).cloned() {
                             checker.warn_implicit_nullable_result(&m.signature, body, &inferred);
                         }
@@ -660,10 +667,11 @@ fn check_method_bodies(checker: &mut Checker, program: &Program, schemes_only: b
                                 body,
                                 &mut scopes,
                                 ret.as_ref(),
-                                &t.name,
+                                &t.symbol,
                                 &v.name,
                             );
-                            let key = (format!("{}.{}", t.name, v.name), m.signature.name.clone());
+                            let key =
+                                (format!("{}.{}", t.symbol, v.name), m.signature.name.clone());
                             if let Some(inferred) = checker.method_returns.get(&key).cloned() {
                                 checker.warn_implicit_nullable_result(
                                     &m.signature,
@@ -759,15 +767,15 @@ pub fn analyze_generated(
                 };
                 let mut scopes = checker.signature_scopes(&method.signature.params);
                 checker.current_co_method =
-                    Some((info.name.clone(), method.signature.name.clone()));
+                    Some((info.symbol.clone(), method.signature.name.clone()));
                 checker.check_block_with_self(
                     body,
                     &mut scopes,
                     method.signature.ret_ty.as_ref(),
-                    &info.name,
+                    &info.symbol,
                 );
                 checker.current_co_method = None;
-                let key = (info.name.clone(), method.signature.name.clone());
+                let key = (info.symbol.clone(), method.signature.name.clone());
                 if let Some(inferred) = checker.method_returns.get(&key).cloned() {
                     checker.warn_implicit_nullable_result(&method.signature, body, &inferred);
                 }
@@ -790,11 +798,11 @@ pub fn analyze_generated(
                         body,
                         &mut scopes,
                         method.signature.ret_ty.as_ref(),
-                        &info.name,
+                        &info.symbol,
                         &variant.name,
                     );
                     let key = (
-                        format!("{}.{}", info.name, variant.name),
+                        format!("{}.{}", info.symbol, variant.name),
                         method.signature.name.clone(),
                     );
                     if let Some(inferred) = checker.method_returns.get(&key).cloned() {
@@ -1628,13 +1636,13 @@ struct Checker<'a> {
     global_scopes: HashMap<Vec<String>, Rc<HashMap<String, Type>>>,
     function_returns: HashMap<String, Type>,
     /// (method qualifier, method name) -> return type.
-    /// Record qualifiers are the type name; variant qualifiers are `Type.Variant`.
+    /// Record qualifiers are storage symbols; variant qualifiers append `.Variant`.
     method_returns: HashMap<(String, String), Type>,
     /// Methods whose `method_returns` entry carries propagation (`error(...)` /
     /// nullable `!`) wrapping from the light assembly; the co-check's plain
     /// return reconciliation must not replace those (see `co_method_returns`).
     method_return_props: HashSet<(String, String)>,
-    /// (record type name, method name) -> the return type the full co-check of
+    /// (record storage symbol, method name) -> the return type the full co-check of
     /// the method bodies reconciled in the shared per-type environment. Unlike
     /// the light-pass `method_returns`, these are expressed over the same
     /// variables as the record's fields, so scheme generalization ties a
@@ -1648,7 +1656,7 @@ struct Checker<'a> {
     /// type), while a free function's returns stay loose -- its signature keeps
     /// its own variables, bound per call site.
     co_checking: bool,
-    /// The `(type name, method name)` whose body the co-check pass is
+    /// The `(type symbol, method name)` whose body the co-check pass is
     /// currently checking, so return reconciliation can attribute the links it
     /// records (see `co_return_links`).
     current_co_method: Option<(String, String)>,
@@ -1758,7 +1766,7 @@ struct Checker<'a> {
     /// payload is one of their own parameter variables: a generic error type
     /// named per call site, exempt from the uninferable-error report.
     generic_error_returns: HashSet<String>,
-    /// Per record-type generalized scheme, keyed by type name. Built after the
+    /// Per record-type generalized scheme, keyed by storage symbol. Built after the
     /// method bodies are co-checked and consulted at call sites to type a method
     /// call's result by instantiating the method's scheme against the receiver.
     schemes: HashMap<String, TypeScheme>,
@@ -1979,7 +1987,7 @@ impl<'a> Checker<'a> {
         // substitution restates its own field layout and drowns the message.
         // The warning is about the two layers, not the payload internals, so
         // that nominal renders bare; any other error type keeps its full form.
-        let error_id = self.program.types.get("Error").map(|info| info.id);
+        let error_id = self.program.prelude_type("Error").map(|info| info.id);
         let type_text = match result.result_payloads() {
             Some((ok, err)) => {
                 let err_text = match err {

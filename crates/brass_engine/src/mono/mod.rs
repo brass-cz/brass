@@ -1332,7 +1332,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
         // body whose propagation/return rebuilds its Err arm contains both
         // the pre-lift construction and the lifted one, and the lifted one is
         // what the body hands back.
-        let error_id = self.program.types.get("Error").map(|i| i.id);
+        let error_id = self.program.prelude_type("Error").map(|i| i.id);
         let note_err = |slot: &mut Option<Type>, t: Option<Type>| {
             let Some(t) = t else {
                 return;
@@ -1681,7 +1681,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
     /// from the raw construction is provisional; the lifted one is what the
     /// body actually hands back once the rebuild arm types.
     fn result_err_upgrade(&self, old: &Type, new: &Type) -> bool {
-        let error_id = match self.program.types.get("Error") {
+        let error_id = match self.program.prelude_type("Error") {
             Some(i) => i.id,
             None => return false,
         };
@@ -1707,7 +1707,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
     /// substitution), so a mutual-recursion guess equals the final instance.
     /// Bare `string` in a program without the prelude.
     fn guessed_error_payload(&self) -> Type {
-        let Some(info) = self.program.types.get("Error") else {
+        let Some(info) = self.program.prelude_type("Error") else {
             return Type::Str;
         };
         let TypeKind::Record { fields, .. } = &info.kind else {
@@ -1768,6 +1768,18 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
                     return Ok(None);
                 };
                 self.resolve_free(cur_sym, cur_ret, base, arg_types)
+            }
+            // Nominal declarations own their methods even when a method shares
+            // a name with an array or string operation.
+            Rvalue::Call(Callee::Method(name), args)
+                if matches!(
+                    self.operand_type(args.first().unwrap_or(&Operand::void()), local_types)?
+                        .as_ref()
+                        .map(unwrap_nullable),
+                    Some(Type::Record(_) | Type::Sum(_))
+                ) =>
+            {
+                self.method_call_type(name, args, cur_sym, cur_ret, local_types)
             }
             // `arr.push(v)`/`arr.insert(i, v)` are growable-array mutations (void),
             // not user methods.

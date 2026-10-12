@@ -710,7 +710,9 @@ impl<'a, 'p> FnLower<'a, 'p> {
         let loc = self.location_operand(span);
         let frames = match self
             .ctx
-            .concrete_nominal_ref(&self.module, "Frame")
+            .program
+            .prelude_type("Frame")
+            .map(brass_hir::TypeInfo::type_ref)
             .map(|t| Type::Slice(Box::new(t)))
         {
             Some(t) => self.b.fresh_local_typed(None, t),
@@ -719,7 +721,12 @@ impl<'a, 'p> FnLower<'a, 'p> {
         self.b
             .push(MirStmt::Assign(frames, Rvalue::Array(Vec::new())));
         let err = self.b.emit(Rvalue::Record {
-            ty: "Error".to_string(),
+            ty: self
+                .ctx
+                .program
+                .prelude_type("Error")
+                .map(|info| info.symbol.clone())
+                .unwrap_or_else(|| "Error".into()),
             fields: vec![
                 ("value".to_string(), old),
                 ("location".to_string(), loc),
@@ -1108,6 +1115,29 @@ impl<'a, 'p> FnLower<'a, 'p> {
                     ops,
                 );
             }
+            // A sum variant qualifier is a static receiver, including aliases
+            // and module markers; evaluating it as a value loses its type.
+            if let Expr::Field(sum, variant, _) = &**base
+                && let Expr::Ident(type_name, _) = &**sum
+                && self.lookup(type_name).is_none()
+                && let Some(info) = self
+                    .ctx
+                    .program
+                    .resolve_type_or_alias(&self.module, &self.resolve_self_name(type_name))
+                && info.variant(variant).is_some()
+            {
+                let ty = info.symbol.clone();
+                let defaults = self.ctx.static_call_defaults(&self.module, &ty, method);
+                let mut ops = self.lower_args(args);
+                self.complete_call_args(defaults.as_deref(), &mut ops, span);
+                return Rvalue::Call(
+                    Callee::Static {
+                        ty,
+                        method: method.clone(),
+                    },
+                    ops,
+                );
+            }
             // No trailing-nullable padding here: `method` names a *method*, whose
             // arity the checker enforces in full. Looking the name up as a free
             // function (as free calls below do) would pad from an unrelated
@@ -1213,7 +1243,12 @@ impl<'a, 'p> FnLower<'a, 'p> {
     fn location_operand(&mut self, span: Span) -> Operand {
         let (file, line, col) = self.ctx.call_location(span);
         self.b.emit(Rvalue::Record {
-            ty: "Location".to_string(),
+            ty: self
+                .ctx
+                .program
+                .prelude_type("Location")
+                .map(|info| info.symbol.clone())
+                .unwrap_or_else(|| "Location".into()),
             fields: vec![
                 ("file".to_string(), Operand::Const(Literal::Str(file))),
                 (

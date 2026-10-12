@@ -1,0 +1,4 @@
+// A user Location parameter is required; only the prelude identity is implicit.
+type Location = { line: int32 }
+fun read(loc: Location) { return loc.line }
+fun main() { println(read()) }

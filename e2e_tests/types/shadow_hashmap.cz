@@ -1,0 +1,4 @@
+// A nominal len method dispatches on its receiver, including a shadow of HashMap.
+type HashMap = { size: int32 }
+fun HashMap.len(self) { return self.size }
+fun main() { println(HashMap { size: 3 }.len()) }

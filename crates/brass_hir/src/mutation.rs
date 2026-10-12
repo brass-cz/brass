@@ -43,11 +43,11 @@ pub struct MutationInfo {
     /// rooted at it into another write-through position. A least fixpoint over
     /// the call graph.
     functions: HashMap<String, HashSet<usize>>,
-    /// `(type name, method name)` -> call-site argument indices (the receiver is
+    /// `(type or variant storage qualifier, method name)` -> call-site argument indices (the receiver is
     /// excluded, so index 0 is the first non-`self` parameter) that write
     /// through, by the same `ref(mut(T))`-or-forwarding rule as `functions`.
     method_args: HashMap<(String, String), HashSet<usize>>,
-    /// `(type name, method name)` pairs whose body mutates `self` *through a
+    /// `(type or variant storage qualifier, method name)` pairs whose body mutates `self` *through a
     /// write-through `self`* (an unannotated `self`, inferred `ref(mut(Self))`,
     /// or an explicit `ref(mut(Self))`) -- directly or by forwarding `self` into
     /// another write-through position. A method taking `self: Self`/`mut(Self)`
@@ -70,11 +70,18 @@ impl MutationInfo {
         self.functions.get(symbol)
     }
 
-    /// Whether method `type_name::method` mutates the caller's receiver through a
-    /// write-through `self`, so calling it on a `const` receiver is rejected.
-    pub fn method_writes_through_self(&self, type_name: &str, method: &str) -> bool {
+    /// Whether a method on this storage symbol mutates the caller's receiver.
+    /// A sum receiver includes every variant because its active tag is unknown.
+    pub fn method_writes_through_self(&self, symbol: &str, method: &str) -> bool {
         self.self_write_through_methods
-            .contains(&(type_name.to_string(), method.to_string()))
+            .iter()
+            .any(|(qualifier, name)| {
+                name == method
+                    && (qualifier == symbol
+                        || qualifier
+                            .split_once('.')
+                            .is_some_and(|(owner, _)| owner == symbol))
+            })
     }
 
     /// The union of write-through call-site argument indices of every method
@@ -116,17 +123,29 @@ fn self_writes_through(self_param: &ParamInfo) -> bool {
     }
 }
 
-/// Every method of every type with its owning type name, whether its first
-/// parameter is `self`, and the module its body resolves names in.
+/// Every method with its owner, unique qualifier, and declaration. Variants
+/// have independent entries even when their source method names coincide.
 fn all_methods(
     program: &Program,
-) -> impl Iterator<Item = (&TypeInfo, &String, &crate::MethodInfo)> {
+) -> impl Iterator<Item = (&TypeInfo, String, &String, &crate::MethodInfo)> {
     program.types.values().flat_map(|info| {
-        let methods: Vec<(&String, &crate::MethodInfo)> = match &info.kind {
-            TypeKind::Record { methods, .. } => methods.iter().collect(),
-            TypeKind::Sum { variants } => variants.iter().flat_map(|v| v.methods.iter()).collect(),
+        let methods: Vec<_> = match &info.kind {
+            TypeKind::Record { methods, .. } => methods
+                .iter()
+                .map(|(name, m)| (info.symbol.clone(), name, m))
+                .collect(),
+            TypeKind::Sum { variants } => variants
+                .iter()
+                .flat_map(|v| {
+                    v.methods
+                        .iter()
+                        .map(|(name, m)| (format!("{}.{}", info.symbol, v.name), name, m))
+                })
+                .collect(),
         };
-        methods.into_iter().map(move |(name, m)| (info, name, m))
+        methods
+            .into_iter()
+            .map(move |(qualifier, name, m)| (info, qualifier, name, m))
     })
 }
 
@@ -173,7 +192,7 @@ fn write_through_fixpoint(program: &Program) -> MutationInfo {
             info.functions.insert(f.symbol.clone(), indices);
         }
     }
-    for (tinfo, mname, m) in all_methods(program) {
+    for (_, qualifier, mname, m) in all_methods(program) {
         let has_self = method_has_self(m);
         let indices: HashSet<usize> = m
             .signature
@@ -186,7 +205,7 @@ fn write_through_fixpoint(program: &Program) -> MutationInfo {
             .collect();
         if !indices.is_empty() {
             info.method_args
-                .insert((tinfo.name.clone(), mname.clone()), indices);
+                .insert((qualifier.clone(), mname.clone()), indices);
         }
         if has_self
             && m.signature.params.first().is_some_and(self_writes_through)
@@ -196,7 +215,7 @@ fn write_through_fixpoint(program: &Program) -> MutationInfo {
                 .is_some_and(|body| mutates_root(body, "self"))
         {
             info.self_write_through_methods
-                .insert((tinfo.name.clone(), mname.clone()));
+                .insert((qualifier.clone(), mname.clone()));
         }
     }
     // Propagate through forwarding calls until the fixpoint is reached.
@@ -229,11 +248,11 @@ fn write_through_fixpoint(program: &Program) -> MutationInfo {
                 }
             }
         }
-        for (tinfo, mname, m) in all_methods(program) {
+        for (tinfo, qualifier, mname, m) in all_methods(program) {
             let Some(body) = m.decl.body.as_ref() else {
                 continue;
             };
-            let key = (tinfo.name.clone(), mname.clone());
+            let key = (qualifier.clone(), mname.clone());
             let has_self = method_has_self(m);
             for (arg_idx, p) in m
                 .signature

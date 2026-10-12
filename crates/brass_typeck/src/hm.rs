@@ -1502,7 +1502,7 @@ impl<'p> Hm<'p> {
                 }
                 // A program without the prelude (unit tests, embedders) keeps
                 // the legacy raw payload.
-                let err = match self.program.types.get("Error") {
+                let err = match self.program.prelude_type("Error") {
                     Some(err_info) => {
                         let mut err = brass_hir::NominalType::new(err_info.id, &err_info.name);
                         err.substitution
@@ -1550,7 +1550,7 @@ impl<'p> Hm<'p> {
                 if matches!(&inner, Type::Sum(result) if result.id == brass_hir::RESULT_TYPE_ID) {
                     return inner;
                 }
-                let error = match self.program.types.get("Error") {
+                let error = match self.program.prelude_type("Error") {
                     Some(info) => {
                         let mut error = brass_hir::NominalType::new(info.id, &info.name);
                         error.substitution.insert("value", Type::Str);
@@ -1602,7 +1602,7 @@ impl<'p> Hm<'p> {
                 // A call may omit a trailing `Location` parameter (the
                 // implicit caller-location MIR fills in).
                 if params.len() == arg_tys.len() + 1
-                    && matches!(params.last(), Some(Type::Record(n)) if n.is_name("Location"))
+                    && matches!(params.last(), Some(Type::Record(n)) if self.program.is_prelude_type(n.id, "Location"))
                 {
                     for (p, a) in params.iter().zip(&arg_tys) {
                         self.flow_into(a, p, span);

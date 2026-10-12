@@ -415,7 +415,7 @@ impl<'a> Checker<'a> {
                     self.infer_expr_light(&a.expr, env, props);
                 }
                 // A program without the prelude keeps the legacy raw payload.
-                let err_ty = match self.program.types.get("Error") {
+                let err_ty = match self.program.prelude_type("Error") {
                     Some(err_info) => {
                         let mut err = NominalType::new(err_info.id, &err_info.name);
                         err.substitution.insert("value", self.resolve(&value_ty));
@@ -453,10 +453,8 @@ impl<'a> Checker<'a> {
         if let Expr::Field(base, method, _) = callee
             && !callee.span().is_parenthesized()
         {
-            if let Expr::Ident(tname, _) = &**base
-                && self.lookup(env, tname).is_none()
-            {
-                let ret = self.primitive_static_type(tname, method);
+            if let Some(qualifier) = self.static_qualifier(base, env) {
+                let ret = self.primitive_static_type(&qualifier, method);
                 if ret.is_some() {
                     args.iter().for_each(|arg| {
                         self.infer_expr_light(&arg.expr, env, props);
@@ -488,9 +486,7 @@ impl<'a> Checker<'a> {
                 // to serve's nominal) has only module-qualified symbols, and the
                 // bare lookup missing made `HttpServer.new(..)!` type as unknown --
                 // the caller then lost its whole inferred fallibility.
-                if self.resolve_type_symbol(tname).is_some()
-                    && let Some(resolved) = self.method_for_qualifier(tname, method)
-                {
+                if let Some(resolved) = self.method_for_qualifier(&qualifier, method) {
                     let declared = resolved.signature.ret_ty.clone();
                     let ret = match &declared {
                         Some(ty) if brass_hir::is_fully_known(ty) => declared,
@@ -538,7 +534,7 @@ impl<'a> Checker<'a> {
                 if matches!(&inner, Type::Sum(result) if result.id == brass_hir::RESULT_TYPE_ID) {
                     return inner;
                 }
-                let error = match self.program.types.get("Error") {
+                let error = match self.program.prelude_type("Error") {
                     Some(info) => {
                         let mut error = NominalType::new(info.id, &info.name);
                         error.substitution.insert("value", Type::Str);
@@ -558,9 +554,17 @@ impl<'a> Checker<'a> {
                 other => other,
             };
             if let Type::Record(n) | Type::Sum(n) = &peeled
+                && let Some(info) = self.program.type_by_id(n.id)
+                && let Some(qualifier) = match &info.kind {
+                    TypeKind::Record { .. } => Some(info.symbol.clone()),
+                    TypeKind::Sum { variants } => variants
+                        .iter()
+                        .find(|variant| variant.methods.contains_key(method))
+                        .map(|variant| format!("{}.{}", info.symbol, variant.name)),
+                }
                 && let Some(ret) = self
                     .method_returns
-                    .get(&(n.name.clone(), method.clone()))
+                    .get(&(qualifier, method.clone()))
                     .cloned()
             {
                 args.iter().for_each(|arg| {
@@ -594,7 +598,7 @@ impl<'a> Checker<'a> {
         if info.slots.is_empty() {
             return None;
         }
-        let scheme = self.schemes.get(n.name())?.clone();
+        let scheme = self.schemes.get(&info.symbol)?.clone();
         let mut map: HashMap<u32, Type> = HashMap::default();
         for p in &scheme.params {
             let fresh = self.fresh_unknown();
@@ -634,8 +638,7 @@ impl<'a> Checker<'a> {
         match self.resolve(&base_ty) {
             Type::Record(record) => record.substitution.get(name).cloned().unwrap_or_else(|| {
                 self.program
-                    .types
-                    .get(record.name())
+                    .type_by_id(record.id)
                     .and_then(|info| match &info.kind {
                         TypeKind::Record { fields, .. } => fields.iter().find(|f| f.name == name),
                         TypeKind::Sum { .. } => None,

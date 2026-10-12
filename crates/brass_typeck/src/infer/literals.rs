@@ -377,7 +377,7 @@ impl<'a> Checker<'a> {
             return None;
         }
         let (self_sum, variant) = self.self_variant.clone()?;
-        if self_sum != sum.name() {
+        if self.program.types.get(&self_sum).map(|info| info.id) != Some(sum.id) {
             return None;
         }
         self.variant_field_type(sum, &variant, name)
@@ -386,8 +386,7 @@ impl<'a> Checker<'a> {
     fn variant_field_type(&mut self, sum: &NominalType, variant: &str, name: &str) -> Option<Type> {
         let fallback = self
             .program
-            .types
-            .get(sum.name())?
+            .type_by_id(sum.id)?
             .variant(variant)?
             .fields
             .iter()

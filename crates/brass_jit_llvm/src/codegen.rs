@@ -2024,7 +2024,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             // A structural record (anonymous structure / `T.from` result) renders
             // under the `anonymous` label rather than its internal `<structural>`.
             Type::Record(n) => {
-                let header = if n.name == brass_hir::STRUCTURAL_RECORD_NAME {
+                let header = if n.id == brass_hir::STRUCTURAL_RECORD_ID {
                     "anonymous".to_string()
                 } else {
                     n.name.clone()

@@ -69,7 +69,12 @@ The error value model behind `error(..)` and `!` (normatively specified in
 `error` and `context` declare a trailing `loc: Location` parameter the
 compiler fills with the call site (the
 [implicit location argument](/references/syntax-sugar/#error-traces)); a
-caller may also pass it explicitly. The compiler's reserved handling of
+caller may also pass it explicitly. Only the prelude declaration qualifies:
+a user-defined `Location` is an ordinary record and its parameters remain
+required. Compiler-created traces use the prelude `Error`, `Location`, and
+`Frame` even when a module declares types with those names.
+
+The compiler's reserved handling of
 `error(...)` still validates that signature: one payload is required, only the
 trailing `Location` may be omitted, and other arities or argument types fail.
 The nullable overload belongs to the compiler because `T?` has no nominal

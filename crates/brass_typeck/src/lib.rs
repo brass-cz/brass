@@ -95,14 +95,14 @@ pub struct Analysis {
     pub warnings: Vec<TypeError>,
     pub typed: TypedProgram,
     /// Per record-type generalized scheme (inferred type parameters and the
-    /// field/method signatures over them), keyed by the type's source name. The
+    /// field/method signatures over them), keyed by the type's storage symbol. The
     /// language server renders a method generically from this.
     pub schemes: fxhash::FxHashMap<String, brass_hir::TypeScheme>,
     /// The inferred return type of every free function, keyed by symbol. An
     /// unannotated return is absent from the signature table, so this is where
     /// the checker's answer lives.
     pub function_returns: fxhash::FxHashMap<String, brass_hir::Type>,
-    /// The same for methods, keyed by (type name, method name).
+    /// The same for methods, keyed by (type or variant storage qualifier, method name).
     pub method_returns: fxhash::FxHashMap<(String, String), brass_hir::Type>,
     /// Unambiguous display-only closure-parameter instantiations, var id ->
     /// observed type. A closure application's unification is local to the
@@ -353,7 +353,7 @@ fn analyze_impl(
 /// Mirrored by MIR's propagation arm, which rebuilds the value.
 pub(crate) fn lift_err_payload(program: &Program, resolved: brass_hir::Type) -> brass_hir::Type {
     use brass_hir::{NominalType, Type};
-    let Some(info) = program.types.get("Error") else {
+    let Some(info) = program.prelude_type("Error") else {
         return resolved;
     };
     if resolved.is_unknown() || matches!(&resolved, Type::Record(n) if n.id == info.id) {

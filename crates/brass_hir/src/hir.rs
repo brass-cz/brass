@@ -450,6 +450,28 @@ impl Program {
             .and_then(|symbol| self.types.get(symbol))
     }
 
+    /// Find an implicit-prelude declaration independently of source-level
+    /// shadowing. Compiler-synthesized values must use this identity.
+    pub fn prelude_type(&self, name: &str) -> Option<&TypeInfo> {
+        self.types
+            .get(name)
+            .filter(|info| self.prelude_modules.contains(&info.module))
+            .or_else(|| {
+                if !self.has_type_named(name) {
+                    return None;
+                }
+                self.prelude_modules
+                    .iter()
+                    .find_map(|module| self.types.get(&qualify(name, module)))
+            })
+    }
+
+    /// Whether a nominal id denotes the named implicit-prelude declaration.
+    pub fn is_prelude_type(&self, id: i32, name: &str) -> bool {
+        self.type_by_id(id)
+            .is_some_and(|info| info.name == name && self.prelude_modules.contains(&info.module))
+    }
+
     /// The compile-time presence of an uncalled member `x.m`: `Some(true)` when
     /// the receiver's class or declared type carries a METHOD `m`, `Some(false)`
     /// when it carries nothing of that name at all (a primitive class without
@@ -567,6 +589,13 @@ impl Program {
                 )
             },
         )
+        .or_else(|| {
+            let info = self.prelude_type(name)?;
+            // A nearer alias shadows a colliding prelude nominal too.
+            self.resolve_type_alias(module, name)
+                .is_none()
+                .then_some(info)
+        })
     }
 
     /// Resolve a type alias as seen from `module`, preserving the alias's full

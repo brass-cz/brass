@@ -659,8 +659,7 @@ impl<'a> Checker<'a> {
         if let Some(location) = args.get(1) {
             let location_ty = self
                 .program
-                .types
-                .get("Location")
+                .prelude_type("Location")
                 .map(brass_hir::TypeInfo::type_ref)
                 .unwrap_or_else(|| self.fresh_unknown());
             self.check_expr_against(&location.expr, &location_ty, scopes);
@@ -673,7 +672,7 @@ impl<'a> Checker<'a> {
         if matches!(&inner, Type::Sum(result) if result.id == brass_hir::RESULT_TYPE_ID) {
             return Some(inner);
         }
-        let error = match self.program.types.get("Error") {
+        let error = match self.program.prelude_type("Error") {
             Some(info) => {
                 let mut error = NominalType::new(info.id, &info.name);
                 error.substitution.insert("value", Type::Str);

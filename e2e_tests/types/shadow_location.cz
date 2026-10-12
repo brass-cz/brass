@@ -1,0 +1,4 @@
+// The user's unannotated method and prelude Location.display have distinct returns.
+type Location = { file: string, line: int32 }
+fun Location.display(self) { return self.line }
+fun main() { println(Location { file: "f", line: 1 }.display()) }

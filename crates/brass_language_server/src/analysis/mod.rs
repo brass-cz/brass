@@ -74,7 +74,7 @@ pub struct FullAnalysis {
     /// with no `-> T` annotation has none in its signature, so hover reads it
     /// here rather than reverse-engineering it from call sites.
     pub function_returns: fxhash::FxHashMap<String, brass_hir::Type>,
-    /// The same for methods, keyed by (type name, method name). An annotated
+    /// The same for methods, keyed by (type or variant storage qualifier, method name). An annotated
     /// `-> T!` return leaves its Err payload open, so this is where the Err type
     /// a method actually produces lives.
     pub method_returns: fxhash::FxHashMap<(String, String), brass_hir::Type>,

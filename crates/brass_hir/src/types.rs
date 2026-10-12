@@ -240,7 +240,7 @@ impl Substitution {
 }
 
 /// A lowered nominal type reference. `id` is the runtime type id assigned by
-/// HIR lowering; `name` is retained for diagnostics and current lookup tables.
+/// HIR lowering; `name` is retained for diagnostics and spelling-based syntax.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NominalType {
     pub id: i32,
@@ -279,6 +279,9 @@ impl NominalType {
             && self.substitution == other.substitution
     }
 
+    /// Whether this nominal carries fallibility syntax. Source declarations
+    /// named Result participate by design, including a module's own shadow;
+    /// this predicate does not identify the prelude declaration alone.
     pub fn is_result_type(&self) -> bool {
         self.is_name(RESULT_TYPE_NAME)
     }
@@ -322,7 +325,7 @@ impl NominalType {
         // `anonymous { field: Type, ... }` form the programmer writes, so a
         // diagnostic reads naturally instead of exposing the `<structural>`
         // placeholder. Fields are keyed in sorted name order by the substitution.
-        if self.name == STRUCTURAL_RECORD_NAME {
+        if self.id == STRUCTURAL_RECORD_ID {
             let fields = self
                 .substitution
                 .iter()

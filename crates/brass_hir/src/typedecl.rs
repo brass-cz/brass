@@ -296,7 +296,14 @@ impl Resolver<'_> {
                 return Some(qo);
             }
         }
-        (in_table(name) && bare_is_visible(name)).then(|| name.to_string())
+        (in_table(name) && bare_is_visible(name))
+            .then(|| name.to_string())
+            .or_else(|| {
+                self.prelude_modules
+                    .iter()
+                    .map(|module| crate::hir::qualify(name, module))
+                    .find(|symbol| in_table(symbol))
+            })
     }
 
     /// Expand `type Alias = <type expr>` by symbol, memoized.

@@ -216,7 +216,11 @@ impl<'a> Checker<'a> {
     }
 
     pub(super) fn type_by_name(&self, name: &str) -> Type {
-        self.resolve_type_ref(name)
+        self.program
+            .types
+            .get(name)
+            .map(TypeInfo::type_ref)
+            .or_else(|| self.resolve_type_ref(name))
             .unwrap_or_else(|| Type::Record(NominalType::new(-1, name)))
     }
 

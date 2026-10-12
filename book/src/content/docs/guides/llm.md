@@ -262,6 +262,10 @@ fun length(val) {
 
 ## Error handling
 
+- Same-named types in different modules have distinct identities. A user type
+  named `Location`, `Error`, or `Frame` does not replace the prelude types used
+  in error traces. Only a trailing prelude `Location` parameter is implicit.
+  A module's own `type Result` still supplies that module's fallibility sugar.
 - `Result` has `Ok { value }` and `Err { error }` variants. Standard failures
   carry an `Error` record with `value`, `location`, `frames`, and `display()`.
 - `error(payload)` creates an `Err`. Returning a plain value from a fallible

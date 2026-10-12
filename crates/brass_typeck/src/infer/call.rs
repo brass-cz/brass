@@ -98,7 +98,7 @@ impl<'a> Checker<'a> {
                 };
                 // A program without the prelude (unit tests, embedders) keeps
                 // the legacy raw payload.
-                let err_ty = match self.program.types.get("Error") {
+                let err_ty = match self.program.prelude_type("Error") {
                     Some(err_info) => {
                         let mut err = NominalType::new(err_info.id, &err_info.name);
                         err.substitution.insert("value", self.resolve(&value_ty));
@@ -1398,7 +1398,9 @@ impl<'a> Checker<'a> {
         // the call site); complete the collected types so the callee still
         // instantiates at full arity.
         if arg_types.len() + 1 == params.len()
-            && params.last().is_some_and(param_is_location)
+            && params
+                .last()
+                .is_some_and(|p| param_is_location(self.program, p))
             && let Some(loc) = self.location_instance()
         {
             arg_types.push(loc);
@@ -1409,8 +1411,7 @@ impl<'a> Checker<'a> {
     /// The prelude `Location` record instance a filled implicit argument has.
     fn location_instance(&self) -> Option<Type> {
         self.program
-            .types
-            .get("Location")
+            .prelude_type("Location")
             .map(brass_hir::TypeInfo::type_ref)
     }
 
@@ -1476,7 +1477,7 @@ impl<'a> Checker<'a> {
         got: usize,
         span: brass_parser::Span,
     ) {
-        let min = required_arg_count(params);
+        let min = required_arg_count(self.program, params);
         let max = params.len();
         if got < min || got > max {
             let want = if min == max {

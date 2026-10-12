@@ -66,18 +66,20 @@ impl<'a> Checker<'a> {
     ) -> Option<ResolvedMethod> {
         // `Sum.Variant.method()`: only when the first segment is actually a
         // type (not a module alias producing a marker like `"vec.Vec2"`).
-        if let Some((sum, variant)) = qualifier.split_once('.')
-            && let Some(symbol) = self.resolve_type_symbol(sum)
+        if let Some((sum, variant)) = qualifier.rsplit_once('.')
+            && let Some(info) = self
+                .program
+                .resolve_type_or_alias(&self.current_module, &self.resolve_self_name(sum))
+                .or_else(|| {
+                    sum.contains('@')
+                        .then(|| self.program.types.get(sum))
+                        .flatten()
+                })
         {
-            let info = self.program.types.get(&symbol)?;
+            let symbol = &info.symbol;
             if let Some(v_method) = info.variant(variant).and_then(|v| v.methods.get(method)) {
-                // The qualifier is the type's NAME: it keys the method-return
-                // tables, which `precompute_method_returns` fills by name. The
-                // symbol only equals it while the name is unique program-wide --
-                // another module declaring the same name (an alias of this very
-                // type, even) qualifies the symbol and every keyed lookup missed.
                 return Some(ResolvedMethod {
-                    qualifier: format!("{}.{variant}", info.name),
+                    qualifier: format!("{}.{variant}", info.symbol),
                     self_type: symbol.clone(),
                     signature: v_method.signature.clone(),
                     method: Rc::clone(&v_method.decl),
@@ -88,19 +90,21 @@ impl<'a> Checker<'a> {
         // A type-ALIAS qualifier (`type Names = Stack { .. }`; `Names.new()`)
         // answers with its TARGET's declaration: the alias is not a nominal of
         // its own and declares no methods, so the lookup follows it.
-        let info = match self.resolve_type_symbol(&type_name) {
-            Some(symbol) => self.program.types.get(&symbol)?,
-            None => self
-                .program
-                .resolve_type_or_alias(&self.current_module, &type_name)?,
-        };
+        let info = self
+            .program
+            .resolve_type_or_alias(&self.current_module, &type_name)
+            .or_else(|| {
+                type_name
+                    .contains('@')
+                    .then(|| self.program.types.get(&type_name))
+                    .flatten()
+            })?;
         let symbol = info.symbol.clone();
         match &info.kind {
             TypeKind::Record { methods, .. } => {
                 let method = methods.get(method)?;
                 Some(ResolvedMethod {
-                    // The NAME, for the same reason as the variant branch above.
-                    qualifier: info.name.clone(),
+                    qualifier: info.symbol.clone(),
                     self_type: symbol,
                     signature: method.signature.clone(),
                     method: Rc::clone(&method.decl),
@@ -120,7 +124,7 @@ impl<'a> Checker<'a> {
                 let variant = variants.iter().find(|v| v.methods.contains_key(method))?;
                 let m = variant.methods.get(method)?;
                 Some(ResolvedMethod {
-                    qualifier: format!("{}.{}", info.name, variant.name),
+                    qualifier: format!("{}.{}", info.symbol, variant.name),
                     self_type: symbol,
                     signature: m.signature.clone(),
                     method: Rc::clone(&m.decl),
@@ -177,7 +181,10 @@ impl<'a> Checker<'a> {
                 };
                 let ty = self.static_arg_type(&arg.expr, scopes)?;
                 match brass_hir::peel_modes(&self.resolve(&ty)) {
-                    Type::Record(n) | Type::Sum(n) => Some(n.name.clone()),
+                    Type::Record(n) | Type::Sum(n) => self
+                        .program
+                        .type_by_id(n.id)
+                        .map(|info| info.symbol.clone()),
                     Type::Unknown(_) => None,
                     other => Some(other.type_name()),
                 }
@@ -192,11 +199,15 @@ impl<'a> Checker<'a> {
                 let resolved = self.resolve_self_name(type_name);
                 let info = self
                     .program
-                    .types
-                    .get(&resolved)
-                    .or_else(|| self.program.resolve_type(&self.current_module, &resolved));
-                info.and_then(|i| i.variant(variant))
-                    .map(|_| format!("{resolved}.{variant}"))
+                    .resolve_type_or_alias(&self.current_module, &resolved)
+                    .or_else(|| {
+                        resolved
+                            .contains('@')
+                            .then(|| self.program.types.get(&resolved))
+                            .flatten()
+                    })?;
+                info.variant(variant)
+                    .map(|_| format!("{}.{variant}", info.symbol))
             }
             _ => None,
         }
@@ -586,7 +597,7 @@ impl<'a> Checker<'a> {
         if name.contains('.') {
             return self
                 .program
-                .resolve_type(&self.current_module, name)
+                .resolve_type_or_alias(&self.current_module, name)
                 .is_some();
         }
         // A renamed import (`import m.{ Vec2 as V }`): the local name appears
@@ -594,7 +605,7 @@ impl<'a> Checker<'a> {
         if self.import_remote(name).is_some() {
             return self
                 .program
-                .resolve_type(&self.current_module, name)
+                .resolve_type_or_alias(&self.current_module, name)
                 .is_some();
         }
         self.program.has_type_named(name)
@@ -626,6 +637,6 @@ impl<'a> Checker<'a> {
         self.program
             .sums_containing_variant(variant)
             .first()
-            .map(|info| info.name.clone())
+            .map(|info| info.symbol.clone())
     }
 }

@@ -119,7 +119,7 @@ pub use brass_utils::float_str;
 /// The label a record renders under: its nominal name, or `anonymous` for a
 /// structural record (an anonymous structure / `T.from` result).
 fn record_header(n: &NominalType) -> &str {
-    if n.name == brass_hir::STRUCTURAL_RECORD_NAME {
+    if n.id == brass_hir::STRUCTURAL_RECORD_ID {
         "anonymous"
     } else {
         &n.name

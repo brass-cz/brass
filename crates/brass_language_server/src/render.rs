@@ -117,7 +117,7 @@ pub(crate) fn render_nullable_context_signature(
         if matches!(inner, Type::Sum(result) if result.id == brass_hir::RESULT_TYPE_ID) {
             return inner.clone();
         }
-        let error = match program.types.get("Error") {
+        let error = match program.prelude_type("Error") {
             Some(info) => {
                 let mut error = NominalType::new(info.id, &info.name);
                 error.substitution.insert("value", Type::Str);

@@ -362,13 +362,13 @@ impl<'a> Checker<'a> {
             match &info.kind {
                 TypeKind::Record { methods, .. } => {
                     for (name, m) in methods {
-                        method(&info.name, name, m);
+                        method(&info.symbol, name, m);
                     }
                 }
                 TypeKind::Sum { variants } => {
                     for v in variants {
                         for (name, m) in &v.methods {
-                            method(&format!("{}.{}", info.name, v.name), name, m);
+                            method(&format!("{}.{}", info.symbol, v.name), name, m);
                         }
                     }
                 }
@@ -464,8 +464,8 @@ or drop the `!`"
                     .keys()
                     .map(|m| {
                         (
-                            info.name.clone(),
-                            info.name.clone(),
+                            info.symbol.clone(),
+                            info.symbol.clone(),
                             m.clone(),
                             info.module.clone(),
                         )
@@ -476,8 +476,8 @@ or drop the `!`"
                     .flat_map(|variant| {
                         variant.methods.keys().map(|m| {
                             (
-                                format!("{}.{}", info.name, variant.name),
-                                info.name.clone(),
+                                format!("{}.{}", info.symbol, variant.name),
+                                info.symbol.clone(),
                                 m.clone(),
                                 info.module.clone(),
                             )
@@ -487,9 +487,19 @@ or drop the `!`"
             })
             .collect();
         entries.sort();
-        loop {
-            let mut changed = false;
-            for (qualifier, self_type, method, module) in &entries {
+        // Each round can propagate one more dependency edge. The extra round
+        // observes stability after every entry has received its dependencies.
+        self.precompute_method_entries(&entries, entries.len().saturating_add(1));
+    }
+
+    fn precompute_method_entries(
+        &mut self,
+        entries: &[(String, String, String, Vec<String>)],
+        limit: usize,
+    ) {
+        for round in 0..limit {
+            let mut changing = Vec::new();
+            for (qualifier, self_type, method, module) in entries {
                 // A seeded context type's returns are already in the table.
                 if self.seeded_module(module) {
                     continue;
@@ -510,11 +520,41 @@ or drop the `!`"
                 let current = self.canonical_return_shape(&ty);
                 if previous.as_ref() != Some(&current) {
                     self.method_returns.insert(key, ty);
-                    changed = true;
+                    changing.push((qualifier.clone(), method.clone()));
                 }
             }
-            if !changed {
-                break;
+            if changing.is_empty() {
+                return;
+            }
+            if round + 1 == limit {
+                let names = changing
+                    .iter()
+                    .map(|(q, m)| format!("{q}.{m}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                for (qualifier, method) in changing {
+                    // Entries carry storage identities, independent of the
+                    // caller's source scope restored after each inference.
+                    let (symbol, variant) = qualifier
+                        .split_once('.')
+                        .map_or((qualifier.as_str(), None), |(s, v)| (s, Some(v)));
+                    let span = match &self.program.types[symbol].kind {
+                        TypeKind::Record { methods, .. } => methods[&method].decl.name_span,
+                        TypeKind::Sum { variants } => {
+                            variants
+                                .iter()
+                                .find(|v| Some(v.name.as_str()) == variant)
+                                .expect("method entry's variant")
+                                .methods[&method]
+                                .decl
+                                .name_span
+                        }
+                    };
+                    self.errors.push(TypeError {
+                        message: format!("internal compiler error: method return inference did not converge; changing entries: {names}"),
+                        span,
+                    });
+                }
             }
         }
     }
@@ -576,7 +616,7 @@ or drop the `!`"
         if signature_params.first().is_some_and(|p| p.name == "self") {
             env.last_mut()
                 .expect("signature scope frame")
-                .insert("self".to_string(), self.type_by_name(self_type));
+                .insert("self".to_string(), self.program.types[self_type].type_ref());
         }
         let param_vars: std::collections::BTreeSet<u32> = env
             .iter()
@@ -628,12 +668,12 @@ or drop the `!`"
                 // co-check did not run here, so generalizing now would produce
                 // an empty shell over nothing.
                 if self.seeded_module(&info.module) {
-                    if let Some(scheme) = self.schemes.get(&info.name) {
-                        out.insert(info.name.clone(), scheme.clone());
+                    if let Some(scheme) = self.schemes.get(&info.symbol) {
+                        out.insert(info.symbol.clone(), scheme.clone());
                     }
                     continue;
                 }
-                out.insert(info.name.clone(), self.build_record_scheme(info));
+                out.insert(info.symbol.clone(), self.build_record_scheme(info));
             }
         }
         out
@@ -667,7 +707,7 @@ or drop the `!`"
             // preferring a field variable, so the tie is visible to the
             // instance pinning that resolves scheme parameters from the
             // receiver's fields (`get_or`'s `dflt` becomes the value slot).
-            let aliases = self.return_link_aliases(&info.name, name.as_str(), &field_vars);
+            let aliases = self.return_link_aliases(&info.symbol, name.as_str(), &field_vars);
             let canon = |this: &Self, t: Type| {
                 if aliases.is_empty() {
                     t
@@ -696,8 +736,11 @@ or drop the `!`"
             // light assembly builds -- those keep the precomputed type.
             let ret = self
                 .co_method_returns
-                .get(&(info.name.clone(), name.clone()))
-                .or_else(|| self.method_returns.get(&(info.name.clone(), name.clone())))
+                .get(&(info.symbol.clone(), name.clone()))
+                .or_else(|| {
+                    self.method_returns
+                        .get(&(info.symbol.clone(), name.clone()))
+                })
                 .map(|t| self.resolve(t))
                 .or_else(|| resolved(self, method.signature.ret_ty.as_ref()))
                 .unwrap_or(Type::Void);
@@ -1115,6 +1158,88 @@ fn block_has_type_test(b: &Block) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn method_return_budget_reports_changing_symbols_at_method_names() {
+        // Exhausting an intentionally short budget pins the otherwise defensive
+        // ICE, including the changing identity and the exact method-name span.
+        let source = "type Item = { value: int32 }\nfun Item.get(self) { return self.value }\ntype Choice = | One { value: int32 }\nfun Choice.get(self) { return self.value }";
+        let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+            is_prelude: false,
+            path: vec!["main".into()],
+            ast: brass_parser::parse(source).unwrap(),
+        }]);
+        assert!(errors.is_empty());
+        let mut checker =
+            Checker::new(&program, Rc::new(brass_typesys::RowInfo::analyze(&program)));
+        checker.precompute_method_entries(
+            &[
+                (
+                    "Item".into(),
+                    "Item".into(),
+                    "get".into(),
+                    vec!["main".into()],
+                ),
+                (
+                    "Choice.One".into(),
+                    "Choice".into(),
+                    "get".into(),
+                    vec!["main".into()],
+                ),
+            ],
+            1,
+        );
+        assert_eq!(checker.errors.len(), 2);
+        assert_eq!(
+            checker.errors[0].message,
+            "internal compiler error: method return inference did not converge; changing entries: Item.get, Choice.One.get"
+        );
+        let start = source.find("get").unwrap();
+        assert_eq!(checker.errors[0].span, Span::new(start, start + 3));
+        assert_eq!(checker.errors[1].message, checker.errors[0].message);
+        let start = source.rfind("get").unwrap();
+        assert_eq!(checker.errors[1].span, Span::new(start, start + 3));
+    }
+
+    #[test]
+    fn same_named_receivers_have_distinct_light_returns() {
+        // Inspect the precomputed table itself so call-site re-inference cannot
+        // conceal unknown or cross-module return entries.
+        let modules =
+            [("a", "int32"), ("b", "string")].map(|(module, ty)| brass_hir::LoadedModule {
+                is_prelude: false,
+                path: vec![module.into()],
+                ast: brass_parser::parse(&format!(
+                    "type Item = {{ value: {ty} }}\nfun Item.get(self) {{ return self.value }}\nfun Item.forward(self) {{ return self.get() }}"
+                ))
+                .unwrap(),
+            });
+        let (program, errors) = brass_hir::lower(&modules);
+        assert!(errors.is_empty());
+        let mut checker =
+            Checker::new(&program, Rc::new(brass_typesys::RowInfo::analyze(&program)));
+        checker.precompute_method_returns();
+        assert!(checker.errors.is_empty());
+        assert_eq!(
+            checker.method_returns[&("Item@a".into(), "get".into())],
+            Type::Int(IntKind::I32)
+        );
+        assert_eq!(
+            checker.method_returns[&("Item@b".into(), "get".into())],
+            Type::Str
+        );
+        assert_eq!(
+            checker.method_returns[&("Item@a".into(), "forward".into())],
+            Type::Int(IntKind::I32)
+        );
+        assert_eq!(
+            checker.method_returns[&("Item@b".into(), "forward".into())],
+            Type::Str
+        );
+        let schemes = checker.build_schemes();
+        assert!(schemes.contains_key("Item@a"));
+        assert!(schemes.contains_key("Item@b"));
+    }
 
     #[test]
     fn failed_inferred_return_link_rolls_back_partial_bindings() {

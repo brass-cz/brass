@@ -551,7 +551,7 @@ pub(crate) fn typedef_method_signatures(
     substitution: &Substitution,
 ) -> HashMap<String, CallableSignature> {
     let mut out = HashMap::default();
-    let Some(scheme) = full.schemes.get(&info.name) else {
+    let Some(scheme) = full.schemes.get(&info.symbol) else {
         return out;
     };
     let TypeKind::Record { fields, methods } = &info.kind else {
@@ -625,7 +625,7 @@ fn receiver_scheme<'a>(
         _ => return None,
     };
     let info = full.program.type_by_id(nominal.id)?;
-    full.schemes.get(&info.name).map(|s| (nominal, s))
+    full.schemes.get(&info.symbol).map(|s| (nominal, s))
 }
 
 /// Map each scheme parameter to the receiver instance's concrete type, by
@@ -699,8 +699,7 @@ fn record_method<'a>(
 }
 
 /// The checker's inferred return for method `name` on `recv_ty`, when it settled
-/// on a concrete type. Keyed by the NOMINAL's name, which is how the checker
-/// records a method (a sum's variants share one table).
+/// on a concrete type. Storage symbols distinguish same-named declarations.
 fn inferred_method_return(full: &FullAnalysis, recv_ty: &Type, name: &str) -> Option<Type> {
     let mut t = recv_ty;
     while let Type::Ref(i) | Type::Mut(i) | Type::ConstOf(i) | Type::Nullable(i) = t {
@@ -710,10 +709,10 @@ fn inferred_method_return(full: &FullAnalysis, recv_ty: &Type, name: &str) -> Op
         Type::Record(n) | Type::Sum(n) => n,
         _ => return None,
     };
-    // A record's methods are keyed by the type name; a SUM's are keyed per VARIANT
+    // A record's methods are keyed by its symbol; a SUM's are keyed per VARIANT
     // (`TomlValue.Table`), all dispatching on the sum, so any variant's entry
     // answers for the sum.
-    let owner = nominal.name();
+    let owner = full.program.type_by_id(nominal.id)?.symbol.as_str();
     let variant_prefix = format!("{owner}.");
     full.method_returns
         .iter()

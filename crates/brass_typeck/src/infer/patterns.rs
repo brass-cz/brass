@@ -156,13 +156,12 @@ impl<'a> Checker<'a> {
         match resolved {
             Type::Sum(sum) => match self.program.type_by_id(sum.id) {
                 Some(info) => info.variant(variant).is_some(),
-                // No table entry (e.g. a synthesized sum): fall back to
-                // matching the sum's name against the variant's possible owners.
+                // A synthesized sum must still share its owner's nominal identity.
                 None => self
                     .program
                     .sums_containing_variant(variant)
                     .iter()
-                    .any(|info| sum.is_name(&info.name)),
+                    .any(|info| sum.id == info.id),
             },
             Type::Unknown(_) => true,
             _ => false,

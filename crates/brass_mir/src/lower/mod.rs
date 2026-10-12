@@ -273,7 +273,7 @@ impl<'p> ProgramCtx<'p> {
 
     fn free_call_defaults(&self, module: &[String], name: &str) -> Option<Vec<CallDefault>> {
         let info = self.program.resolve_function(module, name)?;
-        Some(call_defaults(&info.signature.params))
+        Some(call_defaults(self.program, &info.signature.params))
     }
 
     /// Defaults for the static method selected by `qualifier` in `module`.
@@ -301,7 +301,7 @@ impl<'p> ProgramCtx<'p> {
                     .signature
             }
         };
-        Some(call_defaults(&signature.params))
+        Some(call_defaults(self.program, &signature.params))
     }
 
     /// Defaults for the instance method resolved at this call site. The
@@ -337,7 +337,7 @@ impl<'p> ProgramCtx<'p> {
                 &self.program.functions.get(symbol)?.signature.params
             }
         };
-        Some(call_defaults(params))
+        Some(call_defaults(self.program, params))
     }
 
     /// The storage key of module-level global `name` as referenced from
@@ -881,11 +881,11 @@ enum CallDefault {
 /// Classify a resolved callable's parameters for source-level omission. MIR
 /// needs only the default kind and declaration order; the checker already
 /// validated every explicit argument against the full parameter types.
-fn call_defaults(params: &[brass_hir::ParamInfo]) -> Vec<CallDefault> {
+fn call_defaults(program: &Program, params: &[brass_hir::ParamInfo]) -> Vec<CallDefault> {
     params
         .iter()
         .map(|param| {
-            if matches!(&param.resolved_ty, Some(Type::Record(n)) if n.is_name("Location")) {
+            if matches!(&param.resolved_ty, Some(Type::Record(n)) if program.is_prelude_type(n.id, "Location")) {
                 CallDefault::Location
             } else if matches!(param.resolved_ty, Some(Type::Nullable(_)))
                 || matches!(param.ty, Some(brass_parser::ast::TypeExpr::Nullable(..)))

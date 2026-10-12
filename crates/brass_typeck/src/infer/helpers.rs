@@ -358,17 +358,17 @@ fn param_is_nullable(param: &ParamInfo) -> bool {
 /// annotated with the prelude's `Location` record may be omitted at call
 /// sites, and MIR fills it with the call site's position (`error(..)` and
 /// `Result.context(..)` build error traces from it).
-pub(super) fn param_is_location(param: &ParamInfo) -> bool {
-    matches!(&param.resolved_ty, Some(Type::Record(n)) if n.is_name("Location"))
+pub(super) fn param_is_location(program: &Program, param: &ParamInfo) -> bool {
+    matches!(&param.resolved_ty, Some(Type::Record(n)) if program.is_prelude_type(n.id, "Location"))
 }
 
 /// The fewest arguments a call must supply: the parameter count minus the trailing
 /// run of optional (nullable, or implicit-location) parameters.
-pub(super) fn required_arg_count(params: &[ParamInfo]) -> usize {
+pub(super) fn required_arg_count(program: &Program, params: &[ParamInfo]) -> usize {
     let optional = params
         .iter()
         .rev()
-        .take_while(|p| param_is_nullable(p) || param_is_location(p))
+        .take_while(|p| param_is_nullable(p) || param_is_location(program, p))
         .count();
     params.len() - optional
 }

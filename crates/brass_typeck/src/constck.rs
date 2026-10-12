@@ -74,10 +74,10 @@ fn peel(ty: &Type) -> &Type {
     }
 }
 
-/// The nominal (record/sum) type name a value of `ty` dispatches methods on.
-fn nominal_name(ty: &Type) -> Option<&str> {
+/// The nominal storage symbol used by the mutation facts for this receiver.
+fn nominal_symbol<'a>(program: &'a Program, ty: &Type) -> Option<&'a str> {
     match peel(ty) {
-        Type::Record(n) | Type::Sum(n) => Some(n.name()),
+        Type::Record(n) | Type::Sum(n) => Some(program.type_by_id(n.id)?.symbol.as_str()),
         _ => None,
     }
 }
@@ -460,7 +460,9 @@ impl ConstChecker<'_> {
             return;
         };
         let place_ty = self.const_place_type(receiver, scopes);
-        let nominal = place_ty.as_ref().and_then(|t| nominal_name(t));
+        let nominal = place_ty
+            .as_ref()
+            .and_then(|t| nominal_symbol(self.program, t));
         // A built-in growable-array mutator (`push`/`insert`/`remove`/`pop`) on a
         // const array -- or an array reachable from a const struct/sum/tuple root --
         // modifies a value declared immutable, so it is rejected. The receiver is a

@@ -1785,3 +1785,105 @@ fn eager_spawn_precompiles_only_worker_reachable_code() {
         "main-only dead branch was materialized despite the spawn: {stderr}"
     );
 }
+
+#[test]
+fn same_named_method_returns_are_independent() {
+    // Light-pass returns must retain both nominal identities across calls,
+    // renamed imports, module markers, and aliases.
+    let main = setup(
+        "same_named_method_returns",
+        &[
+            (
+                "a/item.cz",
+                "type Item = { value: int32 }\nfun Item.get(self) { return self.value }\nfun Item.new() { return Item { value: 3 } }\nfun make_a() { return Item.new() }\ntype Exported = Item\n",
+            ),
+            (
+                "b/item.cz",
+                "type Item = { value: string }\nfun Item.get(self) { return self.value }\nfun Item.new() { return Item { value: \"b\" } }\nfun make_b() { return Item.new() }\n",
+            ),
+            (
+                "main.cz",
+                "import a.item.{ make_a, Item as A, Exported as RenamedAlias }\nimport b.item.{ make_b }\nimport b.item as b\ntype Alias = A\nfun main() {\nprintln(make_a().get() + 1)\nprintln(make_b().get() + \"?\")\nprintln(A.new().get() + 2)\nprintln(b.Item.new().get() + \"!\")\nprintln(Alias.new().get() + 3)\nprintln(RenamedAlias.new().get() + 4)\n}\n",
+            ),
+        ],
+    );
+    let (ok, out) = check(&main);
+    assert!(ok, "{out}");
+    let (ok, out) = run(&main);
+    assert!(ok, "{out}");
+    assert_eq!(out.trim(), "4\nb?\n5\nb!\n6\n7");
+}
+
+#[test]
+fn same_named_sum_method_qualifiers_resolve_symbols() {
+    // Variant qualifiers retain identity through renamed imports, module
+    // markers, and aliases, including self-field inference in variant bodies.
+    let main = setup(
+        "same_named_sum_methods",
+        &[
+            (
+                "a/item.cz",
+                "type Item = | One { value: int32 }\nfun Item.get(self) { return self.value }\nfun Item.make() { return Item.One { value: 5 } }\n",
+            ),
+            (
+                "b/item.cz",
+                "type Item = | One { value: string }\nfun Item.get(self) { return self.value }\nfun Item.make() { return Item.One { value: \"b\" } }\n",
+            ),
+            (
+                "main.cz",
+                "import a.item.{ Item as A }\nimport b.item as b\ntype Alias = A\nfun main() {\nprintln(A.One.make().get() + 1)\nprintln(b.Item.One.make().get() + \"?\")\nprintln(Alias.One.make().get() + 2)\n}\n",
+            ),
+        ],
+    );
+    let (ok, out) = check(&main);
+    assert!(ok, "{out}");
+    let (ok, out) = run(&main);
+    assert!(ok, "{out}");
+    assert_eq!(out.trim(), "6\nb?\n7");
+}
+
+#[test]
+fn checking_core_entry_modules_terminates() {
+    // Loading a core file as main redeclares prelude names; a checker error is
+    // acceptable, but method-return inference must finish within the deadline.
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for file in ["core/error.cz", "core/collections.cz"] {
+        let mut child = support::brass_command(env!("CARGO_BIN_EXE_brass"))
+            .arg("check")
+            .arg(root.join(file))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Drain both pipes concurrently so verbose diagnostics cannot fill a
+        // pipe and masquerade as a compiler hang.
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let read = |mut pipe: Box<dyn std::io::Read + Send>| {
+            std::thread::spawn(move || {
+                let mut output = String::new();
+                pipe.read_to_string(&mut output).unwrap();
+                output
+            })
+        };
+        let out = read(Box::new(stdout));
+        let err = read(Box::new(stderr));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let timed_out = loop {
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                break true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let status = child.wait().unwrap();
+        let output = format!("{}{}", out.join().unwrap(), err.join().unwrap());
+        eprintln!("{file}: {status}\n{output}");
+        assert!(!timed_out, "{file} exceeded 20 seconds: {output}");
+    }
+}
