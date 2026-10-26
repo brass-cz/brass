@@ -1,36 +1,37 @@
 //! Row inference: what a callable body requires of each unannotated parameter
 //! that may receive an anonymous (structural) value.
 //!
-//! For every unannotated, non-`self` parameter of every free function and
-//! method, the body is scanned for field accesses and the way each field is
-//! used, producing a [`Row`]: the set of field names with, per field,
+//! For every unannotated, non-`self` parameter of every free function, the body
+//! is scanned for field accesses and the way each field is used, producing a
+//! [`Row`]: the set of field names with, per field,
 //!
 //! - a [`Presence`]: `Required` when the body reads/writes the field
-//!   unguarded, `Guarded` when every access is dominated by a truthiness /
-//!   `if let` test of that same field (or only rendered, which tolerates
-//!   absence);
+//!   unguarded (rendering a field is a read too), `Guarded` when every access
+//!   is dominated by a truthiness / `if let` test of that same field;
 //! - a [`RowTy`]: `Forced(T)` when an unambiguous use pins a primitive type
 //!   (the field flows into a `T`-annotated parameter, `let x: T =`, or a
 //!   declared primitive return), otherwise `Open` (the argument's own field
 //!   type flows through).
 //!
-//! A parameter forwarded whole into another *eligible* unannotated free-function
+//! A parameter forwarded whole into another unannotated free-function
 //! parameter unions that callee's row (an interprocedural least fixpoint, the
-//! same shape as `brass_hir::mutation`). Any use that a reduced field set
-//! could not honor -- method receiver use, escaping into a store / return /
-//! closure capture, being passed to an annotated or unknown position -- marks
-//! the parameter *view-ineligible*: its row is still derived for diagnostics,
-//! but the call boundary must keep the argument's full value.
+//! same shape as `brass_hir::mutation`); forwarding into an ineligible one
+//! makes it ineligible too. Any use that a reduced field set could not honor
+//! -- method receiver use, escaping into a store / return / closure capture,
+//! being passed to an annotated or unknown position -- marks the parameter
+//! *view-ineligible*: its row is still derived for diagnostics, but the call
+//! boundary must keep the argument's full value.
 //!
-//! Consumers: the checker validates each anonymous argument against the callee
-//! row at the argument's own span, and (for eligible parameters) the back end
-//! converts the argument into the row's *view* (see [`view_type`]), collapsing
+//! Consumers: the checker validates each anonymous argument to a free
+//! function's parameter against the callee row at the argument's own span,
+//! and (for eligible parameters) both the checker's body elaboration and
+//! monomorphization use the argument's *view* (see [`view_type`]), collapsing
 //! every argument shape with the same view into one compiled instance.
 
 use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::BTreeMap;
 
-use brass_hir::{Program, Type, TypeKind};
+use brass_hir::{Program, Type};
 use brass_parser::ast::{Arg, Block, Expr, Pattern, Stmt, StrSeg, TypeExpr};
 
 use crate::flow::{Flow, numeric_flow};
@@ -39,7 +40,7 @@ use crate::flow::{Flow, numeric_flow};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Presence {
     /// Every access is dominated by a truthiness/`if let` test of the field
-    /// itself (or is a rendering use); an absent field takes the fallback path.
+    /// itself; an absent field takes the fallback path.
     Guarded,
     /// The body uses the field unguarded; the caller must supply it.
     Required,
@@ -80,15 +81,14 @@ pub struct ParamRow {
 }
 
 /// Interprocedural row table over a whole program: free-function parameters
-/// keyed by storage symbol, method parameters keyed by (type symbol, method).
+/// keyed by storage symbol.
 /// Only unannotated non-`self` parameters carry an entry.
 pub struct RowInfo {
     functions: HashMap<String, Vec<Option<ParamRow>>>,
-    methods: HashMap<(String, String), Vec<Option<ParamRow>>>,
 }
 
 impl RowInfo {
-    /// Analyze every free function and method of `program` (least fixpoint over
+    /// Analyze every free function of `program` (least fixpoint over
     /// whole-parameter forwarding; rows only grow and eligibility only flips to
     /// false over a finite field universe, so it terminates).
     pub fn analyze(program: &Program) -> Self {
@@ -99,15 +99,6 @@ impl RowInfo {
     /// is unannotated (annotated parameters keep their declared checking).
     pub fn function_param(&self, symbol: &str, idx: usize) -> Option<&ParamRow> {
         self.functions.get(symbol)?.get(idx)?.as_ref()
-    }
-
-    /// The row of method `(type symbol, method)`'s call-site argument `idx`
-    /// (the receiver is excluded; index 0 is the first non-`self` parameter).
-    pub fn method_param(&self, type_symbol: &str, method: &str, idx: usize) -> Option<&ParamRow> {
-        self.methods
-            .get(&(type_symbol.to_string(), method.to_string()))?
-            .get(idx)?
-            .as_ref()
     }
 }
 
@@ -122,8 +113,9 @@ pub fn field_satisfies(have: &Type, want: &Type) -> bool {
 
 /// Check a structural value's resolved fields against `row`, returning rendered
 /// issues (empty = the value fits). Only `Required` fields reject: a `Guarded`
-/// field that is absent or type-mismatched degrades to null at the view (the
-/// body's fallback path runs), which is the specified graceful degradation.
+/// field may be absent (the view then carries null and the body's fallback
+/// path runs, the specified graceful degradation), and its type is judged by
+/// the body re-elaboration at the argument's own field type.
 pub fn check_row(row: &Row, fields: &[(String, Type)]) -> Vec<String> {
     let mut issues = Vec::new();
     for (name, rf) in &row.fields {
@@ -149,41 +141,55 @@ pub fn check_row(row: &Row, fields: &[(String, Type)]) -> Vec<String> {
 }
 
 /// The canonical *view* type of `row` for a concrete structural `source`: a
-/// structural record with exactly the row's fields. A `Required` field carries
-/// its forced type (or the source's own type when open); a `Guarded` field is
-/// nullable -- its forced type wrapped, or the source's type wrapped when open
-/// (`never?` when absent), so absence/mismatch materializes as null at run
-/// time. Errors when a required field is missing from the source (the checker
-/// prevents this for checked calls; the deferred boundary surfaces it).
+/// structural record with exactly the row's fields, each at the SOURCE's own
+/// field type. A `Guarded` field the source lacks -- or carries at a type that
+/// cannot serve the field's `Forced` use even once narrowed to non-null -- is
+/// the always-null `never?`, exactly what an absent field reads as: every use
+/// of a guarded field sits behind a presence test, so the body takes its
+/// fallback path (the graceful degradation of an open field).
+///
+/// The view drops the fields the body never touches but never changes the
+/// type of one it does. Both the checker (which elaborates the callee body for
+/// this argument at the view) and the back ends (which compile the body at the
+/// view) see the same field types, and those are the argument's own: a
+/// `Forced` row type is a requirement on the argument (see [`check_row`]),
+/// never a representation change. Widening the slot would change the body's
+/// arithmetic (`p.n / 2` on an `int32` field would divide as `float64`), and
+/// wrapping a guarded `bool` slot into `bool?` would turn `if p.flag` into a
+/// presence test.
+///
+/// Errors when a required field is missing from the source. The checker
+/// rejects such an argument ([`check_row`]), so monomorphization meets this
+/// only as an internal inconsistency.
 pub fn view_type(row: &Row, source: &brass_hir::NominalType) -> Result<Type, String> {
     let mut fields: Vec<(String, Type)> = Vec::with_capacity(row.fields.len());
     for (name, rf) in &row.fields {
-        let have = source.substitution.get(name);
-        let ty = match (&rf.presence, &rf.ty) {
-            (Presence::Required, RowTy::Forced(t)) => t.clone(),
-            (Presence::Required, RowTy::Open) => have
-                .cloned()
-                .ok_or_else(|| format!("view source is missing required field `{name}`"))?,
-            // A guarded field's slot always exists in the view; whether the
-            // value or null lands in it is decided per field at construction.
-            (Presence::Guarded, RowTy::Forced(t)) => nullable_of(t.clone()),
-            (Presence::Guarded, RowTy::Open) => match have {
-                Some(t) => nullable_of(t.clone()),
-                None => Type::Nullable(Box::new(Type::Never)),
-            },
+        let ty = match (source.substitution.get(name), rf.presence) {
+            (Some(have), Presence::Guarded) if !guarded_field_fits(have, &rf.ty) => Type::null(),
+            (Some(have), _) => have.clone(),
+            (None, Presence::Guarded) => Type::null(),
+            (None, Presence::Required) => {
+                return Err(format!("view source is missing required field `{name}`"));
+            }
         };
         fields.push((name.clone(), ty));
     }
     Ok(brass_hir::structural_record(fields))
 }
 
-/// Wrap `t` nullable unless it already is (a chained view's guarded field is
-/// already `T?`; double-wrapping would change its representation).
-fn nullable_of(t: Type) -> Type {
-    match t {
-        Type::Nullable(_) => t,
-        other => Type::Nullable(Box::new(other)),
-    }
+/// Whether a guarded field the source carries at `have` can serve the row's
+/// use of it. Every use sits behind a presence test, so a nullable source is
+/// judged by its non-null payload. A type that is not fully known yet stays
+/// flexible, as in [`check_row`].
+fn guarded_field_fits(have: &Type, ty: &RowTy) -> bool {
+    let RowTy::Forced(want) = ty else {
+        return true;
+    };
+    let payload = match brass_hir::peel_modes(have) {
+        Type::Nullable(inner) => inner,
+        other => other,
+    };
+    !brass_hir::is_fully_known(payload) || field_satisfies(payload, want)
 }
 
 // ----- derivation -----
@@ -210,26 +216,6 @@ fn analyze_rows(program: &Program) -> RowInfo {
         );
         fn_scans.insert(f.symbol.clone(), scans);
     }
-    let mut method_scans: HashMap<(String, String), Vec<Option<LocalScan>>> = HashMap::default();
-    for info in program.types.values() {
-        let methods: Vec<(&String, &brass_hir::MethodInfo)> = match &info.kind {
-            TypeKind::Record { methods, .. } => methods.iter().collect(),
-            TypeKind::Sum { variants } => variants.iter().flat_map(|v| v.methods.iter()).collect(),
-        };
-        for (mname, m) in methods {
-            let has_self = m.signature.params.first().is_some_and(|p| p.name == "self");
-            let params = &m.signature.params[usize::from(has_self)..];
-            let scans = scan_params(
-                program,
-                &info.module,
-                params,
-                m.decl.body.as_ref(),
-                m.signature.ret_ty.as_ref(),
-            );
-            method_scans.insert((info.symbol.clone(), mname.clone()), scans);
-        }
-    }
-
     // Phase 2: least fixpoint. Each parameter's row is its local row unioned
     // with every forward target's current row; forwarding into a missing or
     // ineligible target makes the parameter ineligible too (the callee may use
@@ -240,10 +226,6 @@ fn analyze_rows(program: &Program) -> RowInfo {
             .iter()
             .map(|(sym, scans)| (sym.clone(), seed_rows(scans)))
             .collect(),
-        methods: method_scans
-            .iter()
-            .map(|(key, scans)| (key.clone(), seed_rows(scans)))
-            .collect(),
     };
     loop {
         let mut changed = false;
@@ -253,16 +235,6 @@ fn analyze_rows(program: &Program) -> RowInfo {
                 let merged = merge_forwards(&info, scan, &info.functions[sym][idx]);
                 if let Some(next) = merged {
                     info.functions.get_mut(sym).unwrap()[idx] = Some(next);
-                    changed = true;
-                }
-            }
-        }
-        for (key, scans) in &method_scans {
-            for (idx, scan) in scans.iter().enumerate() {
-                let Some(scan) = scan else { continue };
-                let merged = merge_forwards(&info, scan, &info.methods[key][idx]);
-                if let Some(next) = merged {
-                    info.methods.get_mut(key).unwrap()[idx] = Some(next);
                     changed = true;
                 }
             }
@@ -308,7 +280,7 @@ fn merge_forwards(
                 }
             }
             // The callee parameter is annotated (or unknown): a typed position
-            // the row cannot summarize -- the parameter keeps today's full-value
+            // the row cannot summarize -- the parameter keeps the full-value
             // path.
             None => next.eligible = false,
         }
@@ -369,6 +341,8 @@ fn scan_params(
                 param: &p.name,
                 forced_ret: ret_ty.and_then(forced_return_type),
                 guarded: HashSet::default(),
+                aliases: Vec::new(),
+                locals: vec![params.iter().map(|q| q.name.clone()).collect()],
                 out: LocalScan {
                     row: Row::default(),
                     eligible: true,
@@ -433,6 +407,17 @@ struct ParamScan<'p> {
     /// The primitive the declared return type forces on `return p.f`.
     forced_ret: Option<Type>,
     guarded: HashSet<String>,
+    /// The bindings of `if let v = p.f` presence tests whose then-arm is being
+    /// walked: `(v, f, depth)`, `depth` being the index of the pattern's own
+    /// scope in `locals`. A use of `v` there is a guarded use of `f`, so a
+    /// type it pins (`let s: string = v`) constrains the field exactly as
+    /// `let s: string = p.f` behind `if p.f` does.
+    aliases: Vec<(String, String, usize)>,
+    /// The lexical scopes of local value names (the callable's parameters,
+    /// `let` / `for` / pattern binders), innermost last. A call through a
+    /// local name calls that value, never a same-named function, exactly as
+    /// MIR lowering resolves it.
+    locals: Vec<HashSet<String>>,
     out: LocalScan,
 }
 
@@ -491,9 +476,44 @@ impl ParamScan<'_> {
         self.out.eligible = pr.eligible;
     }
 
+    /// The parameter field the local `name` stands for here: an `if let`
+    /// presence binding of it (see `aliases`) that no deeper scope shadows.
+    fn field_alias(&self, name: &str) -> Option<&str> {
+        let (_, field, depth) = self.aliases.iter().rev().find(|(n, _, _)| n == name)?;
+        let shadowed = self
+            .locals
+            .get(depth + 1..)
+            .is_some_and(|scopes| scopes.iter().any(|scope| scope.contains(name)));
+        (!shadowed).then_some(field.as_str())
+    }
+
     /// Whether `e` is the bare parameter itself.
     fn is_param(&self, e: &Expr, active: bool) -> bool {
         active && matches!(e, Expr::Ident(name, _) if name == self.param)
+    }
+
+    /// Whether `name` is bound by an enclosing local scope (shadowing any
+    /// function of that name).
+    fn is_local(&self, name: &str) -> bool {
+        self.locals.iter().any(|scope| scope.contains(name))
+    }
+
+    /// Bind every name `pat` introduces in the innermost local scope.
+    fn bind_pattern(&mut self, pat: &Pattern) {
+        let names: Vec<String> = pat.bound_names().into_iter().map(str::to_string).collect();
+        if let Some(scope) = self.locals.last_mut() {
+            scope.extend(names);
+        }
+    }
+
+    /// Run `walk` inside a fresh local scope holding the names `pat` binds.
+    fn with_pattern_scope(&mut self, pat: Option<&Pattern>, walk: impl FnOnce(&mut Self)) {
+        self.locals.push(HashSet::default());
+        if let Some(pat) = pat {
+            self.bind_pattern(pat);
+        }
+        walk(self);
+        self.locals.pop();
     }
 
     /// The field name when `e` is a direct field access `p.f`.
@@ -505,10 +525,13 @@ impl ParamScan<'_> {
     }
 
     /// Walk a block in statement order, threading shadowing through `active`.
-    fn walk_block(&mut self, block: &Block, mut active: bool) {
-        for stmt in &block.stmts {
-            active = self.walk_stmt(stmt, active);
-        }
+    fn walk_block(&mut self, block: &Block, active: bool) {
+        self.with_pattern_scope(None, |s| {
+            let mut active = active;
+            for stmt in &block.stmts {
+                active = s.walk_stmt(stmt, active);
+            }
+        });
     }
 
     /// Walk one statement; returns the parameter's `active` state for the
@@ -520,6 +543,7 @@ impl ParamScan<'_> {
                     let forced = ty.as_ref().and_then(forced_primitive_annotation);
                     self.walk_value(value, active, forced.as_ref());
                 }
+                self.bind_pattern(pat);
                 // A binder of the same name shadows the parameter from here on.
                 if pattern_binds(pat, self.param) {
                     return false;
@@ -528,6 +552,10 @@ impl ParamScan<'_> {
             }
             Stmt::Assign { target, value, .. } => {
                 self.walk_value(value, active, None);
+                // Rebinding a presence binding ends its standing for the field.
+                if let Expr::Ident(name, _) = target {
+                    self.aliases.retain(|(n, _, _)| n != name);
+                }
                 if self.is_param(target, active) {
                     // A bare reassignment rebinds the local: later uses are the
                     // new value, not the argument.
@@ -551,7 +579,7 @@ impl ParamScan<'_> {
                 self.walk_value(iter, active, None);
                 // A loop variable that shadows the parameter hides it in the body.
                 let shadows = pat.bound_names().contains(&self.param);
-                self.walk_block(body, active && !shadows);
+                self.with_pattern_scope(Some(pat), |s| s.walk_block(body, active && !shadows));
                 active
             }
             Stmt::Expr(e) => {
@@ -600,6 +628,13 @@ impl ParamScan<'_> {
         if let Some(f) = self.param_field(e, active) {
             let f = f.to_string();
             self.access(&f, Presence::Required, forced);
+            return;
+        }
+        if let Expr::Ident(name, _) = e
+            && let Some(f) = self.field_alias(name)
+        {
+            let f = f.to_string();
+            self.access(&f, Presence::Guarded, forced);
             return;
         }
         match e {
@@ -662,10 +697,21 @@ impl ParamScan<'_> {
                     self.walk_value(scrut, active, None);
                 }
                 let inner_active = active && !pattern_binds(pat, self.param);
+                let alias = match (pat, &then_guard) {
+                    (Pattern::Binding(name, None, _), Some(f)) => Some((name.clone(), f.clone())),
+                    _ => None,
+                };
                 let added = then_guard
                     .map(|f| self.guarded.insert(f.clone()).then_some(f))
                     .unwrap_or(None);
-                self.walk_block(then, inner_active);
+                self.with_pattern_scope(Some(pat), |s| {
+                    let depth = s.locals.len() - 1;
+                    if let Some((name, f)) = alias {
+                        s.aliases.push((name, f, depth));
+                    }
+                    s.walk_block(then, inner_active);
+                    s.aliases.retain(|(_, _, d)| *d != depth);
+                });
                 if let Some(f) = added {
                     self.guarded.remove(&f);
                 }
@@ -677,7 +723,9 @@ impl ParamScan<'_> {
                 self.walk_value(scrut, active, None);
                 for arm in arms {
                     let inner_active = active && !pattern_binds(&arm.pattern, self.param);
-                    self.walk_value(&arm.body, inner_active, None);
+                    self.with_pattern_scope(Some(&arm.pattern), |s| {
+                        s.walk_value(&arm.body, inner_active, None)
+                    });
                 }
             }
             Expr::Block(block, _) => self.walk_block(block, active),
@@ -695,6 +743,16 @@ impl ParamScan<'_> {
     /// annotated, method, builtin, or indirect position they make the parameter
     /// ineligible -- except the pure rendering builtins, which the view serves.
     fn walk_call(&mut self, callee: &Expr, args: &[Arg], active: bool) {
+        // `string.from(x)` renders its argument exactly like `"{x}"`.
+        if let Expr::Field(base, method, _) = callee
+            && method == "from"
+            && matches!(&**base, Expr::Ident(t, _) if t == "string" && !self.is_local(t))
+        {
+            for a in args {
+                self.walk_render_arg(&a.expr, active);
+            }
+            return;
+        }
         if let Expr::Field(base, _method, _) = callee {
             if self.is_param(base, active) {
                 // The parameter is a method receiver (or a function-typed field
@@ -716,22 +774,36 @@ impl ParamScan<'_> {
             return;
         }
         if let Expr::Ident(fname, _) = callee {
-            if self.is_param(callee, active) {
-                // The parameter itself is called as a function value.
-                self.ineligible();
+            // A local value of the callee's name (a closure parameter, a
+            // `let`-bound closure, a pattern binder) is what the call invokes:
+            // it shadows any same-named function, and its parameter rows are
+            // unknown, so the whole parameter passed to it keeps its full
+            // value. `error` is reserved in call position and never shadowed.
+            if self.is_param(callee, active) || (fname != "error" && self.is_local(fname)) {
                 for a in args {
-                    self.walk_value(&a.expr, active, None);
+                    if self.is_param(&a.expr, active) {
+                        self.ineligible();
+                    } else {
+                        self.walk_value(&a.expr, active, None);
+                    }
+                }
+                if self.is_param(callee, active) {
+                    // The parameter itself is called as a function value.
+                    self.ineligible();
                 }
                 return;
             }
             if let Some(finfo) = self.program.resolve_function(self.module, fname) {
                 let params = finfo.signature.params.clone();
                 let symbol = finfo.symbol.clone();
-                if symbol == "print" || symbol == "println" {
-                    // The stdlib print/println bodies are never instantiated by
-                    // the typed back ends (both intercept these calls as typed
-                    // I/O), so despite resolving to real functions they are
-                    // rendering positions, exactly like interpolation.
+                if is_prelude_print(self.program, finfo) {
+                    // The prelude print/println only render their argument
+                    // (the typed back ends intercept them as typed I/O, and
+                    // the bodies themselves just format it), so despite
+                    // resolving to real functions they are rendering
+                    // positions, exactly like interpolation. Identified by
+                    // the resolved declaration: a module's own `println`
+                    // shadows the prelude's and is an ordinary callee.
                     for a in args {
                         self.walk_render_arg(&a.expr, active);
                     }
@@ -757,10 +829,11 @@ impl ParamScan<'_> {
                 }
                 return;
             }
-            // A runtime builtin or a local closure. Rendering builtins only
-            // format the value, which the view is specified to serve; anything
-            // else (spawn, error, len, a closure...) needs the full value.
-            let rendering = matches!(fname.as_str(), "print" | "println" | "to_string");
+            // A name that resolves to no function: a runtime builtin or a
+            // module-level callable value. Rendering builtins only format the
+            // value, which the view is specified to serve; anything else needs
+            // the full value.
+            let rendering = matches!(fname.as_str(), "print" | "println");
             for a in args {
                 if rendering {
                     self.walk_render_arg(&a.expr, active);
@@ -779,7 +852,7 @@ impl ParamScan<'_> {
         }
     }
 
-    /// A rendering position (`println(x)`, `to_string(x)`, `"{x}"`): the whole
+    /// A rendering position (`println(x)`, `string.from(x)`, `"{x}"`): the whole
     /// parameter may be rendered (the view renders instead -- specified), and a
     /// direct field access renders null when absent, so it is a Guarded access.
     fn walk_render_arg(&mut self, e: &Expr, active: bool) {
@@ -895,6 +968,12 @@ impl ParamScan<'_> {
             other => self.walk_value(other, active, None),
         }
     }
+}
+
+/// Whether `f` is the implicit prelude's `print` or `println`.
+fn is_prelude_print(program: &Program, f: &brass_hir::FunInfo) -> bool {
+    matches!(f.decl.name.as_str(), "print" | "println")
+        && program.prelude_modules.contains(&f.module)
 }
 
 /// Whether a pattern binds `name` (shadowing the tracked parameter).

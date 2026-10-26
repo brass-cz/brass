@@ -1,12 +1,23 @@
-//! Pre-pass computation over the program's signatures before bodies
-//! are checked: duplicate-parameter validation, inference of
-//! unannotated function and method returns (with reconciliation of
-//! multiple return/error payloads), record type schemes, and the
-//! parameter scopes and global bindings the body checks start from.
+//! The tables the body checks start from, and their settlement:
+//! duplicate-parameter validation; the precomputed returns of unannotated
+//! functions and methods (light walk, with the reconciliation of multiple
+//! return and error payloads) and the completed Err side of a `T!`; record
+//! type schemes, generalized after the method co-check; the provisional
+//! global bindings and the scopes the bodies start from. As the full check
+//! reaches each body it settles these entries against what the body really
+//! returns or binds (`settle_definitional_return`, `link_inferred_return`,
+//! `settle_global`), and a `T!` whose error type nothing determines is
+//! reported. The return-table fixpoint is the `fixpoint` submodule.
 
 use super::*;
 
+mod fixpoint;
+
+pub(super) use fixpoint::ReturnKey;
+
 impl<'a> Checker<'a> {
+    /// Report every duplicate parameter name of a function or method
+    /// signature.
     pub(super) fn validate_param_declarations(&mut self) {
         let functions = self.program.functions.values().map(|f| {
             (
@@ -79,65 +90,6 @@ impl<'a> Checker<'a> {
         }
     }
 
-    pub(super) fn precompute_function_returns(&mut self) {
-        let mut names: Vec<String> = self.program.functions.keys().cloned().collect();
-        names.sort();
-        for name in names {
-            if self.function_returns.contains_key(&name) {
-                continue;
-            }
-            let Some(info) = self.program.functions.get(&name) else {
-                continue;
-            };
-            let ty = self.function_return_entry(info);
-            self.function_returns.insert(name, ty);
-        }
-    }
-
-    /// Re-infer every UNANNOTATED function return, replacing the first pass's
-    /// answer.
-    ///
-    /// The first pass necessarily runs before any method return exists (a
-    /// method's body calls free functions, so its own pass needs theirs), which
-    /// leaves a function whose value flows OUT of a method call with nothing to
-    /// read: `http`'s `fetch` returns `client.fetch(path)`, and with
-    /// `HttpClient.fetch` still unknown the light pass could only give the
-    /// return a bare variable -- reported as `Result<unknown, string>` once the
-    /// body's own `error(..)` propagation supplied the Err payload. Running the
-    /// two in alternation closes that loop, exactly as repeating
-    /// `precompute_method_returns` closes it for cross-TYPE method chains.
-    ///
-    /// A FULLY-KNOWN annotation is skipped: its entry is the declaration itself
-    /// and re-inferring it would be both wasted work and a chance to disagree with
-    /// what the checker enforces. A `T!` annotation is not fully known -- it names
-    /// only the OK payload -- so its Err side is completed here.
-    pub(super) fn refresh_function_returns(&mut self) {
-        let mut names: Vec<String> = self.program.functions.keys().cloned().collect();
-        names.sort();
-        for name in names {
-            let Some(info) = self.program.functions.get(&name) else {
-                continue;
-            };
-            // A seeded context function's return is already in the table.
-            if self.seeded_module(&info.module) {
-                continue;
-            }
-            // A fully-known annotation is the declaration itself: re-inferring it
-            // would be wasted work and a chance to disagree with what the checker
-            // enforces.
-            if info
-                .signature
-                .ret_ty
-                .as_ref()
-                .is_some_and(brass_hir::is_fully_known)
-            {
-                continue;
-            }
-            let ty = self.function_return_entry(info);
-            self.function_returns.insert(name, ty);
-        }
-    }
-
     /// The return-table entry for `info`: its annotation when that is fully known,
     /// the light-pass inference when there is none, and -- for a `T!`, which names
     /// only the OK payload -- the annotation with its Err side completed.
@@ -200,8 +152,9 @@ impl<'a> Checker<'a> {
     }
 
     /// The Err payload of a body whose light pass produced `normal` and `props`,
-    /// and whether the body had ANY error site at all. See
-    /// [`Self::body_error_payload`].
+    /// whether the body had ANY error site at all, and whether the payload is
+    /// one of the signature's own variables (`param_vars`): a generic error
+    /// type. See [`Self::body_error_payload`].
     ///
     /// The two answers differ, and the difference is what makes an unusable `T!`
     /// detectable: NO site is fine (a `T!` whose body never fails still Ok-wraps its
@@ -256,31 +209,31 @@ impl<'a> Checker<'a> {
         (reconciled.or(generic), any, generic_used)
     }
 
-    /// Fill the open Err payload of a `T!` return with `err`.
+    /// Tie the PROVISIONAL return a recursive call was typed against to what
+    /// the full check found the body to return (`inferred`), for the
+    /// elaboration of `symbol` the call at `span` started.
     ///
-    /// `T!` names only the OK side; the Err side is inferred from the body's
-    /// `error(..)` sites, so the annotation alone describes `Result<T, ?>` -- which
-    /// is what a caller reading the signature table, and the editor rendering it,
-    /// were left with (`Result<TomlValue, unknown_0>`). Only an OPEN Err is filled,
-    /// so an annotation that already names one is never overridden.
-    /// Tie the PRECOMPUTED return of an unannotated function to what the full
-    /// check inferred for its body.
-    ///
-    /// Every CALL SITE reads the precomputed entry, and shares its variables. The
-    /// light pass that built it cannot do the receiver-scheme parameter pinning the
-    /// full check does, so a body that builds a `HashMap.new()` and `set`s into it
-    /// leaves the precomputed map's key/value OPEN while the full check pins them.
-    /// A recursive function is where that shows: its own body reads the precomputed
-    /// entry for the recursive call, and a method called on the map it hands back
-    /// (`collect(..)!.pairs()`) then monomorphizes at an open type, which the typed
-    /// back end refuses -- a program the checker accepted.
+    /// The recursive call's result was used inside the body at the provisional
+    /// type (see `instance_provisional_return`), so the two must be one type.
+    /// Unifying them is what pins a container the body fills: the recursive
+    /// call's value is no longer OPEN where it is used. The light pass that
+    /// built the provisional type cannot do the receiver-scheme parameter
+    /// pinning the full check does, so a body that builds a `HashMap.new()` and
+    /// `set`s into it leaves the map's key/value open there while the full
+    /// check pins them, and a method called on what the recursion hands back
+    /// (`collect(..)!.pairs()`) would otherwise monomorphize at an open type.
     ///
     /// Only the OK payloads are linked. The `Result`/`?` wrapping is the light
-    /// assembly's; the full check's reconciliation does not rebuild it, so unifying
-    /// the whole types would fight over the shape rather than fill in the payload.
-    /// A conflict is ignored: this only ever REFINES an open variable, and a
-    /// genuine disagreement is the light pass's approximation, not a program error.
-    pub(super) fn link_inferred_return(&mut self, precomputed: &Type, inferred: &Type) {
+    /// assembly's on both sides. A payload the two cannot share means the
+    /// recursive call was typed at a type the body does not return: that is
+    /// reported, since every use of the call's value was checked against it.
+    pub(super) fn link_inferred_return(
+        &mut self,
+        precomputed: &Type,
+        inferred: &Type,
+        symbol: &str,
+        span: Span,
+    ) {
         let want = Self::ok_payload(&self.resolve(precomputed));
         let got = Self::ok_payload(&self.resolve(inferred));
         // A body that only ever errors has no Ok value: its payload is a variable no
@@ -291,11 +244,134 @@ impl<'a> Checker<'a> {
         let snapshot = self.solver.snapshot();
         if self.solver.unify(&want, &got).is_err() {
             self.solver.rollback(snapshot);
+            let name = self
+                .program
+                .functions
+                .get(symbol)
+                .map_or(symbol, |f| f.signature.name.as_str());
+            self.errors.push(TypeError {
+                message: format!(
+                    "cannot infer the return type of recursive `{name}`: its recursive call \
+                     was typed `{}`, but the body returns `{}`; annotate the return type of \
+                     `{name}`",
+                    self.resolve(&want).display(),
+                    self.resolve(&got).display()
+                ),
+                span,
+            });
         }
     }
 
+    /// Settle a callable's precomputed return `entry` against its definitional
+    /// full check, whose `return` types `check_block_root` just collected. The
+    /// full check is the authority for the Ok payload; the light pass that built
+    /// the entry only approximates it. When the two payloads cannot be one type
+    /// the entry's Ok payload is replaced by the full check's (inside the light
+    /// assembly's `Result`/`?` shape), and the settled entry is returned. Agreeing
+    /// payloads are left alone -- this pass's variables are the signature's own,
+    /// shared by every call site, so nothing is unified here.
+    pub(super) fn settle_definitional_return(
+        &mut self,
+        entry: &Type,
+        body: &Block,
+        collected: Vec<(Type, Span)>,
+    ) -> Option<Type> {
+        // A type-test body returns a different type per instance; its open
+        // definitional walk joins arms no single instance compiles together.
+        if block_has_type_test(body) {
+            return None;
+        }
+        let full = self.full_normal_return(collected)?;
+        let got = Self::ok_payload(&self.resolve(&full));
+        if got.is_unknown() {
+            return None;
+        }
+        let entry = self.resolve(entry);
+        let want = Self::ok_payload(&entry);
+        // The outer `?` a nullable `!` adds is the light shape's, never part of
+        // the value the body returns.
+        let peeled = match (&want, &got) {
+            (Type::Nullable(inner), got) if !matches!(got, Type::Nullable(_)) => inner.as_ref(),
+            _ => &want,
+        };
+        if self.can_unify(peeled, &got) {
+            return None;
+        }
+        Some(with_ok_payload(&entry, got))
+    }
+
+    /// Reject a recursive instantiation of `symbol` at fully-known
+    /// `arg_types` whose return `ret` nothing determined: every path returns
+    /// another call into the recursion, so the checker has no type to give the
+    /// calls and the back end none to compile them at. A `mutual` recursion
+    /// went through another callable.
+    pub(super) fn report_unsettled_recursive_return(
+        &mut self,
+        symbol: &str,
+        arg_types: &[Type],
+        ret: &Type,
+        mutual: bool,
+        span: Span,
+    ) {
+        if !arg_types
+            .iter()
+            .all(|arg| brass_hir::is_fully_known(&self.resolve(arg)))
+        {
+            return;
+        }
+        let ret = self.resolve(ret);
+        let value = match ret.result_payloads() {
+            Some((ok, _)) => ok.clone(),
+            None => ret,
+        };
+        let Type::Unknown(id) = value else {
+            return;
+        };
+        if !matches!(
+            self.solver.kind_of(id),
+            None | Some(InferenceVarKind::Source)
+        ) {
+            return;
+        }
+        let name = self
+            .program
+            .functions
+            .get(symbol)
+            .map_or(symbol, |f| f.signature.name.as_str());
+        let kind = if mutual { " (mutual recursion)" } else { "" };
+        self.errors.push(TypeError {
+            message: format!(
+                "cannot infer the return type of `{name}`: every value it returns comes from \
+                 its own recursion; annotate the return type of `{name}`{kind}"
+            ),
+            span,
+        });
+    }
+
+    /// Fill the open Err payload of a `T!` return with `err`.
+    ///
+    /// `T!` names only the OK side; the Err side is inferred from the body's
+    /// `error(..)` sites, so the annotation alone describes `Result<T, ?>`. The
+    /// completed entry is what a caller reading the signature table, and the
+    /// editor rendering it, see. Only an OPEN Err is filled, so an annotation
+    /// that already names one is never overridden.
+    fn complete_open_error(&mut self, declared: &Type, err: Option<Type>) -> Type {
+        let Some(err) = err else {
+            return declared.clone();
+        };
+        let resolved = self.resolve(declared);
+        let Some((ok, declared_err)) = resolved.result_payloads() else {
+            return declared.clone();
+        };
+        if !declared_err.is_unknown() {
+            return declared.clone();
+        }
+        // Keep the declared Result's nominal (a scope's shadow included).
+        resolved.rebuild_result(ok.clone(), err)
+    }
+
     /// A `Result`'s Ok payload, or the type itself when it is not one.
-    fn ok_payload(ty: &Type) -> Type {
+    pub(super) fn ok_payload(ty: &Type) -> Type {
         ty.result_payloads()
             .map(|(ok, _)| ok.clone())
             .unwrap_or_else(|| ty.clone())
@@ -307,9 +383,8 @@ impl<'a> Checker<'a> {
     /// `error(..)` sites and from the `Result`s it forwards. A body with neither
     /// gives inference nothing to work with -- including one whose ONLY propagation
     /// is its own recursive `!`, whose error type is the very variable being
-    /// inferred. Left open, the variable reaches the back end, which has no type to
-    /// lay the payload out at ("cannot infer the type of an expression temporary").
-    /// That is a type error, and it belongs here rather than there.
+    /// inferred. Left open, the variable would reach the back end, which has no
+    /// type to lay the payload out at. That is a type error, and it belongs here.
     ///
     /// Read from the RETURN TABLE, after the passes that fill it: an entry whose Err
     /// is still open is one `complete_open_error` found nothing for. A keyed
@@ -322,8 +397,10 @@ impl<'a> Checker<'a> {
         self.report_uninferable_method_error_types();
     }
 
-    /// A body's return contract must be validated before its checked event.
-    /// The caller runs this only after the body's inference has settled.
+    /// The check of [`Self::report_uninferable_error_types`] for one function.
+    /// The streaming run calls it per body, after the body's inference has
+    /// settled and before the body's checked event: a body's return contract
+    /// is validated before the consumer may compile it.
     pub(super) fn report_uninferable_function_error_type(&mut self, f: &FunInfo) {
         if self.seeded_module(&f.module) || f.signature.ret_ty.is_none() {
             return;
@@ -336,8 +413,9 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Methods settle together in the shared context phase. Report their
-    /// unresolved return contracts before any entry body can be released.
+    /// The check of [`Self::report_uninferable_error_types`] for every method.
+    /// Methods settle together in the co-check, so the streaming run reports
+    /// them once, before any body's event is emitted.
     pub(super) fn report_uninferable_method_error_types(&mut self) {
         let mut open: Vec<Span> = Vec::new();
         for info in self.program.types.values() {
@@ -379,6 +457,10 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Where to report the uninferable error type of the callable `key`
+    /// (`fn:<symbol>` / `m:<qualifier>.<name>`), if it has one: only a
+    /// callable with an error site whose Err is not its own generic parameter
+    /// (see `generic_error_returns`) and is still open.
     fn uninferable_error_span(
         &self,
         key: &str,
@@ -427,136 +509,13 @@ or drop the `!`"
     /// Resolved through the solver: the full body checks ran before this
     /// report, and a body whose only error source is a FORWARDED callee
     /// Result (`return helper()`) binds its Err variable there rather than in
-    /// the light-pass reconciliation the table entry was built from. An err
-    /// that is one of the signature's own variables is a GENERIC error type,
-    /// named per call site, not an inference failure. Only a variable nothing
-    /// binds and nothing ties is genuinely open.
+    /// the light-pass reconciliation the table entry was built from.
     fn open_error_span(&self, ret: &Type, decl_ret: Option<&TypeExpr>) -> Option<Span> {
         let (_, err) = ret.result_payloads()?;
         if !self.resolve(err).is_unknown() {
             return None;
         }
         Some(decl_ret?.span())
-    }
-
-    fn complete_open_error(&mut self, declared: &Type, err: Option<Type>) -> Type {
-        let Some(err) = err else {
-            return declared.clone();
-        };
-        let resolved = self.resolve(declared);
-        let Some((ok, declared_err)) = resolved.result_payloads() else {
-            return declared.clone();
-        };
-        if !declared_err.is_unknown() {
-            return declared.clone();
-        }
-        // Keep the declared Result's nominal (a scope's shadow included).
-        resolved.rebuild_result(ok.clone(), err)
-    }
-
-    pub(super) fn precompute_method_returns(&mut self) {
-        let mut entries: Vec<(String, String, String, Vec<String>)> = self
-            .program
-            .types
-            .values()
-            .flat_map(|info| match &info.kind {
-                TypeKind::Record { methods, .. } => methods
-                    .keys()
-                    .map(|m| {
-                        (
-                            info.symbol.clone(),
-                            info.symbol.clone(),
-                            m.clone(),
-                            info.module.clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-                TypeKind::Sum { variants } => variants
-                    .iter()
-                    .flat_map(|variant| {
-                        variant.methods.keys().map(|m| {
-                            (
-                                format!("{}.{}", info.symbol, variant.name),
-                                info.symbol.clone(),
-                                m.clone(),
-                                info.module.clone(),
-                            )
-                        })
-                    })
-                    .collect(),
-            })
-            .collect();
-        entries.sort();
-        // Each round can propagate one more dependency edge. The extra round
-        // observes stability after every entry has received its dependencies.
-        self.precompute_method_entries(&entries, entries.len().saturating_add(1));
-    }
-
-    fn precompute_method_entries(
-        &mut self,
-        entries: &[(String, String, String, Vec<String>)],
-        limit: usize,
-    ) {
-        for round in 0..limit {
-            let mut changing = Vec::new();
-            for (qualifier, self_type, method, module) in entries {
-                // A seeded context type's returns are already in the table.
-                if self.seeded_module(module) {
-                    continue;
-                }
-                let key = (qualifier.clone(), method.clone());
-                let previous = self
-                    .method_returns
-                    .get(&key)
-                    .map(|ty| self.canonical_return_shape(ty));
-                // As in `function_return_entry`: the light pass resolves names
-                // against the current module, which here is the TYPE's.
-                let saved = std::mem::replace(&mut self.current_module, module.clone());
-                let (ty, has_props) = self.infer_method_return(qualifier, self_type, method);
-                self.current_module = saved;
-                if has_props {
-                    self.method_return_props.insert(key.clone());
-                }
-                let current = self.canonical_return_shape(&ty);
-                if previous.as_ref() != Some(&current) {
-                    self.method_returns.insert(key, ty);
-                    changing.push((qualifier.clone(), method.clone()));
-                }
-            }
-            if changing.is_empty() {
-                return;
-            }
-            if round + 1 == limit {
-                let names = changing
-                    .iter()
-                    .map(|(q, m)| format!("{q}.{m}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                for (qualifier, method) in changing {
-                    // Entries carry storage identities, independent of the
-                    // caller's source scope restored after each inference.
-                    let (symbol, variant) = qualifier
-                        .split_once('.')
-                        .map_or((qualifier.as_str(), None), |(s, v)| (s, Some(v)));
-                    let span = match &self.program.types[symbol].kind {
-                        TypeKind::Record { methods, .. } => methods[&method].decl.name_span,
-                        TypeKind::Sum { variants } => {
-                            variants
-                                .iter()
-                                .find(|v| Some(v.name.as_str()) == variant)
-                                .expect("method entry's variant")
-                                .methods[&method]
-                                .decl
-                                .name_span
-                        }
-                    };
-                    self.errors.push(TypeError {
-                        message: format!("internal compiler error: method return inference did not converge; changing entries: {names}"),
-                        span,
-                    });
-                }
-            }
-        }
     }
 
     /// Resolve a table return and renumber its remaining variables so fresh
@@ -575,7 +534,7 @@ or drop the `!`"
     /// propagation sites (`error(...)` / nullable `!`) -- when it does, the
     /// light assembly (`Result`/`?` wrapping) is the only correct return shape,
     /// so the co-check's plain reconciliation must not replace it (see the
-    /// method-body loop in `infer_program`).
+    /// method-body loop in `check_method_bodies`).
     fn infer_method_return(
         &mut self,
         qualifier: &str,
@@ -591,11 +550,18 @@ or drop the `!`"
         // A fully-known annotation IS the return type. A `T!` is not -- it names
         // only the OK payload, leaving the Err side to the body's `error(..)` sites
         // -- so the light pass below runs anyway, purely to complete it. A keyed
-        // `-> infer!` template has no fixed type at all (it is specialized per call
-        // site from the caller's expectation), so it stays exactly as declared.
+        // `-> infer!` template has no fixed Ok type (it is specialized per call
+        // site from the caller's expectation), but every specialization fails
+        // with the prelude `Error` wrapping a message, exactly as a keyed call
+        // is typed (`check_keyed_method_call`). The entry says so: a caller that
+        // propagates the call with `!` has that error type to infer.
         let complete_error = match &declared {
+            Some(ty) if brass_hir::keyed_return(decl.ret.as_ref()) => {
+                let err = crate::lift_err_payload(self.program, Type::Str);
+                return (self.complete_open_error(ty, Some(err)), false);
+            }
             Some(ty) => {
-                if brass_hir::is_fully_known(ty) || brass_hir::keyed_return(decl.ret.as_ref()) {
+                if brass_hir::is_fully_known(ty) {
                     return (ty.clone(), false);
                 }
                 true
@@ -643,10 +609,11 @@ or drop the `!`"
             // annotated method.
             return (self.complete_open_error(&declared, err_ty), false);
         }
+        let normal = self.split_forwarded_returns(normal, &mut props);
         let has_props = !props.errors.is_empty() || !props.nulls.is_empty();
-        // Type-test arms disagree per instance by design; see
-        // `infer_function_return`.
-        let report = !block_has_type_test(body);
+        // Type-test and open member-presence arms disagree per instance by
+        // design; see `infer_function_return`.
+        let report = !block_has_type_test(body) && !props.open_static_test;
         let normal_ty = self.reconcile_return_types(&normal, report);
         let base = self.result_from_payloads(normal_ty, &props.errors, report);
         (wrap_null_propagated_return(base, &props.nulls), has_props)
@@ -657,7 +624,7 @@ or drop the `!`"
     /// `self` to the bare type, so a type's methods share one field variable, and
     /// the bodies' stores/reads link a field's element to the methods' parameter
     /// and return variables (`HashMap`'s entry key/value is the `key`/`value` of
-    /// `set`/`_insert` through `self.entries[i] = _Entry { .. }`). This reads the
+    /// `set`/`_insert` through `self._entries[i] = _Entry { .. }`). This reads the
     /// solver's solution for each field and method signature and quantifies the
     /// inference variables still free across them -- the inferred type parameters.
     pub(super) fn build_schemes(&self) -> HashMap<String, TypeScheme> {
@@ -809,14 +776,52 @@ or drop the `!`"
         let mut normal = Vec::new();
         let mut props = LightProps::default();
         self.infer_returns_block(body, &mut env, &mut normal, &mut props);
-        // A body with a type test dispatches per instance: its arms may return
-        // (and fail with) different types, one per instantiation, so the OPEN
+        // A body with a type test, or a member-presence test on a binding the
+        // walk left open, dispatches per instance: its arms may return (and
+        // fail with) different types, one per instantiation, so the OPEN
         // definitional walk -- which cannot select an arm -- must not report
         // their disagreement. Each instance reconciles its own live path.
-        let report = !block_has_type_test(body);
+        let report = !block_has_type_test(body) && !props.open_static_test;
+        let normal = self.split_forwarded_returns(normal, &mut props);
         let normal_ty = self.reconcile_return_types(&normal, report);
         let base = self.result_from_payloads(normal_ty, &props.errors, report);
         wrap_null_propagated_return(base, &props.nulls)
+    }
+
+    /// Classify the value returns of a FALLIBLE body (one with an error site,
+    /// or a `!` on an operand the walk could not type) that mixes forwarded
+    /// `Result`s with bare values. In such a body `return v` Ok-wraps a bare
+    /// value and passes a `Result` through whole (types.md, Result), so the two
+    /// meet at the Ok payload: each forwarded Result contributes its Ok payload
+    /// to the value returns and its Err payload to the error sites. A body that
+    /// only forwards is assembled whole by `result_from_payloads`, and a body
+    /// without an error site is not fallible, so mixing there stays an
+    /// incompatible-return error.
+    pub(super) fn split_forwarded_returns(
+        &self,
+        normal: Vec<(Type, Span)>,
+        props: &mut LightProps,
+    ) -> Vec<(Type, Span)> {
+        if props.errors.is_empty() && !props.open_errors {
+            return normal;
+        }
+        let forwards = normal
+            .iter()
+            .filter(|(ty, _)| self.resolve(ty).result_payloads().is_some())
+            .count();
+        if forwards == 0 || forwards == normal.len() {
+            return normal;
+        }
+        normal
+            .into_iter()
+            .map(|(ty, span)| match self.resolve(&ty).result_payloads() {
+                Some((ok, err)) => {
+                    props.errors.push((err.clone(), span));
+                    (ok.clone(), span)
+                }
+                None => (ty, span),
+            })
+            .collect()
     }
 
     /// Combine the inferred normal (Ok) and error (Err) return payloads into a
@@ -827,10 +832,8 @@ or drop the `!`"
     /// nested: the back ends Ok-wrap only bare return values (an
     /// already-fallible value passes through), so a nested
     /// `Result<Result<T>>` here would describe a value the program never
-    /// builds -- the mismatch surfaces as a double-`!` unwrap that
-    /// reinterprets the payload record as a Result (type confusion). This
-    /// mirrors the annotated-return path, which flows `Result`-typed values
-    /// whole (see `check_return`).
+    /// builds. This mirrors the annotated-return path, which flows
+    /// `Result`-typed values whole (see `check_return`).
     pub(super) fn result_from_payloads(
         &mut self,
         normal_ty: Option<Type>,
@@ -896,46 +899,74 @@ or drop the `!`"
     /// return (an open parameter, a stored field's value) is tied to its
     /// sibling instead of surviving as an independent scheme parameter.
     /// `HashMap.get_or` returns `e.value` on one path and `dflt` on the
-    /// other; without the link `dflt` stayed its own scheme parameter, a call
-    /// could pass a string default into an int32-valued map, and the back end
-    /// reinterpreted the bits.
+    /// other; without the link `dflt` would stay its own scheme parameter,
+    /// and a call could pass a string default into an `int32`-valued map.
     ///
     /// The tie is a side record applied at scheme build, NOT a solver
-    /// binding: a commit into the shared persistent solver binds variables
-    /// other bodies' cached signature types still reference (the `_Entry`
-    /// field variable is program-global), and leaked bindings surfaced as
-    /// order-dependent phantom type errors in unrelated functions.
+    /// binding: a commit into the shared persistent solver would bind
+    /// variables other bodies' cached signature types still reference (the
+    /// `_Entry` field variable is program-global), constraining unrelated
+    /// functions.
     pub(super) fn reconcile_return_types_with(
         &mut self,
         normal: &[(Type, Span)],
         report: bool,
         link: bool,
     ) -> Option<Type> {
-        let (first, rest) = normal.split_first()?;
-        let mut common = first.0.clone();
-        for (ty, span) in rest {
+        let first = normal.first()?;
+        // A fully-known set (an instantiation, or a definition whose returns
+        // do not depend on open parameters) joins by the shared value join:
+        // numeric widening, literal adaptation, nullable and sum-parent
+        // rules, independent of the order of the returns.
+        if let Some(joined) = self.join_known_values(normal) {
+            return match joined {
+                Ok(ty) => ty,
+                Err(conflict) => {
+                    if report {
+                        self.report_join_conflict("return types", normal, conflict);
+                    }
+                    // Keep the first type so callers check against a
+                    // definite type rather than cascading a second error.
+                    Some(first.0.clone())
+                }
+            };
+        }
+        // An open set. A numeric literal return adapts to whatever the other
+        // returns join at, so when one returns a still-open closure parameter
+        // (typed by each application) the common type is taken from it --
+        // otherwise `return 0` written before `return x` would fix `x` to
+        // `int32` for every application.
+        let lead = normal
+            .iter()
+            .position(|(ty, _)| {
+                matches!(self.resolve(ty), Type::Unknown(id) if self.closure_param_vars.contains(&id))
+            })
+            .filter(|_| {
+                normal
+                    .iter()
+                    .any(|(_, span)| self.return_literals.contains_key(span))
+            })
+            .unwrap_or(0);
+        let mut common = normal[lead].0.clone();
+        let others = normal[..lead].iter().chain(&normal[lead + 1..]);
+        for (ty, span) in others {
             if let Some(nullable) = common_nullable_type(&common, ty) {
                 common = nullable;
                 continue;
             }
             if self.can_unify(&common, ty) {
-                if link && let Some(key) = self.current_co_method.clone() {
-                    self.co_return_links
-                        .entry(key)
-                        .or_default()
-                        .push((common.clone(), ty.clone()));
+                if link && self.current_co_method.is_some() {
+                    self.record_co_return_link(common.clone(), ty.clone());
                 }
                 continue;
             }
             if report {
-                self.errors.push(TypeError {
-                    message: format!(
-                        "incompatible return types: `{}` and `{}`",
-                        self.resolve(&common).display(),
-                        self.resolve(ty).display()
-                    ),
-                    span: *span,
-                });
+                let message = format!(
+                    "incompatible return types: `{}` and `{}`",
+                    self.resolve(&common).display(),
+                    self.resolve(ty).display()
+                );
+                self.report_conflict_once("return types", message, *span);
             }
             // Keep the first concrete type so callers check against a
             // definite type rather than cascading a second error.
@@ -957,6 +988,19 @@ or drop the `!`"
         report: bool,
     ) -> Option<Type> {
         let (first, rest) = errors.split_first()?;
+        // A fully-known set joins by the shared value join (see
+        // `reconcile_return_types_with`).
+        if let Some(joined) = self.join_known_values(errors) {
+            return match joined {
+                Ok(ty) => ty,
+                Err(conflict) => {
+                    if report {
+                        self.report_join_conflict("error payloads", errors, conflict);
+                    }
+                    Some(first.0.clone())
+                }
+            };
+        }
         let mut common = first.0.clone();
         for (ty, span) in rest {
             if let Some(nullable) = common_nullable_type(&common, ty) {
@@ -965,14 +1009,12 @@ or drop the `!`"
             }
             if !self.can_unify(&common, ty) {
                 if report {
-                    self.errors.push(TypeError {
-                        message: format!(
-                            "incompatible error payloads: `{}` and `{}`",
-                            self.resolve(&common).display(),
-                            self.resolve(ty).display()
-                        ),
-                        span: *span,
-                    });
+                    let message = format!(
+                        "incompatible error payloads: `{}` and `{}`",
+                        self.resolve(&common).display(),
+                        self.resolve(ty).display()
+                    );
+                    self.report_conflict_once("error payloads", message, *span);
                 }
                 return Some(common);
             }
@@ -1012,10 +1054,16 @@ or drop the `!`"
     /// and record them per DEFINING module. Bindings accumulate as iteration
     /// proceeds, so a later global is never visible to an earlier initializer, and
     /// a module's initializers see only what that module can see (its own globals
-    /// so far, its imports', and the stdlib's) -- modules are processed in
+    /// so far, its imports', and the prelude's) -- modules are processed in
     /// dependency order, so an imported module's globals are already inferred.
     /// Annotation resolution errors are surfaced by `resolve_annotations`, so they
     /// are intentionally swallowed here.
+    ///
+    /// These are PROVISIONAL types: the full check of each module initializer
+    /// is the authority, and replaces each entry as soon as the binding's own
+    /// statement is checked (see `settle_global`). Until then the bodies
+    /// checked before the initializers -- the method co-check -- and the
+    /// light return inference read these.
     pub(super) fn precompute_global_bindings(&mut self) {
         let program = self.program;
         let mut props = LightProps::default();
@@ -1024,13 +1072,22 @@ or drop the `!`"
             if self.seeded_module(&init.path) {
                 continue;
             }
+            // Annotations and names resolve in the initializer's own module.
+            let saved = std::mem::replace(&mut self.current_module, init.path.clone());
             let mut env = vec![Scope::new(self.globals_visible_from(&init.path))];
             let mut own = vec![Scope::default()];
             for stmt in &init.stmts {
-                let Stmt::Let { pat, ty, value, .. } = stmt else {
+                let Stmt::Let {
+                    pat,
+                    ty,
+                    value,
+                    is_const,
+                    ..
+                } = stmt
+                else {
                     continue;
                 };
-                let Some(value) = value else {
+                if value.is_none() {
                     // A module-level binding is a global initialized by the
                     // module's init; without an initializer there is no init
                     // order at which it becomes defined.
@@ -1039,18 +1096,13 @@ or drop the `!`"
                         span: stmt.span(),
                     });
                     continue;
-                };
-                let value_ty = self.infer_expr_light(value, &env, &mut props);
-                let binding_ty = match ty {
-                    Some(te) => match self.resolve_type(te) {
-                        Ok(annotated) => self.instantiate_annotated_type(&annotated, &value_ty),
-                        Err(_) => value_ty,
-                    },
-                    None => value_ty,
-                };
+                }
+                let binding_ty =
+                    self.light_let_type(ty.as_ref(), value.as_ref(), *is_const, &env, &mut props);
                 self.bind_pattern_light(pat, &binding_ty, &mut env);
                 self.bind_pattern_light(pat, &binding_ty, &mut own);
             }
+            self.current_module = saved;
             self.global_defs.insert(
                 init.path.clone(),
                 own.pop().expect("global scope frame").into_map(),
@@ -1059,10 +1111,47 @@ or drop the `!`"
         }
     }
 
+    /// Make the full check's type of the global `name` of `module` -- the
+    /// binding its initializer statement just bound -- the type every later
+    /// body reads. The provisional (light) entry is unified with it first, so
+    /// whatever already shares the entry's variables (a light return that
+    /// hands the global back, a container's element slots) follows; a
+    /// method body co-checked against an entry the full check contradicts was
+    /// checked at the wrong type, which is reported.
+    pub(super) fn settle_global(&mut self, module: &[String], name: &str, full: &Type, span: Span) {
+        let Some(light) = self
+            .global_defs
+            .get(module)
+            .and_then(|g| g.get(name))
+            .cloned()
+        else {
+            return;
+        };
+        let snapshot = self.solver.snapshot();
+        if self.solver.unify(&light, full).is_err() {
+            self.solver.rollback(snapshot);
+            if self.co_global_reads.contains(name) {
+                self.errors.push(TypeError {
+                    message: format!(
+                        "global `{name}` has type `{}`, but a method reading it was checked \
+                         when it was only known as `{}`; annotate `{name}`",
+                        self.resolve(full).display(),
+                        self.resolve(&light).display()
+                    ),
+                    span,
+                });
+            }
+        }
+        if let Some(globals) = self.global_defs.get_mut(module) {
+            globals.insert(name.to_string(), full.clone());
+        }
+        self.global_scopes.clear();
+    }
+
     /// The globals a body in `module` sees, by the name it sees them under: the
-    /// stdlib's (visible everywhere, so `INT64_MAX` needs no import), then the
-    /// ones its imports bring in (under the LOCAL name, so a rename resolves),
-    /// then its own, which shadow both.
+    /// prelude's (`core` modules, visible everywhere, so `INT64_MAX` needs no
+    /// import), then the ones its imports bring in (under the LOCAL name, so a
+    /// rename resolves), then its own, which shadow both.
     pub(super) fn globals_visible_from(&self, module: &[String]) -> HashMap<String, Type> {
         let mut out: HashMap<String, Type> = HashMap::default();
         let mut core_paths: Vec<&Vec<String>> = self
@@ -1117,8 +1206,8 @@ or drop the `!`"
         ]
     }
 
-    /// The layered environment used for return inference, with shared globals
-    /// below signature parameters so parameter bindings preserve shadowing.
+    /// [`Self::signature_scopes`], as the environment of the light return
+    /// inference.
     fn signature_param_env(&mut self, params: &[ParamInfo]) -> ScopeStack {
         self.signature_scopes(params)
     }
@@ -1138,10 +1227,26 @@ pub(super) fn wrap_null_propagated_return(base: Type, nulls: &[Span]) -> Type {
     }
 }
 
+/// A light-assembled return `shape` -- a payload, a `Result` over it, either
+/// one under the outer `?` a nullable `!` adds -- with its Ok payload replaced
+/// by `ok`.
+fn with_ok_payload(shape: &Type, ok: Type) -> Type {
+    match shape {
+        Type::Nullable(inner) if inner.result_payloads().is_some() => {
+            Type::Nullable(Box::new(with_ok_payload(inner, ok)))
+        }
+        Type::Nullable(_) => Type::nullable(ok),
+        result => match result.result_payloads() {
+            Some((_, err)) => result.rebuild_result(ok, err.clone()),
+            None => ok,
+        },
+    }
+}
+
 /// Whether `b` contains a type-test `if` condition anywhere. Such a body
 /// dispatches per instance, so the open definitional walk reconciles its
 /// returns leniently (see `infer_function_return`).
-fn block_has_type_test(b: &Block) -> bool {
+pub(super) fn block_has_type_test(b: &Block) -> bool {
     struct Finder(bool);
     impl crate::walk::ExprVisitor for Finder {
         fn visit(&mut self, e: &Expr) {
@@ -1160,48 +1265,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn method_return_budget_reports_changing_symbols_at_method_names() {
-        // Exhausting an intentionally short budget pins the otherwise defensive
-        // ICE, including the changing identity and the exact method-name span.
-        let source = "type Item = { value: int32 }\nfun Item.get(self) { return self.value }\ntype Choice = | One { value: int32 }\nfun Choice.get(self) { return self.value }";
-        let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
-            is_prelude: false,
-            path: vec!["main".into()],
-            ast: brass_parser::parse(source).unwrap(),
-        }]);
-        assert!(errors.is_empty());
-        let mut checker =
-            Checker::new(&program, Rc::new(brass_typesys::RowInfo::analyze(&program)));
-        checker.precompute_method_entries(
-            &[
-                (
-                    "Item".into(),
-                    "Item".into(),
-                    "get".into(),
-                    vec!["main".into()],
-                ),
-                (
-                    "Choice.One".into(),
-                    "Choice".into(),
-                    "get".into(),
-                    vec!["main".into()],
-                ),
-            ],
-            1,
-        );
-        assert_eq!(checker.errors.len(), 2);
-        assert_eq!(
-            checker.errors[0].message,
-            "internal compiler error: method return inference did not converge; changing entries: Item.get, Choice.One.get"
-        );
-        let start = source.find("get").unwrap();
-        assert_eq!(checker.errors[0].span, Span::new(start, start + 3));
-        assert_eq!(checker.errors[1].message, checker.errors[0].message);
-        let start = source.rfind("get").unwrap();
-        assert_eq!(checker.errors[1].span, Span::new(start, start + 3));
-    }
-
-    #[test]
     fn same_named_receivers_have_distinct_light_returns() {
         // Inspect the precomputed table itself so call-site re-inference cannot
         // conceal unknown or cross-module return entries.
@@ -1218,7 +1281,7 @@ mod tests {
         assert!(errors.is_empty());
         let mut checker =
             Checker::new(&program, Rc::new(brass_typesys::RowInfo::analyze(&program)));
-        checker.precompute_method_returns();
+        checker.precompute_returns();
         assert!(checker.errors.is_empty());
         assert_eq!(
             checker.method_returns[&("Item@a".into(), "get".into())],
@@ -1242,6 +1305,42 @@ mod tests {
     }
 
     #[test]
+    fn a_caller_of_prelude_input_takes_its_declared_return() {
+        // The light pass types a call of the prelude's `input` by the
+        // prelude declaration's (inferred) return -- its Err is the prelude
+        // `Error` -- not by the builtin stand-in used without a prelude.
+        let prelude = |name: &str, src: &str| brass_hir::LoadedModule {
+            is_prelude: true,
+            path: vec!["core".into(), name.into()],
+            ast: brass_parser::parse(src).unwrap(),
+        };
+        let modules = [
+            prelude("error", include_str!("../../../../core/error.cz")),
+            prelude("io", include_str!("../../../../core/io.cz")),
+            brass_hir::LoadedModule {
+                is_prelude: false,
+                path: vec!["main".into()],
+                ast: brass_parser::parse("fun ask() { return input() }").unwrap(),
+            },
+        ];
+        let (program, errors) = brass_hir::lower(&modules);
+        assert!(errors.is_empty(), "{errors:?}");
+        let mut checker =
+            Checker::new(&program, Rc::new(brass_typesys::RowInfo::analyze(&program)));
+        checker.precompute_returns();
+        let input = checker.resolve(&checker.function_returns["input"]);
+        let ask = checker.resolve(&checker.function_returns["ask"]);
+        let (_, input_err) = input.result_payloads().expect("input is fallible");
+        let (_, ask_err) = ask.result_payloads().expect("ask forwards input's Result");
+        assert!(
+            matches!(input_err, Type::Record(n) if n.name == "Error"),
+            "{}",
+            input.display()
+        );
+        assert_eq!(ask_err.display(), input_err.display());
+    }
+
+    #[test]
     fn failed_inferred_return_link_rolls_back_partial_bindings() {
         let program = Program::empty();
         let mut checker =
@@ -1250,11 +1349,18 @@ mod tests {
         let precomputed = Type::Tuple(vec![open.clone(), Type::Str]);
         let inferred = Type::Tuple(vec![Type::Bool, Type::Int(IntKind::I32)]);
 
-        checker.link_inferred_return(&precomputed, &inferred);
+        checker.link_inferred_return(&precomputed, &inferred, "f", Span::new(3, 4));
 
-        // Linking is an optional refinement: a later component mismatch must undo
-        // the earlier component binding instead of poisoning the shared solver.
+        // A later component mismatch must undo the earlier component binding
+        // instead of poisoning the shared solver, and the disagreement between
+        // the recursive call's type and the body's return is reported.
         assert!(checker.resolve(&open).is_unknown());
+        assert_eq!(checker.errors.len(), 1);
+        assert!(
+            checker.errors[0]
+                .message
+                .contains("cannot infer the return type of recursive `f`")
+        );
     }
 
     #[test]

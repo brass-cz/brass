@@ -1,5 +1,6 @@
 //! Editor features built on the analysis layer: diagnostics, semantic-token
-//! highlighting, hover, go-to-definition, and completion.
+//! highlighting, hover (with its signature rendering), go-to-definition, and
+//! completion, plus the position helpers they share (`nav`).
 
 pub mod completion;
 pub mod definition;

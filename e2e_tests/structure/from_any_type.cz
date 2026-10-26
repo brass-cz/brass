@@ -1,10 +1,10 @@
-// `T.from(v)` is a structural conversion that accepts an argument of ANY type
-// and answers `T?`: the record when the concrete argument carries every field
-// `T` declares, null otherwise -- including when the argument is not a record at
-// all. That is what lets one function branch on "is this a T?" for a value whose
-// type differs per call site (`fs.create_dir` takes a string or a `Path` this
-// way); rejecting a non-record argument at compile time, as the checker once
-// did, made the idiom impossible to write.
+// `T.from(v)` is a structural conversion that accepts an argument of ANY
+// type and answers `T?`: the record when the concrete argument carries every
+// field `T` declares, null otherwise -- including when the argument is not a
+// record at all. That is what lets one function branch on "is this a T?" for
+// a value whose type differs per call site (`fs.create_dir` takes a string or
+// a `Path` this way), which rejecting a non-record argument at compile time
+// would rule out.
 type Point = {
     x: int32
     y: int32

@@ -1,0 +1,10 @@
+// Access through an alias is reported under the promoted lock root.
+type Counter = { count: int32 }
+fun main() {
+    let counter = Counter { count: 0 }
+    spawn(() -> { with(counter, (c) -> { c.count += 1 }) })
+    spawn(() -> { with(counter, (c) -> { c.count += 2 }) })
+    sync()
+    let alias = counter
+    if true { println(alias.count) }
+}

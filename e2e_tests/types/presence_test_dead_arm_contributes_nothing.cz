@@ -1,0 +1,50 @@
+// @backends: all
+// A condition the type alone decides folds per instantiation, and the arm it
+// makes unreachable contributes nothing to that instance: no `return` joins
+// its return type and no `error(..)` makes it fallible. This holds for a
+// member-presence test (`if v.chars`), a presence `if let` over an absent
+// member, and a type test alike.
+type R = { name: string }
+type Other = { id: int32 }
+
+fun first(v) {
+    if v.chars { return 1 }
+    return "s"
+}
+
+fun checked(v) {
+    if v.chars { return v.len() }
+    return error("no chars")
+}
+
+fun named(v) {
+    if v.name { return v.name }
+    return error("no name")
+}
+
+fun after_dead_error(v) {
+    if v.chars { return 1 }
+    let r = error("x")
+    return 2
+}
+
+fun bound(v) {
+    if let n = v.name { return n }
+    return 0
+}
+
+fun tested(v) {
+    if v: string { return 1 }
+    return error("x")
+}
+
+println(typeof(first("x")))
+println(typeof(first(1)))
+println(typeof(checked("abc")))
+println(checked("abc"))
+println(typeof(named(R { name: "n" })))
+println(named(R { name: "n" }))
+println(typeof(after_dead_error("s")))
+println(typeof(bound(R { name: "n" })))
+println(typeof(bound(Other { id: 1 })))
+println(typeof(tested("s")))

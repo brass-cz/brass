@@ -1,0 +1,69 @@
+// @backends: all
+// A narrowed module global is re-widened by any call that can run user code,
+// because the callee may reassign it -- also when the call sits in a branch
+// that falls through, earlier in a loop body (the next iteration runs after
+// it), or is the implicit `display` call that `print`/`println` and a `"{v}"`
+// segment make for a value whose type declares one -- a present nullable of
+// such a type renders through `display` too. Each unchecked read after such a
+// call is rejected.
+let g: string? = "abc"
+type T = {
+    a: int32
+}
+fun T.display(self) -> string {
+    g = null
+    return "T"
+}
+fun clear() {
+    g = null
+}
+fun in_branch(c: bool) {
+    if g {
+        if c { clear() }
+        println(g.len())
+    }
+}
+fun in_loop() {
+    if g {
+        let i = 0
+        while i < 2 {
+            println(g.len())
+            clear()
+            i = i + 1
+        }
+    }
+}
+fun interpolated(t: T) {
+    if g {
+        let s = "{t}"
+        println(s)
+        println(g.len())
+    }
+}
+fun printed(t: T) {
+    if g {
+        println(t)
+        println(g.len())
+    }
+}
+fun printed_nullable(t: T?) {
+    if g {
+        println(t)
+        println(g.len())
+    }
+}
+fun interpolated_nullable(t: T?) {
+    if g {
+        let s = "{t}"
+        println(s)
+        println(g.len())
+    }
+}
+fun main() {
+    in_branch(true)
+    in_loop()
+    interpolated(T { a: 1 })
+    printed(T { a: 1 })
+    printed_nullable(T { a: 1 })
+    interpolated_nullable(null)
+}

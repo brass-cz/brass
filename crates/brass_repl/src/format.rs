@@ -6,15 +6,16 @@
 //!  - a float keeps a trailing `.0` when it is an integral finite value below 1e15;
 //!  - an unsigned integer renders in its unsigned decimal range, a signed one in
 //!    its signed range;
-//!  - an array renders as `[e0, e1, ...]`;
+//!  - an array or tuple renders as `[e0, e1, ...]`, its elements unquoted;
 //!  - a nullable renders its value, or `null`;
 //!  - a record renders as `T {\n    field: <value>,\n}` and a sum variant as
 //!    `T.Variant {\n    field: <value>,\n}` (a field-less variant as bare
 //!    `T.Variant`), each field rendered recursively and indented one level so
-//!    nested aggregates step in. Which fields render, in what order, at what
-//!    types is not decided here: both back ends resolve that through
-//!    `brass_engine::render_record_fields` / `render_variant_fields`, so the
-//!    field decision cannot drift between them.
+//!    nested aggregates step in; a string field renders quoted and escaped,
+//!    and a function-valued field as `<opaque>`. Which fields render, in what
+//!    order, at what types is not decided here: both back ends resolve that
+//!    through `brass_engine::render_record_fields` / `render_variant_fields`,
+//!    so the field decision cannot drift between them.
 
 use brass_hir::{IntKind, NominalType, Program, Type};
 
@@ -90,7 +91,9 @@ fn format_value_at(
             Value::Variant(var) => render_sum(program, n, var, depth)?,
             _ => n.name.clone(),
         },
-        other => other.display(),
+        // A value with no rendering of its own -- a function-valued field of
+        // a rendered record -- shows as the same placeholder the JIT emits.
+        _ => "<opaque>".to_string(),
     })
 }
 
@@ -113,9 +116,6 @@ fn int_str(v: i64, k: IntKind) -> String {
 /// A float with the typed path's trailing-`.0` rule.
 pub use brass_utils::float_str;
 
-/// Build `<header> {\n    f: <v>,\n}` for the named fields (or `<header> {}` when
-/// the type has none). Each field value is rendered recursively and indented one
-/// level (four spaces after each newline) so a nested aggregate steps in.
 /// The label a record renders under: its nominal name, or `anonymous` for a
 /// structural record (an anonymous structure / `T.from` result).
 fn record_header(n: &NominalType) -> &str {
@@ -126,6 +126,9 @@ fn record_header(n: &NominalType) -> &str {
     }
 }
 
+/// Build `<header> {\n    f: <v>,\n}` for the named fields (or `<header> {}` when
+/// the type has none). Each field value is rendered recursively and indented one
+/// level (four spaces after each newline) so a nested aggregate steps in.
 fn render_named_fields(
     program: &Program,
     header: &str,
@@ -139,20 +142,21 @@ fn render_named_fields(
     let mut out = format!("{header} {{\n");
     for (fname, fty) in fields {
         let fv = values.get(fname).cloned().unwrap_or(Value::Void);
-        let rendered = format_value_at(program, &fv, fty, depth + 1)?.replace('\n', "\n    ");
-        // A string-typed field value renders QUOTED (a present nullable string
-        // too; `null` stays bare), so the struct output distinguishes the
-        // string "1" from the number 1 -- mirroring the JIT renderer.
+        // A string-typed field value renders in its quoted, escaped debug form
+        // (a present nullable string too; `null` stays bare), so the struct
+        // output distinguishes the string "1" from the number 1 -- mirroring
+        // the JIT renderer.
         let quoted = match fty {
             Type::Str => true,
             Type::Nullable(inner) if matches!(**inner, Type::Str) => !fv.is_null(),
             _ => false,
         };
-        if quoted {
-            out.push_str(&format!("    {fname}: \"{rendered}\",\n"));
+        let rendered = if quoted {
+            brass_utils::debug_quote(fv.as_str())
         } else {
-            out.push_str(&format!("    {fname}: {rendered},\n"));
-        }
+            format_value_at(program, &fv, fty, depth + 1)?.replace('\n', "\n    ")
+        };
+        out.push_str(&format!("    {fname}: {rendered},\n"));
     }
     out.push('}');
     Ok(out)

@@ -1,7 +1,8 @@
 //! The high-level intermediate representation: the whole program collected
 //! into global type and function tables with numeric type ids assigned for the
-//! runtime. Records and sum types keep their members (as AST nodes, lowered
-//! on demand by codegen); this is the "typed HIR" the back end consumes.
+//! runtime. Function and method bodies stay AST nodes: the checker types them
+//! and MIR lowering lowers them, while the back ends read the type tables
+//! (declared fields, variants, ids) to lay out values.
 
 use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::rc::Rc;
@@ -11,14 +12,18 @@ use brass_parser::ast::{FunDecl, Method, Module, Param, Stmt, TypeExpr};
 
 use crate::types::{NominalType, Type};
 
+mod pattern_index;
+pub use pattern_index::{PatternScope, PatternTypeHead};
+
 /// Reserved id for the built-in `Result` type (matches the runtime).
 pub use crate::types::RESULT_TYPE_ID;
 
 /// Free-function names the runtime and the compiler own. A `.cz` definition of
-/// one is rejected (it would capture the standard library's internal calls, or
-/// -- for `error` -- be dead because `error(x)` desugars to `Result.Err`), and
-/// the plugin-module loader renames a plugin function that lands on one rather
-/// than synthesizing a module that cannot be checked.
+/// one outside the prelude is rejected (it would capture the standard
+/// library's internal calls, or -- for the prelude's `error` -- detach
+/// `error(..)` from the fallibility sugar), and the plugin-module loader
+/// renames a plugin function that lands on one rather than synthesizing a
+/// module that cannot be checked.
 pub const RESERVED_FUNCTION_NAMES: &[&str] =
     &["len", "spawn", "with", "sync", "error", "fields", "typeof"];
 
@@ -26,7 +31,7 @@ pub const RESERVED_FUNCTION_NAMES: &[&str] =
 /// module path it is defined in. The storage/codegen key (`symbol`) is its
 /// `Display` form `name@a/b` -- the module path joins with `/`, never `.`, so the
 /// key cannot collide with the `Type.Variant` separator used in method
-/// qualifiers. Program tables are keyed by this string today; the struct gives
+/// qualifiers. Program tables are keyed by this string; the struct gives
 /// resolution a typed identity to pass around instead of re-parsing the symbol.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct QualifiedName {
@@ -140,6 +145,37 @@ pub fn resolve_qualified<'a, T>(
     table.get(name).filter(|v| bare_is_visible(v))
 }
 
+/// The table key a dotted MARKER name denotes from `module`. The
+/// qualified-use rewrite turns `alias.Name` (after a whole-module
+/// `import a.b`) into the marker `"alias.Name"`; it denotes the definition of
+/// `Name` in the module the alias names: its qualified symbol, or the bare
+/// symbol a program-wide unique definition is stored under (found through
+/// `symbol_aliases`). `in_table` answers whether a key is present in the table
+/// being searched. `None` for a name without a dot, an alias `module` does
+/// not have, or a definition the table does not hold.
+///
+/// Every resolution of a type or function name -- declaration annotations
+/// during lowering as well as the checker and the back ends -- recognizes
+/// markers through this one rule.
+pub fn resolve_marker_key(
+    module_aliases: &HashMap<Vec<String>, HashMap<String, Vec<String>>>,
+    symbol_aliases: &HashMap<String, String>,
+    module: &[String],
+    name: &str,
+    in_table: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let (alias, bare) = name.split_once('.')?;
+    let target = module_aliases.get(module)?.get(alias)?;
+    let qualified = qualify(bare, target);
+    if in_table(&qualified) {
+        return Some(qualified);
+    }
+    symbol_aliases
+        .get(&qualified)
+        .filter(|canonical| in_table(canonical))
+        .cloned()
+}
+
 /// A parsed source file tagged with its module path.
 #[derive(Clone)]
 pub struct LoadedModule {
@@ -166,6 +202,9 @@ pub struct GeneratedDecl {
     pub key: Type,
 }
 
+/// A declared record field or variant payload field: its name, its written
+/// annotation, and the type that annotation resolves to (filled by
+/// declaration resolution).
 #[derive(Clone, Debug)]
 pub struct FieldInfo {
     pub name: String,
@@ -227,6 +266,9 @@ pub struct CallableSignature {
 }
 
 impl CallableSignature {
+    /// The signature of `fun name(..)` as written; the resolved types
+    /// (`ParamInfo::resolved_ty`, `ret_ty`) are filled by annotation
+    /// resolution.
     pub fn from_function(decl: &FunDecl) -> Self {
         Self {
             name: decl.name.clone(),
@@ -237,6 +279,7 @@ impl CallableSignature {
         }
     }
 
+    /// The signature of a method as written (see [`Self::from_function`]).
     pub fn from_method(method: &Method) -> Self {
         Self {
             name: method.name.clone(),
@@ -249,13 +292,15 @@ impl CallableSignature {
 }
 
 /// A method lowered into HIR. The signature is owned by HIR; the parser method
-/// is retained while code generation still consumes AST bodies.
+/// is retained for its body, which the checker and MIR lowering read as AST.
 #[derive(Clone)]
 pub struct MethodInfo {
     pub signature: CallableSignature,
     pub decl: Rc<Method>,
 }
 
+/// One variant of a sum type: its name, runtime tag, payload fields, and the
+/// sum's methods (every variant carries the methods declared for the sum).
 #[derive(Clone)]
 pub struct VariantInfo {
     pub name: String,
@@ -264,6 +309,8 @@ pub struct VariantInfo {
     pub methods: HashMap<String, MethodInfo>,
 }
 
+/// The shape of a declared type: a record (fields and methods) or a sum
+/// (variants).
 #[derive(Clone)]
 pub enum TypeKind {
     Record {
@@ -275,6 +322,9 @@ pub enum TypeKind {
     },
 }
 
+/// A declared record or sum type (`type T = ..`): its identity (`name`,
+/// runtime `id`, storage `symbol`, defining `module`), its shape, and its
+/// declaration metadata.
 #[derive(Clone)]
 pub struct TypeInfo {
     pub name: String,
@@ -286,7 +336,7 @@ pub struct TypeInfo {
     pub module: Vec<String>,
     pub span: Span,
     /// Globally unique storage/codegen key. Equal to the bare `name` when only
-    /// one module defines that name, and module-qualified (`Name@a.b`) when the
+    /// one module defines that name, and module-qualified (`Name@a/b`) when the
     /// same type name is defined in several modules, so both coexist with
     /// distinct symbols and method-dispatch keys.
     pub symbol: String,
@@ -301,10 +351,12 @@ pub struct TypeInfo {
 }
 
 impl TypeInfo {
+    /// A bare reference to this type: its id and name, no substitution.
     pub fn nominal_ref(&self) -> NominalType {
         NominalType::new(self.id, &self.name)
     }
 
+    /// [`Self::nominal_ref`] as a record or sum [`Type`].
     pub fn type_ref(&self) -> Type {
         match self.kind {
             TypeKind::Record { .. } => Type::Record(self.nominal_ref()),
@@ -315,6 +367,20 @@ impl TypeInfo {
     pub fn is_sum(&self) -> bool {
         matches!(self.kind, TypeKind::Sum { .. })
     }
+    /// Whether `T.from(v)` on this type is the builtin structural
+    /// conversion: the type is a record with no declared static `from`.
+    /// An instance method named `from` keeps structural conversion available;
+    /// only a declaration without `self` shadows the static builtin.
+    pub fn has_structural_from(&self) -> bool {
+        !self.is_sum()
+            && self.record_method("from").is_none_or(|method| {
+                method
+                    .params
+                    .first()
+                    .is_some_and(|param| param.name == "self")
+            })
+    }
+
     pub fn record_method(&self, name: &str) -> Option<&Rc<Method>> {
         match &self.kind {
             TypeKind::Record { methods, .. } => methods.get(name).map(|m| &m.decl),
@@ -329,14 +395,18 @@ impl TypeInfo {
     }
 }
 
+/// A top-level free function collected into the program. A primitive or
+/// array method (`fun string.m(..)`, `fun T[].m(..)`) is stored as one too,
+/// registered in [`Program::primitive_methods`].
 pub struct FunInfo {
     pub signature: CallableSignature,
     pub decl: Rc<FunDecl>,
     pub module: Vec<String>,
     /// Globally unique storage/codegen key. Equal to the bare name when that
-    /// name is defined in only one module; module-qualified (`name@a.b`) when
+    /// name is defined in only one module; module-qualified (`name@a/b`) when
     /// the same local name is defined in several modules, so both definitions
-    /// coexist with distinct symbols.
+    /// coexist with distinct symbols (a prelude function keeps the bare name;
+    /// see `lower`).
     pub symbol: String,
 }
 
@@ -347,15 +417,24 @@ pub struct ModuleInit {
 }
 
 /// The collected, id-assigned program.
+///
+/// Changes to nominal identities, variant names/field counts, aliases or module
+/// visibility must finish with [`Self::rebuild_resolution_indexes`] before any
+/// resolution query. Field types and method bodies/signatures do not change
+/// these indexes. Debug queries check declaration counts to catch missed rebuilds.
 pub struct Program {
     pub types: HashMap<String, TypeInfo>,
+    /// Nominal ids mapped to canonical symbols; rebuilt with the pattern indexes.
     pub(crate) types_by_id: HashMap<i32, String>,
+    /// Canonical and local nominal names used for declaration membership tests.
     pub(crate) type_names: HashSet<String>,
+    /// Declaration-only pattern facts, invalidated by topology changes.
+    pub(crate) pattern_index: pattern_index::PatternIndex,
     /// One past the highest `Type::Unknown` id lowering minted into the
     /// resolved signature and field types above. Every solver that types
     /// against this program MUST seed its fresh-variable counter here
     /// (`Solver::seed_var_counter`): a solver-local variable that collides
-    /// with an HIR-embedded id aliases an unrelated type, which surfaced as
+    /// with an HIR-embedded id aliases an unrelated type and produces
     /// order-dependent phantom type errors.
     pub next_infer_var: u32,
     pub functions: HashMap<String, FunInfo>,
@@ -394,7 +473,7 @@ pub struct Program {
     /// symbol; the body itself lives in `functions` under that symbol. The
     /// dispatch class is the receiver's primitive class ([`Type::primitive_class`]):
     /// a scalar type word (`"string"`, `"int32"`, ...) or `"array"`. Used to
-    /// route a `recv.m()` call on a primitive receiver, replacing UFCS.
+    /// route a `recv.m()` call to a declared method on a primitive receiver.
     pub primitive_methods: HashMap<(String, String), String>,
     /// Type aliases (`type Alias = <type expression>`): the alias name resolves
     /// to a pre-resolved type, typically a refinement of a nominal record
@@ -414,6 +493,21 @@ fn builtin_member(class: &str, name: &str) -> bool {
     }
 }
 
+/// How an unqualified braced pattern head resolves
+/// ([`Program::braced_pattern_head`]). The checker and MIR lowering share
+/// this, so a head is destructured the same way by both.
+#[derive(Clone, Copy)]
+pub enum BracedHead<'a> {
+    /// A plain record pattern: fields are read by their own names.
+    Record,
+    /// A sum variant pattern: a tag test, then variant-scoped fields.
+    Variant,
+    /// The name is both a record type in scope and some sum's variant: a
+    /// value of that record is destructured as the record, any other value
+    /// as the variant (written `Sum.Name { .. }` to be explicit).
+    RecordOrVariant(&'a TypeInfo),
+}
+
 /// A resolved `type Alias = <type expression>` binding: the module it is
 /// declared in and the concrete type its name expands to.
 #[derive(Clone, Debug)]
@@ -430,6 +524,7 @@ impl Program {
             types: HashMap::default(),
             types_by_id: HashMap::default(),
             type_names: HashSet::default(),
+            pattern_index: pattern_index::PatternIndex::default(),
             next_infer_var: 0,
             functions: HashMap::default(),
             inits: Vec::new(),
@@ -444,7 +539,13 @@ impl Program {
         }
     }
 
+    /// The declaration with nominal identity `id`, when collected in this program.
     pub fn type_by_id(&self, id: i32) -> Option<&TypeInfo> {
+        debug_assert_eq!(
+            self.types.len(),
+            self.types_by_id.len(),
+            "rebuild resolution indexes after topology changes"
+        );
         self.types_by_id
             .get(&id)
             .and_then(|symbol| self.types.get(symbol))
@@ -536,14 +637,11 @@ impl Program {
         }
     }
 
+    /// A bare reference to the type stored under the symbol `name`.
     pub fn type_ref(&self, name: &str) -> Option<Type> {
         self.types.get(name).map(TypeInfo::type_ref)
     }
 
-    /// Whether any loaded type has the bare display name `name`, regardless of
-    /// the module it lives in. Used by validation passes that only need to know
-    /// a name denotes some type (not which one), so they do not false-positive
-    /// on a module-qualified symbol such as `Name@a.b`.
     /// Resolve a dotted marker `"alias.bare"` against this module's alias
     /// table. Returns `None` for non-marker names (no dot).
     fn resolve_marker<'a, T>(
@@ -552,18 +650,34 @@ impl Program {
         module: &[String],
         name: &str,
     ) -> Option<&'a T> {
-        let (alias, bare) = name.split_once('.')?;
-        let target = self.module_aliases.get(module)?.get(alias)?;
-        let qualified = qualify(bare, target);
-        table.get(&qualified).or_else(|| {
-            self.symbol_aliases
-                .get(&qualified)
-                .and_then(|c| table.get(c))
-        })
+        let key = resolve_marker_key(
+            &self.module_aliases,
+            &self.symbol_aliases,
+            module,
+            name,
+            |k| table.contains_key(k),
+        )?;
+        table.get(&key)
     }
 
+    /// Whether any loaded type has the bare display name `name`, regardless of
+    /// the module it lives in. Used by validation passes that only need to know
+    /// a name denotes some type (not which one), so they do not false-positive
+    /// on a module-qualified symbol such as `Name@a.b`.
     pub fn has_type_named(&self, name: &str) -> bool {
         self.type_names.contains(name)
+    }
+
+    /// Whether any module declares a `type Alias = ..` named `name`, whatever
+    /// module it lives in (its storage symbol is `name` or `name@a/b`). Like
+    /// [`Self::has_type_named`], for passes that only need to know the name
+    /// denotes some type.
+    pub fn has_type_alias_named(&self, name: &str) -> bool {
+        self.type_aliases.contains_key(name)
+            || self.type_aliases.keys().any(|k| {
+                k.strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with('@'))
+            })
     }
 
     /// Resolve a bare type name to its definition as seen from `module`: its
@@ -736,15 +850,82 @@ impl Program {
     /// pick one owner do so deterministically from this order -- the type table
     /// is a `HashMap` whose iteration order must never decide accept/reject.
     pub fn sums_containing_variant(&self, variant: &str) -> Vec<&TypeInfo> {
-        let mut sums: Vec<&TypeInfo> = self
-            .types
-            .values()
-            .filter(|info| match &info.kind {
-                TypeKind::Sum { variants } => variants.iter().any(|v| v.name == variant),
-                TypeKind::Record { .. } => false,
+        self.variant_owner_ids(variant)
+            .iter()
+            .filter_map(|id| self.type_by_id(*id))
+            .collect()
+    }
+
+    /// Whether the variants of sum `info` are in scope in `module`, i.e.
+    /// whether the sum itself is: declared there, declared in the implicit
+    /// prelude, imported into `module` by name (including a rename or an
+    /// imported alias of it), or exported by a module `module` imports whole
+    /// (`import a` makes `a.Sum` and its variants reachable). A sum that is
+    /// only reachable transitively, through a module some imported module
+    /// imports, is not in scope.
+    ///
+    /// Bare unit-variant names resolve through this scope (see
+    /// [`Self::is_unit_variant_in_scope`]); braced heads use global variant names.
+    /// the checker and MIR lowering share it so they agree on which bare names
+    /// are variant tests and which are bindings.
+    pub fn sum_in_scope(&self, module: &[String], info: &TypeInfo) -> bool {
+        if info.module.is_empty()
+            || info.module == module
+            || self.prelude_modules.contains(&info.module)
+        {
+            return true;
+        }
+        if self
+            .module_aliases
+            .get(module)
+            .is_some_and(|aliases| aliases.values().any(|m| *m == info.module))
+        {
+            return true;
+        }
+        self.module_imports.get(module).is_some_and(|names| {
+            names.iter().any(|local| {
+                self.resolve_type_or_alias(module, local)
+                    .is_some_and(|t| t.id == info.id)
             })
-            .collect();
-        sums.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.symbol.cmp(&b.symbol)));
-        sums
+        })
+    }
+
+    /// Every sum in scope in `module` (see [`Self::sum_in_scope`]) that
+    /// declares a variant named `variant`, in the deterministic order of
+    /// [`Self::sums_containing_variant`].
+    pub fn sums_in_scope_with_variant(&self, module: &[String], variant: &str) -> Vec<&TypeInfo> {
+        self.pattern_scope(module)
+            .owner_ids(variant)
+            .iter()
+            .filter_map(|id| self.type_by_id(*id))
+            .collect()
+    }
+
+    /// Whether an unqualified bare-name pattern `name` written in `module` is
+    /// a unit-variant test rather than a binding: some sum in scope there
+    /// declares a FIELDLESS variant `name`. A variant of a sum that is not in
+    /// scope never turns a binding into a test.
+    pub fn is_unit_variant_in_scope(&self, module: &[String], name: &str) -> bool {
+        self.pattern_scope(module).is_unit_variant(name)
+    }
+
+    /// How an unqualified braced pattern head `name { .. }` written in
+    /// `module` resolves (see [`BracedHead`]). A dotted head is a
+    /// module-qualified record type. Otherwise a record type in scope under
+    /// that name and a sum variant spelled the same are told apart by the
+    /// matched value; a head naming only a variant is that variant -- a braced
+    /// head is never a binding, so the matched value's own sum decides which
+    /// of several same-named variants it is.
+    pub fn braced_pattern_head(&self, module: &[String], name: &str) -> BracedHead<'_> {
+        self.pattern_scope(module).braced_head(name)
+    }
+
+    /// The record type an unqualified braced pattern head names in `module`,
+    /// when one is in scope there (a type alias of a record included).
+    pub fn record_pattern_head(&self, module: &[String], name: &str) -> Option<&TypeInfo> {
+        match self.pattern_scope(module).type_head(name) {
+            PatternTypeHead::Nominal(info) if !info.is_sum() => Some(info),
+            _ => None,
+        }
     }
 }

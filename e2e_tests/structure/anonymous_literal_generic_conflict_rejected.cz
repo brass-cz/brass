@@ -1,0 +1,15 @@
+// A generic function's body is lowered once, so one anonymous literal in it
+// cannot be built as different declared records in different instantiations.
+type A = { v: int32 }
+type B = { v: int32 }
+
+fun add(list) {
+    list.push({ v: 7 })
+}
+
+fun main() {
+    let xs: A[] = []
+    add(xs)
+    let ys: B[] = []
+    add(ys)
+}

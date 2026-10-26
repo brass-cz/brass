@@ -1,7 +1,6 @@
-// Pins a non-void function whose only returns are inside `while true`: the MIR
-// builder synthesizes a fall-through `Return(void)` for the unterminated final
-// block, which the back end used to emit as a mistyped `ret i1 false` (an LLVM
-// verifier failure). The fall-through is unreachable and must lower to a trap.
+// A non-void function whose only returns are inside `while true` compiles and
+// runs: the fall-through after the loop is unreachable, so it needs no value
+// of the return type.
 fun f() -> int64 {
     let i = 0
     while true {

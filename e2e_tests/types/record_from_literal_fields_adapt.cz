@@ -1,0 +1,42 @@
+// @backends: all
+// In `T.from({ .. })`, a field written as a numeric literal flows into `T`'s
+// field like any literal flowing into a slot: it takes the field's type when
+// its value fits (a float32 field, narrower integer fields, a nullable
+// numeric field), and otherwise keeps its default type, so the conversion
+// answers `null` rather than narrowing.
+type G = { x: float32 }
+type H = { x: int64, y: uint8 }
+type N = { n: int16? }
+
+fun main() {
+    if let g = G.from({ x: 5 }) {
+        println(g.x)
+    } else {
+        println("G null")
+    }
+    if let h = H.from({ x: 5, y: 7 }) {
+        println(h.y)
+    } else {
+        println("H null")
+    }
+    if let n = N.from({ n: -3 }) {
+        println(n)
+    } else {
+        println("N null")
+    }
+    if let h = H.from({ x: 5, y: 300 }) {
+        println(h)
+    } else {
+        println("300 does not fit uint8")
+    }
+    if let g = G.from({ x: 16777217 }) {
+        println(g)
+    } else {
+        println("16777217 is not exact in float32")
+    }
+    if let g = G.from({ x: 2.5 }) {
+        println(g.x)
+    } else {
+        println("G float null")
+    }
+}

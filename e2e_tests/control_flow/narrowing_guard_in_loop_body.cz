@@ -1,0 +1,31 @@
+// @backends: all
+// A guard narrows the rest of its own block. Inside a loop body that is the
+// rest of the iteration (a `break` or `continue` guard included); after the
+// loop a fresh guard makes the variable usable again.
+fun pick(b: bool) -> string? {
+    if b { return "hello" }
+    return null
+}
+fun main() {
+    let x = pick(true)
+    let i = 0
+    while i < 2 {
+        if !x { return }
+        println(x.len())
+        i = i + 1
+    }
+    if !x { return }
+    println(x.len())
+    for n in ["ab", "cde", "fg"] {
+        let y = pick(n.len() == 2)
+        if !y { continue }
+        println("{n}: {y.len()}")
+    }
+    let z = pick(true)
+    while true {
+        if !z { break }
+        println(z.len())
+        z = null
+    }
+    println(z)
+}

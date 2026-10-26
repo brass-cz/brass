@@ -1,0 +1,28 @@
+// @backends: all
+// `typeof` in value position names the same type the type position means:
+// a `const`-bound bracket literal is a fixed-length array (`int32[2]`), so it
+// reports `int32[2]` -- directly, and through a generic parameter it reaches
+// -- exactly as `let y: typeof(c)` declares an `int32[2]`. A `let`-bound
+// literal stays a growable `int32[]`.
+const c = [1, 2]
+println(typeof(c))
+let d = [1, 2]
+println(typeof(d))
+let x: int32[3] = [1, 2, 3]
+println(typeof(x))
+
+fun name(v) {
+    return typeof(v)
+}
+println(name(c))
+println(name(d))
+
+let y: typeof(c) = [5, 6]
+println(typeof(y))
+println(y)
+const wide = [1, 5000000000]
+println(typeof(wide))
+for v in c {
+    println(v)
+}
+println(c.len())

@@ -1,0 +1,44 @@
+// @backends: all
+// A `type A = R` alias of a record names the record in a record literal and
+// in a structural conversion `A.from(v)`. Through a refinement alias
+// (`type Box64 = Box { item: int64 }`) the literal and the conversion are
+// built at the alias's instance: a pinned field takes the pinned type, so a
+// literal value adapts to it, the same as when the literal flows into a slot
+// annotated with the alias (`let b: Box64 = { item: 3 }`) or written with the
+// record's own name (`let c: Box64 = Box { item: 4 }`).
+type Point = { x: int32, y: int32 }
+type P2 = Point
+type Box = { item }
+type Box64 = Box { item: int64 }
+type SBox = Box { item: string }
+
+fun Point.sum(self) -> int32 {
+    return self.x + self.y
+}
+
+fun main() {
+    let p = P2 { x: 1, y: 2 }
+    println(p.sum())
+    println(typeof(p))
+    let w = Box64 { item: 3 }
+    println(w.item + 5000000000)
+    let b: Box64 = { item: 3 }
+    println(b.item + 5000000000)
+    let c: Box64 = Box { item: 4 }
+    println(c.item + 5000000000)
+    if let q = P2.from({ x: 3, y: 4, z: 5 }) {
+        println(q.sum())
+    }
+    if let r = Box64.from({ item: 7 }) {
+        println(r.item + 5000000000)
+    }
+    let small: int32 = 9
+    if let r = Box64.from({ item: small }) {
+        println(r.item + 5000000000)
+    }
+    if let s = SBox.from({ item: 1 }) {
+        println(s)
+    } else {
+        println("an int32 is no string")
+    }
+}

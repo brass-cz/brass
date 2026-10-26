@@ -4,6 +4,8 @@
 //! plus argument checking against signatures, arity validation, and
 //! re-attribution of argument errors to the call site.
 
+mod constructs;
+
 use super::*;
 
 /// A record type declaring the method a structural (anonymous) receiver asked
@@ -23,6 +25,13 @@ struct StructuralMethodType {
 }
 
 impl<'a> Checker<'a> {
+    /// Type the call `callee(args)` at `span` and return its result type. A
+    /// bare name resolves in this order: the language constructs,
+    /// a builtin the call reaches, a bound value, a free function
+    /// visible here (its body re-elaborated at the arguments). `recv.m(..)`
+    /// resolves as a static call when `recv` names a type, else as a method,
+    /// stdlib primitive method or function-typed field of the receiver's
+    /// type. Any other callee is applied as a function value.
     pub(super) fn check_call(
         &mut self,
         callee: &Expr,
@@ -30,92 +39,39 @@ impl<'a> Checker<'a> {
         span: brass_parser::Span,
         scopes: &mut ScopeStack,
     ) -> Type {
+        if !self.numeric_enabled {
+            return self.check_call_inner(callee, args, span, scopes);
+        }
+        let saved = self.numeric.result.take();
+        if self.numeric.active {
+            self.numeric.calls.push(span);
+        }
+        let ty = self.check_call_inner(callee, args, span, scopes);
+        let origin = self.numeric.result.take();
+        if self.numeric.active {
+            self.numeric.calls.pop();
+        }
+        self.numeric.result = origin;
+        self.note_numeric_call(span);
+        self.numeric.result = saved;
+        ty
+    }
+
+    fn check_call_inner(
+        &mut self,
+        callee: &Expr,
+        args: &[Arg],
+        span: Span,
+        scopes: &mut ScopeStack,
+    ) -> Type {
         // Consume the caller's expectation (a keyed `-> infer!` method reads it);
         // taking it here keeps an argument's own calls from reusing it.
         let call_expected = self.call_expected.take();
         if let Expr::Ident(name, _) = callee {
-            if name == "fields" {
-                self.errors.push(TypeError {
-                    message: "`fields(..)` is a compile-time construct, usable only as a \
-                              `for` loop iterable"
-                        .to_string(),
-                    span,
-                });
-                return self.fresh_unknown();
-            }
-            // `typeof(x)` in value position: a compile-time string constant, the
-            // source name of x's static type (the same construct also names a
-            // type in type/receiver position; see resolve_annotation and
-            // static_qualifier). Only the argument is checked here: the name
-            // itself is derived per monomorphic instance by the back ends
-            // (`Rvalue::TypeName`), never recorded by span -- a generic body is
-            // re-checked once per instantiation at the same span, and a
-            // span-keyed name would leak the last instance's answer into all.
-            if name == "typeof" {
-                if args.len() != 1 {
-                    self.errors.push(TypeError {
-                        message: format!("`typeof` takes 1 argument, found {}", args.len()),
-                        span,
-                    });
-                }
-                for a in args {
-                    self.check_expr(&a.expr, scopes);
-                }
-                return Type::Str;
-            }
-            // `error(x)` executes the ordinary prelude function, but its TYPE
-            // is special-cased so the fully-known result can be seeded: the
-            // Ok payload comes from the call's required position (nothing in
-            // the expression itself can constrain it -- see the prelude's
-            // `-> infer!`), and the Err payload is the prelude `Error` record
-            // wrapping the argument's type, mirroring what the body builds.
-            // `error` is a reserved callee name: a local binding (a match's
-            // `Err { error }` payload) never shadows it in call position.
-            if name == "error" {
-                let signature_params = self
-                    .lookup_function(name)
-                    .map(|info| info.signature.params.clone());
-                let value_ty = if let Some(params) = signature_params {
-                    // The specialized result construction below changes only the
-                    // return type. The ordinary signature still owns arity and the
-                    // explicit trailing Location argument's type.
-                    self.check_arg_count_range(name, &params, args.len(), span);
-                    self.check_signature_args_collect(&params, args, scopes)
-                        .into_iter()
-                        .next()
-                        .unwrap_or(Type::Void)
-                } else {
-                    // A program without the prelude has no resolved signature;
-                    // keep the legacy raw-payload fallback for embedders.
-                    let value_ty = args
-                        .first()
-                        .map(|a| self.check_expr(&a.expr, scopes))
-                        .unwrap_or(Type::Void);
-                    for a in args.iter().skip(1) {
-                        self.check_expr(&a.expr, scopes);
-                    }
-                    value_ty
-                };
-                // A program without the prelude (unit tests, embedders) keeps
-                // the legacy raw payload.
-                let err_ty = match self.program.prelude_type("Error") {
-                    Some(err_info) => {
-                        let mut err = NominalType::new(err_info.id, &err_info.name);
-                        err.substitution.insert("value", self.resolve(&value_ty));
-                        Type::Record(err)
-                    }
-                    None => self.resolve(&value_ty),
-                };
-                let ok_ty = call_expected
-                    .as_ref()
-                    .and_then(|want| {
-                        self.resolve(want)
-                            .result_payloads()
-                            .map(|(ok, _)| ok.clone())
-                    })
-                    .filter(brass_hir::is_fully_known)
-                    .unwrap_or_else(|| self.fresh_unknown());
-                return Type::result(ok_ty, err_ty);
+            if let Some(ret) =
+                self.check_construct_call(name, args, span, scopes, call_expected.as_ref())
+            {
+                return ret;
             }
             if let Some(ret) = self.builtin_function_type(name, args, span, scopes) {
                 return ret;
@@ -123,12 +79,33 @@ impl<'a> Checker<'a> {
             // A local binding (e.g. a closure parameter) shadows a same-named
             // global function, matching codegen's resolution order.
             if let Some(local) = self.lookup(scopes, name) {
+                // A generalized closure is applied at its own instance.
+                let local = self.instantiate_closure_scheme(local);
                 // Record the callee's type so hover can recover it. Applying it
                 // below constrains an unknown callee to a function type, and the
                 // final zonking pass then resolves this recorded type through it,
                 // so `fun apply(f, x) { f(x) }` shows `f` as `(U) -> V`.
-                self.record_expr_type(callee, &local);
-                let ret = self.check_callable_value(local, args, span, scopes);
+                let closure_body = match &local {
+                    Type::Fun(params, ret) if self.numeric_enabled => {
+                        self.saved_closure_body(params, ret)
+                    }
+                    _ => None,
+                };
+                let ret = self.check_callable_value(name, local.clone(), args, span, scopes);
+                if let Some(body) = closure_body
+                    && let Expr::Closure(_, body, _) = &body.expr
+                {
+                    self.record_numeric_call(
+                        callee.span(),
+                        self.numeric_layout_for(body.span()),
+                        self.current_instance(),
+                    );
+                }
+                let effective = match self.resolve(&local) {
+                    Type::Fun(params, _) => Type::Fun(params, Box::new(ret.clone())),
+                    other => other,
+                };
+                self.record_expr_type(callee, &effective);
                 self.invalidate_narrowed_after_call(scopes);
                 return ret;
             }
@@ -136,7 +113,7 @@ impl<'a> Checker<'a> {
             // function defined in another, non-imported module is invisible and
             // falls through to the unknown-name path below. The
             // lookup is module-aware so a name defined in several modules
-            // resolves to this module's own or imported definition (R2).
+            // resolves to this module's own or imported definition.
             if let Some(info) = self.lookup_function(name) {
                 let decl = info.decl.clone();
                 let signature_params = info.signature.params.clone();
@@ -152,29 +129,37 @@ impl<'a> Checker<'a> {
                 // An ANONYMOUS structural argument to a row-covered eligible
                 // parameter is checked against the callee's derived row HERE, at
                 // the value's own span: presence of every Required field and its
-                // Forced type. This replaces the body re-elaboration as the error
+                // Forced type. This, not the body re-elaboration, is the error
                 // source for these arguments -- on a row failure the body is not
                 // re-elaborated at all (the call is already known bad; interior
                 // spans would only duplicate the value-site report). A clean row
                 // check records the argument span so lowering may convert the
-                // argument into the parameter's view.
-                if !self.check_args_against_rows(name, &symbol, args, &arg_types) {
+                // argument into the parameter's view, and the body below is
+                // elaborated at that view: the back ends compile the callee for
+                // the view, so the checker must see exactly its field types.
+                let Some(elaboration_types) =
+                    self.check_args_against_rows(name, &symbol, args, &arg_types)
+                else {
                     self.invalidate_narrowed_after_call(scopes);
                     return fallback_ret;
-                }
+                };
                 // The lazy profile types a call from the signature alone when
                 // re-elaborating the body could not tell it more (see
                 // `Checker::lazy_profile`): the entry's gate then costs the
                 // entry's own body, not its call tree. Never for a callee
                 // that can reach a keyed (`-> infer!`) call -- that call must
-                // be SEEN by this pass, or its later discovery would restart
-                // the analysis after execution began.
+                // be SEEN here, or it could first be reported after execution
+                // began, too late to specialize (see `Checker::keyed_tainted`).
                 //
                 // Only for a callee that GETS a dedicated pass and is fully
                 // annotated: such a body is instantiation-independent and its
                 // own pass records its channels. A SEEDED (context) body has
                 // no dedicated pass -- this call-site elaboration is a source
                 // of its channel entries -- so seeded calls keep elaborating.
+                // A record argument of another declaration than its
+                // parameter's annotation (structural subtyping) instantiates
+                // the callee at the argument's type, so that body is checked
+                // here at it.
                 let skip_elaboration = self.lazy_profile
                     && !self.keyed_tainted.contains(&symbol)
                     && !self.seeded_module(&module)
@@ -183,6 +168,11 @@ impl<'a> Checker<'a> {
                         p.resolved_ty
                             .as_ref()
                             .is_some_and(|t| brass_hir::is_fully_known(brass_hir::peel_modes(t)))
+                    })
+                    && signature_params.iter().zip(&arg_types).all(|(p, arg)| {
+                        p.resolved_ty
+                            .as_ref()
+                            .is_none_or(|t| !self.param_instance_follows_argument(t, arg))
                     });
                 if skip_elaboration {
                     self.invalidate_narrowed_after_call(scopes);
@@ -196,7 +186,7 @@ impl<'a> Checker<'a> {
                     &decl.body,
                     declared_ret,
                     fallback_ret,
-                    &arg_types,
+                    &elaboration_types,
                     span,
                 );
                 // A body re-elaboration failure caused by an ANONYMOUS argument
@@ -226,7 +216,6 @@ impl<'a> Checker<'a> {
                         );
                     }
                 }
-                self.recheck_closure_args(args, &arg_types, scopes);
                 // User code ran conceptually: a narrowed global (or a local a
                 // closure of this body assigns) may have been re-nulled.
                 self.invalidate_narrowed_after_call(scopes);
@@ -234,9 +223,10 @@ impl<'a> Checker<'a> {
             }
             // The callee is a bare identifier that is not `error`, a builtin, a
             // local value, or a known free function. A runtime builtin (e.g.
-            // `println` when the stdlib is not loaded) still defers below; any
-            // other name is undeclared and reported here rather than collapsing
-            // to a fresh unknown.
+            // `println` when the stdlib is not loaded) or a type word falls
+            // through to the callee-value path below; any other name is
+            // undeclared and reported here rather than collapsing to a fresh
+            // unknown.
             if !self.is_resolvable_free_name(name) && !self.is_type_word(name) {
                 // A function that exists but is not visible here gets a
                 // pointed hint: an import for a public name; privacy for a
@@ -261,7 +251,32 @@ impl<'a> Checker<'a> {
         if let Expr::Field(base, method, _) = callee
             && !callee.span().is_parenthesized()
         {
-            if let Some(qualifier) = self.static_qualifier(base, scopes) {
+            if let Expr::Call(c, _, tspan) = &**base
+                && matches!(&**c, Expr::Ident(n, _) if n == "typeof")
+            {
+                self.check_construct_binding("typeof", *tspan, scopes);
+            }
+            // `typeof(<compound>).method(..)` -- a literal, a call, an element
+            // read: the operand is typed (and runs for its effects) and its
+            // static type is the receiver, exactly as for `typeof(v)`.
+            if let Expr::Call(c, cargs, tspan) = &**base
+                && matches!(&**c, Expr::Ident(n, _) if n == "typeof")
+                && let [operand] = cargs.as_slice()
+                && !matches!(operand.expr, Expr::Ident(..) | Expr::SelfExpr(_))
+            {
+                let operand_ty = self.check_expr(&operand.expr, scopes);
+                if let Some(qualifier) = self.type_qualifier(&operand_ty) {
+                    self.record_type_name(*tspan, qualifier.clone());
+                    let ret = self.check_static_call(&qualifier, method, args, span, scopes);
+                    self.invalidate_narrowed_after_call(scopes);
+                    return ret;
+                }
+                for a in args {
+                    self.check_expr(&a.expr, scopes);
+                }
+                return self.fresh_unknown();
+            }
+            if let Some(qualifier) = self.static_call_qualifier(base, method, scopes) {
                 // A `typeof(v)` qualifier resolves to v's type NAME; record it at
                 // the inner `typeof(v)` span so MIR routes the static call. The
                 // channel is keyed by span while MIR shares one body across a
@@ -294,8 +309,21 @@ impl<'a> Checker<'a> {
                 self.invalidate_narrowed_after_call(scopes);
                 return ret;
             }
+            // `typeof(v).method(..)` whose `v` is still open (a generic body's
+            // definitional pass) names no type yet; every instance resolves
+            // the static call at its own type. It is not a method call on the
+            // type-name string `typeof(v)` decays to elsewhere.
+            if let Expr::Call(c, cargs, _) = &**base
+                && matches!(&**c, Expr::Ident(n, _) if n == "typeof")
+            {
+                for a in cargs.iter().chain(args) {
+                    self.check_expr(&a.expr, scopes);
+                }
+                return self.fresh_unknown();
+            }
             let recv_ty = self.check_expr(base, scopes);
             let resolved_receiver = self.resolve(&recv_ty);
+            self.check_const_method_call(span, method, &resolved_receiver);
             self.record_typed(
                 brass_hir::TypedExprKind::MethodReceiver,
                 span,
@@ -303,6 +331,7 @@ impl<'a> Checker<'a> {
                 Constness::Unknown,
             );
             if let Some(ret) = self.builtin_method_type(&recv_ty, method, args, scopes, span) {
+                self.record_call_kind(span, None);
                 return ret;
             }
             if let Type::Nullable(_) = self.resolve_head(&recv_ty) {
@@ -313,6 +342,7 @@ impl<'a> Checker<'a> {
             // driver generates a concrete specialization per key (this call is
             // rewritten to it). The template body is not elaborated here.
             if let Some(methods) = self.methods_for_type(&recv_ty, method) {
+                self.record_call_kind(span, None);
                 if methods
                     .first()
                     .is_some_and(|m| brass_hir::keyed_return(m.method.ret.as_ref()))
@@ -335,12 +365,13 @@ impl<'a> Checker<'a> {
             if let Some(ret) =
                 self.check_primitive_method_call(&recv_ty, method, args, span, scopes)
             {
+                self.record_call_kind(span, None);
                 // Stdlib primitive methods are user-defined Brass code.
                 self.invalidate_narrowed_after_call(scopes);
                 return ret;
             }
             // The missing-method diagnostics below look through mode wrappers so
-            // a `ref(mut(T))` receiver reports against `T` instead of deferring.
+            // a `ref(mut(T))` receiver is reported against `T`.
             let peeled_recv = brass_hir::peel_modes(&self.resolve(&recv_ty)).clone();
             if let Type::Record(record) = &peeled_recv {
                 // A function-typed FIELD is callable through the same syntax (a
@@ -370,6 +401,9 @@ impl<'a> Checker<'a> {
                                 )
                         })
                     {
+                        // Provided by a method of the receiver's concrete type:
+                        // dispatched as a method call.
+                        self.record_call_kind(span, None);
                         let (params, ret) = (params.clone(), (**ret).clone());
                         self.record_expr_type(callee, &fty);
                         for (a, want) in args.iter().zip(params[1..].iter()) {
@@ -379,8 +413,20 @@ impl<'a> Checker<'a> {
                         return ret;
                     }
                     if matches!(resolved, Type::Fun(..) | Type::Unknown(_)) {
+                        // The receiver's identity as a type-test pattern: its
+                        // nominal (any instance), or for an anonymous record
+                        // any record with this field.
+                        let pattern = if record.id == brass_hir::STRUCTURAL_RECORD_ID {
+                            brass_hir::structural_record(vec![(
+                                method.to_string(),
+                                Type::Unknown(brass_hir::INFER_VAR),
+                            )])
+                        } else {
+                            Type::Record(NominalType::new(record.id, record.name()))
+                        };
+                        self.record_call_kind(span, Some(pattern));
                         self.record_expr_type(callee, &fty);
-                        let ret = self.apply_callable(fty, args, span, scopes);
+                        let ret = self.apply_callable(Some(method), fty, args, span, scopes);
                         self.invalidate_narrowed_after_call(scopes);
                         return ret;
                     }
@@ -483,11 +529,10 @@ impl<'a> Checker<'a> {
                 }
                 return self.fresh_unknown();
             }
-            // A primitive receiver has a fully known type with no user methods,
-            // so an unresolved call is a static error rather than deferred
-            // structural dispatch (shape constraints).
+            // A known receiver head determines method availability even when
+            // its element or parameter types are still open.
             let resolved = peeled_recv;
-            if is_concrete_primitive(&resolved) {
+            if !matches!(resolved, Type::Unknown(_)) {
                 self.errors.push(TypeError {
                     message: format!("`{}` has no method `{method}`", resolved.display()),
                     span,
@@ -497,11 +542,12 @@ impl<'a> Checker<'a> {
                 }
                 return self.fresh_unknown();
             }
-            // Otherwise the member resolves at runtime (builtin methods, or
-            // deferred structural dispatch). If the receiver is an unknown
-            // inference variable, record that it must expose this method so a
-            // closure like `(x) -> x.speak()` rejects an `int32` argument at
-            // its call site. Evaluate the args and defer.
+            // No method resolves on this receiver here. An open receiver (an
+            // inference variable) names no type yet: each instantiation of a
+            // generic body re-elaborates the call at its concrete receiver, and
+            // a `HasMethod` shape is recorded so a closure like
+            // `(x) -> x.speak()` rejects an `int32` argument at its
+            // application. The arguments are checked; the result stays open.
             if let Type::Unknown(_) = resolved {
                 self.record_shape(&recv_ty, ShapeConstraint::HasMethod(method.to_string()));
             }
@@ -516,11 +562,7 @@ impl<'a> Checker<'a> {
             let is_method = if let Some(qualifier) = self.static_qualifier(base, scopes) {
                 self.method_for_qualifier(&qualifier, method).is_some()
                     || self.primitive_static_type(&qualifier, method).is_some()
-                    || (method == "from"
-                        && self
-                            .program
-                            .resolve_type(&self.current_module, &qualifier)
-                            .is_some_and(|info| matches!(info.kind, TypeKind::Record { .. })))
+                    || (method == "from" && self.record_head_id(&qualifier).is_some())
             } else {
                 let recv_ty = self.check_expr(base, scopes);
                 let resolved = self.resolve(&recv_ty);
@@ -547,7 +589,11 @@ impl<'a> Checker<'a> {
             }
         }
         let callee_ty = self.check_expr(callee, scopes);
-        let ret = self.apply_callable(callee_ty, args, span, scopes);
+        let name = match callee {
+            Expr::Ident(name, _) => Some(name.as_str()),
+            _ => None,
+        };
+        let ret = self.apply_callable(name, callee_ty, args, span, scopes);
         self.invalidate_narrowed_after_call(scopes);
         ret
     }
@@ -601,7 +647,7 @@ impl<'a> Checker<'a> {
         if let Some(first) = signature_params.first()
             && let Some(want) = param_expected_type(first)
         {
-            self.expect_assignable(recv_ty, want, span);
+            self.expect_assignable_at(recv_ty, want, span, FlowSite::Parameter);
         }
         let mut arg_types = vec![recv_ty.clone()];
         if signature_params.len() > 1 {
@@ -615,7 +661,7 @@ impl<'a> Checker<'a> {
                 arg_types.push(self.check_expr(&a.expr, scopes));
             }
         }
-        let ret = self.instantiate_function_call(
+        self.instantiate_function_call(
             &func.symbol,
             &func.module,
             signature_params,
@@ -624,133 +670,22 @@ impl<'a> Checker<'a> {
             fallback_ret,
             &arg_types,
             span,
-        );
-        self.recheck_closure_args(args, &arg_types[1..], scopes);
-        ret
+        )
     }
 
-    /// Re-check each closure literal argument at the parameter types its
-    /// application was observed to instantiate (see `record_closure_binding`),
-    /// run right after the callee-body elaboration that produced the
-    /// observations.
-    ///
-    /// The first check of such a closure ran with its parameters OPEN (the
-    /// callee's parameter is unannotated), so everything derived from a
-    /// parameter -- `v.group(1)` in `xs.map((v) -> v.group(1))` -- took the
-    /// deferred-dispatch path: it was typed as an unconstrained unknown and
-    /// recorded NOTHING in the span channels MIR lowers from (a `!` on such an
-    /// operand has no null-vs-Result kind). This pass is where a closure body
-    /// under a generic callee is finally typed at concrete types: it records
-    /// the sidecar entries hover and completion read, fills the propagation
-    /// channels for the body's spans (conflicting instantiations poison them,
-    /// the same rule shared generic bodies already follow), and reports the
-    /// concrete-type errors the deferred pass could not see (duplicates
-    /// collapse in the final sort+dedup).
-    ///
-    /// The unifications stay local: the solver is rolled back (recorded types
-    /// were resolved at record time), so the closure value the callee received
-    /// keeps its generic type -- like the other speculative passes, which is
-    /// also why the elaboration memo stays off inside (`closure_recheck_depth`
-    /// in `memo_enabled`). The concrete result is harvested before the
-    /// rollback and fed back as an observation on the closure's RETURN
-    /// variables, so the enclosing call's own result (`xs.map(..) : R[]`)
-    /// resolves for display too.
-    fn recheck_closure_args(&mut self, args: &[Arg], arg_types: &[Type], scopes: &mut ScopeStack) {
-        // The depth bound cuts pathological closure-in-closure nesting; real
-        // code is one or two levels.
-        if self.closure_recheck_depth >= 4 {
-            return;
-        }
-        for (arg, ty) in args.iter().zip(arg_types) {
-            if !matches!(arg.expr, Expr::Closure(..)) {
-                continue;
-            }
-            let Type::Fun(params, ret) = self.resolve_head(ty) else {
-                continue;
-            };
-            if params.is_empty() {
-                continue;
-            }
-            // Every parameter must be concrete after applying the
-            // observations, and at least one must come FROM an observation --
-            // otherwise the first check already typed the body concretely and
-            // there is nothing to recover.
-            let mut observed_any = false;
-            let mut want_params = Vec::with_capacity(params.len());
-            let mut usable = true;
-            for p in &params {
-                let resolved = self.resolve(p);
-                if brass_hir::is_fully_known(&resolved) {
-                    want_params.push(resolved);
-                    continue;
-                }
-                match resolved {
-                    Type::Unknown(id) => match self.closure_bindings.get(&id) {
-                        Some(Some(t)) => {
-                            observed_any = true;
-                            want_params.push(t.clone());
-                        }
-                        _ => {
-                            usable = false;
-                            break;
-                        }
-                    },
-                    _ => {
-                        usable = false;
-                        break;
-                    }
-                }
-            }
-            if !usable || !observed_any {
-                continue;
-            }
-            let snapshot = self.solver.snapshot();
-            self.closure_recheck_depth += 1;
-            let want_ret = self.fresh_unknown();
-            let want = Type::Fun(want_params, Box::new(want_ret));
-            let got = self.check_expr_against(&arg.expr, &want, scopes);
-            // Harvest the concrete return before the rollback discards the
-            // re-check's bindings, and record it against the ORIGINAL return
-            // variables. Sidecar entries recorded during the re-check keep
-            // their types: they were resolved at record time.
-            let mut harvested: Vec<(u32, Type)> = Vec::new();
-            if let Type::Fun(_, got_ret) = self.resolve_head(&got) {
-                let got_ret = self.resolve(&got_ret);
-                let mut subst = Subst::new();
-                let _ = subst.unify(&ret, &got_ret);
-                for id in brass_hir::type_vars(&ret) {
-                    let observed = subst.resolve_deep(&Type::Unknown(id));
-                    if observed != Type::Unknown(id) {
-                        harvested.push((id, self.resolve(&observed)));
-                    }
-                }
-            }
-            self.closure_recheck_depth -= 1;
-            self.solver.rollback(snapshot);
-            for (id, observed) in harvested {
-                self.record_closure_binding(id, &observed);
-            }
-        }
-    }
-
-    /// Type-check a call whose callee is a value (closure/function value).
+    /// Type-check a call whose callee is a value (closure/function value)
+    /// bound to the local `name`.
     fn check_callable_value(
         &mut self,
+        name: &str,
         callee_ty: Type,
         args: &[Arg],
         span: brass_parser::Span,
         scopes: &mut ScopeStack,
     ) -> Type {
-        self.apply_callable(callee_ty, args, span, scopes)
+        self.apply_callable(Some(name), callee_ty, args, span, scopes)
     }
 
-    /// Given a resolved callee type, check argument compatibility for `Fun`
-    /// types and yield the call's result type. Each argument is checked exactly
-    /// once here.
-    /// Type a resolved method call (the shared tail of nominal and structural
-    /// method resolution): check the signature/arity/arguments, re-elaborate
-    /// each candidate body, and produce the call's result type. Body errors are
-    /// re-attributed to `reattribute_to` when given (a structural receiver's
     /// Type a reflective `-> infer!` method call. The result is the caller's
     /// expectation (unwrapped from a `Result`/nullable), wrapped as `key!`; the
     /// (receiver, method, key) triple is recorded so the driver generates the
@@ -800,6 +735,10 @@ impl<'a> Checker<'a> {
         Type::result(key, err)
     }
 
+    /// Type a resolved method call (the shared tail of nominal and structural
+    /// method resolution): check the signature/arity/arguments, re-elaborate
+    /// each candidate body, and produce the call's result type. Body errors are
+    /// re-attributed to `reattribute_to` when given (a structural receiver's
     /// value span), else to the call site for a foreign-module method.
     #[allow(clippy::too_many_arguments)]
     fn check_methods_call(
@@ -835,15 +774,19 @@ impl<'a> Checker<'a> {
         // The types this receiver instance pins each parameter to (its scheme):
         // a witness-free `string -> int64` map's `set` value is `int64`. Checking
         // arguments against these lets a bare literal take the pinned width.
-        let scheme_params = if skip_self {
-            self.scheme_method_param_types(recv_ty, method)
+        let (scheme_params, pinned) = if skip_self {
+            (
+                self.scheme_method_param_types(recv_ty, method),
+                self.scheme_method_param_pinned(recv_ty, method),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let arg_types = self.check_signature_args_collect_expected(
             &signature_params,
             args,
             &scheme_params,
+            &pinned,
             scopes,
         );
         // A method defined in another module (e.g. the stdlib) is checked by
@@ -859,6 +802,17 @@ impl<'a> Checker<'a> {
             .get(&methods[0].self_type)
             .is_some_and(|t| t.module != self.current_module);
         let before = self.errors.len();
+        // A body with a type test decides per instance which of its paths are
+        // live -- and so what it returns, and whether it can fail at all --
+        // while the scheme comes from the definitional pass, which keeps
+        // every arm.
+        let decided_per_instance = methods.iter().any(|resolved| {
+            resolved
+                .method
+                .body
+                .as_ref()
+                .is_some_and(super::precompute::block_has_type_test)
+        });
         let mut returns = Vec::with_capacity(methods.len());
         for resolved in methods {
             let declared_ret = resolved.signature.ret_ty.clone();
@@ -895,7 +849,6 @@ impl<'a> Checker<'a> {
                 self.reattribute_errors_to_call(before, method, span);
             }
         }
-        self.recheck_closure_args(args, &arg_types, scopes);
         // The method body ran conceptually: undo narrowings it may have
         // invalidated (see `invalidate_narrowed_after_call`).
         self.invalidate_narrowed_after_call(scopes);
@@ -906,6 +859,12 @@ impl<'a> Checker<'a> {
         // unify onto a scheme parameter, so a `map.get(1)` clash is caught
         // there, not by the scheme. The re-elaborated return is the
         // fallback when the scheme cannot resolve the result.
+        if decided_per_instance
+            && let Some(ret) = self.common_type_list(&returns)
+            && brass_hir::is_fully_known(&self.resolve(&ret))
+        {
+            return ret;
+        }
         if let Some(ret) = self.scheme_method_return(recv_ty, method) {
             return ret;
         }
@@ -964,7 +923,7 @@ impl<'a> Checker<'a> {
     /// fields the structural (anonymous) instance `record` satisfies. A type
     /// the module never imported must not capture an anonymous value, even
     /// when the shape matches: the author has not named it here.
-    fn structural_method_candidates(
+    pub(super) fn structural_method_candidates(
         &mut self,
         record: &NominalType,
         method: &str,
@@ -1040,8 +999,13 @@ impl<'a> Checker<'a> {
         )
     }
 
+    /// Apply a callable value of type `callee_ty` to `args`: check argument
+    /// compatibility for a `Fun` type and yield the call's result type. Each
+    /// argument is checked exactly once here. `callee` names the value for
+    /// diagnostics when it is a plain name.
     fn apply_callable(
         &mut self,
+        callee: Option<&str>,
         callee_ty: Type,
         args: &[Arg],
         span: brass_parser::Span,
@@ -1050,17 +1014,21 @@ impl<'a> Checker<'a> {
         match self.resolve_head(&callee_ty) {
             Type::Fun(params, ret) => {
                 self.check_arg_count("<closure>", params.len(), args.len(), span);
-                // Instantiate the (possibly polymorphic) callable for this call
-                // site: unify each concrete argument into the parameter type,
-                // then resolve the declared return type through that local
-                // substitution. This recovers the result of an unannotated
-                // closure such as `(x) -> x` applied to `int32` as `int32`
-                // instead of an unconstrained unknown, so a later
-                // `let s: string = f(1)` is correctly rejected.
-                let mut subst = Subst::new();
+                self.check_read_only_value_args(span, &params);
+                // A function value is monomorphic: each argument is checked
+                // against its parameter type and an open parameter is
+                // committed to the argument in the solver, so this
+                // application fixes the closure's type and every other
+                // application must agree with it (a `let` binding's numeric
+                // parameter may already be fixed at the join of its direct
+                // applications, see `closure_applications`). A generalized
+                // closure binding reaches here already instantiated for this
+                // one use (`instantiate_closure_scheme`), so committing its
+                // fresh variables pins nothing another use sees.
                 for (idx, arg) in args.iter().enumerate() {
                     if let Some(param) = params.get(idx) {
                         let mut expected = self.resolve(param);
+                        let open = !brass_hir::is_fully_known(&expected);
                         if matches!(arg.expr, Expr::Array(..))
                             && matches!(expected, Type::Array(..) | Type::Slice(..))
                             && !brass_hir::is_fully_known(&expected)
@@ -1072,43 +1040,27 @@ impl<'a> Checker<'a> {
                             expected = self.instantiate_annotated_type(&expected, &actual);
                         }
                         let got = self.check_expr_against(&arg.expr, &expected, scopes);
-                        let _ = subst.unify(param, &got);
-                        // Calling through a CONCRETE parameter type pins an open
-                        // argument variable persistently: `(x) -> g(x)` with
-                        // `g: (int32) -> int32` fixes `x = int32`, so the
-                        // enclosing closure's recorded type is concrete (a
-                        // closure stored into an unannotated record field takes
-                        // its instance type from this). A parameter still
-                        // carrying its own inference variables stays local-only:
-                        // pinning through it would defeat let-polymorphism.
-                        if self.solver.free_vars(param).is_empty()
-                            && matches!(self.resolve_head(&got), Type::Unknown(_))
-                        {
-                            let _ = self.solver.unify(&got, param);
+                        if self.reject_void_argument(&got, arg.expr.span()) {
+                            continue;
                         }
                         // Verify any structural constraints the closure body
-                        // recorded on this parameter (e.g. `(x) -> x + 1`
-                        // requires a numeric argument) now that the concrete
-                        // argument type is known.
+                        // recorded on this still-open parameter (e.g. `(x) ->
+                        // x + 1` requires a numeric argument) against the
+                        // argument, then commit the parameter to it.
                         self.verify_shape_constraints(param, &got, arg.expr.span());
+                        if open {
+                            let _ = self.solver.unify(param, &got);
+                        }
                     } else {
                         self.check_expr(&arg.expr, scopes);
                     }
                 }
-                self.check_callable_body(&params, &ret, &subst);
-                // Remember what this application instantiated the callable's
-                // open parameter variables to. The instantiation stays in the
-                // LOCAL substitution above, so the sidecar entries mentioning
-                // those variables (the closure's type, its parameter's uses)
-                // would render as `unknown` forever; the observation lets the
-                // language server show the concrete type instead.
-                for id in params.iter().flat_map(brass_hir::type_vars) {
-                    let observed = subst.resolve_deep(&Type::Unknown(id));
-                    if observed != Type::Unknown(id) {
-                        self.record_closure_binding(id, &observed);
-                    }
-                }
-                self.resolve(&subst.resolve_deep(&ret))
+                let observed = self.check_callable_body(&params, &ret);
+                // The generic return type may not express what this
+                // application returns (`(q) -> q.b` on a record): the body
+                // checked at the argument types answers then.
+                let result = self.resolve(&ret);
+                observed.unwrap_or(result)
             }
             // Calling a value of still-unknown type constrains it to a function:
             // unify it with `(arg types...) -> fresh_ret`. This is the application
@@ -1116,17 +1068,44 @@ impl<'a> Checker<'a> {
             // infers `f: (unknown) -> unknown` (and `apply` as
             // `((U) -> V, U) -> V`), letting a function argument type-check and
             // monomorphize instead of leaving `f` an uncallable unknown.
-            callee @ Type::Unknown(_) => {
+            callee_var @ Type::Unknown(id) => {
+                // A function named as a value whose trailing parameters are
+                // optional takes the arity of this application.
+                if let Some(ret) = self.apply_function_value(id, args, span, scopes) {
+                    return ret;
+                }
                 let arg_types: Vec<Type> = args
                     .iter()
-                    .map(|arg| self.check_expr(&arg.expr, scopes))
+                    .map(|arg| {
+                        let got = self.check_expr(&arg.expr, scopes);
+                        if self.reject_void_argument(&got, arg.expr.span()) {
+                            self.fresh_unknown()
+                        } else {
+                            got
+                        }
+                    })
                     .collect();
                 let ret = self.fresh_unknown();
                 let fun_ty = Type::Fun(arg_types, Box::new(ret.clone()));
-                let _ = self.solver.unify(&callee, &fun_ty);
+                // A value passed to itself (`x(x)`) would need a type that
+                // contains itself; the solver refuses the binding, and the
+                // call is reported rather than left as an uncallable unknown
+                // the back ends cannot type.
+                if self.solver.occurs(id, &fun_ty) {
+                    self.errors.push(TypeError {
+                        message: helpers::infinite_application_message(callee),
+                        span,
+                    });
+                } else {
+                    let _ = self.solver.unify(&callee_var, &fun_ty);
+                }
                 ret
             }
-            _ => {
+            resolved => {
+                self.errors.push(TypeError {
+                    message: format!("cannot call a value of type `{}`", resolved.display()),
+                    span,
+                });
                 for arg in args {
                     self.check_expr(&arg.expr, scopes);
                 }
@@ -1143,7 +1122,9 @@ impl<'a> Checker<'a> {
         span: brass_parser::Span,
         scopes: &mut ScopeStack,
     ) -> Type {
-        // `T.from(v)`: a *fallible* structural conversion to record type `T`. The
+        // `T.from(v)`: a *fallible* structural conversion to record type `T`,
+        // unless `T` declares a static `from`, which shadows it and is called
+        // below like any static method (see `conversion_target`). The
         // result is `T?` for an argument of ANY type: whether `v` actually has
         // every field `T` declares is decided per monomorphized argument type
         // (the conversion yields the record when the concrete argument has the
@@ -1154,35 +1135,30 @@ impl<'a> Checker<'a> {
         // Accepting a non-record argument is what lets ONE function take a value
         // of several types and decide per instance: `if let p = Path.from(x) {..}`
         // reads as "when this is a Path", and answers null when `x` is a string.
-        // Rejecting it (as this once did, on the ground that the conversion could
-        // only ever produce null) made that idiom impossible to write.
-        if method == "from" {
-            let target = self
-                .program
-                .resolve_type(&self.current_module, qualifier)
-                .and_then(|info| match &info.kind {
-                    TypeKind::Record { .. } => Some(info.type_ref()),
-                    _ => None,
-                });
-            if let Some(ty) = target {
-                // Every argument is still type-checked (an undeclared name in a
-                // trailing argument must surface) -- but no argument TYPE is
-                // required: any value may be offered to the conversion. The arity
-                // is exactly one.
-                for arg in args {
-                    self.check_expr(&arg.expr, scopes);
+        if method == "from"
+            && let Some((ty, target_fields)) = self.conversion_target(qualifier)
+        {
+            // Every argument is still type-checked (an undeclared name in a
+            // trailing argument must surface) -- but no argument TYPE is
+            // required: any value may be offered to the conversion. The arity
+            // is exactly one.
+            for arg in args {
+                match &arg.expr {
+                    Expr::TypeLit(name, fields, _) if name.is_empty() => {
+                        self.check_from_source_literal(&arg.expr, fields, &target_fields, scopes);
+                    }
+                    other => {
+                        self.check_expr(other, scopes);
+                    }
                 }
-                if args.len() != 1 {
-                    self.errors.push(TypeError {
-                        message: format!(
-                            "`{qualifier}.from` takes 1 argument, found {}",
-                            args.len()
-                        ),
-                        span,
-                    });
-                }
-                return Type::Nullable(Box::new(ty));
             }
+            if args.len() != 1 {
+                self.errors.push(TypeError {
+                    message: format!("`{qualifier}.from` takes 1 argument, found {}", args.len()),
+                    span,
+                });
+            }
+            return Type::Nullable(Box::new(ty));
         }
         if let Some(ret) = self.primitive_static_call(qualifier, method, args, scopes) {
             return ret;
@@ -1220,11 +1196,10 @@ impl<'a> Checker<'a> {
         });
         // Nothing resolved the call: not a record/sum method (through the
         // qualifier or a type alias of it), not a primitive static, not a
-        // structural `from`. Deferring silently left the result an open
-        // unknown -- `check` stayed green and the back end failed at run time
-        // with an unrelated-looking lowering error -- so report it here. An
-        // empty qualifier is `Self` outside any type; the resolution error is
-        // reported elsewhere.
+        // structural `from`. An open result would let `check` pass and the
+        // back end fail with an unrelated-looking lowering error, so report it
+        // here. An empty qualifier is `Self` outside any type; the resolution
+        // error is reported elsewhere.
         if !qualifier.is_empty() {
             self.errors.push(TypeError {
                 message: format!("`{qualifier}` has no static method `{method}`"),
@@ -1234,70 +1209,6 @@ impl<'a> Checker<'a> {
         self.fresh_unknown()
     }
 
-    fn primitive_static_call(
-        &mut self,
-        tname: &str,
-        method: &str,
-        args: &[Arg],
-        scopes: &mut ScopeStack,
-    ) -> Option<Type> {
-        let ret = self.primitive_static_type(tname, method)?;
-        let arg_types: Vec<Type> = args
-            .iter()
-            .map(|a| self.check_expr(&a.expr, scopes))
-            .collect();
-        self.check_numeric_conversion_args(tname, method, &arg_types, args);
-        Some(ret)
-    }
-
-    /// Constrain the source type of the numeric conversions:
-    /// `intN.from`/`floatN.from` take a numeric value and `intN.parse`/
-    /// `floatN.parse` take a string. Without this, `float64.from("abc")` would
-    /// type-check and silently produce `0.0` at runtime. `string.from` accepts
-    /// any value, so it is intentionally not constrained. Unknown arguments are
-    /// deferred to the runtime.
-    fn check_numeric_conversion_args(
-        &mut self,
-        tname: &str,
-        method: &str,
-        arg_types: &[Type],
-        args: &[Arg],
-    ) {
-        let numeric_target =
-            IntKind::from_name(tname).is_some() || matches!(tname, "float32" | "float64");
-        if !numeric_target {
-            return;
-        }
-        let (Some(arg_ty), Some(arg)) = (arg_types.first(), args.first()) else {
-            return;
-        };
-        let resolved = self.resolve(arg_ty);
-        if resolved.is_unknown() {
-            return;
-        }
-        match method {
-            "parse" if !matches!(resolved, Type::Str) => {
-                self.errors.push(TypeError {
-                    message: format!(
-                        "`{tname}.parse` expects a string, found `{}`",
-                        resolved.display()
-                    ),
-                    span: arg.expr.span(),
-                });
-            }
-            "from" if !matches!(resolved, Type::Int(_) | Type::Float(_)) => {
-                self.errors.push(TypeError {
-                    message: format!(
-                        "`{tname}.from` expects a numeric value, found `{}`",
-                        resolved.display()
-                    ),
-                    span: arg.expr.span(),
-                });
-            }
-            _ => {}
-        }
-    }
-
     /// Check every anonymous structural argument of a free-function call
     /// against the callee parameter's derived row (see
     /// `brass_typesys::rows`): a Required field must be present with a type
@@ -1305,18 +1216,22 @@ impl<'a> Checker<'a> {
     /// (they degrade to null in the view). Errors land on the argument's own
     /// span -- the value is where the mismatch lives, not the callee body.
     ///
-    /// Returns `false` when a row rejected an argument (the caller skips the
+    /// Returns `None` when a row rejected an argument (the caller skips the
     /// body re-elaboration: it would only restate the failure at interior
     /// spans). On success, each checked argument to a view-ELIGIBLE parameter
-    /// is recorded in `view_args` for MIR lowering's view conversion.
+    /// is recorded in `view_args` for MIR lowering's view conversion, and the
+    /// returned argument types carry its view (`brass_typesys::view_type`) in
+    /// place of the argument's own type -- the type the callee body is
+    /// elaborated, and compiled, at.
     fn check_args_against_rows(
         &mut self,
         name: &str,
         symbol: &str,
         args: &[Arg],
         arg_types: &[Type],
-    ) -> bool {
+    ) -> Option<Vec<Type>> {
         let mut ok = true;
+        let mut elaboration_types = arg_types.to_vec();
         for (idx, arg) in args.iter().enumerate() {
             let Some(arg_ty) = arg_types.get(idx) else {
                 continue;
@@ -1345,6 +1260,9 @@ impl<'a> Checker<'a> {
             let issues = brass_typesys::check_row(&row, &fields);
             if issues.is_empty() {
                 self.record_view_arg(arg.expr.span());
+                if let Ok(view) = brass_typesys::view_type(&row, n) {
+                    elaboration_types[idx] = view;
+                }
             } else {
                 ok = false;
                 for issue in issues {
@@ -1355,7 +1273,31 @@ impl<'a> Checker<'a> {
                 }
             }
         }
-        ok
+        ok.then_some(elaboration_types)
+    }
+
+    /// Elaborate the prelude `error` body at one call's argument types, as
+    /// any call elaborates its callee: the call's TYPE is special-cased (see
+    /// `check_call`), but the body still runs per instance, and its
+    /// constructions must be observed per instance like any generic body's.
+    /// Otherwise the lazy pipeline, which checks a demanded body once at the
+    /// first instance it is asked for, would publish that instance's
+    /// construction types as every instance's (an `error(n)` with an `int32`
+    /// payload building an `Error` of the first call's `string`).
+    fn elaborate_error_body(&mut self, params: &[ParamInfo], arg_types: &[Type], span: Span) {
+        let Some(info) = self.lookup_function("error") else {
+            return;
+        };
+        let (symbol, module, body, declared) = (
+            info.symbol.clone(),
+            info.module.clone(),
+            info.decl.body.clone(),
+            info.signature.ret_ty.clone(),
+        );
+        let fallback = self.fresh_unknown();
+        self.instantiate_function_call(
+            &symbol, &module, params, &body, declared, fallback, arg_types, span,
+        );
     }
 
     fn check_signature_args_collect(
@@ -1364,7 +1306,7 @@ impl<'a> Checker<'a> {
         args: &[Arg],
         scopes: &mut ScopeStack,
     ) -> Vec<Type> {
-        self.check_signature_args_collect_expected(params, args, &[], scopes)
+        self.check_signature_args_collect_expected(params, args, &[], &[], scopes)
     }
 
     /// Check a call's arguments, preferring the receiver-instantiated parameter
@@ -1374,25 +1316,68 @@ impl<'a> Checker<'a> {
     /// `string -> int64` map is checked against `int64` (so it types as int64
     /// rather than defaulting to int32), and an int32 argument widens at the
     /// call boundary.
+    ///
+    /// An argument is a parameter flow (the callee is instantiated at its own
+    /// type), except where `pinned` marks the receiver instance as fixing the
+    /// parameter's type: the method stores that argument in the receiver's
+    /// own slots (a map's key or value), so it is checked as storage.
     fn check_signature_args_collect_expected(
         &mut self,
         params: &[ParamInfo],
         args: &[Arg],
         scheme_params: &[Option<Type>],
+        pinned: &[bool],
         scopes: &mut ScopeStack,
     ) -> Vec<Type> {
         let mut arg_types = Vec::with_capacity(args.len());
+        let mut origins = Vec::new();
         for (idx, arg) in args.iter().enumerate() {
-            let want = scheme_params
-                .get(idx)
-                .and_then(|o| o.as_ref())
-                .or_else(|| params.get(idx).and_then(param_expected_type));
+            let scheme_want = scheme_params.get(idx).and_then(|o| o.as_ref());
+            let site = if scheme_want.is_some() && pinned.get(idx).copied().unwrap_or(false) {
+                FlowSite::Storage
+            } else {
+                FlowSite::Parameter
+            };
+            let want = scheme_want.or_else(|| params.get(idx).and_then(param_expected_type));
             let got = if let Some(want) = want.cloned() {
-                self.check_expr_against(&arg.expr, &want, scopes)
+                self.check_expr_against_at(&arg.expr, &want, site, scopes)
             } else {
                 self.check_expr(&arg.expr, scopes)
             };
+            // A rejected `void` argument instantiates the callee open rather
+            // than at `void`, so its body does not report the same mistake
+            // again from inside.
+            let got = if self.reject_void_argument(&got, arg.expr.span()) {
+                self.fresh_unknown()
+            } else {
+                got
+            };
+            let (got, origin) = if self.numeric.active && want.is_none() {
+                self.numeric_argument(&arg.expr, &got)
+            } else {
+                (got, None)
+            };
+            if self.numeric.probing {
+                origins.push(origin);
+            }
+            if self.numeric_enabled
+                && !self.numeric.active
+                && want.is_none()
+                && brass_typesys::NumericLiteral::of_expr(&arg.expr).is_some()
+            {
+                self.record_typed(
+                    brass_hir::TypedExprKind::NumericArgument,
+                    arg.expr.span(),
+                    got.clone(),
+                    Constness::Unknown,
+                );
+            }
             arg_types.push(got);
+        }
+        if self.numeric.probing {
+            self.numeric
+                .arguments
+                .insert(self.numeric.calls.clone(), origins);
         }
         // A call may omit a trailing `Location` parameter (MIR fills it with
         // the call site); complete the collected types so the callee still
@@ -1406,6 +1391,25 @@ impl<'a> Checker<'a> {
             arg_types.push(loc);
         }
         arg_types
+    }
+
+    /// Reject an argument whose value is `void`. A parameter binds a name,
+    /// and a `void` call result has no value to bind -- exactly as `let y =
+    /// f()` is rejected -- so the call it comes from is a mistake (classically
+    /// a block-bodied closure or function without an explicit `return`).
+    /// Returns whether the argument was rejected.
+    fn reject_void_argument(&mut self, got: &Type, span: brass_parser::Span) -> bool {
+        let void = matches!(self.resolve(got), Type::Void);
+        if void {
+            self.errors.push(TypeError {
+                message: "cannot pass a `void` value as an argument: a parameter binds a \
+                          name, and the call it comes from returns no value (a block-bodied \
+                          closure or function returns `void` without an explicit `return`)"
+                    .to_string(),
+                span,
+            });
+        }
+        void
     }
 
     /// The prelude `Location` record instance a filled implicit argument has.
@@ -1478,7 +1482,18 @@ impl<'a> Checker<'a> {
         span: brass_parser::Span,
     ) {
         let min = required_arg_count(self.program, params);
-        let max = params.len();
+        self.check_arg_count_range_counts(name, min, params.len(), got, span);
+    }
+
+    /// Report `got` arguments outside `min..=max` for the callable `name`.
+    pub(super) fn check_arg_count_range_counts(
+        &mut self,
+        name: &str,
+        min: usize,
+        max: usize,
+        got: usize,
+        span: brass_parser::Span,
+    ) {
         if got < min || got > max {
             let want = if min == max {
                 format!("{max}")

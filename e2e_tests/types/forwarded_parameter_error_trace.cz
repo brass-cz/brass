@@ -1,0 +1,6 @@
+// @backends: all
+// An entry-point failure renders the location of the forwarding return expression.
+fun forward(r) -> int32! {
+    return r
+}
+forward(int32.parse("zz"))!

@@ -1,0 +1,62 @@
+// @backends: all
+// A function or method PARAMETER admits structural subtyping: the callee is
+// instantiated at the argument's own type, so a record with more fields than
+// the annotation requires is accepted as it is -- annotated or not, through
+// an unannotated forwarder, as an anonymous record, through a nullable
+// parameter (instantiated at the nullable argument), and for a protocol
+// record type satisfied by methods.
+type Animal = { name: string }
+type Dog = { age: int32, name: string }
+type Point = { x: int64, y: int64 }
+type P3 = { z: float64, x: int64, y: int64 }
+type Temp = { celsius: float64 }
+
+fun Temp.display(self) -> string {
+    return "{self.celsius}C"
+}
+
+fun describe(a: Animal) -> string {
+    return "animal {a.name}"
+}
+
+fun loose(a) -> string {
+    return "loose {a.name}"
+}
+
+fun forward(v) -> string {
+    return describe(v)
+}
+
+fun sum(p: Point) -> int64 {
+    return p.x + p.y
+}
+
+fun maybe(a: Animal?) -> string {
+    if let x = a {
+        return x.name
+    }
+    return "nobody"
+}
+
+fun Dog.greet(self, other: Animal) -> string {
+    return "{self.name} greets {other.name}"
+}
+
+fun show(item: Display) -> string {
+    return item.display()
+}
+
+fun main() {
+    let d = Dog { age: 3, name: "rex" }
+    println(describe(d))
+    println(loose(d))
+    println(forward(d))
+    println(describe({ name: "anon", legs: 4 }))
+    println(maybe(d))
+    let none: Dog? = null
+    println(maybe(none))
+    println(d.greet(Dog { age: 1, name: "fido" }))
+    println(sum(P3 { z: 0.5, x: 1, y: 2 }))
+    println(show(Temp { celsius: 1.5 }))
+    println(show(42))
+}

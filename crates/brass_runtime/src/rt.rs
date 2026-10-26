@@ -1,7 +1,7 @@
 //! Core heap object header shared with the typed JIT-compiled code. Every heap
 //! object is prefixed with a 16-byte `Header`; the typed back end lays out the
 //! object body itself (strings, arrays, records/sums, Result cells) and accesses
-//! the fields directly. The bump allocator that produces these objects lives in
+//! the fields directly. The allocator that produces these objects lives in
 //! `crate::mem`.
 
 // ----- integer / float tags -----

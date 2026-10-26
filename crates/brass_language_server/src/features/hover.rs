@@ -41,8 +41,7 @@ pub fn hover(doc: &Document, full: &FullAnalysis, pos: Position) -> Option<Hover
     }
 
     // The cursor on a method name in `recv.method(...)` shows the *method's* type
-    // (its signature), not the call's result type. (A method called through UFCS is
-    // a free function and is handled by the `resolve_function` path below.)
+    // (its signature), not the call's result type.
     if let Some(h) = method_hover(doc, full, local) {
         return Some(h);
     }
@@ -50,17 +49,17 @@ pub fn hover(doc: &Document, full: &FullAnalysis, pos: Position) -> Option<Hover
     // The cursor on the name in a method DECLARATION (`fun T.m(..)`). It must be
     // answered before the identifier paths below, which resolve a bare name
     // against the FREE functions: `http` declares both `fun HttpClient.request`
-    // and a free `request`, and the declaration showed the free one's signature
-    // and doc comment.
+    // and a free `request`, and the declaration must not show the free one's
+    // signature and doc comment.
     if let Some(h) = method_decl_hover(doc, full, local, global) {
         return Some(h);
     }
 
     // The cursor on the method name in a TYPE-qualified access (`HashMap.new()`,
     // `Alias.method(..)`). The receiver is a type name, not a value, so
-    // `method_hover` finds no receiver expression there and the position used to
-    // fall through to the enclosing call -- showing the call's RESULT type
-    // instead of the method's own signature.
+    // `method_hover` finds no receiver expression there; falling through to the
+    // enclosing call would show the call's RESULT type instead of the method's
+    // own signature.
     if let Some(h) = type_method_hover(doc, full, local) {
         return Some(h);
     }
@@ -270,8 +269,8 @@ fn value_hover(full: &FullAnalysis, name: &str, ty: &Type, range: Option<Range>)
 /// Hover for the method name in `recv.method(...)`: the method's signature (its
 /// type). Returns `None` unless the cursor sits on an identifier immediately
 /// preceded by `.` whose receiver resolves to a record type declaring that method,
-/// so plain fields, UFCS free functions, and built-in methods fall through to the
-/// general hover paths. The return slot is filled from the enclosing call's
+/// so plain fields and built-in methods fall through to the general hover
+/// paths. The return slot is filled from the enclosing call's
 /// inferred result type when present, so an unannotated method return shows its
 /// concrete type rather than a bare `unknown_N`.
 fn method_hover(doc: &Document, full: &FullAnalysis, local: usize) -> Option<Hover> {
@@ -451,7 +450,16 @@ fn method_signature_hover(
         specialized
             .params
             .iter()
-            .map(|p| brass_hir::mutates_value(&full.program, module, body, &p.name, &mutation))
+            .map(|p| {
+                brass_hir::mutates_value(
+                    &full.program,
+                    module,
+                    &specialized.params,
+                    body,
+                    &p.name,
+                    &mutation,
+                )
+            })
             .collect()
     });
     let rendered = render_signature_into(

@@ -1,21 +1,27 @@
 //! HIR (AST-bearing) -> MIR lowering: building the type-independent CFG.
 //!
-//! [`lower_program`] walks a `brass_hir::Program` the same way codegen does
-//! (free functions, record/sum methods, module inits, nested closures) and
-//! produces a [`MirProgram`]. Each callable body becomes a [`MirBody`] via a
+//! [`lower_program_with_types`] walks a `brass_hir::Program` (free functions,
+//! record/sum methods, module inits, nested closures) and produces a
+//! [`MirProgram`]; the lazy pipeline lowers the same items on demand through
+//! [`SubsetLowering`]. Each callable body becomes a [`MirBody`] via a
 //! [`FnLower`], which keeps a [`BodyBuilder`] cursor plus the lexical scope and
 //! loop-target stacks needed to place branches.
 //!
-//! The lowering performs three jobs and no type work:
+//! The lowering performs three jobs and infers no types:
 //!  - control flow (`if`/`while`/`for`/`match`/`if let`/`&&`/`||`/`expr!`) is
 //!    decomposed into basic blocks (see [`stmt`]);
 //!  - expressions are flattened to three-address form, every value named by a
 //!    local (see [`expr`]);
-//!  - calls, places, and globals are resolved structurally, matching how the
-//!    AST-walking codegen routes them so a MIR-driven back end is a faithful
-//!    refactor.
+//!  - calls, places, and globals are resolved structurally, by name, scope and
+//!    declaration.
+//!
+//! Where a body's shape depends on a type decision (a seeded literal, a view
+//! argument, a sum-subtype rebuild, a nullable `!`), the lowering reads the
+//! checker's decision from its span-keyed channels ([`CheckerChannels`]).
 
+mod closure;
 mod expr;
+mod order;
 mod pattern;
 mod stmt;
 
@@ -33,10 +39,6 @@ use crate::cfg::MirBody;
 use crate::ids::{BlockId, ClosureId, LocalId};
 use crate::program::{MirClosure, MirFunction, MirInit, MirMethod, MirProgram};
 
-/// Shared, immutable-by-reference state for one lowering run. Interior
-/// mutability holds the growing closure table and the global closure-id counter,
-/// so deeply nested closure lowering can borrow this context immutably and still
-/// register the closures it discovers without a borrow conflict.
 /// The program-wide tables lowering derives from the HIR alone (no checker
 /// channels): computed once and shared across every `ProgramCtx`. The lazy
 /// pipeline builds a fresh context per lowered body -- and rebuilds the whole
@@ -48,13 +50,6 @@ pub struct LowerTables {
     /// them to count handing the parameter to a mutating position (a
     /// `m.set(..)` receiver) as a mutation, exactly like the const checker.
     mutation: brass_hir::MutationInfo,
-    /// Unit sum-variant names, used to tell a binding pattern (`x`) from a
-    /// complete unit-variant pattern (`Red`) during match lowering.
-    variant_names: fxhash::FxHashSet<String>,
-    /// Every sum-variant name, including payload variants. Record-pattern
-    /// lowering needs this wider set to emit the tag test and qualify payload
-    /// projections without treating the same name as a bare unit pattern.
-    record_variant_names: fxhash::FxHashSet<String>,
     /// Names each module's init binds as module-level globals (top-level
     /// `let`s), used to key global storage per defining module.
     module_globals: HashMap<Vec<String>, fxhash::FxHashSet<String>>,
@@ -62,25 +57,20 @@ pub struct LowerTables {
     /// `INT64_MAX` etc. are visible everywhere without an import). First
     /// definition in sorted module order wins, deterministically.
     prelude_globals: HashMap<String, Vec<String>>,
+    /// The binding spans of the program's generalized closure bindings
+    /// (`brass_hir::generalized_closure_bindings`, the checker's rule): each
+    /// use of such a binding builds its own closure value.
+    generalized: fxhash::FxHashSet<Span>,
+    /// The module-level generalized closure bindings, by global storage
+    /// symbol: their defining module, parameters and body. They have no
+    /// storage; every use, in any body, rebuilds the closure from these.
+    global_templates: HashMap<String, GlobalTemplate>,
 }
 
 impl LowerTables {
+    /// Derive the tables from `program`'s HIR (this runs the whole-program
+    /// mutation analysis).
     pub fn new(program: &Program) -> Self {
-        let mut variant_names = fxhash::FxHashSet::default();
-        let mut record_variant_names = fxhash::FxHashSet::default();
-        for info in program.types.values() {
-            if let TypeKind::Sum { variants } = &info.kind {
-                for v in &variants[..] {
-                    record_variant_names.insert(v.name.clone());
-                    // Only a unit variant is also a complete pattern by name.
-                    // Payload variants must remain ordinary bindings unless
-                    // their enclosing record pattern names the variant.
-                    if v.fields.is_empty() {
-                        variant_names.insert(v.name.clone());
-                    }
-                }
-            }
-        }
         let mut module_globals: HashMap<Vec<String>, fxhash::FxHashSet<String>> =
             HashMap::default();
         for init in &program.inits {
@@ -104,78 +94,73 @@ impl LowerTables {
                     .or_insert_with(|| path.clone());
             }
         }
+        let generalized = brass_hir::generalized_closure_bindings(program);
+        let mut global_templates = HashMap::default();
+        for init in &program.inits {
+            for s in &init.stmts {
+                if let brass_parser::ast::Stmt::Let {
+                    pat: brass_parser::ast::Pattern::Binding(name, None, span),
+                    value: Some(brass_parser::ast::Expr::Closure(params, body, _)),
+                    ..
+                } = s
+                    && generalized.contains(span)
+                {
+                    global_templates.insert(
+                        brass_hir::qualify(name, &init.path),
+                        (
+                            init.path.clone(),
+                            params.clone(),
+                            std::rc::Rc::new((**body).clone()),
+                        ),
+                    );
+                }
+            }
+        }
         LowerTables {
             mutation: brass_hir::MutationInfo::analyze(program),
-            variant_names,
-            record_variant_names,
             module_globals,
             prelude_globals,
+            generalized,
+            global_templates,
         }
     }
 }
 
+/// A module-level generalized closure binding: its defining module, its
+/// parameters and its body.
+type GlobalTemplate = (
+    Vec<String>,
+    Vec<Param>,
+    std::rc::Rc<brass_parser::ast::Expr>,
+);
+
+/// Shared, immutable-by-reference state for one lowering run. Interior
+/// mutability holds the growing closure table and the global closure-id counter,
+/// so deeply nested closure lowering can borrow this context immutably and still
+/// register the closures it discovers without a borrow conflict.
 pub(crate) struct ProgramCtx<'p> {
     program: &'p Program,
     /// The shared program-wide tables (see [`LowerTables`]).
     tables: &'p LowerTables,
-    /// Checker-resolved aggregate result types, keyed by source span. These
-    /// seed MIR locals whose representation cannot be reconstructed from their
-    /// operands. Empty without a checked program.
+    // The checker's channels, borrowed from [`CheckerChannels`]; each field
+    // is documented there under the same name.
     expr_types: &'p HashMap<Span, Type>,
-    /// Checker-resolved method receiver types, keyed by the enclosing call
-    /// span. Kept separate from result seeds so receiver evidence can never
-    /// force the representation of an unrelated MIR local.
+    instance_seeds: &'p brass_hir::InstanceChannel<Type>,
     receiver_types: &'p HashMap<Span, Type>,
-    /// Spans of free-call arguments the checker verified as anonymous
-    /// structural values fitting a view-ELIGIBLE callee parameter's row. Only
-    /// these arguments are wrapped in [`crate::Rvalue::RecordView`]; lowering
-    /// itself stays type-free -- the checker decided, this set is the channel.
-    /// Empty when lowering without a checked program, so no view is ever
-    /// emitted then (tests, deferred re-lowering keep full values).
+    receiver_owners: &'p HashMap<Span, Vec<Type>>,
     view_args: &'p fxhash::FxHashSet<Span>,
-    /// Value expressions the checker accepted as a declared sum subtype at a
-    /// flow site, keyed by the expression's span, mapped to the PARENT sum
-    /// instance the site required. Lowering rebuilds exactly these values as
-    /// the parent (per-variant tag test + reconstruction); the child's variant
-    /// payloads may be wider, so identity flow would misread the unboxed
-    /// layout. Empty when lowering without a checked program.
+    numeric_calls: &'p brass_hir::NumericCalls,
+    field_calls: &'p HashMap<Span, Option<Vec<Type>>>,
     sum_views: &'p HashMap<Span, Type>,
-    /// Source positions of every call expression (diagnostic label, 1-based
-    /// line/col), keyed by the call's span. A call that omits a callee's
-    /// trailing `Location` parameter is completed from this map; empty when
-    /// lowering without a checked program (the fill degrades to a placeholder).
     call_locations: &'p HashMap<Span, (String, u32, u32)>,
-    /// `expr!` sites whose propagated Err payload is re-raised wrapped into
-    /// the prelude `Error` (gaining the site's location); the propagation arm
-    /// rebuilds the value. Empty when lowering without a checked program.
     lift_errs: &'p fxhash::FxHashSet<Span>,
-    /// Field lists of `for f in fields(x)` loops, keyed by the loop statement's
-    /// span: the checker resolved the record type and checked one expanded copy
-    /// per field; lowering unrolls the same copies (`brass_hir::expand`).
-    /// Empty when lowering without a checked program -- a fields-loop reached
-    /// through deferred re-lowering is therefore unsupported.
     fields_loops: &'p HashMap<Span, Vec<String>>,
-    /// Resolved type names of `typeof(x)` calls, keyed by call span; each
-    /// such call lowers to this string constant.
     type_names: &'p HashMap<Span, String>,
-    /// Resolved binding types of `typeof`-bearing local annotations, keyed by
-    /// the annotation span; a `let x: typeof(v)` slot is seeded from this.
     typeof_types: &'p HashMap<Span, Type>,
-    /// Spans of `expr!` operators the checker resolved with a NULLABLE operand:
-    /// those lower to a presence test (`__present`/`__nonnull`) whose null arm
-    /// propagates `Result.Null`, instead of the `Result` tag-test shape. Empty
-    /// when lowering without a checked program (tests, deferred re-lowering),
-    /// where a nullable `!` is therefore unsupported.
     null_props: &'p fxhash::FxHashSet<Span>,
-    /// Resolved type-test patterns (`if v: T`), keyed by the test's span: the
-    /// annotation with `infer` holes pinned by the tested arm or left as
-    /// wildcards. Embedded into the test's `Rvalue::TypeTest` so the back ends
-    /// fold the branch per monomorphized instance. A missing entry (lowering
-    /// without a checked program, or a body no instantiation ever decided)
-    /// falls back to the syntactic annotation with every hole a wildcard.
     type_tests: &'p HashMap<Span, Type>,
-    /// Keyed call span -> concrete generated method name.
     keyed_dispatch: &'p HashMap<Span, String>,
+    instance_dispatch: &'p brass_hir::InstanceChannel<String>,
     closures: RefCell<Vec<MirClosure>>,
     next_closure: Cell<u32>,
 }
@@ -186,8 +171,12 @@ impl<'p> ProgramCtx<'p> {
             program,
             tables,
             expr_types: channels.expr_types,
+            instance_seeds: channels.instance_seeds,
             receiver_types: channels.receiver_types,
+            receiver_owners: channels.receiver_owners,
             view_args: channels.view_args,
+            numeric_calls: channels.numeric_calls,
+            field_calls: channels.field_calls,
             sum_views: channels.sum_views,
             call_locations: channels.call_locations,
             lift_errs: channels.lift_errs,
@@ -197,6 +186,7 @@ impl<'p> ProgramCtx<'p> {
             null_props: channels.null_props,
             type_tests: channels.type_tests,
             keyed_dispatch: channels.keyed_dispatch,
+            instance_dispatch: channels.instance_dispatch,
             closures: RefCell::new(Vec::new()),
             next_closure: Cell::new(0),
         }
@@ -262,11 +252,15 @@ impl<'p> ProgramCtx<'p> {
         concrete.then(|| info.type_ref())
     }
 
-    /// The source position of the call at `span`, or a placeholder when
-    /// lowering without a checked program (tests, deferred re-lowering).
+    /// The source position of the call (or `!`, or construction) at `span`,
+    /// or a placeholder when lowering without a checked program (unit
+    /// tests). A span inside a compiler-made copy of source
+    /// code -- an unrolled `fields` loop, a reflective specialization -- is
+    /// located at the position it was copied from.
     fn call_location(&self, span: Span) -> (String, u32, u32) {
         self.call_locations
             .get(&span)
+            .or_else(|| self.call_locations.get(&span.source_span()))
             .cloned()
             .unwrap_or_else(|| ("<unknown>".to_string(), 0, 0))
     }
@@ -308,7 +302,13 @@ impl<'p> ProgramCtx<'p> {
     /// receiver's checker type is keyed by its source span, so an unrelated
     /// same-named method elsewhere cannot suppress completion.
     fn instance_call_defaults(&self, call: Span, method: &str) -> Option<Vec<CallDefault>> {
-        let receiver_ty = brass_hir::peel_modes(self.receiver_types.get(&call)?);
+        self.owner_call_defaults(self.receiver_types.get(&call)?, method)
+    }
+
+    /// Defaults for instance method `method` declared on `owner` (a nominal
+    /// or a primitive receiver type).
+    fn owner_call_defaults(&self, owner: &Type, method: &str) -> Option<Vec<CallDefault>> {
+        let receiver_ty = brass_hir::peel_modes(owner);
         let params = match receiver_ty {
             Type::Record(n) => {
                 let info = self.program.type_by_id(n.id)?;
@@ -340,14 +340,32 @@ impl<'p> ProgramCtx<'p> {
         Some(call_defaults(self.program, params))
     }
 
-    /// The storage key of module-level global `name` as referenced from
-    /// `module`. Globals are keyed per *defining* module (`name@a/b`, like
-    /// function storage symbols), so two modules' same-named top-level `let`s
-    /// never share a slot. A name the referencing module does not define itself
-    /// resolves through its import origin, then through the stdlib prelude
-    /// (`INT64_MAX` and friends are visible without an import); an unresolved
-    /// name keys under the referencing module (the checker rejects genuinely
-    /// unknown names).
+    /// The owners of the method call at `call`, each with its signature's
+    /// omitted-argument defaults, when the call's instances resolve the
+    /// method on different owners (in the checker's order, most specific
+    /// first). `None` for a call with one owner, and for one reaching a
+    /// nullable receiver (the compiler-owned `context` hook), which has no
+    /// declared signature to complete from.
+    fn owner_defaults(
+        &self,
+        call: Span,
+        method: &str,
+    ) -> Option<Vec<(Type, Option<Vec<CallDefault>>)>> {
+        let owners = self.receiver_owners.get(&call)?;
+        if owners
+            .iter()
+            .any(|owner| matches!(owner, Type::Nullable(_)))
+        {
+            return None;
+        }
+        Some(
+            owners
+                .iter()
+                .map(|owner| (owner.clone(), self.owner_call_defaults(owner, method)))
+                .collect(),
+        )
+    }
+
     /// Whether `name` resolves to a module-level global visible from `module`
     /// (its own, an import origin's, or a stdlib prelude global) -- the same
     /// resolution [`Self::global_symbol`] keys storage by.
@@ -371,6 +389,14 @@ impl<'p> ProgramCtx<'p> {
             || self.tables.prelude_globals.contains_key(name)
     }
 
+    /// The storage key of module-level global `name` as referenced from
+    /// `module`. Globals are keyed per *defining* module (`name@a/b`, like
+    /// function storage symbols), so two modules' same-named top-level `let`s
+    /// never share a slot. A name the referencing module does not define itself
+    /// resolves through its import origin, then through the stdlib prelude
+    /// (`INT64_MAX` and friends are visible without an import); an unresolved
+    /// name keys under the referencing module (the checker rejects genuinely
+    /// unknown names).
     fn global_symbol(&self, module: &[String], name: &str) -> String {
         let defines = |m: &[String], n: &str| {
             self.tables
@@ -433,7 +459,7 @@ impl<'p> ProgramCtx<'p> {
 
     /// The type with nominal id `id`, if any.
     pub(crate) fn type_info_by_id(&self, id: i32) -> Option<&brass_hir::TypeInfo> {
-        self.program.types.values().find(|i| i.id == id)
+        self.program.type_by_id(id)
     }
 
     /// Allocate the next globally-unique closure id.
@@ -444,7 +470,7 @@ impl<'p> ProgramCtx<'p> {
     }
 
     /// Whether `name` denotes a type rather than a value: a user type, `Self`,
-    /// the builtin `File`, or a primitive type word. Mirrors codegen's
+    /// the builtin `File`, or a primitive type word. Mirrors the checker's
     /// `is_type_word` so `Type.method(...)` routes as a static call. A dotted
     /// marker (`alias.T`) and a renamed import (`import m.{ T as name }`)
     /// appear in no table under `name` and resolve through the module-aware
@@ -487,22 +513,19 @@ impl<'p> ProgramCtx<'p> {
         })
     }
 
-    /// The declared field names of record type `ty` (as seen from `module`), in
-    /// declaration order, or `None` if `ty` is not a record. Used to desugar
-    /// `T.from(v)` into a record built from `v`'s fields.
-    fn record_field_names(&self, module: &[String], ty: &str) -> Option<Vec<String>> {
-        let info = self.program.resolve_type_or_alias(module, ty)?;
-        match &info.kind {
-            TypeKind::Record { fields, .. } => {
-                Some(fields.iter().map(|f| f.name.clone()).collect())
-            }
-            _ => None,
-        }
+    /// Whether `ty.from(v)` (as seen from `module`) is the builtin structural
+    /// conversion, which lowers to a record built from `v`'s fields: `ty` is a
+    /// record declaring no static `from` of its own (see
+    /// [`brass_hir::TypeInfo::has_structural_from`]).
+    fn has_structural_from(&self, module: &[String], ty: &str) -> bool {
+        self.program
+            .resolve_type_or_alias(module, ty)
+            .is_some_and(brass_hir::TypeInfo::has_structural_from)
     }
 
     /// The dispatch key for a static call `ty.method(...)`: a user type's unique
     /// symbol (an alias qualifier dispatches on its target type), or the
-    /// primitive type word unchanged (matches codegen).
+    /// primitive type word unchanged.
     fn static_qualifier(&self, module: &[String], ty: &str) -> String {
         self.program
             .resolve_type_or_alias(module, ty)
@@ -517,8 +540,6 @@ impl<'p> ProgramCtx<'p> {
         self.program.resolve_fn_symbol(module, name)
     }
 
-    /// Per-parameter nullability of free function `name` as seen from `module`,
-    /// used to pad omitted trailing nullable arguments with `null` at call sites. `None` if `name` is not a known free function.
     /// The parameter count of free function `name` as seen from `module`, used to
     /// eta-expand a bare function-name value into a forwarding closure. `None` if
     /// `name` is not a known free function.
@@ -545,10 +566,26 @@ impl<'p> ProgramCtx<'p> {
 pub(crate) struct LoopFrame {
     pub(crate) cont: BlockId,
     pub(crate) brk: BlockId,
-    /// `Some((arr, idx, var))` when the body reassigns the `for` variable `var`:
-    /// its current value is stored back to `arr[idx]` before the iteration ends
-    /// (fall-through, `continue`, or `break` -- not just the fall-through tail).
-    pub(crate) writeback: Option<(LocalId, LocalId, String)>,
+    /// Present when the body reassigns the `for` variable: its current value
+    /// is stored back into the iterated element on every edge that ends the
+    /// iteration -- the fall-through tail, `continue`, `break`, `return`, and
+    /// a failed `!` returning from the callable.
+    pub(crate) writeback: Option<LoopWriteBack>,
+}
+
+/// A `for` loop's pending element write-back: the loop variable's binding is
+/// stored into `arr[idx]` when an iteration ends.
+#[derive(Clone, Copy)]
+pub(crate) struct LoopWriteBack {
+    /// The iterated array.
+    pub(crate) arr: LocalId,
+    /// The current element index.
+    pub(crate) idx: LocalId,
+    /// The loop variable's own binding. Held by slot rather than by name, so
+    /// a body `let` shadowing the variable cannot redirect the write-back.
+    pub(crate) var: LocalId,
+    /// Whether that binding is a heap-promoted cell (its value is element 0).
+    pub(crate) cell: bool,
 }
 
 /// Per-body lowering state.
@@ -556,6 +593,8 @@ pub(crate) struct FnLower<'a, 'p> {
     pub(crate) b: BodyBuilder,
     pub(crate) ctx: &'a ProgramCtx<'p>,
     pub(crate) module: Vec<String>,
+    /// Shared declaration facts for this body's fixed module.
+    patterns: std::cell::OnceCell<brass_hir::PatternScope<'p>>,
     pub(crate) self_type: Option<String>,
     /// Whether a failed `expr!` in this body ABORTS the program (printing the
     /// error and exiting non-zero) instead of returning the error `Result`
@@ -577,14 +616,17 @@ pub(crate) struct FnLower<'a, 'p> {
     pub(crate) cells: fxhash::FxHashSet<String>,
 }
 
-/// A name bound in a lexical scope: its local slot, plus whether this
-/// particular binding is a heap-promoted shared cell. Cell-ness is per
-/// binding, not per name -- a `let` shadowing a non-cell parameter of the same
-/// name may itself be a cell.
-#[derive(Clone, Copy)]
-struct ScopeBinding {
-    local: LocalId,
-    cell: bool,
+/// A name bound in a lexical scope.
+#[derive(Clone)]
+enum ScopeBinding {
+    /// A value in a local slot, plus whether this particular binding is a
+    /// heap-promoted shared cell. Cell-ness is per binding, not per name -- a
+    /// `let` shadowing a non-cell parameter of the same name may itself be a
+    /// cell.
+    Local { local: LocalId, cell: bool },
+    /// A generalized closure binding: no slot, every use builds its own
+    /// closure value (see [`closure`]).
+    Template(std::rc::Rc<closure::ClosureTemplate>),
 }
 
 impl<'a, 'p> FnLower<'a, 'p> {
@@ -592,6 +634,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
         FnLower {
             b: BodyBuilder::new(),
             ctx,
+            patterns: std::cell::OnceCell::new(),
             module,
             self_type,
             abort_error_prop: false,
@@ -607,7 +650,8 @@ impl<'a, 'p> FnLower<'a, 'p> {
     /// accessed through global storage rather than a cell local.
     pub(crate) fn is_cell(&self, name: &str) -> bool {
         match self.lookup_binding(name) {
-            Some(b) => b.cell,
+            Some(ScopeBinding::Local { cell, .. }) => cell,
+            Some(ScopeBinding::Template(_)) => false,
             None => self.cells.contains(name),
         }
     }
@@ -632,15 +676,50 @@ impl<'a, 'p> FnLower<'a, 'p> {
         self.scopes
             .last_mut()
             .expect("a scope is always open")
-            .insert(name.to_string(), ScopeBinding { local, cell });
+            .insert(name.to_string(), ScopeBinding::Local { local, cell });
     }
 
+    /// Bind `name` to a generalized closure binding's template in the
+    /// innermost scope.
+    fn bind_template(&mut self, name: &str, template: std::rc::Rc<closure::ClosureTemplate>) {
+        self.scopes
+            .last_mut()
+            .expect("a scope is always open")
+            .insert(name.to_string(), ScopeBinding::Template(template));
+    }
+
+    /// The local slot `name` is bound to, when it names a local value.
     pub(crate) fn lookup(&self, name: &str) -> Option<LocalId> {
-        self.lookup_binding(name).map(|b| b.local)
+        self.local_binding(name).map(|(local, _)| local)
+    }
+
+    /// The local slot `name` is bound to and whether it is a shared cell,
+    /// when it names a local value.
+    pub(crate) fn local_binding(&self, name: &str) -> Option<(LocalId, bool)> {
+        match self.lookup_binding(name)? {
+            ScopeBinding::Local { local, cell } => Some((local, cell)),
+            ScopeBinding::Template(_) => None,
+        }
+    }
+
+    /// The template `name` is bound to, when it names a generalized closure
+    /// binding.
+    fn lookup_template(&self, name: &str) -> Option<std::rc::Rc<closure::ClosureTemplate>> {
+        match self.lookup_binding(name)? {
+            ScopeBinding::Template(template) => Some(template),
+            ScopeBinding::Local { .. } => None,
+        }
+    }
+
+    /// Whether `name` is bound in a lexical scope at all (a local value or a
+    /// generalized closure binding), so it shadows any global, function or
+    /// type of the same name.
+    pub(crate) fn is_bound(&self, name: &str) -> bool {
+        self.lookup_binding(name).is_some()
     }
 
     fn lookup_binding(&self, name: &str) -> Option<ScopeBinding> {
-        self.scopes.iter().rev().find_map(|s| s.get(name).copied())
+        self.scopes.iter().rev().find_map(|s| s.get(name).cloned())
     }
 
     /// Create a freshly named local, copy `op` into it, and bind `name` to it.
@@ -728,6 +807,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
                     None => brass_hir::mutates_value(
                         self.ctx.program,
                         &self.module,
+                        params,
                         body,
                         &p.name,
                         &self.ctx.tables.mutation,
@@ -792,22 +872,11 @@ impl<'a, 'p> FnLower<'a, 'p> {
     }
 }
 
-/// Collect the global names a top-level `let` pattern binds, mirroring the
-/// binding forms `store_global_pattern` writes (a bare name, or an array
-/// pattern destructured element-wise).
+/// Collect the global names a top-level `let` pattern binds: every name the
+/// pattern binds, exactly as the local form would (see `store_global_pattern`).
+/// A top-level pattern is irrefutable, so no name in it is a variant test.
 fn collect_global_names(pat: &brass_parser::ast::Pattern, out: &mut fxhash::FxHashSet<String>) {
-    use brass_parser::ast::Pattern;
-    match pat {
-        Pattern::Binding(name, _, _) => {
-            out.insert(name.clone());
-        }
-        Pattern::Array(pats, _) => {
-            for p in pats {
-                collect_global_names(p, out);
-            }
-        }
-        Pattern::Record(..) | Pattern::Wildcard(_) | Pattern::Literal(..) => {}
-    }
+    out.extend(pat.bound_names().into_iter().map(str::to_string));
 }
 
 /// The binary operator a compound assignment folds through.
@@ -822,8 +891,8 @@ pub(crate) fn compound_op(op: AssignOp) -> BinOp {
     }
 }
 
-/// Lower a single callable body standalone, returning the body and any closures
-/// it spawned. Convenient for tests and for on-demand lowering of one callable;
+/// Lower a single callable body standalone, without checker channels,
+/// returning the body and any closures it spawned (for tests);
 /// [`lower_program`] keeps closure ids unique across the whole program instead.
 pub fn lower_body(
     program: &Program,
@@ -846,7 +915,10 @@ pub fn lower_body(
     let channels = CheckerChannels {
         expr_types: &no_types,
         receiver_types: &no_types,
+        receiver_owners: &HashMap::default(),
         view_args: &no_views,
+        numeric_calls: &HashMap::default(),
+        field_calls: &HashMap::default(),
         sum_views: &no_sum_views,
         call_locations: &no_call_locations,
         lift_errs: &no_lift_errs,
@@ -856,6 +928,9 @@ pub fn lower_body(
         null_props: &no_null_props,
         type_tests: &no_type_tests,
         keyed_dispatch: &HashMap::default(),
+        instance_seeds: &HashMap::default(),
+        instance_dispatch: &HashMap::default(),
+        instance_returns: &HashMap::default(),
     };
     let ctx = ProgramCtx::new(program, &tables, &channels);
     let body = lower_one(
@@ -871,7 +946,7 @@ pub fn lower_body(
     (body, closures)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum CallDefault {
     Required,
     Nullable,
@@ -915,16 +990,20 @@ fn lower_one(
     fl.b.finish(param_locals, BlockId(0))
 }
 
-/// Lower a whole program to MIR: every function, method, init body, and the
-/// closures they spawn. Item enumeration mirrors `codegen::gen_functions` /
-/// `gen_inits`, including the `Name@module` storage-symbol keys.
+/// Lower a whole program to MIR without checker channels: every function,
+/// method, init body, and the closures they spawn, each item under its
+/// `Name@module` storage-symbol key. For tests and other programs that never
+/// ran the checker; see [`lower_program_with_types`].
 pub fn lower_program(program: &Program) -> MirProgram {
     lower_program_with_types(
         program,
         &CheckerChannels {
             expr_types: &HashMap::default(),
             receiver_types: &HashMap::default(),
+            receiver_owners: &HashMap::default(),
             view_args: &fxhash::FxHashSet::default(),
+            numeric_calls: &HashMap::default(),
+            field_calls: &HashMap::default(),
             sum_views: &HashMap::default(),
             call_locations: &HashMap::default(),
             lift_errs: &fxhash::FxHashSet::default(),
@@ -934,6 +1013,9 @@ pub fn lower_program(program: &Program) -> MirProgram {
             null_props: &fxhash::FxHashSet::default(),
             type_tests: &HashMap::default(),
             keyed_dispatch: &HashMap::default(),
+            instance_seeds: &HashMap::default(),
+            instance_dispatch: &HashMap::default(),
+            instance_returns: &HashMap::default(),
         },
     )
 }
@@ -944,138 +1026,105 @@ pub fn lower_program(program: &Program) -> MirProgram {
 /// reordering or omitting a channel as the checker grows another output. The
 /// lazy pipeline can also re-borrow its changing channel state without
 /// rebuilding a positional argument list at every lowering boundary.
-pub struct CheckerChannels<'a> {
-    pub expr_types: &'a HashMap<Span, Type>,
-    pub receiver_types: &'a HashMap<Span, Type>,
-    pub view_args: &'a fxhash::FxHashSet<Span>,
-    pub sum_views: &'a HashMap<Span, Type>,
-    pub call_locations: &'a HashMap<Span, (String, u32, u32)>,
-    pub lift_errs: &'a fxhash::FxHashSet<Span>,
-    pub fields_loops: &'a HashMap<Span, Vec<String>>,
-    pub type_names: &'a HashMap<Span, String>,
-    pub typeof_types: &'a HashMap<Span, Type>,
-    pub null_props: &'a fxhash::FxHashSet<Span>,
-    pub type_tests: &'a HashMap<Span, Type>,
-    pub keyed_dispatch: &'a HashMap<Span, String>,
-}
-
-/// A partially lowered MIR program for the lazy pipeline. Methods and module
-/// initializers are lowered up front -- the checker settles every method body
-/// before its first body event, and execution runs every init -- while free
-/// functions are lowered one at a time as their checks stream in
-/// ([`SubsetLowering::add_function`]). Closure ids are allocated from one
-/// counter carried across calls, so a late body's closures never collide
-/// with an early one's.
 ///
-/// Constant-array promotion is NOT run: it is a whole-program
-/// interprocedural fixpoint (see [`crate::promote`]) and cannot run on a
-/// partial call graph, so the literals are constructed at their use sites,
-/// exactly as un-promoted code always is.
-pub struct SubsetLowering {
-    pub mir: MirProgram,
-    lowered: fxhash::FxHashSet<String>,
-    next_closure: u32,
+/// Every table is empty when lowering without a checked program (unit tests,
+/// [`lower_program`]); the constructs that need one (a fields-loop, a
+/// nullable `!`) are then unsupported, and a call-site `Location` degrades to
+/// a placeholder.
+pub struct CheckerChannels<'a> {
+    /// Checker-resolved expression types, keyed by source span, that every
+    /// instance of the enclosing body agrees on. They seed the MIR locals
+    /// whose type cannot be reconstructed from their operands: the result of
+    /// a call or a literal that builds an aggregate, a closure's function
+    /// type, a range's element type, and the numeric type a literal-branch
+    /// `if`/`match` joins at.
+    pub expr_types: &'a HashMap<Span, Type>,
+    /// Checker-resolved method receiver types, keyed by the enclosing call
+    /// span. Kept separate from result seeds so receiver evidence can never
+    /// force the representation of an unrelated MIR local; lowering completes
+    /// a method call's omitted trailing arguments from the receiver's method.
+    pub receiver_types: &'a HashMap<Span, Type>,
+    /// The method calls whose instances resolve the method on different
+    /// owners, with every owner. Their omitted trailing arguments are
+    /// completed per owner, behind a type test on the receiver that each
+    /// instance folds (see `FnLower::lower_method_call`).
+    pub receiver_owners: &'a HashMap<Span, Vec<Type>>,
+    /// Spans of free-call arguments the checker verified as anonymous
+    /// structural values fitting a view-ELIGIBLE callee parameter's row. Only
+    /// these arguments are wrapped in [`crate::Rvalue::RecordView`]; lowering
+    /// itself stays type-free -- the checker decided, this set is the channel.
+    pub view_args: &'a fxhash::FxHashSet<Span>,
+    /// Settled numeric call contracts, by call span and enclosing instance.
+    pub numeric_calls: &'a brass_hir::NumericCalls,
+    /// The `recv.name(..)` calls the checker resolved to calling the
+    /// function value a record field holds: `None` when every instantiation
+    /// does, else the type-test patterns of the receivers that do (the
+    /// others call a method). These lower to a field load and an indirect
+    /// call even when some type in the program declares a method of that
+    /// name.
+    pub field_calls: &'a HashMap<Span, Option<Vec<Type>>>,
+    /// Value expressions the checker accepted as a declared sum subtype at a
+    /// flow site, keyed by the expression's span, mapped to the PARENT sum
+    /// instance the site required. Lowering rebuilds exactly these values as
+    /// the parent (per-variant tag test + reconstruction); the child's variant
+    /// payloads may be wider, so identity flow would misread the unboxed
+    /// layout.
+    pub sum_views: &'a HashMap<Span, Type>,
+    /// Source positions of every call expression (diagnostic label, 1-based
+    /// line/col), keyed by the call's span. A call that omits a callee's
+    /// trailing `Location` parameter is completed from this map.
+    pub call_locations: &'a HashMap<Span, (String, u32, u32)>,
+    /// `expr!` sites whose propagated Err payload is re-raised wrapped into
+    /// the prelude `Error` (gaining the site's location); the propagation arm
+    /// rebuilds the value.
+    pub lift_errs: &'a fxhash::FxHashSet<Span>,
+    /// Field lists of `for f in fields(x)` loops, keyed by the loop statement's
+    /// span: the checker resolved the record type and checked one expanded copy
+    /// per field; lowering unrolls the same copies (`brass_hir::expand`).
+    pub fields_loops: &'a HashMap<Span, Vec<String>>,
+    /// Type names the checker resolved for expressions, keyed by span: a
+    /// `typeof(x)` call's static type (`typeof(x).method(..)` routes as a
+    /// static call on it), and the declared record an anonymous record
+    /// literal is built as (the literal lowers as a construction of that
+    /// record).
+    pub type_names: &'a HashMap<Span, String>,
+    /// Resolved binding types of `typeof`-bearing local annotations, keyed by
+    /// the annotation span; a `let x: typeof(v)` slot is seeded from this.
+    pub typeof_types: &'a HashMap<Span, Type>,
+    /// Spans of `expr!` operators the checker resolved with a NULLABLE
+    /// operand: those lower to a presence test (`__present`/`__nonnull`) whose
+    /// null arm returns `null` from the callable (or aborts at an entry
+    /// point), instead of the `Result` tag-test shape.
+    pub null_props: &'a fxhash::FxHashSet<Span>,
+    /// Resolved type-test patterns (`if v: T`), keyed by the test's span: the
+    /// annotation with `infer` holes pinned by the tested arm or left as
+    /// wildcards. Embedded into the test's `Rvalue::TypeTest` so each
+    /// monomorphized instance folds the branch. A missing entry (a body no
+    /// instantiation ever decided) falls back to the syntactic annotation
+    /// with every hole a wildcard.
+    pub type_tests: &'a HashMap<Span, Type>,
+    /// Keyed (`-> infer!`) call span -> the generated specialization it
+    /// dispatches to; for a call whose instances key it differently,
+    /// `instance_dispatch` decides per instance.
+    pub keyed_dispatch: &'a HashMap<Span, String>,
+    /// Per-instance aggregate seeds of the spans `expr_types` leaves unseeded
+    /// because their instances disagree; carried into
+    /// [`MirProgram::instance_seeds`].
+    pub instance_seeds: &'a brass_hir::InstanceChannel<Type>,
+    /// The per-instance dispatch of keyed calls whose instances key them
+    /// differently (lowered as [`crate::Callee::Keyed`]); carried into
+    /// [`MirProgram::instance_dispatch`].
+    pub instance_dispatch: &'a brass_hir::InstanceChannel<String>,
+    /// The checker's fully-known returns of unannotated function instances,
+    /// keyed by (function symbol, argument types); carried into
+    /// [`MirProgram::instance_returns`].
+    pub instance_returns: &'a HashMap<(String, Vec<Type>), Type>,
 }
 
-impl SubsetLowering {
-    /// Lower every method body and module initializer of `program` (with the
-    /// channel state current at call time); no free function is lowered yet.
-    /// `tables` are the shared HIR-derived tables ([`LowerTables`]), computed
-    /// once by the caller and reused across rebuilds.
-    pub fn new(program: &Program, tables: &LowerTables, channels: &CheckerChannels) -> Self {
-        let ctx = subset_ctx(program, tables, channels, 0);
-        let mut mir = MirProgram::default();
-        lower_methods_into(&ctx, &mut mir, program);
-        for init in &program.inits {
-            let body = lower_init(&ctx, init.path.clone(), &init.stmts);
-            mir.inits.push(MirInit {
-                module: init.path.clone(),
-                body,
-            });
-        }
-        let next_closure = ctx.next_closure.get();
-        let mut closures = ctx.closures.into_inner();
-        closures.sort_by_key(|c| c.id.0);
-        mir.closures = closures;
-        SubsetLowering {
-            mir,
-            lowered: fxhash::FxHashSet::default(),
-            next_closure,
-        }
-    }
-
-    /// Whether free function `symbol`'s body was already added on demand.
-    pub fn is_lowered(&self, symbol: &str) -> bool {
-        self.lowered.contains(symbol)
-    }
-
-    /// Lower free function `symbol`'s body into the program against the
-    /// CURRENT channel state. Returns `false` when `symbol` names no function
-    /// of `program` or was already lowered -- nothing was added, and a caller
-    /// looping on demand should treat a repeat as an unsatisfiable demand
-    /// rather than retry forever.
-    pub fn add_function(
-        &mut self,
-        program: &Program,
-        tables: &LowerTables,
-        symbol: &str,
-        channels: &CheckerChannels,
-    ) -> bool {
-        if self.lowered.contains(symbol) {
-            return false;
-        }
-        let Some(info) = program.functions.get(symbol) else {
-            return false;
-        };
-        let ctx = subset_ctx(program, tables, channels, self.next_closure);
-        lower_function_into(&ctx, &mut self.mir, info);
-        self.next_closure = ctx.next_closure.get();
-        let mut closures = ctx.closures.into_inner();
-        closures.sort_by_key(|c| c.id.0);
-        self.mir.closures.extend(closures);
-        self.lowered.insert(symbol.to_string());
-        true
-    }
-
-    /// Re-lower an already-added free function against revised checker
-    /// channels without rebuilding methods, initializers, or other functions.
-    /// Old closure entries stay unreachable; replacement closures receive new
-    /// ids from the shared counter and are appended to the program.
-    pub fn refresh_function(
-        &mut self,
-        program: &Program,
-        tables: &LowerTables,
-        symbol: &str,
-        channels: &CheckerChannels,
-    ) -> bool {
-        if !self.lowered.contains(symbol) {
-            return false;
-        }
-        let Some(info) = program.functions.get(symbol) else {
-            return false;
-        };
-        let Some(index) = self
-            .mir
-            .functions
-            .iter()
-            .position(|function| function.symbol == symbol)
-        else {
-            return false;
-        };
-        let ctx = subset_ctx(program, tables, channels, self.next_closure);
-        let mut replacement = MirProgram::default();
-        lower_function_into(&ctx, &mut replacement, info);
-        self.next_closure = ctx.next_closure.get();
-        let mut closures = ctx.closures.into_inner();
-        closures.sort_by_key(|closure| closure.id.0);
-        self.mir.closures.extend(closures);
-        self.mir.functions[index] = replacement
-            .functions
-            .pop()
-            .expect("one requested function was lowered");
-        true
-    }
-}
+mod region;
+mod subset;
+pub use region::LoweringRegion;
+pub use subset::SubsetLowering;
 
 /// A lowering context over the bundled channels, with the closure-id counter
 /// seeded so ids stay unique across separately lowered batches.
@@ -1107,6 +1156,11 @@ fn lower_function_into(ctx: &ProgramCtx, out: &mut MirProgram, info: &brass_hir:
         entry_main,
     );
     body.declared_fallible = info.decl.ret.as_ref().is_some_and(annotation_is_fallible);
+    body.declared_nullable_result = info
+        .decl
+        .ret
+        .as_ref()
+        .is_some_and(annotation_is_nullable_result);
     let fallible = if entry_main && info.decl.ret.is_none() {
         crate::analysis::constructs_error_block(&info.decl.body)
     } else {
@@ -1182,13 +1236,12 @@ fn lower_methods_into(ctx: &ProgramCtx, out: &mut MirProgram, program: &Program)
     }
 }
 
-/// Lower a whole program with the checker's outputs available: resolved
-/// expression types, so call results that construct an aggregate are seeded
-/// with their instance type (see [`ProgramCtx::expr_types`]); and the spans of
-/// view-convertible anonymous arguments (see [`ProgramCtx::view_args`]). The
-/// real execution paths pass the checker's data; [`lower_program`] is the
-/// inputs-free form used by tests and by runtime re-lowering, where the back
-/// end re-derives types on its own and keeps full argument values.
+/// Lower a whole program against the checker's outputs (`channels`, see
+/// [`CheckerChannels`]): every function, method and init body, and the
+/// closures they spawn, followed by constant-array promotion. The
+/// whole-program pipelines (`--eager`, the REPL interpreter) lower this way;
+/// the lazy pipeline uses [`SubsetLowering`], and [`lower_program`] is the
+/// channel-free form for tests.
 pub fn lower_program_with_types(program: &Program, channels: &CheckerChannels<'_>) -> MirProgram {
     let tables = LowerTables::new(program);
     let ctx = ProgramCtx::new(program, &tables, channels);
@@ -1213,8 +1266,12 @@ pub fn lower_program_with_types(program: &Program, channels: &CheckerChannels<'_
     let mut closures = ctx.closures.into_inner();
     closures.sort_by_key(|c| c.id.0);
     out.closures = closures;
+    out.instance_returns = channels.instance_returns.clone();
+    out.instance_seeds = channels.instance_seeds.clone();
+    out.instance_dispatch = channels.instance_dispatch.clone();
+    out.numeric_calls = channels.numeric_calls.clone();
     // Constant array literals whose value is only ever read become
-    // once-initialized globals (see [`crate::promote`]); running on the shared
+    // once-initialized globals (see the `promote` module); running on the shared
     // MIR keeps the JIT and the REPL interpreter behaviorally identical.
     crate::promote::promote_const_array_literals(&mut out);
     out
@@ -1240,6 +1297,7 @@ fn lower_method(
         false,
     );
     mir_body.declared_fallible = ret.is_some_and(annotation_is_fallible);
+    mir_body.declared_nullable_result = ret.is_some_and(annotation_is_nullable_result);
     MirMethod {
         type_name: info.name.clone(),
         type_symbol: info.symbol.clone(),
@@ -1249,10 +1307,9 @@ fn lower_method(
         module: info.module.clone(),
         // A method's fallibility follows exactly the same rule as a free
         // function's: a declared `-> T!` wraps plain returns in `Result.Ok` even
-        // when the body never builds an error itself. Judging a method by its body
-        // alone left `fun C.k(self) -> string[]!` returning the bare array where
-        // the caller's `!` expected a `Result` -- the value read back as `never`
-        // (or, for a scalar payload, as `null`).
+        // when the body never builds an error itself, so
+        // `fun C.k(self) -> string[]!` returns the `Result` its caller's `!`
+        // expects rather than the bare array.
         fallible: function_fallible(ret, body, ctx.null_props),
         body: mir_body,
     }
@@ -1288,10 +1345,20 @@ fn annotation_is_fallible(ret: &brass_parser::ast::TypeExpr) -> bool {
     }
 }
 
+/// Whether a return annotation is a nullable fallible type (`T!?`): a
+/// `Result` behind an outer `?` layer.
+fn annotation_is_nullable_result(ret: &brass_parser::ast::TypeExpr) -> bool {
+    matches!(
+        ret,
+        brass_parser::ast::TypeExpr::Nullable(inner, _)
+            if matches!(**inner, brass_parser::ast::TypeExpr::Fallible(..))
+    )
+}
+
 /// Lower a module init body: top-level `let`/`const` initialize module globals;
-/// every other statement runs as ordinary code (matches `codegen::gen_inits`).
+/// every other statement runs as ordinary code.
 fn lower_init(ctx: &ProgramCtx, module: Vec<String>, stmts: &[brass_parser::ast::Stmt]) -> MirBody {
-    use brass_parser::ast::Stmt;
+    use brass_parser::ast::{Pattern, Stmt};
 
     let mut fl = FnLower::new(ctx, module, None);
     // Top-level statements are an entry point: a failed `expr!` aborts (see
@@ -1307,17 +1374,29 @@ fn lower_init(ctx: &ProgramCtx, module: Vec<String>, stmts: &[brass_parser::ast:
                 // A module-level `let` needs an initializer (the checker
                 // rejects the uninitialized form at top level); skip defensively.
                 let Some(value) = value else { continue };
+                // A generalized closure binding has no storage: every use
+                // rebuilds the closure (`LowerTables::global_templates`).
+                if let Pattern::Binding(_, None, span) = pat
+                    && ctx.tables.generalized.contains(span)
+                {
+                    continue;
+                }
                 let v = fl.lower_expr(value);
                 // A resolvable annotation fixes the global's type exactly as it
-                // fixes a function-local slot: routing the value through a typed
-                // local makes the store coerce (nullable wrap, numeric flow) and
-                // monomorphization record the annotated type -- otherwise
-                // `let g: int32? = 5` records a bare int32 global whose reads
-                // then mismatch the nullable representation the checker assumed.
-                let v = match ty
+                // fixes a function-local slot (the same `slot_type`): routing the
+                // value through a typed local makes the store coerce (nullable
+                // wrap, numeric flow) and monomorphization record the annotated
+                // type -- otherwise `let g: int32? = 5` records a bare int32
+                // global, and `let cache: P? = null` a `never?` one, whose reads
+                // then mismatch the representation the checker assumed.
+                let slot = ty
                     .as_ref()
-                    .and_then(crate::lower::stmt::resolve_simple_type)
-                {
+                    .and_then(|t| fl.slot_type(t))
+                    .or_else(|| match pat {
+                        Pattern::Binding(_, None, span) => ctx.expr_type(*span).cloned(),
+                        _ => None,
+                    });
+                let v = match slot {
                     Some(t) => {
                         use crate::value::Rvalue;
                         let local = fl.b.fresh_local_typed(None, t);
@@ -1336,32 +1415,36 @@ fn lower_init(ctx: &ProgramCtx, module: Vec<String>, stmts: &[brass_parser::ast:
 }
 
 impl<'a, 'p> FnLower<'a, 'p> {
-    /// Store a top-level binding into module globals. A bare name binds directly;
-    /// an array/tuple pattern destructures by position, storing each element's
-    /// binding into its own global (so `let [i, s] = [1, "s"]` at module level
-    /// makes `i` and `s` globals, matching how it binds locals inside a function).
+    /// Store a top-level binding into module globals. A bare name binds
+    /// directly. A destructuring pattern (array, tuple, record, or the variant
+    /// of a one-variant sum) binds exactly as the local form does, in a scope
+    /// of its own, and each bound name's value is then stored into its global
+    /// -- so `let P { x, y } = p` or `let [i, s] = [1, "s"]` at module level
+    /// makes `x`/`y` or `i`/`s` globals. The scope is closed again so later
+    /// top-level statements read and write the globals, not the temporaries.
     fn store_global_pattern(&mut self, pat: &brass_parser::ast::Pattern, v: crate::value::Operand) {
         use crate::cfg::MirStmt;
-        use crate::value::{Literal, Operand, Place, Projection, Rvalue};
         use brass_parser::ast::Pattern;
         match pat {
             Pattern::Binding(name, _, _) => {
                 let key = self.ctx.global_symbol(&self.module, name);
                 self.b.push(MirStmt::SetGlobal(key, v));
             }
-            Pattern::Array(pats, _) => {
+            // The value was already evaluated for its effects.
+            Pattern::Wildcard(_) | Pattern::Literal(..) => {}
+            Pattern::Array(..) | Pattern::Record(..) => {
                 let subj = self.b.make_local(v);
-                for (i, p) in pats.iter().enumerate() {
-                    let elem = self.b.emit(Rvalue::Load(Place::projected(
-                        subj,
-                        vec![Projection::Index(Operand::Const(Literal::Int(i as i64)))],
-                    )));
-                    self.store_global_pattern(p, elem);
+                self.push_scope();
+                self.lower_pattern_bind(pat, subj);
+                for name in pat.bound_names() {
+                    if self.lookup(name).is_some() {
+                        let value = self.lower_ident(name);
+                        let key = self.ctx.global_symbol(&self.module, name);
+                        self.b.push(MirStmt::SetGlobal(key, value));
+                    }
                 }
+                self.pop_scope();
             }
-            // A record/variant pattern or a wildcard/literal at module top level is
-            // not a global binding form: the value was already evaluated for effects.
-            Pattern::Record(..) | Pattern::Wildcard(_) | Pattern::Literal(..) => {}
         }
     }
 }

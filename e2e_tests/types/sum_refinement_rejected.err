@@ -1,0 +1,1 @@
+`Opt` is a sum type and cannot be refined: a refinement `Base { .. }` pins the slots and fields of a record type

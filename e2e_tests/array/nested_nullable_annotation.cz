@@ -1,0 +1,22 @@
+// @backends: all
+// A nested nullable annotation (`T??`) is the plain nullable `T?`: there is
+// one `null`, so a `T?` value is returned through it unchanged, and `get` on
+// a map of `T?` values is a plain `T?` (a stored `null` and a missing key
+// both read `null`).
+
+fun lookup(xs: int32?[], i: int64) -> int32?? {
+    if i >= xs.len() { return null }
+    return xs[i]
+}
+fun main() {
+    let xs: int32?[] = [1, null]
+    println(lookup(xs, 0))
+    println(lookup(xs, 1))
+    println(lookup(xs, 5))
+    let m: HashMap { key: string, value: int32? } = HashMap.new()
+    m.set("a", null)
+    m.set("b", 5)
+    println(m.get("a"))
+    println(m.get("b"))
+    println(m.get("c"))
+}

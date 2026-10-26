@@ -1,0 +1,2 @@
+14:19: error: cannot use `P` where `bool` is required
+15:19: error: cannot use `P` where `bool` is required

@@ -1,0 +1,11 @@
+// A grouped access reports each promoted lock root once.
+type Counter = { count: int32 }
+fun total(a, b) { return a.count + b.count }
+fun main() {
+    let a = Counter { count: 0 }
+    let b = Counter { count: 0 }
+    spawn(() -> { a.count += 1 })
+    spawn(() -> { b.count += 2 })
+    sync()
+    println(total(a, b))
+}

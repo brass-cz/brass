@@ -1,0 +1,21 @@
+// @backends: all
+// A sum named through an alias across modules: a local alias of a qualified
+// sum (`type M = kinds.Mode`) and an alias imported by name (`Speed`) both
+// construct and match the sum's variants.
+import kinds
+import kinds.{ Speed }
+
+type M = kinds.Mode
+
+fun rank(m: M) -> int32 {
+    return match m {
+        M.fast => 1,
+        Speed.slow => 2,
+    }
+}
+
+fun main() {
+    println(rank(M.slow))
+    println(rank(Speed.fast))
+    println(rank(kinds.pick()))
+}

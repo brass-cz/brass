@@ -1,0 +1,3 @@
+render_void_rejected.cz:9:13: error: cannot print `void`: the expression produces no value
+render_void_rejected.cz:10:16: error: cannot interpolate `void`: the expression produces no value
+render_void_rejected.cz:11:25: error: `string.from` cannot render `void`: the expression produces no value

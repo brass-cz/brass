@@ -1,0 +1,10 @@
+// @backends: all
+fun main() {
+    let xs: int64[] = [1, 2]
+    let total = 0
+    for x in xs {
+        total = total + x
+    }
+    println(total)
+    println(xs.fold(0, (s, x) -> s + x))
+}

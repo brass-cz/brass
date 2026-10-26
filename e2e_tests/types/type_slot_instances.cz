@@ -1,9 +1,7 @@
 // Two instantiations of a slotted record in one scope stay independent: a
 // record literal (and a witness-free constructor call) instantiates the
 // declaration's type slots fresh per literal, so pinning one instance's
-// `item` must not constrain the other's. Regression: the checker used to
-// unify every literal's fields through the declaration's shared slot
-// variables, so the first instance's element type leaked into all others.
+// `item` does not constrain the other's -- each keeps its own element type.
 
 type Stack = {
     type item

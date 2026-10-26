@@ -1,0 +1,19 @@
+// @backends: all
+// Interface implementations accept each matching parameter passing mode.
+type Big = { a: int32 }
+type M0 = { w(self, x: Big) -> int32 }
+type T0: M0 = { n: int32 }
+fun T0.w(self, x: Big) -> int32 { return x.a }
+println(T0 { n: 0 }.w(Big { a: 1 }))
+type M1 = { w(self, x: ref(Big)) -> int32 }
+type T1: M1 = { n: int32 }
+fun T1.w(self, x: ref(Big)) -> int32 { return x.a }
+println(T1 { n: 0 }.w(Big { a: 2 }))
+type M2 = { w(self, x: mut(Big)) -> int32 }
+type T2: M2 = { n: int32 }
+fun T2.w(self, x: mut(Big)) -> int32 { return x.a }
+println(T2 { n: 0 }.w(Big { a: 3 }))
+type M3 = { w(self, x: ref(mut(Big))) -> int32 }
+type T3: M3 = { n: int32 }
+fun T3.w(self, x: ref(mut(Big))) -> int32 { return x.a }
+println(T3 { n: 0 }.w(Big { a: 4 }))

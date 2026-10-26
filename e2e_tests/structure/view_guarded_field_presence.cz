@@ -1,0 +1,49 @@
+// @backends: all
+// A guarded field keeps the argument's own type in the view: a nullable field
+// is a real presence test (`if let`), a present non-nullable one is used as
+// is (widened into the forced `int64`), and a field that is absent -- or
+// present at a type the guarded use cannot take -- reads as null, so the body
+// takes its fallback.
+fun take64(x: int64) -> int64 {
+    return x * 2
+}
+
+fun f(p) -> int64 {
+    if p.n {
+        return take64(p.n)
+    }
+    return -1
+}
+
+fun g(p) -> int64 {
+    if p.n {
+        return p.n
+    }
+    return -1
+}
+
+fun maybe(k: int32) -> int32? {
+    if k > 0 {
+        return k
+    }
+    return null
+}
+
+fun h(p) -> string {
+    if let v = p.n {
+        return "has {v}"
+    }
+    return "none"
+}
+
+fun main() {
+    println(f({ n: 5 }))
+    println(f({ m: 5 }))
+    println(f({ n: "five" }))
+    println(g({ n: 7 }))
+    println(g({ n: "seven" }))
+    println(h({ n: maybe(3) }))
+    println(h({ n: maybe(0) }))
+    println(h({ n: 4 }))
+    println(h({ q: 1 }))
+}

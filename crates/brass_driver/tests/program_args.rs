@@ -77,6 +77,8 @@ fn trailing_arguments_reach_args() {
         "check",
         "repl",
         "--eager",
+        "--no-jit-cache",
+        "cache",
         "--help",
         "--version",
         "--",

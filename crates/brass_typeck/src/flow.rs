@@ -1,32 +1,62 @@
 //! Control-flow completeness. A function or method with an
 //! explicit non-`void` return type must produce a value on every path. Without
 //! this check a body that falls off its end would yield an undefined value at
-//! runtime while still satisfying the declared return type statically.
+//! runtime while still satisfying the declared return type statically. The
+//! module also rejects `break`/`continue` outside of a loop.
 //!
-//! The analysis is intentionally conservative: it only flags bodies that are
-//! provably able to reach their end. Genuinely diverging constructs such as
-//! `while true { ... }` with no `break` are treated as non-returning so they are
-//! never falsely reported.
+//! The analysis is syntactic and conservative: a body passes only when every
+//! path provably ends in a `return` or diverges. Constructs that diverge by
+//! their shape count -- an `if`/`else` whose both sides do, a `match` whose
+//! arms all do and one of which must run, `while true { ... }` with no
+//! `break` -- but conditions are not evaluated, so a body whose last
+//! `return` sits behind a condition that always holds is still reported.
+//! Inferred-return checking also supplies this instance's `never` expressions
+//! and static branch choices, without changing the types of branch values.
 
 use brass_hir::{CallableSignature, Program, Type, TypeKind};
+use brass_parser::Span;
 use brass_parser::ast::*;
+use fxhash::{FxHashMap, FxHashSet};
 
 use crate::TypeError;
 use crate::exhaustive::{pattern_irrefutable, pattern_names_sum_variant};
 
+/// The program and the module whose body is analyzed: pattern names resolve
+/// against that module's scope (a bare name is a variant test only where its
+/// sum is in scope).
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    program: &'a Program,
+    module: &'a [String],
+    diverging_exprs: Option<&'a FxHashSet<Span>>,
+    static_folds: Option<&'a FxHashMap<Span, bool>>,
+}
+
 /// Report every function/method whose explicit non-`void` return type can be
-/// bypassed by falling through the end of the body.
+/// bypassed by falling through the end of the body, and every
+/// `break`/`continue` outside of a loop.
 pub fn check(program: &Program) -> Vec<TypeError> {
     check_in(program, crate::AnalysisModules::all())
 }
 
+/// [`check`] over the modules `modules` checks.
 pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -> Vec<TypeError> {
     let mut errors = Vec::new();
     for f in program.functions.values() {
         if !modules.checks(&f.module) {
             continue;
         }
-        check_callable(program, &f.signature, Some(&f.decl.body), &mut errors);
+        check_callable(
+            Scope {
+                program,
+                module: &f.module,
+                diverging_exprs: None,
+                static_folds: None,
+            },
+            &f.signature,
+            Some(&f.decl.body),
+            &mut errors,
+        );
     }
     for info in program.types.values() {
         if !modules.checks(&info.module) {
@@ -38,7 +68,17 @@ pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -
                     if brass_hir::keyed_return(m.decl.ret.as_ref()) {
                         continue;
                     }
-                    check_callable(program, &m.signature, m.decl.body.as_ref(), &mut errors);
+                    check_callable(
+                        Scope {
+                            program,
+                            module: &info.module,
+                            diverging_exprs: None,
+                            static_folds: None,
+                        },
+                        &m.signature,
+                        m.decl.body.as_ref(),
+                        &mut errors,
+                    );
                 }
             }
             TypeKind::Sum { variants } => {
@@ -47,7 +87,17 @@ pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -
                         if brass_hir::keyed_return(m.decl.ret.as_ref()) {
                             continue;
                         }
-                        check_callable(program, &m.signature, m.decl.body.as_ref(), &mut errors);
+                        check_callable(
+                            Scope {
+                                program,
+                                module: &info.module,
+                                diverging_exprs: None,
+                                static_folds: None,
+                            },
+                            &m.signature,
+                            m.decl.body.as_ref(),
+                            &mut errors,
+                        );
                     }
                 }
             }
@@ -63,7 +113,7 @@ pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -
 }
 
 fn check_callable(
-    program: &Program,
+    scope: Scope<'_>,
     sig: &CallableSignature,
     body: Option<&Block>,
     errors: &mut Vec<TypeError>,
@@ -77,7 +127,7 @@ fn check_callable(
     let Some(body) = body else {
         return;
     };
-    if !block_returns(program, body) {
+    if !block_returns(scope, body) {
         let span = sig.ret.as_ref().map(|r| r.span()).unwrap_or(sig.span);
         errors.push(TypeError {
             message: format!(
@@ -91,11 +141,11 @@ fn check_callable(
 }
 
 /// The declared return type when it is explicitly annotated and not `void`.
-/// Inferred return types are not enforced here so that fallthrough remains a
-/// `void` return rather than an error. A fallible void return (`-> void!`)
-/// is exempt like `void` itself: falling off the end IS the Ok exit (the
-/// back ends construct `Ok` on the fall-through path of a fallible body),
-/// so completeness has nothing to demand.
+/// An unannotated return is not enforced here: its type is the join of the
+/// body's `return`s, which the infer pass decides. A fallible void return
+/// (`-> void!`) is exempt like `void` itself: falling off the end IS the Ok
+/// exit (the back ends construct `Ok` on the fall-through path of a fallible
+/// body), so completeness has nothing to demand.
 fn non_void_return(sig: &CallableSignature) -> Option<&Type> {
     sig.ret.as_ref()?;
     match sig.ret_ty.as_ref()? {
@@ -220,72 +270,104 @@ fn check_loop_control_expr(expr: &Expr, in_loop: bool, errors: &mut Vec<TypeErro
 /// True when control cannot fall off the end of the block: every path either
 /// returns or diverges. A diverging statement makes the rest of the block
 /// unreachable, so the presence of any diverging statement is sufficient.
-fn block_returns(program: &Program, block: &Block) -> bool {
-    block.stmts.iter().any(|s| stmt_diverges(program, s))
+/// `diverging_exprs` and `static_folds` are facts from checking this instance.
+pub(crate) fn block_diverges(
+    program: &Program,
+    module: &[String],
+    block: &Block,
+    diverging_exprs: &FxHashSet<Span>,
+    static_folds: &FxHashMap<Span, bool>,
+) -> bool {
+    block_returns(
+        Scope {
+            program,
+            module,
+            diverging_exprs: Some(diverging_exprs),
+            static_folds: Some(static_folds),
+        },
+        block,
+    )
 }
 
-fn stmt_diverges(program: &Program, stmt: &Stmt) -> bool {
+fn block_returns(scope: Scope<'_>, block: &Block) -> bool {
+    block.stmts.iter().any(|s| stmt_diverges(scope, s))
+}
+
+fn stmt_diverges(scope: Scope<'_>, stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Return(..) => true,
-        Stmt::Expr(e) => expr_diverges(program, e),
+        Stmt::Expr(e) => expr_diverges(scope, e),
         Stmt::Let {
             value: Some(value), ..
-        } => expr_diverges(program, value),
+        } => expr_diverges(scope, value),
         Stmt::Let { value: None, .. } => false,
         Stmt::Assign { target, value, .. } => {
-            expr_diverges(program, value) || expr_diverges(program, target)
+            expr_diverges(scope, value) || expr_diverges(scope, target)
         }
         Stmt::While { cond, body, .. } => {
-            expr_diverges(program, cond) || is_infinite_loop(cond, body)
+            expr_diverges(scope, cond) || is_infinite_loop(cond, body)
         }
         // A `for` loop may iterate zero times, but its iterand is always
         // evaluated before that decision.
-        Stmt::For { iter, .. } => expr_diverges(program, iter),
+        Stmt::For { iter, .. } => expr_diverges(scope, iter),
         // `break`/`continue` leave a loop, not the function.
         Stmt::Break(_) | Stmt::Continue(_) => false,
     }
 }
 
-fn expr_diverges(program: &Program, expr: &Expr) -> bool {
+fn expr_diverges(scope: Scope<'_>, expr: &Expr) -> bool {
+    if scope
+        .diverging_exprs
+        .is_some_and(|spans| spans.contains(&expr.span()))
+    {
+        return true;
+    }
     match expr {
-        Expr::Unary(_, inner, _)
-        | Expr::ErrorProp(inner, _)
-        | Expr::Field(inner, _, _)
-        | Expr::TypeTest(inner, _, _, _) => expr_diverges(program, inner),
+        Expr::Unary(_, inner, _) | Expr::Field(inner, _, _) | Expr::TypeTest(inner, _, _, _) => {
+            expr_diverges(scope, inner)
+        }
+        // Literal absence and the reserved error constructor have no success
+        // path, so propagating either always leaves the enclosing callable.
+        Expr::ErrorProp(inner, _) => {
+            expr_diverges(scope, inner)
+                || matches!(&**inner, Expr::Null(_))
+                || matches!(&**inner, Expr::Call(callee, _, _)
+                    if matches!(&**callee, Expr::Ident(name, _) if name == "error"))
+        }
         Expr::Binary(op, left, right, _) => {
-            expr_diverges(program, left)
-                || binary_rhs_is_unconditional(*op, left) && expr_diverges(program, right)
+            expr_diverges(scope, left)
+                || binary_rhs_is_unconditional(*op, left) && expr_diverges(scope, right)
         }
         Expr::Index(base, index, _) | Expr::Range(base, index, _) => {
-            expr_diverges(program, base) || expr_diverges(program, index)
+            expr_diverges(scope, base) || expr_diverges(scope, index)
         }
         Expr::Call(callee, args, _) => {
-            expr_diverges(program, callee)
-                || args.iter().any(|arg| expr_diverges(program, &arg.expr))
+            expr_diverges(scope, callee) || args.iter().any(|arg| expr_diverges(scope, &arg.expr))
         }
         // Constructing a closure does not evaluate its body.
         Expr::Closure(..) => false,
-        Expr::Array(items, _) => items.iter().any(|item| expr_diverges(program, item)),
-        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => fields
-            .iter()
-            .any(|(_, value)| expr_diverges(program, value)),
+        Expr::Array(items, _) => items.iter().any(|item| expr_diverges(scope, item)),
+        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => {
+            fields.iter().any(|(_, value)| expr_diverges(scope, value))
+        }
         Expr::Str(segments, _) => segments.iter().any(|segment| match segment {
-            StrSeg::Expr(inner) => expr_diverges(program, inner),
+            StrSeg::Expr(inner) => expr_diverges(scope, inner),
             StrSeg::Lit(_) => false,
         }),
-        // An `if` returns on every path only when it has an `else` and both
-        // sides return. Its condition is evaluated on every path first.
-        Expr::If(cond, then, els, _) => {
-            expr_diverges(program, cond)
-                || els
-                    .as_deref()
-                    .is_some_and(|els| block_returns(program, then) && expr_diverges(program, els))
-        }
-        Expr::IfLet(_, scrutinee, then, els, _) => {
-            expr_diverges(program, scrutinee)
-                || els
-                    .as_deref()
-                    .is_some_and(|els| block_returns(program, then) && expr_diverges(program, els))
+        // A decided test follows its chosen arm; otherwise both arms must
+        // return. The condition is evaluated on every path first.
+        Expr::If(cond, then, els, span) | Expr::IfLet(_, cond, then, els, span) => {
+            expr_diverges(scope, cond)
+                || match scope
+                    .static_folds
+                    .and_then(|folds| folds.get(span).or_else(|| folds.get(&cond.span())))
+                {
+                    Some(true) => block_returns(scope, then),
+                    Some(false) => els.as_deref().is_some_and(|els| expr_diverges(scope, els)),
+                    None => els
+                        .as_deref()
+                        .is_some_and(|els| block_returns(scope, then) && expr_diverges(scope, els)),
+                }
         }
         // A `match` returns when every arm returns AND an arm is guaranteed to
         // run: a catch-all (irrefutable) arm, or arms naming a sum's variants
@@ -294,12 +376,12 @@ fn expr_diverges(program: &Program, expr: &Expr) -> bool {
         // -- control can fall through every arm at runtime, so the match must
         // not be treated as diverging.
         Expr::Match(scrutinee, arms, _) => {
-            expr_diverges(program, scrutinee)
+            expr_diverges(scope, scrutinee)
                 || !arms.is_empty()
-                    && arms.iter().all(|arm| expr_diverges(program, &arm.body))
-                    && match_coverage_is_checked(program, arms)
+                    && arms.iter().all(|arm| expr_diverges(scope, &arm.body))
+                    && match_coverage_is_checked(scope, arms)
         }
-        Expr::Block(block, _) => block_returns(program, block),
+        Expr::Block(block, _) => block_returns(scope, block),
         Expr::Int(..)
         | Expr::Float(..)
         | Expr::Bool(..)
@@ -324,12 +406,12 @@ fn binary_rhs_is_unconditional(op: BinOp, left: &Expr) -> bool {
 /// variants is verified exhaustive by the exhaustiveness pass (or rejected
 /// there). A match over non-sum scrutinees (int/string literals) with no
 /// catch-all has no such guarantee.
-fn match_coverage_is_checked(program: &Program, arms: &[MatchArm]) -> bool {
+fn match_coverage_is_checked(scope: Scope<'_>, arms: &[MatchArm]) -> bool {
     arms.iter()
-        .any(|arm| pattern_irrefutable(program, &arm.pattern))
+        .any(|arm| pattern_irrefutable(scope.program, scope.module, &arm.pattern))
         || arms
             .iter()
-            .any(|arm| pattern_names_sum_variant(program, &arm.pattern))
+            .any(|arm| pattern_names_sum_variant(scope.program, scope.module, &arm.pattern))
 }
 
 /// A `while true { ... }` with no `break` reachable in its own body never

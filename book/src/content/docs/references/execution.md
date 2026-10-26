@@ -53,18 +53,14 @@ As with other body diagnostics, uninstantiated reflective method templates
 and statically pruned branches follow the checker's selection rules (see
 [type tests](/references/types/#type-tests)).
 
-Errors use the same diagnostic text and source locations as `brass check`.
-Match coverage is checked after the relevant argument types are known, before
-the affected body can execute. Checker warnings remain non-fatal in all modes.
+Errors use the same diagnostic text and source locations as `brass check`, and
+a run that stops on an error prints the checker's complete verdict, including
+errors in bodies the run never reached. Match coverage is checked after the
+relevant argument types are known, before the affected body can execute.
+Checker warnings remain non-fatal in all modes.
 
 Consequently, a successful run is not a complete whole-program verdict. Use
 `brass check` in CI and whenever all code must be validated.
-
-In one known case the demand-driven pipeline stops a program that the
-whole-program commands accept: a very deep call chain of unannotated returns
-whose inferred type differs from the default integer width. The run fails
-with a defined error naming the function whose return type to annotate;
-annotating it (or running with `--eager`) resolves the program.
 
 A reflective specialization discovered only after execution starts completes
 checking and reports any source errors. If checking succeeds but the running
@@ -100,21 +96,45 @@ threads do not compile.
 
 |                                          | JIT (default)          | Interpreter                                                   |
 | ---------------------------------------- | ---------------------- | ------------------------------------------------------------- |
-| Engine                                   | LLVM-based native code | tree-walking, pure Rust                                       |
+| Engine                                   | LLVM-based native code | MIR interpreter, pure Rust                                    |
 | Used by                                  | `brass file.cz`        | `brass repl`, wasm/playground, `--no-default-features` builds |
 | Library plugins (fs, process, net, path) | yes                    | yes (the plugins execute natively either way)                 |
 | Concurrency                              | yes                    | refused at runtime                                            |
 | On-demand native compilation             | yes                    | not applicable                                                |
 
-Both back ends implement the same semantics for the sequential language
-surface and are tested against each other. The driver is built with the `jit`
-cargo feature by default; without it (or on WebAssembly) only the interpreter
-is available.
+For a program that checks, a normal run, `--eager`, and the interpreter
+produce the same output. The exceptions are concurrency, which the interpreter
+refuses when execution reaches it, and the recursion limit below. The driver
+is built with the `jit` cargo feature by default; without it (or on
+WebAssembly) only the interpreter is available.
 
 The interactive REPL accumulates definitions and validates the combined session
-history each turn, but executes only the new input. Earlier effectful statements
-are not run again, so an `input()` or a print from a prior turn is not repeated.
-The REPL always uses the interpreter.
+history each turn, but executes each input once: an `input()`, a print or any
+other call from a prior turn is not repeated. To give a new input the values it
+reads, the earlier inputs that only rebuild values run again ahead of it. Such
+an input is a single statement of one of these forms:
+
+- a `let`/`const` binding whose initializer has no side effects: literals
+  (strings without `{..}` interpolation), names of available bindings and of
+  functions, operators, field and index reads, ranges, array/record/variant
+  constructions, and closure literals that assign or mutate no captured
+  binding;
+- an assignment to an available binding or to a field or element of one, with
+  side-effect-free target and value;
+- `push`, `insert`, `remove` or `pop` on an available array, with
+  side-effect-free arguments.
+
+A binding made any other way (its initializer calls a function, interpolates a
+string, which may run a `display` method, branches, or propagates with `!`) is
+not available to later inputs, since producing its value again would repeat
+the effects. Neither is a binding that an input which is not run again may
+have changed (assigned, mutated in place, or passed to a `ref(mut(T))`
+parameter), nor one sharing a value with it (`let c = xs` names the same
+array), since replaying it would show a stale value; a binding read from an
+unavailable one is unavailable too. Using such a name reports that it is not
+available in this input; binding the name again makes it available. Top-level
+definitions (functions, types, imports) are always available. The REPL always
+uses the interpreter.
 
 ## Runtime behavior guarantees
 
@@ -130,20 +150,65 @@ The REPL always uses the interpreter.
   trap, on both back ends.
 - **Floats** follow IEEE 754 (native hardware semantics).
 - **Recursion depth** differs: the interpreter guards at a fixed depth
-  (currently 8000 calls) and reports a clean error; the JIT uses the native
-  stack, so runaway recursion aborts on stack overflow instead.
+  (8000 calls) and reports a clean error; the JIT uses the native stack, so
+  runaway recursion aborts on stack overflow instead.
 - On the JIT, a runtime panic **aborts** the process (JIT frames cannot be
   unwound); the interpreter unwinds and reports.
-- A failed `!` at an entry point (module top level or `main`) prints
-  `unhandled error: <payload>` (or the null-propagation message) to stderr
-  and exits non-zero, on both back ends (see
-  [Result](/references/types/#result)).
+- A failed `!` at an entry point (module top level or `main`) prints the
+  error to stderr and exits non-zero, on both back ends: the nested
+  `[file:line:col] unhandled error: ...` trace when the payload is the prelude
+  `Error` (see [Error traces](/references/syntax-sugar/#error-traces)),
+  otherwise `runtime error: unhandled error: <payload>` or the
+  null-propagation message.
+
+## JIT object cache
+
+Native runs share content-addressed objects in `$XDG_CACHE_HOME/brass/jit`,
+falling back to `$HOME/.cache/brass/jit`. Changed compiler inputs get new keys,
+so changed source cannot reuse stale code. Cleanup covers the whole shared
+cache, not individual source files.
+
+`brass cache info` shows the directory, configured enabled/disabled status,
+object count, size, limit, and stale temp count. Sizes include exact bytes.
+`brass cache clean` removes all published objects. It also removes temp
+files older than 24 hours. It reports removed counts and object bytes. Fresh temps and unknown entries
+stay intact. Both commands work with caching disabled. A missing directory
+is empty. Concurrent readers see a miss; writers may repopulate the cache.
+Management I/O errors exit with status 1. Builds without the JIT report that
+no cache is available and exit successfully.
+
+`brass --no-jit-cache program.cz` disables reads and writes for that run,
+like `BRASS_JIT_CACHE=off`. It works with `--eager` and preserves stored
+objects. Put the flag before the program filename. `brass cache` never
+changes package downloads in `~/.brass/packages`. See
+[Performance diagnostics](/references/performance/#jit-cache) for keys and
+eviction.
 
 ## Environment
 
 - `BRASS_LOG`: tracing filter for compiler logs (`info`, `debug`, module
   filters).
+- `BRASS_CHANNEL_CHECK=1`: compare each streaming checker flush with an
+  independent full-scan publisher, preserving diagnostics and owner order.
+- `BRASS_MEMO_CHECK=1`: bypass elaboration memo reuse for differential checking.
+- `BRASS_LAZY_COMPLETE=off|auto`: lazy checker policy (`auto` by default;
+  unknown values use the default). `off` keeps pure demand settlement.
+  `auto` may finish the same checker after a sustained runtime demand cascade,
+  then lower a closed region of checked bodies with final, clean diagnostics.
+  Bodies with uncertain dispatch, held diagnostics or keyed calls stay on the
+  demand path, together with their callers. Reached region bodies pass the
+  usual diagnostic gate.
 - `BRASS_LOG_TYPE`: comma-separated named dumps (e.g. `mir`).
+- `BRASS_PACKAGES`, `BRASS_INCLUDE`: module search roots (see
+  [Module resolution](/references/modules/#module-resolution)).
+- `BRASS_OPT`: native optimization tier (see
+  [Performance diagnostics](/references/performance/)).
+- `BRASS_JIT_CACHE=off|0`: disable JIT cache reads and writes; other values
+  permit caching, which is enabled by default.
+- `BRASS_JIT_CACHE_MAX_MB`: object cache cap in MiB (default 256); invalid
+  values use the default. Zero permits immediate eviction.
+- `XDG_CACHE_HOME`, `HOME`: select the JIT cache directory as described above;
+  without either nonempty variable, caching is disabled.
 
 ## Tooling summary
 
@@ -152,17 +217,23 @@ brass program.cz         # lazy check + run (JIT)
 brass --eager program.cz # whole-program check + compile, then run
 brass check program.cz   # check only (always whole-program)
 brass repl [program.cz]  # interpreter / interactive REPL
+brass --no-jit-cache program.cz # run without cache reads or writes
+brass cache info         # inspect the shared JIT object cache
+brass cache clean        # remove all cached objects and stale temp files
 czls                       # LSP server (hover, diagnostics, completion,
                            # go-to-definition, semantic tokens)
 ```
 
-Driver options such as `--eager` are parsed before the program file. Everything
-after that file is passed to the program verbatim, including flag-shaped values,
-and can be read with `env.args()`:
+Driver options such as `--eager` and `--no-jit-cache` are parsed before the
+program file. Everything after that file is passed to the program verbatim,
+including flag-shaped values, and can be read with `env.args()`:
 
 ```bash
 brass --eager program.cz input.txt --verbose
 ```
+
+The first words `check`, `repl`, `cache`, and `help` are reserved commands.
+Use `brass -- cache` to run a file literally named `cache`.
 
 The LSP server builds without LLVM, checks incrementally, and also targets
 WebAssembly (it powers the browser playground). An editor setup for Neovim

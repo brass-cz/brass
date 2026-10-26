@@ -1,0 +1,2 @@
+narrowing_generic_instances_rejected.cz:14:17: error: nullable value must be checked for null before use
+narrowing_generic_instances_rejected.cz:21:13: error: nullable value must be checked for null before use

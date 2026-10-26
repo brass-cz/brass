@@ -1,0 +1,11 @@
+// @backends: all
+fun recurse(n) {
+    let value = 0
+    if n == 0 { return value }
+    return recurse(n - 1)
+}
+fun main() {
+    println(recurse(2))
+    let invoke = recurse
+    println(invoke(2))
+}

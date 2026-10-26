@@ -1,0 +1,25 @@
+// @backends: all
+// An `infer` parameter of a method is instantiated per call: two calls in one
+// body may pass different types (`l.log(1)` and `l.log("s")`), exactly as
+// they may from two different bodies.
+type Logger = {
+    prefix: string
+}
+
+fun Logger.log(self, x: infer) {
+    println("{self.prefix}{x}")
+}
+
+fun Logger.wrap(self, x: infer) -> infer[] {
+    return [x]
+}
+
+fun main() {
+    let l = Logger { prefix: "> " }
+    l.log(1)
+    l.log("s")
+    let a: int32[] = l.wrap(1)
+    let b: string[] = l.wrap("s")
+    println(a[0])
+    println(b[0])
+}

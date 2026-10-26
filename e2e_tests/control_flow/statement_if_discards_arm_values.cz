@@ -1,0 +1,72 @@
+// @backends: all
+// An `if`, `if let` or `match` in statement position has no value: the
+// trailing values of its arms are discarded, so an arm ending in a
+// value-producing call needs no `else`, and arms of different types are fine.
+// Only a branching expression whose value is used joins its arms.
+type Shape =
+    | Circle {
+        r: int32
+    }
+    | Square {
+        s: int32
+    }
+
+fun bump(log: ref(mut(int32[]))) -> int64 {
+    log.push(1)
+    return log.len()
+}
+
+fun pick(c: bool) -> int32 {
+    if c {
+        return 1
+    } else {
+        return 2
+    }
+}
+
+fun tail_if(c: bool, log: ref(mut(int32[]))) {
+    if c {
+        bump(log)
+    }
+}
+
+fun main() {
+    let log: int32[] = []
+    let c = true
+    if c {
+        bump(log)
+    }
+    if c {
+        bump(log)
+    } else {
+        "ignored"
+    }
+    if c {
+        if c {
+            bump(log)
+        }
+    }
+    let o: int32? = 3
+    if let v = o {
+        bump(log)
+    }
+    let shape = Shape.Circle { r: 2 }
+    match shape {
+        Circle { r } => bump(log)
+        Square { s } => println("square {s}")
+    }
+    let task = () -> {
+        if c {
+            bump(log)
+        }
+    }
+    task()
+    tail_if(true, log)
+    let v = {
+        if c {
+            bump(log)
+        }
+        5
+    }
+    println("pushes: {len(log)}, v: {v}, pick: {pick(false)}")
+}

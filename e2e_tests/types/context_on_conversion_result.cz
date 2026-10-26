@@ -1,0 +1,39 @@
+// @backends: all
+// `.context()` on the Result of a runtime conversion (`parse`, `from`) keeps
+// the receiver's Ok value; only the error side becomes the wrapping `Error`
+// with a trace frame.
+
+fun parse_int(s: string) -> int32! {
+    return int32.parse(s).context("parsing an int")!
+}
+
+fun narrow(x: int32) -> int8! {
+    return int8.from(x).context("narrowing")!
+}
+
+fun parse_float(s: string) -> float64! {
+    return float64.parse(s).context("parsing a float")!
+}
+
+fun report(r: int32!) {
+    match r {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.value} ({error.frames.len()} frame)"),
+    }
+}
+
+fun main() {
+    report(parse_int("41"))
+    report(parse_int("zz"))
+    println(narrow(5)!)
+    match narrow(500) {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.frames[0].message}"),
+    }
+    println(parse_float("2.5")!)
+    let direct = int64.parse("7").context("direct")
+    match direct {
+        Ok { value } => println("direct {value + 1}"),
+        Err { error } => println("direct failed {error.value}"),
+    }
+}

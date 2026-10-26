@@ -2,9 +2,10 @@
 //!
 //! A stdio JSON-RPC LSP server that drives the Brass front end (lex, parse,
 //! lower, resolve, type-check) to provide diagnostics, semantic-token
-//! highlighting, hover types, and go-to-definition. The heavy path -- per-edit
-//! diagnostics -- is incremental: only changed items and their users are
-//! re-checked (see [`analysis`]).
+//! highlighting, hover, go-to-definition, completion and formatting. An edit
+//! re-parses only; opening or saving a document type-checks it, and that check
+//! is incremental: only changed items and their users are re-checked (see
+//! [`analysis`]).
 
 mod analysis;
 mod backend;

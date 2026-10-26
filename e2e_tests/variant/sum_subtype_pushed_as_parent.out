@@ -1,0 +1,5 @@
+[Base.A {
+    v: 7,
+}, Base.B, Base.A {
+    v: 4,
+}, Base.B]

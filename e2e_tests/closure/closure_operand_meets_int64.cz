@@ -1,0 +1,27 @@
+// @backends: all
+// A closure parameter used next to an int64 (`v + s.len()`) accepts any
+// argument the operator rule meets with int64 -- an int32 array element in
+// `map`, an int32 literal argument -- and the closure computes the int64 its
+// body was typed with. A literal `match` arm next to an int64 length arm
+// adapts to int64.
+fun pick(k: int32, x: string) {
+    return match k {
+        0 => 0,
+        _ => x.len(),
+    }
+}
+
+fun main() {
+    let s = "abc"
+    let xs = [1, 2, 3]
+    let ys = xs.map((v) -> v + s.len())
+    println(ys)
+    println(typeof(ys))
+    let y = "hello"
+    let g = (n) -> y.len() + n
+    println(g(10))
+    println(typeof(g(10)))
+    println(pick(0, "abc"))
+    println(pick(1, "abc"))
+    println(typeof(pick(1, "abc")))
+}

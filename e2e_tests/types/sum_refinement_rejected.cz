@@ -1,0 +1,10 @@
+// A refinement `Base { .. }` pins the slots and fields of a record type. A
+// sum type has no slots and its open payload types are inferred from each
+// construction, so refining one is rejected with a diagnostic that says so.
+type Opt = | Some { v } | Nothing
+type IntOpt = Opt { v: int32 }
+
+fun main() {
+    let o = Opt.Some { v: 1 }
+    println(o)
+}

@@ -1,0 +1,19 @@
+// A call that returns nothing has no value to pass: a parameter binds a
+// name, so a `void` argument is rejected exactly like `let y = nothing()` --
+// to a function, to a method (here a map's `set`), and to a closure. (An array
+// may still collect `void` results, as `xs.map` with a printing closure does.)
+fun nothing() {
+    let a = 1
+}
+
+fun keep(x) {
+    return 1
+}
+
+fun main() {
+    println(keep(nothing()))
+    let h = HashMap.new()
+    h.set("k", nothing())
+    let f = (x) -> 2
+    println(f(nothing()))
+}

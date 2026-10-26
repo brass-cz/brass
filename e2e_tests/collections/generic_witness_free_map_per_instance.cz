@@ -1,0 +1,31 @@
+// @backends: all
+// A generic body that builds a witness-free container (`HashMap.new()`)
+// instantiated at two element types: each instance builds its own map type
+// (the checker's per-instance seed), so neither instance shares the other's
+// constructor or reads its entries at the wrong representation.
+
+fun count_by(xs) {
+    let m = HashMap.new()
+    for x in xs {
+        m.set(x, m.get_or(x, 0) + 1)
+    }
+    return m
+}
+
+fun single(v) {
+    let m = HashMap.new()
+    m.set("k", v)
+    return m
+}
+
+fun main() {
+    let a = count_by([1, 2, 2])
+    let b = count_by(["p", "q", "q"])
+    println(a.get_or(2, 0))
+    println(b.get_or("q", 0))
+    println(a.get_or(1, 0))
+    let s1 = single(5)
+    let s2 = single("x")
+    println(s1.get("k"))
+    println(s2.get("k"))
+}

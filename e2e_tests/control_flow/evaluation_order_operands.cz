@@ -1,0 +1,82 @@
+// @backends: all
+// Operands, call arguments, array elements, record literal fields and
+// interpolation segments are evaluated left to right -- a method's receiver
+// before its arguments, an indexed array before its index, a called closure
+// before its arguments -- and each keeps the value it had when it was
+// evaluated: a later sibling that assigns the same variable does not change
+// an operand that was already evaluated.
+
+type Pair = { a: int32, b: int32 }
+
+fun pair(a: int32, b: int32) -> string {
+    return "{a},{b}"
+}
+
+fun Pair.sum(self, extra: int32) -> int32 {
+    return self.a + self.b + extra
+}
+
+fun main() {
+    // Binary operands.
+    let x = 1
+    let y = x + (if true {
+        x = 10
+        1
+    } else {
+        2
+    })
+    println(y)
+
+    // Free-function arguments.
+    let n = 1
+    println(pair(n, match n {
+        1 => {
+            n = 99
+            2
+        },
+        _ => 0,
+    }))
+
+    // Array elements.
+    let k = 3
+    println([k, {
+        k = 4
+        k
+    }])
+
+    // Record literal fields.
+    let f = 5
+    let p = Pair { a: f, b: {
+        f = 6
+        f
+    } }
+    println("{p.a} {p.b}")
+
+    // A method receiver is evaluated before its arguments.
+    let q = Pair { a: 1, b: 2 }
+    println(q.sum({
+        q = Pair { a: 100, b: 200 }
+        0
+    }))
+
+    // An indexed read evaluates the array before the index.
+    let arr = [1, 2, 3]
+    println(arr[{
+        arr = [7, 8, 9]
+        0
+    }])
+
+    // A closure value is fixed before its arguments run.
+    let g = (v: int32) -> v + 1
+    println(g({
+        g = (v: int32) -> v * 100
+        1
+    }))
+
+    // Interpolation segments.
+    let s = 1
+    println("{s}-{if true {
+        s = 5
+        s
+    } else { 0 }}-{s}")
+}

@@ -2,7 +2,9 @@
 # Benchmark harness comparing the two JIT pipelines of the Brass driver:
 #   lazy  -- the default demand-driven pipeline (checker thread + per-function
 #            ORC materialization)
-#   eager -- `brass --eager`, whole-program check + full-module compile first
+#   eager -- `brass --eager`, whole-program check + IR for every instance
+#            first; optimization and instruction selection still run on
+#            first use
 #
 # For every program in cases/ it measures, over REPS repetitions per mode:
 #   total  -- wall time of the whole run (compile + execute + exit)

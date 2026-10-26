@@ -1,8 +1,9 @@
 //! Brass command-line driver.
 //!
 //! Pipeline: resolve the module graph, parse, lower to HIR, check
-//! (resolve + typeck), then run the checked program. The standard library is an
-//! embedded prelude.
+//! (resolve + typeck), then run the checked program. The `core` library is
+//! embedded and implicitly imported; the standard library is the `std` package,
+//! found through the package search paths (`brass_resolve::SearchPaths`).
 //!
 //! Two execution back ends share the same front end. When the JIT back end is
 //! available, `brass <file>` compiles and runs through the LLVM JIT
@@ -14,6 +15,11 @@
 //! interpreter: with a file it runs the file, with none it starts an interactive
 //! session. Argument parsing is `clap`'s derive interface.
 
+#[cfg(jit_backend)]
+mod lazy;
+#[cfg(jit_backend)]
+use lazy::run_lazy;
+
 use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -22,14 +28,20 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use brass_hir::{LoadedModule, Program, lower};
+use brass_parser::Span;
 use brass_parser::ast::{Stmt, TopLevel};
 use brass_parser::parse;
-use brass_parser::{Span, line_col};
+
+mod cache;
+mod repl_replay;
+mod source_locations;
+
+use source_locations::{LocationTables, call_site_locations, collect_call_spans_stmt};
 
 /// The Brass toolchain driver.
 ///
 /// The program file is a bare positional argument (`brass file.cz`) rather than
-/// a `run` subcommand. A leading `check`/`repl` parses as the subcommand; any
+/// a `run` subcommand. A leading `check`/`repl`/`cache` parses as the subcommand; any
 /// other first argument is taken as the file, and everything after the file
 /// is the program's, untouched (see [`parse_cli`]).
 #[derive(Parser)]
@@ -57,12 +69,21 @@ struct Cli {
     /// file belongs to the program.
     #[arg(long)]
     eager: bool,
+    /// Disable JIT object cache reads and writes for this process, equivalent to
+    /// BRASS_JIT_CACHE=off. Must precede the program file.
+    #[arg(long)]
+    no_jit_cache: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect or clean the shared JIT object cache.
+    Cache {
+        #[command(subcommand)]
+        action: cache::CacheAction,
+    },
     /// Type-check a program without running it.
     Check { file: String },
     /// Start the interactive REPL, or run a file through the REPL interpreter.
@@ -93,10 +114,10 @@ enum Mode {
 /// body), so its call-depth guard (`brass_repl`'s 8000-call limit) is only
 /// reachable when the stack holds that many interpreter activation records; the
 /// default 8 MiB main stack overflows first and aborts the process instead of
-/// surfacing the guard's clean error. The reservation is virtual memory — pages
+/// surfacing the guard's clean error. The reservation is virtual memory -- pages
 /// are committed only as the stack actually grows.
 #[cfg(not(target_family = "wasm"))]
-const MAIN_STACK_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const MAIN_STACK_BYTES: usize = 256 * 1024 * 1024;
 
 fn main() -> ExitCode {
     // Shared across the Brass binaries: BRASS_LOG (EnvFilter syntax) and
@@ -119,7 +140,12 @@ fn main() -> ExitCode {
 
 fn run_cli() -> ExitCode {
     let cli = parse_cli();
+    #[cfg(jit_backend)]
+    if cli.no_jit_cache {
+        brass_jit_llvm::disable_jit_cache();
+    }
     match cli.command {
+        Some(Command::Cache { action }) => cache::run(action, cli.no_jit_cache),
         // A bare file argument is type-checked and run; with neither a file nor a
         // subcommand, start an interactive REPL session.
         None => match cli.file {
@@ -155,7 +181,7 @@ fn run_cli() -> ExitCode {
 /// the line), so the argv is split at the file and only the head is parsed.
 ///
 /// The file is the first token that does not start with `-` -- directly for
-/// the bare-file form, after `repl` for the interpreter form. `check` and
+/// the bare-file form, after `repl` for the interpreter form. `check`, `cache`, and
 /// `help` take no program arguments, so their lines stay fully clap's.
 fn parse_cli() -> Cli {
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
@@ -177,7 +203,7 @@ fn parse_cli() -> Cli {
 
 /// Locate the positional program file before splitting its trailing arguments
 /// away from clap. Root flags may precede a subcommand; `--` ends flag and
-/// subcommand recognition, so a following `check` or `repl` is a file name.
+/// subcommand recognition, so a following `check`, `cache`, or `repl` is a file name.
 fn program_file_index(argv: &[std::ffi::OsString]) -> Option<usize> {
     let mut index = 1;
     let mut positional_only = false;
@@ -192,7 +218,7 @@ fn program_file_index(argv: &[std::ffi::OsString]) -> Option<usize> {
             index += 1;
             continue;
         }
-        if !positional_only && (token == "check" || token == "help") {
+        if !positional_only && matches!(token.as_ref(), "check" | "help" | "cache") {
             return None;
         }
         if !positional_only && token == "repl" {
@@ -242,11 +268,10 @@ fn exit_code(r: Result<(), u8>) -> ExitCode {
 /// group form), so the source needs no ownership annotations yet concurrent
 /// mutation is serialized by the cown lock. Interprocedural spawn-capture
 /// summaries are computed first over all modules, so a caller handing a local to
-/// a helper that spawns is promoted and guarded too. Returns the compile errors
-/// for `spawn` arguments the analysis cannot see through (each such spawn would
-/// otherwise share state with no guard at all).
+/// a helper that spawns is promoted and guarded too. Returns rejected spawn
+/// arguments and warnings describing inserted access guards.
 #[cfg(jit_backend)]
-fn auto_acquire_modules(modules: &mut [LoadedModule]) -> Vec<(String, Span)> {
+fn auto_acquire_modules(modules: &mut [LoadedModule]) -> (Vec<(String, Span)>, Vec<String>) {
     use brass_jit_llvm::ownership::{auto_acquire, spawn_capture_summaries};
     use brass_parser::ast::{Block, Member, TypeBody};
 
@@ -350,6 +375,7 @@ fn auto_acquire_modules(modules: &mut [LoadedModule]) -> Vec<(String, Span)> {
         mutated
     };
 
+    let mut warnings = Vec::new();
     let mut errors: Vec<(String, Span)> = Vec::new();
     let mut push_errors = |errs: Vec<brass_jit_llvm::ownership::SpawnError>| {
         errors.extend(errs.into_iter().map(|e| (e.message, e.span)));
@@ -386,7 +412,22 @@ fn auto_acquire_modules(modules: &mut [LoadedModule]) -> Vec<(String, Span)> {
                         &params,
                         &mutated_globals,
                     ));
-                    push_errors(auto_acquire(&mut f.body.stmts, &params, &summaries));
+                    let report = auto_acquire(&mut f.body.stmts, &params, &summaries);
+                    let context = match &f.recv {
+                        Some(brass_parser::ast::TypeExpr::Named(name, _)) => {
+                            format!("{name}.{}", f.name)
+                        }
+                        Some(brass_parser::ast::TypeExpr::Array(inner, _, _)) => {
+                            if let brass_parser::ast::TypeExpr::Named(name, _) = inner.as_ref() {
+                                format!("{name}[].{}", f.name)
+                            } else {
+                                f.name.clone()
+                            }
+                        }
+                        _ => f.name.clone(),
+                    };
+                    warnings.extend(report_spawn_ownership(&report, &context));
+                    push_errors(report.errors);
                 }
                 TopLevel::Type(t) => {
                     let members = match &mut t.body {
@@ -403,7 +444,12 @@ fn auto_acquire_modules(modules: &mut [LoadedModule]) -> Vec<(String, Span)> {
                                 &params,
                                 &mutated_globals,
                             ));
-                            push_errors(auto_acquire(&mut body.stmts, &params, &summaries));
+                            let report = auto_acquire(&mut body.stmts, &params, &summaries);
+                            warnings.extend(report_spawn_ownership(
+                                &report,
+                                &format!("{}.{}", t.name, method.name),
+                            ));
+                            push_errors(report.errors);
                         }
                     }
                 }
@@ -411,78 +457,38 @@ fn auto_acquire_modules(modules: &mut [LoadedModule]) -> Vec<(String, Span)> {
             }
         }
     }
-    errors
+    (errors, warnings)
 }
 
-/// Emit a warning for every `spawn` capture the compiler auto-cowns. The shared ownership analysis (`brass_jit_llvm::ownership`) decides
-/// move/freeze/cown from liveness and mutation; a `Cown` decision means the capture
-/// is mutated and still live, so the compiler wraps it for safe concurrent access.
-///
-/// Runs on the original module ASTs *before* `auto_acquire_modules` rewrites the
-/// mutated captures into explicit `with` scopes: the warning must reflect what
-/// auto-acquire is about to do, so it has to see the pre-transform source.
+/// Format one warning per execution scope and lock root with an inserted access
+/// guard. Captures alone and explicit acquisitions do not produce warnings.
 #[cfg(jit_backend)]
-fn report_spawn_ownership(modules: &[LoadedModule]) -> Vec<String> {
-    use brass_jit_llvm::ownership::{CaptureDecision, Ownership, analyze_spawns_stmts};
-    use brass_parser::ast::{Member, TypeBody};
-
-    fn warn(out: &mut Vec<String>, decisions: Vec<CaptureDecision>, ctx: &str) {
-        for d in decisions {
-            if d.ownership == Ownership::Cown {
-                out.push(format!(
-                    "warning: variable '{}' is shared with a spawned task; every \
-                     access to it is auto-guarded by its cown lock{ctx}\n  = note: for \
-                     finer-grained concurrency, acquire it explicitly with 'with(cown, \
-                     (c) -> {{ ... }})'",
-                    d.var
-                ));
+fn report_spawn_ownership(
+    report: &brass_jit_llvm::ownership::AutoAcquireReport,
+    context: &str,
+) -> Vec<String> {
+    let mut seen = HashSet::default();
+    report
+        .guarded_accesses
+        .iter()
+        .filter_map(|access| {
+            if !seen.insert((access.scope, &access.root_binding)) {
+                return None;
             }
-        }
-    }
-
-    fn param_names(params: &[brass_parser::ast::Param]) -> HashSet<String> {
-        params.iter().map(|p| p.name.clone()).collect()
-    }
-
-    let mut out = Vec::new();
-    for m in modules {
-        let mut init_stmts: Vec<Stmt> = Vec::new();
-        for item in &m.ast.items {
-            match item {
-                TopLevel::Fun(f) => warn(
-                    &mut out,
-                    analyze_spawns_stmts(&f.body.stmts, &param_names(&f.params)),
-                    &format!(" in `{}`", f.name),
-                ),
-                TopLevel::Type(t) => {
-                    let members = match &t.body {
-                        TypeBody::Record(members) => members,
-                        TypeBody::Sum(_) | TypeBody::Alias(_) => continue,
-                    };
-                    for member in members {
-                        if let Member::Method(method) = member
-                            && let Some(body) = &method.body
-                        {
-                            warn(
-                                &mut out,
-                                analyze_spawns_stmts(&body.stmts, &param_names(&method.params)),
-                                &format!(" in `{}.{}`", t.name, method.name),
-                            );
-                        }
-                    }
-                }
-                TopLevel::Stmt(s) => init_stmts.push(s.clone()),
-            }
-        }
-        if !init_stmts.is_empty() {
-            warn(
-                &mut out,
-                analyze_spawns_stmts(&init_stmts, &HashSet::default()),
-                &format!(" in module `{}`", m.path.join(".")),
-            );
-        }
-    }
-    out
+            let scope = if access.scope.is_some() {
+                format!("in a spawned task within `{context}`")
+            } else {
+                format!("in `{context}`")
+            };
+            Some(format!(
+                "warning: variable '{}' is shared with a spawned task; accesses outside \
+             `with` are auto-guarded by its cown lock {scope}\n  = note: for \
+             finer-grained concurrency, acquire it explicitly with 'with(cown, \
+             (c) -> {{ ... }})'",
+                access.root_binding,
+            ))
+        })
+        .collect()
 }
 
 /// Make any Rust panic abort the process instead of unwinding. JIT-compiled
@@ -491,9 +497,9 @@ fn report_spawn_ownership(modules: &[LoadedModule]) -> Vec<String> {
 /// hook -- before unwinding begins -- keeps such a failure well-defined (a clean
 /// abort with the panic message). Installed once, only on the JIT execution path;
 /// the interpreter is pure Rust and unwinds normally, and the in-process JIT
-/// tests call `brass_jit_llvm::run` directly without going through here.
+/// tests drive the back end directly without going through here.
 #[cfg(jit_backend)]
-fn install_jit_panic_guard() {
+pub(crate) fn install_jit_panic_guard() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -508,7 +514,10 @@ fn install_jit_panic_guard() {
 /// Run a checked program through the default runtime: the LLVM JIT, used when the
 /// JIT back end is available (the `jit` feature on a non-wasm target).
 #[cfg(jit_backend)]
-fn execute(program: &Program, channels: &brass_mir::CheckerChannels<'_>) -> Result<(), String> {
+pub(crate) fn execute(
+    program: &Program,
+    channels: &brass_mir::CheckerChannels<'_>,
+) -> Result<(), String> {
     install_jit_panic_guard();
     brass_jit_llvm::run(program, channels)
 }
@@ -516,7 +525,10 @@ fn execute(program: &Program, channels: &brass_mir::CheckerChannels<'_>) -> Resu
 /// Run a checked program through the default runtime: the REPL interpreter, used
 /// when the JIT back end is unavailable (no `jit` feature, or a wasm target).
 #[cfg(not(jit_backend))]
-fn execute(program: &Program, channels: &brass_mir::CheckerChannels<'_>) -> Result<(), String> {
+pub(crate) fn execute(
+    program: &Program,
+    channels: &brass_mir::CheckerChannels<'_>,
+) -> Result<(), String> {
     brass_repl::run(program, channels, &mut io::stdout())
 }
 
@@ -543,9 +555,11 @@ impl Checked {
 }
 
 /// The checker outputs MIR lowering consumes, owned: the counterpart of
-/// [`brass_mir::CheckerChannels`]. Every channel is keyed by source span;
-/// lowering is deterministic, so the spans match the HIR rebuilt from the same
-/// module graph on another thread.
+/// [`brass_mir::CheckerChannels`]. The channels are keyed by source span (the
+/// per-instance ones by span, then instance), except `instance_returns`,
+/// keyed by function symbol and argument types; lowering is deterministic, so
+/// the spans match the HIR rebuilt from the same module graph on another
+/// thread.
 #[derive(Default)]
 struct OwnedChannels {
     /// Checker-resolved aggregate result types that seed MIR locals, keyed by
@@ -554,9 +568,17 @@ struct OwnedChannels {
     /// Method receiver types are isolated from aggregate result seeds so their
     /// source observations can only affect signature selection.
     receiver_types: HashMap<Span, brass_hir::Type>,
+    /// Method calls whose instances resolve different owners, with every
+    /// owner (see `brass_typeck::stream::method_receiver_owners`).
+    receiver_owners: HashMap<Span, Vec<brass_hir::Type>>,
     /// Spans of anonymous structural arguments the checker approved for view
     /// conversion; MIR lowering wraps exactly these in `Rvalue::RecordView`.
     view_args: HashSet<Span>,
+    numeric_calls: brass_hir::NumericCalls,
+    /// `recv.name(..)` calls of a function-valued field (all instantiations,
+    /// or the receivers' patterns that do); MIR lowering emits a field call
+    /// for these.
+    field_calls: HashMap<Span, Option<Vec<brass_hir::Type>>>,
     /// Value expressions the checker accepted as a declared sum subtype at a
     /// flow site (span -> parent sum symbol); MIR lowering rebuilds them.
     sum_views: HashMap<Span, brass_hir::Type>,
@@ -582,6 +604,14 @@ struct OwnedChannels {
     type_tests: HashMap<Span, brass_hir::Type>,
     /// Reflective call sites routed to append-only generated methods.
     keyed_dispatch: HashMap<Span, String>,
+    /// Per-instance aggregate seeds of the spans `expr_types` leaves unseeded
+    /// (see `brass_typeck::stream::aggregate_instance_seeds`).
+    instance_seeds: brass_hir::InstanceChannel<brass_hir::Type>,
+    /// Reflective call sites whose instances dispatch to different
+    /// specializations (span -> instance -> generated method).
+    instance_dispatch: brass_hir::InstanceChannel<String>,
+    /// The checker's settled returns of unannotated function instances.
+    instance_returns: HashMap<(String, Vec<brass_hir::Type>), brass_hir::Type>,
 }
 
 impl OwnedChannels {
@@ -589,7 +619,10 @@ impl OwnedChannels {
         brass_mir::CheckerChannels {
             expr_types: &self.expr_types,
             receiver_types: &self.receiver_types,
+            receiver_owners: &self.receiver_owners,
             view_args: &self.view_args,
+            numeric_calls: &self.numeric_calls,
+            field_calls: &self.field_calls,
             sum_views: &self.sum_views,
             call_locations: &self.call_locations,
             lift_errs: &self.lift_errs,
@@ -599,6 +632,9 @@ impl OwnedChannels {
             null_props: &self.null_props,
             type_tests: &self.type_tests,
             keyed_dispatch: &self.keyed_dispatch,
+            instance_seeds: &self.instance_seeds,
+            instance_dispatch: &self.instance_dispatch,
+            instance_returns: &self.instance_returns,
         }
     }
 }
@@ -621,7 +657,11 @@ fn drive(mode: Mode, file: &str) -> Result<(), u8> {
     if cfg!(jit_backend) && matches!(mode, Mode::Run { eager: false }) {
         return run_lazy(file.to_string(), main_src, root);
     }
-    let checked = match analyze(file, &main_src, &root) {
+    let locations = match mode {
+        Mode::Check => LocationTables::Omit,
+        Mode::Run { .. } | Mode::Repl => LocationTables::Execution,
+    };
+    let checked = match analyze(file, &main_src, &root, locations) {
         Ok(c) => c,
         Err(diagnostics) => return Err(print_diags(diagnostics)),
     };
@@ -800,7 +840,7 @@ fn retain_diagnostic_free_context(
 /// HIR holds `Rc`, so a checked `Program` cannot cross the checker-thread
 /// boundary; the receiver rebuilds it from the modules with
 /// [`assemble_checked`].
-struct AnalyzedProgram {
+pub(crate) struct AnalyzedProgram {
     modules: Vec<LoadedModule>,
     generated: Vec<brass_hir::GeneratedDecl>,
     channels: OwnedChannels,
@@ -835,1760 +875,21 @@ fn assemble_checked(analyzed: AnalyzedProgram) -> Result<Checked, Vec<String>> {
 /// on the calling thread. Returns the checked program or the rendered
 /// diagnostics. Shared by eager file execution and the interactive REPL, so
 /// both report identical errors.
-fn analyze(main_label: &str, main_src: &str, root: &Path) -> Result<Checked, Vec<String>> {
-    assemble_checked(analyze_fresh(main_label, main_src, root, None)?)
-}
-
-/// The checker-thread half of the streaming wiring: progress events flow out
-/// over an unbounded channel (the checker never blocks on a slow consumer),
-/// priority requests flow in and are drained between bodies.
-#[cfg(jit_backend)]
-struct CheckerPause {
-    paused: std::sync::atomic::AtomicBool,
-    requests: tokio::sync::mpsc::UnboundedSender<Option<Vec<brass_typeck::stream::BodyRequest>>>,
-}
-
-#[cfg(jit_backend)]
-impl CheckerPause {
-    fn request(&self, requests: Vec<brass_typeck::stream::BodyRequest>) {
-        if !requests.is_empty() {
-            let _ = self.requests.send(Some(requests));
-        }
-    }
-
-    /// Release a checker parked on the request channel. `None` is a control
-    /// wake and never enters the type checker's priority queue.
-    fn resume(&self) {
-        if self
-            .paused
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            let _ = self.requests.send(None);
-        }
-    }
-
-    fn is_paused(&self) -> bool {
-        self.paused.load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
-
-/// Ensures every exit after checker startup requests termination and wakes a
-/// checker that is waiting for another priority request.
-#[cfg(jit_backend)]
-struct CheckerCleanup {
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    paused: std::sync::Arc<CheckerPause>,
-}
-
-#[cfg(jit_backend)]
-impl Drop for CheckerCleanup {
-    fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        self.paused.resume();
-    }
-}
-
-#[cfg(jit_backend)]
-struct ThreadScheduler {
-    events: tokio::sync::mpsc::UnboundedSender<brass_typeck::stream::CheckEvent>,
-    requests: tokio::sync::mpsc::UnboundedReceiver<Option<Vec<brass_typeck::stream::BodyRequest>>>,
-    /// Set by the driver when the program ends: the checker stops at the
-    /// next body boundary instead of finishing code nothing will run.
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Set while the driver is settling its entry (gate + start-up demands):
-    /// the checker serves only requested bodies, so no demand ever waits for
-    /// a definitional pass the queue happened to start first. Cleared when
-    /// execution begins.
-    paused: std::sync::Arc<CheckerPause>,
-    requests_closed: bool,
-}
-
-#[cfg(jit_backend)]
-impl brass_typeck::stream::Scheduler for ThreadScheduler {
-    fn drain_requests(&mut self) -> Vec<brass_typeck::stream::BodyRequest> {
-        let mut out = Vec::new();
-        while let Ok(request) = self.requests.try_recv() {
-            out.extend(request.into_iter().flatten());
-        }
-        out
-    }
-
-    fn wait_for_requests(&mut self) -> Vec<brass_typeck::stream::BodyRequest> {
-        let mut out = Vec::new();
-        match self.requests.blocking_recv() {
-            Some(request) => out.extend(request.into_iter().flatten()),
-            None => self.requests_closed = true,
-        }
-        out.extend(self.drain_requests());
-        out
-    }
-
-    fn emit(&mut self, event: brass_typeck::stream::CheckEvent) {
-        // A dropped receiver means the consumer stopped listening (it
-        // aborted); checking still finishes for the thread's final result.
-        let _ = self.events.send(event);
-    }
-
-    fn stopped(&self) -> bool {
-        self.stop.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn paused(&self) -> bool {
-        !self.requests_closed && self.paused.is_paused()
-    }
-}
-
-/// The main-thread accumulation of the checker thread's event stream: the
-/// same span-keyed maps [`Checked`] carries, built by replaying channel
-/// deltas as they arrive (removals first -- a delta never removes and
-/// re-adds one span). Generated continuation deltas overwrite by span like
-/// ordinary body deltas.
-#[cfg(jit_backend)]
-#[derive(Default)]
-struct MergedChannels {
-    expr_types: HashMap<Span, brass_hir::Type>,
-    receiver_types: HashMap<Span, brass_hir::Type>,
-    /// Checker-reported instance returns of demanded UNANNOTATED bodies,
-    /// keyed by `(symbol, argument types)`: the runtime-deferral contracts
-    /// `monomorphize_entry_with_returns` compiles call sites against.
-    instance_returns: HashMap<(String, Vec<brass_hir::Type>), brass_hir::Type>,
-    view_args: HashSet<Span>,
-    sum_views: HashMap<Span, brass_hir::Type>,
-    lift_errs: HashSet<Span>,
-    fields_loops: HashMap<Span, Vec<String>>,
-    type_names: HashMap<Span, String>,
-    typeof_types: HashMap<Span, brass_hir::Type>,
-    null_props: HashSet<Span>,
-    type_tests: HashMap<Span, brass_hir::Type>,
-    keyed_dispatch: HashMap<Span, String>,
-}
-
-#[cfg(jit_backend)]
-impl MergedChannels {
-    fn apply(&mut self, event: brass_typeck::stream::CheckEvent) {
-        use brass_typeck::stream::CheckEvent;
-        match event {
-            // Error verdicts ride the thread's final result in this pipeline;
-            // the event copy gates execution once the JIT consumes the stream
-            // mid-run.
-            CheckEvent::StaticChecked(_) => {}
-            CheckEvent::ContextReady(d)
-            | CheckEvent::BodyChecked(_, d)
-            | CheckEvent::Finished(d, _) => self.apply_delta(d),
-            CheckEvent::KeyedReady(_, dispatch, d) => {
-                self.apply_delta(d);
-                self.keyed_dispatch.extend(dispatch);
-            }
-        }
-    }
-
-    fn apply_delta(&mut self, d: brass_typeck::stream::ChannelDelta) {
-        for s in &d.expr_types_removed {
-            self.expr_types.remove(s);
-        }
-        for s in &d.receiver_types_removed {
-            self.receiver_types.remove(s);
-        }
-        for s in &d.typeof_types_removed {
-            self.typeof_types.remove(s);
-        }
-        for s in &d.type_tests_removed {
-            self.type_tests.remove(s);
-        }
-        self.expr_types.extend(d.expr_types);
-        self.receiver_types.extend(d.receiver_types);
-        for (symbol, args, ret) in d.instance_returns {
-            self.instance_returns.insert((symbol, args), ret);
-        }
-        self.view_args.extend(d.view_args);
-        self.sum_views.extend(d.sum_views);
-        self.lift_errs.extend(d.lift_errs);
-        self.fields_loops.extend(d.fields_loops);
-        self.type_names.extend(d.type_names);
-        self.typeof_types.extend(d.typeof_types);
-        self.type_tests.extend(d.type_tests);
-        self.null_props.extend(d.null_props);
-    }
+pub(crate) fn analyze(
+    main_label: &str,
+    main_src: &str,
+    root: &Path,
+    locations: LocationTables,
+) -> Result<Checked, Vec<String>> {
+    assemble_checked(analyze_fresh(main_label, main_src, root, locations, None)?)
 }
 
 /// Render diagnostics to stderr and yield the front end's failure exit code.
-fn print_diags(diags: Vec<String>) -> u8 {
+pub(crate) fn print_diags(diags: Vec<String>) -> u8 {
     for d in diags {
         eprintln!("{d}");
     }
     1
-}
-
-/// Every function and method body's span range, for attributing a
-/// diagnostic to the body containing it. Lazy checking HOLDS an error whose
-/// span lies inside a body execution never needs; an error inside a needed
-/// body -- or outside any body at all (top-level code, declarations,
-/// signatures) -- is fatal at the next gate. Method owners are marked needed
-/// from the monomorphized batch before native compilation.
-#[cfg(jit_backend)]
-struct BodySpans {
-    ranges: Vec<(String, usize, usize)>,
-}
-
-#[cfg(jit_backend)]
-impl BodySpans {
-    fn new(program: &Program) -> Self {
-        // Declarations establish the shared typing environment. Only body
-        // diagnostics may be held for an uncalled function; a rejected
-        // signature must not reach a caller or native compilation.
-        let mut ranges = Vec::new();
-        for (symbol, f) in &program.functions {
-            let span = f.decl.body.span;
-            ranges.push((symbol.clone(), span.lo, span.hi));
-        }
-        for info in program.types.values() {
-            let mut methods: Vec<&brass_hir::MethodInfo> = Vec::new();
-            match &info.kind {
-                brass_hir::TypeKind::Record { methods: ms, .. } => methods.extend(ms.values()),
-                brass_hir::TypeKind::Sum { variants } => {
-                    for v in variants {
-                        methods.extend(v.methods.values());
-                    }
-                }
-            }
-            for m in methods {
-                if let Some(body) = &m.decl.body {
-                    let span = body.span;
-                    ranges.push((
-                        format!("method:{}:{}", info.symbol, m.decl.name),
-                        span.lo,
-                        span.hi,
-                    ));
-                }
-            }
-        }
-        BodySpans { ranges }
-    }
-
-    /// The body whose range contains `span`, if any.
-    fn owner(&self, span: Span) -> Option<&str> {
-        tracing::trace!(target: "brass::lazy", lo = span.lo, ranges = ?self.ranges, "owner probe");
-        self.ranges
-            .iter()
-            .find(|(_, lo, hi)| *lo <= span.lo && span.lo < *hi)
-            .map(|(symbol, _, _)| symbol.as_str())
-    }
-}
-
-/// What a gate should do about the held diagnostics.
-#[cfg(jit_backend)]
-enum FatalVerdict {
-    /// Nothing on the needed path: proceed.
-    Clean,
-    /// Fatal diagnostics were printed: abort with this code.
-    Fatal(u8),
-    /// A runtime-demanded body discovered a keyed call that requires the
-    /// narrow eager fallback.
-    NeedsEager,
-}
-
-/// Judge the held diagnostics at a gate. A fatal candidate is CONFIRMED
-/// before it aborts anything: a keyed (`-> infer!`) program's first pass
-/// records provisional errors that its continuation may clear, so the gate
-/// waits for the checker thread's final verdict once -- and only once
-/// something looked fatal; clean programs
-/// never wait here. Confirmed diagnostics print sorted and deduplicated,
-/// rendered like the eager pipeline.
-#[cfg(jit_backend)]
-fn judge_fatal(
-    lazy: &mut LazyState,
-    bodies: &BodySpans,
-    sources: &brass_resolve::SourceMap,
-) -> FatalVerdict {
-    if lazy.fatal(bodies).is_empty() {
-        return FatalVerdict::Clean;
-    }
-    // Wait for the checker thread to finish publishing continuation results.
-    // The wait is on its own progress, so its queue must be running.
-    lazy.resume_background();
-    while !lazy.closed && !lazy.needs_eager {
-        lazy.pump_blocking();
-    }
-    if lazy.needs_eager {
-        return FatalVerdict::NeedsEager;
-    }
-    let fatal = lazy.fatal(bodies);
-    if fatal.is_empty() {
-        return FatalVerdict::Clean;
-    }
-    for line in render_errors(&fatal, sources) {
-        eprintln!("{line}");
-    }
-    FatalVerdict::Fatal(1)
-}
-
-/// The execution side of the lazy pipeline: replays the checker thread's
-/// events into the merged channel state, tracks which bodies are settled,
-/// and sends the priority requests -- the demanded function's path plus the
-/// concrete argument types of the call that needs it -- that pull bodies to
-/// the front of the checking order.
-#[cfg(jit_backend)]
-struct LazyState {
-    events: tokio::sync::mpsc::UnboundedReceiver<brass_typeck::stream::CheckEvent>,
-    sources: brass_resolve::SourceMap,
-    merged: MergedChannels,
-    checked_fns: HashSet<String>,
-    inits_checked: usize,
-    /// Every diagnostic reported so far, HELD: lazy checking ignores an
-    /// error unless execution needs the body it lives in (see
-    /// [`LazyState::fatal`] and [`BodySpans`]).
-    held: Vec<brass_typeck::TypeError>,
-    /// Warnings are printed as soon as their body delta arrives. The set keeps
-    /// terminal and generated-continuation snapshots from printing a warning
-    /// already delivered by an earlier window.
-    printed_warnings: HashSet<(String, Span)>,
-    /// The bodies execution needs: `main`, every demanded free function, and
-    /// every method in a batch about to enter native compilation.
-    /// (Top-level code needs no entry here -- its spans lie outside every
-    /// body, which is always fatal.) Grows at each demand; held errors are
-    /// re-judged against it at every gate.
-    needed: HashSet<String>,
-    /// Tell the checker to stop at the next body boundary (the program
-    /// ended; what it never executed no longer needs checking).
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// While set, the checker serves only demanded bodies and holds its
-    /// background queue (see `Scheduler::paused`). Cleared when execution
-    /// begins -- and before any wait that needs the checker to make progress
-    /// of its own (a fatal confirmation, a transient-failure retry), which
-    /// would otherwise wait forever on a held queue.
-    paused: std::sync::Arc<CheckerPause>,
-    /// A keyed call first discovered by a runtime-demanded body requires the
-    /// narrow eager fallback until specialization can run per demand.
-    needs_eager: bool,
-    /// The event channel closed (the checker finished and hung up).
-    closed: bool,
-    /// A delta carried channel content since the last MIR revision. Bodies
-    /// lowered before it may be missing entries the checker settled later
-    /// (a cross-body pinning: an init's array literal fixed by a function's
-    /// `push`), so stale owners are refreshed before output is trusted.
-    dirty: bool,
-    /// Free-function declaration ranges used to invalidate only lowered MIR
-    /// bodies whose span-keyed channel inputs changed.
-    function_ranges: Vec<(String, usize, usize)>,
-    dirty_functions: HashSet<String>,
-    /// A channel change outside every free function belongs to a method or
-    /// initializer and still requires rebuilding the subset base.
-    dirty_non_functions: bool,
-    /// The entry gate remains closed between first keyed discovery and the
-    /// append-only continuation event.
-    awaiting_keyed: bool,
-    /// Set once the initial entry gate has completed.
-    entry_open: bool,
-    generated: Vec<brass_hir::GeneratedDecl>,
-    next_demand_batch: u64,
-}
-
-#[cfg(jit_backend)]
-struct DemandBatchResult {
-    complete: bool,
-    new_requests: usize,
-    newly_settled: usize,
-}
-
-#[cfg(jit_backend)]
-const DEMAND_LOOP_STALLED: &str = "internal error: lazy demand loop made no progress";
-
-/// Enforce the demand-loop progress invariant: every retry must discover a
-/// new demand, observe a requested body settle, or add a missing MIR body.
-#[cfg(jit_backend)]
-fn demand_loop_progress(
-    new_demands: usize,
-    newly_settled: usize,
-    supplied_bodies: usize,
-) -> Result<(), &'static str> {
-    if new_demands + newly_settled + supplied_bodies == 0 {
-        Err(DEMAND_LOOP_STALLED)
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(jit_backend)]
-impl LazyState {
-    /// Methods already have checked and lowered bodies when free-function
-    /// demands begin. Match their MIR body identities against this batch so
-    /// their held diagnostics gate native compilation too. Storage symbols
-    /// distinguish identically named types in different modules.
-    fn need_monomorphized_methods(
-        &mut self,
-        mir: &brass_mir::MirProgram,
-        mono: &brass_engine::MonoProgram<'_>,
-    ) {
-        let compiled: HashSet<*const brass_mir::MirBody> = mono
-            .functions
-            .iter()
-            .map(|f| std::ptr::from_ref(f.body))
-            .collect();
-        self.needed.extend(
-            mir.methods
-                .iter()
-                .filter(|m| compiled.contains(&std::ptr::from_ref(&m.body)))
-                .map(|m| format!("method:{}:{}", m.type_symbol, m.method)),
-        );
-    }
-
-    /// Release the checker's background queue (idempotent). Called when
-    /// execution begins, and before any wait on the checker's own progress.
-    fn resume_background(&self) {
-        self.paused.resume();
-    }
-
-    fn take(&mut self, event: brass_typeck::stream::CheckEvent) {
-        use brass_typeck::stream::{BodyId, CheckEvent};
-        match &event {
-            CheckEvent::StaticChecked(errors) => self.held.extend(errors.iter().cloned()),
-            CheckEvent::ContextReady(d) => self.absorb_delta(d),
-            CheckEvent::BodyChecked(id, d) => {
-                self.absorb_delta(d);
-                match id {
-                    BodyId::Init(_) => self.inits_checked += 1,
-                    BodyId::Function(symbol) => {
-                        self.checked_fns.insert(symbol.clone());
-                    }
-                }
-            }
-            CheckEvent::Finished(d, errors) => {
-                self.absorb_delta(d);
-                self.held.extend(errors.iter().cloned());
-            }
-            CheckEvent::KeyedReady(generated, _, d) => {
-                self.absorb_delta(d);
-                // The continuation event carries the complete final verdict;
-                // replace provisional keyed-statement errors from pass one.
-                self.held = d.errors.clone();
-                self.generated.extend(generated.iter().cloned());
-                self.awaiting_keyed = false;
-            }
-        }
-        self.merged.apply(event);
-    }
-
-    /// Track a delta: errors are held for span-attributed judgement, channel
-    /// content marks the current lowering stale.
-    fn absorb_delta(&mut self, d: &brass_typeck::stream::ChannelDelta) {
-        self.held.extend(d.errors.iter().cloned());
-        self.emit_warnings(&d.warnings);
-        if !d.keyed_calls.is_empty() {
-            if self.entry_open {
-                // Per-demand specialization is future work; before execution
-                // this flag reaches finish_eagerly, while an already-running
-                // program fails without replaying prior side effects.
-                self.needs_eager = true;
-            } else {
-                self.awaiting_keyed = true;
-            }
-        }
-        self.dirty |= !d.expr_types.is_empty()
-            || !d.expr_types_removed.is_empty()
-            || !d.view_args.is_empty()
-            || !d.lift_errs.is_empty()
-            || !d.null_props.is_empty()
-            || !d.fields_loops.is_empty()
-            || !d.sum_views.is_empty()
-            || !d.type_names.is_empty()
-            || !d.typeof_types.is_empty()
-            || !d.typeof_types_removed.is_empty()
-            || !d.type_tests.is_empty()
-            || !d.type_tests_removed.is_empty();
-        let mut mark = |span: Span| {
-            if let Some((symbol, _, _)) = self
-                .function_ranges
-                .iter()
-                .find(|(_, lo, hi)| *lo <= span.lo && span.lo < *hi)
-            {
-                self.dirty_functions.insert(symbol.clone());
-            } else {
-                self.dirty_non_functions = true;
-            }
-        };
-        d.expr_types.iter().for_each(|(span, _)| mark(*span));
-        d.expr_types_removed.iter().for_each(|span| mark(*span));
-        d.view_args.iter().for_each(|span| mark(*span));
-        d.lift_errs.iter().for_each(|span| mark(*span));
-        d.null_props.iter().for_each(|span| mark(*span));
-        d.fields_loops.iter().for_each(|(span, _)| mark(*span));
-        d.sum_views.iter().for_each(|(span, _)| mark(*span));
-        d.type_names.iter().for_each(|(span, _)| mark(*span));
-        d.typeof_types.iter().for_each(|(span, _)| mark(*span));
-        d.typeof_types_removed.iter().for_each(|span| mark(*span));
-        d.type_tests.iter().for_each(|(span, _)| mark(*span));
-        d.type_tests_removed.iter().for_each(|span| mark(*span));
-    }
-
-    fn emit_warnings(&mut self, warnings: &[brass_typeck::TypeError]) {
-        let fresh: Vec<(String, Span)> = warnings
-            .iter()
-            .filter_map(|warning| {
-                let key = (warning.message.clone(), warning.span);
-                self.printed_warnings.insert(key.clone()).then_some(key)
-            })
-            .collect();
-        for line in render_warnings(&fresh, &self.sources) {
-            eprintln!("{line}");
-        }
-    }
-
-    /// Refresh only stale free-function MIR. `false` asks the caller to rebuild
-    /// the base because a method or initializer channel changed.
-    fn refresh_lowering(
-        &mut self,
-        lowering: &mut brass_mir::SubsetLowering,
-        program: &Program,
-        tables: &brass_mir::LowerTables,
-        call_locations: &HashMap<Span, (String, u32, u32)>,
-    ) -> bool {
-        if self.dirty_non_functions {
-            return false;
-        }
-        let dirty = std::mem::take(&mut self.dirty_functions);
-        let channels = self.channels(call_locations);
-        let refreshed = dirty
-            .iter()
-            .filter(|symbol| lowering.refresh_function(program, tables, symbol, &channels))
-            .count();
-        tracing::debug!(
-            target: "brass::perf",
-            count = refreshed,
-            "lazy: lowering refresh"
-        );
-        self.dirty = false;
-        true
-    }
-
-    fn mark_lowered(&mut self, symbol: &str) {
-        self.dirty_functions.remove(symbol);
-    }
-
-    fn pump_blocking(&mut self) {
-        match self.events.blocking_recv() {
-            Some(event) => self.take(event),
-            None => self.closed = true,
-        }
-    }
-
-    /// Absorb everything already queued without blocking.
-    fn pump_pending(&mut self) {
-        while let Ok(event) = self.events.try_recv() {
-            self.take(event);
-        }
-    }
-
-    /// The held diagnostics execution cannot ignore: those inside a NEEDED
-    /// body and those inside no known body at all (top-level statements,
-    /// declarations, spanless internal reports). Sorted and deduplicated
-    /// like the eager report.
-    fn fatal(&self, bodies: &BodySpans) -> Vec<(String, Span)> {
-        let mut out: Vec<(String, Span)> = self
-            .held
-            .iter()
-            .filter(|e| match bodies.owner(e.span) {
-                Some(owner) => self.needed.contains(owner),
-                None => true,
-            })
-            .map(|e| (e.message.clone(), e.span))
-            .collect();
-        out.sort_by(|a, b| (a.1.lo, &a.0).cmp(&(b.1.lo, &b.0)));
-        out.dedup();
-        out
-    }
-
-    /// Every held diagnostic, needed or not: the report for a failure the
-    /// span attribution cannot explain (a mono rejection against the
-    /// checker's final state).
-    fn held_all(&self) -> Vec<(String, Span)> {
-        let mut out: Vec<(String, Span)> = self
-            .held
-            .iter()
-            .map(|e| (e.message.clone(), e.span))
-            .collect();
-        out.sort_by(|a, b| (a.1.lo, &a.0).cmp(&(b.1.lo, &b.0)));
-        out.dedup();
-        out
-    }
-
-    /// Block until the entry is settled: every module initializer and (when
-    /// the program has one) `main`. False means the checker hung up (or
-    /// requested the eager fallback) before settling them; held diagnostics are the caller's
-    /// judgement to make.
-    fn wait_gate(&mut self, inits: usize, has_main: bool) -> bool {
-        let settled = |s: &Self| {
-            s.inits_checked >= inits
-                && (!has_main || s.checked_fns.contains("main"))
-                && !s.awaiting_keyed
-        };
-        while !self.needs_eager && !self.closed && !settled(self) {
-            if self.awaiting_keyed {
-                self.resume_background();
-            }
-            self.pump_blocking();
-        }
-        !self.needs_eager && settled(self)
-    }
-
-    /// Send a complete mono demand batch before blocking, then wait until the
-    /// checker has settled every symbol. Each body joins the NEEDED set, so
-    /// callers judge [`LazyState::fatal`] once after the batch completes.
-    fn demand_all(&mut self, demands: &[(String, Vec<brass_hir::Type>)]) -> DemandBatchResult {
-        let started = std::time::Instant::now();
-        let mut pending = HashSet::default();
-        let mut requests = Vec::new();
-        let batch = self.next_demand_batch;
-        self.next_demand_batch += 1;
-        for (symbol, type_args) in demands {
-            self.needed.insert(symbol.clone());
-            if !self.checked_fns.contains(symbol) && pending.insert(symbol.clone()) {
-                requests.push(brass_typeck::stream::BodyRequest {
-                    symbol: symbol.clone(),
-                    type_args: type_args.clone(),
-                    batch,
-                });
-            }
-        }
-        let new_requests = requests.len();
-        self.paused.request(requests);
-        while !self.needs_eager
-            && !self.closed
-            && pending
-                .iter()
-                .any(|symbol| !self.checked_fns.contains(symbol))
-        {
-            self.pump_blocking();
-        }
-        let complete = !self.needs_eager
-            && pending
-                .iter()
-                .all(|symbol| self.checked_fns.contains(symbol));
-        let newly_settled = pending
-            .iter()
-            .filter(|symbol| self.checked_fns.contains(*symbol))
-            .count();
-        tracing::debug!(
-            target: "brass::perf",
-            count = pending.len(),
-            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-            "lazy: demand batch settled"
-        );
-        DemandBatchResult {
-            complete,
-            new_requests,
-            newly_settled,
-        }
-    }
-
-    /// Settle one runtime-discovered body through the same request protocol
-    /// used by start-up batches.
-    fn demand(&mut self, symbol: &str, type_args: Vec<brass_hir::Type>) -> bool {
-        self.demand_all(&[(symbol.to_string(), type_args)]).complete
-    }
-
-    /// The merged channel state as the lowering bundle. Call locations are
-    /// computed by the executor from its own module ASTs, not streamed.
-    fn channels<'a>(
-        &'a self,
-        call_locations: &'a HashMap<Span, (String, u32, u32)>,
-    ) -> brass_mir::CheckerChannels<'a> {
-        brass_mir::CheckerChannels {
-            expr_types: &self.merged.expr_types,
-            receiver_types: &self.merged.receiver_types,
-            view_args: &self.merged.view_args,
-            sum_views: &self.merged.sum_views,
-            call_locations,
-            lift_errs: &self.merged.lift_errs,
-            fields_loops: &self.merged.fields_loops,
-            type_names: &self.merged.type_names,
-            typeof_types: &self.merged.typeof_types,
-            null_props: &self.merged.null_props,
-            type_tests: &self.merged.type_tests,
-            keyed_dispatch: &self.merged.keyed_dispatch,
-        }
-    }
-}
-
-/// Fall back to the whole-analysis verdict: reclaim the checker thread and
-/// re-run the pipeline EAGERLY, in process. The streaming analysis's payload
-/// is never executed or reported from -- its lazy profile types some calls
-/// from signatures without recording their instances' channel entries or
-/// per-instance diagnostics, so only a genuinely eager analysis is a whole
-/// verdict.
-#[cfg(jit_backend)]
-#[allow(clippy::too_many_arguments)]
-fn finish_eagerly(
-    rt: &tokio::runtime::Runtime,
-    checker: tokio::task::JoinHandle<Result<AnalyzedProgram, Vec<String>>>,
-    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    paused: &std::sync::Arc<CheckerPause>,
-    mut events: tokio::sync::mpsc::UnboundedReceiver<brass_typeck::stream::CheckEvent>,
-    label: &str,
-    src: &str,
-    root: &Path,
-) -> Result<(), u8> {
-    // Reclaim the thread: stop it at the next boundary (releasing the held
-    // background queue so it can reach one), drain its events, and join.
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    paused.resume();
-    while events.blocking_recv().is_some() {}
-    let _ = rt
-        .block_on(checker)
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()));
-    tracing::debug!(target: "brass::perf", "lazy: rerunning eagerly");
-    let checked = match analyze(label, src, root) {
-        Ok(c) => c,
-        Err(diags) => return Err(print_diags(diags)),
-    };
-    execute(&checked.program, &checked.channels()).map_err(|e| {
-        report_runtime_error(&e);
-        1
-    })
-}
-
-/// Compile and prime EVERY recorded deferred target, to a fixpoint: called
-/// when a batch containing `spawn` was compiled, before its code runs.
-/// Spawned code executes on worker threads, which answer deferred calls only
-/// from the cross-thread resolved cache; after this drain, every site any
-/// worker could reach is in it. False aborts the run (a target's check or
-/// compilation failed -- `resolve_deferred` reported it).
-#[cfg(jit_backend)]
-#[allow(clippy::too_many_arguments)] // the execution-side state is one bundle
-fn drain_targets_for_spawn(
-    backend: &mut brass_jit_llvm::LlvmCodegen,
-    program: &Program,
-    tables: &brass_mir::LowerTables,
-    call_locations: &HashMap<Span, (String, u32, u32)>,
-    sources: &brass_resolve::SourceMap,
-    bodies: &BodySpans,
-    globals: &[(String, brass_hir::Type)],
-    lowering: &mut brass_mir::SubsetLowering,
-    lazy: &mut LazyState,
-    targets: &mut HashMap<String, brass_engine::DeferredSig>,
-) -> bool {
-    loop {
-        let mut pending: Vec<String> = targets
-            .keys()
-            .filter(|symbol| !backend.has_instance(symbol))
-            .cloned()
-            .collect();
-        pending.sort();
-        if pending.is_empty() {
-            // Targets already defined in another batch still need their shared
-            // deferred slots primed. Static bodies can cross batch boundaries,
-            // so close the whole registered session before workers start.
-            let mut symbols: Vec<_> = targets.keys().collect();
-            symbols.sort();
-            for symbol in symbols {
-                let Some(address) = backend.address_of(symbol) else {
-                    return false;
-                };
-                brass_jit_llvm::prime_resolved(symbol, address);
-            }
-            return match backend.materialize_all() {
-                Ok(()) => true,
-                Err(error) => {
-                    eprintln!("error: worker materialization failed: {error}");
-                    false
-                }
-            };
-        }
-        for symbol in pending {
-            let addr = resolve_deferred(
-                backend,
-                &symbol,
-                program,
-                tables,
-                call_locations,
-                sources,
-                bodies,
-                globals,
-                lowering,
-                lazy,
-                targets,
-            );
-            if addr == 0 {
-                return false;
-            }
-            brass_jit_llvm::prime_resolved(&symbol, addr);
-        }
-    }
-}
-
-/// The runtime half of deferral: called (through `pp_resolve`) the first
-/// time execution reaches a deferred call site. Ensures the target's body is
-/// checked -- sending the function's path and the site's concrete argument
-/// types to the checker and waiting, when it is not -- lowers it, then
-/// monomorphizes and compiles the instance (and everything it newly needs;
-/// its own calls may defer further) into the LIVE engine. Returns the
-/// callable address, or 0 after reporting -- the site then traps, keeping a
-/// resolver failure defined.
-///
-/// Exit the process if the needed path holds a confirmed fatal diagnostic
-/// (see [`judge_fatal`]; reached from JIT code, which cannot unwind, hence
-/// `exit`). A keyed call discovered after execution began cannot safely rerun
-/// prior side effects, so the narrow demand fallback asks for `--eager`.
-#[cfg(jit_backend)]
-fn exit_if_fatal(lazy: &mut LazyState, bodies: &BodySpans, sources: &brass_resolve::SourceMap) {
-    if lazy.fatal(bodies).is_empty() && !lazy.needs_eager {
-        return;
-    }
-    // Wait for the checker thread's final verdict. The wait is on its own
-    // progress, so its queue must be running.
-    lazy.resume_background();
-    while !lazy.closed {
-        lazy.pump_blocking();
-    }
-    use std::io::Write;
-    // A runtime specialization fallback cannot replay prior side effects,
-    // but it can finish checking. Preserve that source verdict before giving
-    // rerun guidance for a program whose continuation actually checked cleanly.
-    let fatal = if lazy.needs_eager {
-        lazy.held_all()
-    } else {
-        lazy.fatal(bodies)
-    };
-    if !fatal.is_empty() {
-        let _ = io::stdout().flush();
-        print_diags(render_errors(&fatal, sources));
-        std::process::exit(1);
-    }
-    if lazy.needs_eager {
-        let _ = io::stdout().flush();
-        eprintln!(
-            "error: a runtime-demanded body requires reflective specialization; rerun with --eager"
-        );
-        std::process::exit(1);
-    }
-}
-
-/// A fatal diagnostic discovered here means the program needed ill-typed
-/// code: the needed-path report is printed and the process exits 1, exactly
-/// as if the error had been found before execution -- output the program
-/// already produced stands, as documented for lazy checking. Held
-/// diagnostics elsewhere stay ignored.
-#[cfg(jit_backend)]
-#[allow(clippy::too_many_arguments)] // the execution-side state is one bundle
-fn resolve_deferred(
-    backend: &mut brass_jit_llvm::LlvmCodegen,
-    symbol: &str,
-    program: &Program,
-    tables: &brass_mir::LowerTables,
-    call_locations: &HashMap<Span, (String, u32, u32)>,
-    sources: &brass_resolve::SourceMap,
-    bodies: &BodySpans,
-    globals: &[(String, brass_hir::Type)],
-    lowering: &mut brass_mir::SubsetLowering,
-    lazy: &mut LazyState,
-    targets: &mut HashMap<String, brass_engine::DeferredSig>,
-) -> usize {
-    tracing::debug!(target: "brass::perf", %symbol, "lazy: runtime resolve");
-    // Already compiled -- by the startup set, or by an earlier resolution.
-    if let Some(addr) = backend.address_of(symbol) {
-        return addr;
-    }
-    let Some(sig) = targets.get(symbol).cloned() else {
-        eprintln!("error: deferred call to unrecorded instance `{symbol}`");
-        return 0;
-    };
-    // A diagnostic on the (just grown) needed path stops the run here,
-    // before the ill-typed code could execute.
-    let fatal_exit = |lazy: &mut LazyState, fallback: &str| -> usize {
-        exit_if_fatal(lazy, bodies, sources);
-        eprintln!("{fallback}");
-        0
-    };
-    if !lowering.is_lowered(&sig.base) {
-        tracing::debug!(target: "brass::perf", base = %sig.base, "lazy: runtime lower");
-        if !lazy.demand(&sig.base, sig.type_args.clone()) {
-            return fatal_exit(
-                lazy,
-                &format!("error: the check of `{}` did not complete", sig.base),
-            );
-        }
-        // The demanded body joined the needed set: a held diagnostic in it
-        // is now fatal, before its code could ever run.
-        exit_if_fatal(lazy, bodies, sources);
-        let channels = lazy.channels(call_locations);
-        lowering.add_function(program, tables, &sig.base, &channels);
-    }
-    loop {
-        match brass_engine::monomorphize_instance_deferred_with_returns(
-            &lowering.mir,
-            program,
-            &sig.base,
-            sig.type_args.clone(),
-            globals,
-            lazy.merged.instance_returns.clone(),
-        ) {
-            Ok(mono) => {
-                lazy.need_monomorphized_methods(&lowering.mir, &mono);
-                exit_if_fatal(lazy, bodies, sources);
-                // An UNANNOTATED instance was deferred against the checker's
-                // reported return; the monomorphized body is the authority.
-                // A mismatch would make the already-compiled call site an
-                // ill-typed indirect call, so it fails resolution (defined,
-                // pre-execution of the instance) instead of miscompiling.
-                let unannotated = program
-                    .functions
-                    .get(&sig.base)
-                    .is_some_and(|f| f.signature.ret_ty.is_none());
-                if unannotated
-                    && let Some(f) = mono.lookup(symbol)
-                    && f.ret != sig.ret
-                {
-                    eprintln!(
-                        "error: deferred instance `{}` resolved with return type `{}` \
-                         but its call site was compiled for `{}`; annotate the return \
-                         type of `{}`",
-                        symbol,
-                        f.ret.display(),
-                        sig.ret.display(),
-                        sig.base
-                    );
-                    return 0;
-                }
-                targets.extend(mono.deferred.clone());
-                let batch_spawns = brass_engine::batch_spawns(&mono);
-                // Register the entire batch before a lookup can materialize
-                // any mutually recursive bodies. Registration skips definitions
-                // already supplied by startup or an earlier runtime batch.
-                for f in &mono.functions {
-                    if !backend.has_instance(&f.symbol) {
-                        tracing::debug!(target: "brass::perf", symbol = %f.symbol, "lazy: runtime compile");
-                    }
-                }
-                if let Err(error) = backend.register_batch(&mono) {
-                    eprintln!("error: runtime compilation of `{symbol}` failed: {error}");
-                    return 0;
-                }
-                drop(mono);
-                let addr = backend.address_of(symbol).unwrap_or(0);
-                if addr != 0 {
-                    brass_jit_llvm::prime_resolved(symbol, addr);
-                }
-                // The batch spawns: everything a worker thread could reach
-                // must be compiled and primed before this call returns (the
-                // spawn runs after it) -- workers cannot compile.
-                if addr != 0
-                    && batch_spawns
-                    && !drain_targets_for_spawn(
-                        backend,
-                        program,
-                        tables,
-                        call_locations,
-                        sources,
-                        bodies,
-                        globals,
-                        lowering,
-                        lazy,
-                        targets,
-                    )
-                {
-                    return 0;
-                }
-                return addr;
-            }
-            Err(brass_engine::MonoStop::MissingBodies(demands)) => {
-                let mut new_demands = 0;
-                let mut newly_settled = 0;
-                let mut supplied_bodies = 0;
-                for (miss, type_args, needs_body) in demands {
-                    if lowering.is_lowered(&miss) || !program.functions.contains_key(&miss) {
-                        continue;
-                    }
-                    let result = lazy.demand_all(&[(miss.clone(), type_args.clone())]);
-                    new_demands += result.new_requests;
-                    newly_settled += result.newly_settled;
-                    if !result.complete {
-                        return fatal_exit(
-                            lazy,
-                            &format!("error: the check of `{miss}` did not complete"),
-                        );
-                    }
-                    exit_if_fatal(lazy, bodies, sources);
-                    if !needs_body
-                        && lazy
-                            .merged
-                            .instance_returns
-                            .contains_key(&(miss.clone(), type_args))
-                    {
-                        // The checker supplied the missing unannotated return
-                        // contract. Retry with it instead of lowering the body;
-                        // the call remains deferred until execution reaches it.
-                        continue;
-                    }
-                    let channels = lazy.channels(call_locations);
-                    supplied_bodies +=
-                        usize::from(lowering.add_function(program, tables, &miss, &channels));
-                }
-                if let Err(error) =
-                    demand_loop_progress(new_demands, newly_settled, supplied_bodies)
-                {
-                    eprintln!("error: {error}");
-                    return 0;
-                }
-            }
-            Err(brass_engine::MonoStop::Fail(e)) => {
-                // The same transient-vs-final rule as start-up: retry once
-                // more of the check has landed; a failure against the final
-                // state is real.
-                if !lazy.closed {
-                    lazy.resume_background();
-                    lazy.pump_blocking();
-                    lazy.pump_pending();
-                    if !lazy.needs_eager {
-                        continue;
-                    }
-                }
-                // A failed batch may never expose its method dependencies.
-                // The completed source verdict takes precedence over the
-                // secondary compilation error, just as at the entry gate.
-                if lazy.closed && !lazy.needs_eager {
-                    let held = lazy.held_all();
-                    if !held.is_empty() {
-                        use std::io::Write;
-                        let _ = io::stdout().flush();
-                        print_diags(render_errors(&held, sources));
-                        std::process::exit(1);
-                    }
-                }
-                return fatal_exit(
-                    lazy,
-                    &format!("error: runtime compilation of `{}` failed: {e}", sig.base),
-                );
-            }
-        }
-    }
-}
-
-/// The lazy-check run: type inference happens on the checker thread while
-/// this thread prepares and executes the program, gating only on the bodies
-/// execution actually needs.
-///
-/// 1. The checker thread runs the full streaming analysis; this thread
-///    assembles its own identical module graph (lowering is deterministic,
-///    so spans and type ids agree with the streamed channels).
-/// 2. Once every module initializer and `main` are settled, entry-rooted
-///    monomorphization starts. A reachable function whose body is not
-///    settled yet stops it; the demand -- the function's path and the
-///    concrete argument types of the call -- goes to the checker thread,
-///    which checks that body next; its channel delta lands here, the body
-///    is lowered, and monomorphization retries. Unreachable code never
-///    gates execution.
-/// 3. Declaration diagnostics and errors in needed bodies abort the run
-///    with the checker's diagnostic text and source locations. Once the program
-///    ran, the run's verdict is the executed path's alone: the checker is
-///    stopped at the next body boundary and whatever it held for code the
-///    run never needed is discarded by policy (pinned by
-///    `e2e_tests/lazy/dead_code_error.cz`) -- the whole-program verdict is
-///    `brass check`'s (or `--eager`'s) job.
-/// 4. A keyed-specialization restart or an executor-side assembly failure
-///    falls back to [`finish_eagerly`] -- behaviorally the eager pipeline.
-#[cfg(jit_backend)]
-fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
-    // The checker recurses per call-site re-elaboration much like the
-    // interpreter recurses per Brass call, so its thread gets the same
-    // generous stack as the driver thread (virtual memory; pages commit only
-    // as the stack grows).
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .thread_name("brass-checker")
-        .thread_stack_size(MAIN_STACK_BYTES)
-        .build()
-        .map_err(|e| {
-            eprintln!("error: cannot start the checker runtime: {e}");
-            1u8
-        })?;
-    // One front end for both sides: the checker thread gets a clone of the
-    // assembled module graph, this thread keeps the original to execute --
-    // lowering is deterministic, so spans and type ids agree with the
-    // streamed channels. Syntax and module-graph problems abort here, before
-    // any thread starts, exactly as eagerly.
-    let search = brass_resolve::SearchPaths::from_env();
-    let front = match front_load(&label, &src, &root, &search) {
-        Ok(front) => front,
-        Err(diags) => return Err(print_diags(diags)),
-    };
-    // Lower on this side first. Keyed methods no longer select the eager
-    // pipeline merely by being present in the module closure.
-    let (mut program, lower_errors) = lower(&front.modules);
-    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // The checker starts PAUSED: until execution begins, it serves only the
-    // driver's demands, so no demand ever waits behind a definitional pass
-    // the background queue happened to start first (an unannotated body's
-    // open-frame pass can be arbitrarily slow; see `Scheduler::paused`).
-    let paused = std::sync::Arc::new(CheckerPause {
-        paused: std::sync::atomic::AtomicBool::new(true),
-        requests: requests_tx,
-    });
-    let checker = rt.spawn_blocking({
-        let front = front.clone();
-        let stop = stop.clone();
-        let paused = paused.clone();
-        move || {
-            let search = brass_resolve::SearchPaths::from_env();
-            let mut sched = ThreadScheduler {
-                events: events_tx,
-                requests: requests_rx,
-                stop,
-                paused,
-                requests_closed: false,
-            };
-            check_front(front, &search, Some(&mut sched))
-        }
-    });
-    let _checker_cleanup = CheckerCleanup {
-        stop: stop.clone(),
-        paused: paused.clone(),
-    };
-
-    // Front-pass diagnostics (qualified uses, spawn ownership) are not
-    // rendered here: the checker reports them with the rest, eager-identical.
-    if !front.errors.is_empty() {
-        return finish_eagerly(&rt, checker, &stop, &paused, events_rx, &label, &src, &root);
-    }
-    if !lower_errors.is_empty() {
-        return finish_eagerly(&rt, checker, &stop, &paused, events_rx, &label, &src, &root);
-    }
-    let call_locations = call_site_locations(&front.modules, &front.sources, &search);
-    let function_ranges = program
-        .functions
-        .iter()
-        .map(|(symbol, function)| (symbol.clone(), function.decl.span.lo, function.decl.span.hi))
-        .collect();
-    let mut lazy = LazyState {
-        events: events_rx,
-        sources: front.sources.clone(),
-        merged: MergedChannels::default(),
-        checked_fns: HashSet::default(),
-        inits_checked: 0,
-        held: Vec::new(),
-        printed_warnings: HashSet::default(),
-        needed: HashSet::from_iter(["main".to_string()]),
-        stop,
-        paused,
-        needs_eager: false,
-        closed: false,
-        dirty: false,
-        function_ranges,
-        dirty_functions: HashSet::default(),
-        dirty_non_functions: false,
-        awaiting_keyed: false,
-        entry_open: false,
-        generated: Vec::new(),
-        next_demand_batch: 0,
-    };
-    let settled = lazy.wait_gate(program.inits.len(), program.functions.contains_key("main"));
-    if lazy.needs_eager {
-        return finish_eagerly(
-            &rt,
-            checker,
-            &lazy.stop,
-            &lazy.paused,
-            lazy.events,
-            &label,
-            &src,
-            &root,
-        );
-    }
-    if !lazy.generated.is_empty()
-        && brass_hir::lower_generated_into(&mut program, &lazy.generated).is_err()
-    {
-        return finish_eagerly(
-            &rt,
-            checker,
-            &lazy.stop,
-            &lazy.paused,
-            lazy.events,
-            &label,
-            &src,
-            &root,
-        );
-    }
-    lazy.entry_open = true;
-    let bodies = BodySpans::new(&program);
-    match judge_fatal(&mut lazy, &bodies, &front.sources) {
-        FatalVerdict::Clean => {}
-        FatalVerdict::Fatal(code) => return Err(code),
-        FatalVerdict::NeedsEager => {
-            return finish_eagerly(
-                &rt,
-                checker,
-                &lazy.stop,
-                &lazy.paused,
-                lazy.events,
-                &label,
-                &src,
-                &root,
-            );
-        }
-    }
-    if !settled {
-        // The checker hung up cleanly without settling the entry: nothing
-        // fatal was held, so fall back to the whole-analysis verdict.
-        return finish_eagerly(
-            &rt,
-            checker,
-            &lazy.stop,
-            &lazy.paused,
-            lazy.events,
-            &label,
-            &src,
-            &root,
-        );
-    }
-
-    // Demand-driven compilation: methods and inits lower up front, function
-    // bodies as monomorphization discovers it needs them. A delta arriving
-    // after a body was lowered can carry entries for that body's spans (a
-    // cross-body pinning settles an earlier body's literal), so those owners
-    // are refreshed before the mono result is trusted.
-    let mut demanded: Vec<String> = Vec::new();
-    // The HIR-derived lowering tables are channel-independent: computed once,
-    // shared across every rebuild.
-    let tables_started = std::time::Instant::now();
-    let tables = brass_mir::LowerTables::new(&program);
-    tracing::debug!(
-        target: "brass::perf",
-        elapsed_ms = tables_started.elapsed().as_secs_f64() * 1000.0,
-        "lazy: lowering tables"
-    );
-    let mut lowering = 'rebuild: loop {
-        lazy.dirty = false;
-        lazy.dirty_functions.clear();
-        lazy.dirty_non_functions = false;
-        tracing::debug!(
-            target: "brass::perf",
-            demanded = demanded.len(),
-            closed = lazy.closed,
-            "lazy: lowering rebuild"
-        );
-        let lowering_started = std::time::Instant::now();
-        let mut built = {
-            let channels = lazy.channels(&call_locations);
-            let mut built = brass_mir::SubsetLowering::new(&program, &tables, &channels);
-            for symbol in &demanded {
-                built.add_function(&program, &tables, symbol, &channels);
-            }
-            built
-        };
-        tracing::debug!(
-            target: "brass::perf",
-            elapsed_ms = lowering_started.elapsed().as_secs_f64() * 1000.0,
-            "lazy: lowering rebuild complete"
-        );
-        // The demand loop: monomorphize, and supply each missing body as it
-        // is reported, INCREMENTALLY -- new bodies are appended against the
-        // channel state of their arrival, and only a mono pass over an
-        // all-deltas-folded lowering with no pending revisions is trusted.
-        loop {
-            let mono_started = std::time::Instant::now();
-            let mono_result = brass_engine::monomorphize_entry_with_returns(
-                &built.mir,
-                &program,
-                true,
-                lazy.merged.instance_returns.clone(),
-            );
-            tracing::debug!(
-                target: "brass::perf",
-                elapsed_ms = mono_started.elapsed().as_secs_f64() * 1000.0,
-                "lazy: monomorphization pass"
-            );
-            match mono_result {
-                Ok(mono) => {
-                    // A `main` that fell outside the typed subset can be
-                    // TRANSIENT under lazy checking -- most prominently a
-                    // keyed (`-> infer!`) call whose specialization re-pass
-                    // is about to restart the whole analysis. Only a skip
-                    // against the checker's final state is the real
-                    // rejection (which the re-run below then reports,
-                    // exactly like the eager JIT).
-                    let main_skipped =
-                        program.functions.contains_key("main") && mono.lookup("main").is_none();
-                    drop(mono);
-                    if main_skipped {
-                        if !lazy.closed {
-                            // Waiting on the checker's own progress: run its
-                            // queue, or no event would ever come.
-                            lazy.resume_background();
-                            lazy.pump_blocking();
-                            lazy.pump_pending();
-                            if lazy.needs_eager {
-                                return finish_eagerly(
-                                    &rt,
-                                    checker,
-                                    &lazy.stop,
-                                    &lazy.paused,
-                                    lazy.events,
-                                    &label,
-                                    &src,
-                                    &root,
-                                );
-                            }
-                            match judge_fatal(&mut lazy, &bodies, &front.sources) {
-                                FatalVerdict::Clean => {}
-                                FatalVerdict::Fatal(code) => return Err(code),
-                                FatalVerdict::NeedsEager => {
-                                    return finish_eagerly(
-                                        &rt,
-                                        checker,
-                                        &lazy.stop,
-                                        &lazy.paused,
-                                        lazy.events,
-                                        &label,
-                                        &src,
-                                        &root,
-                                    );
-                                }
-                            }
-                            continue 'rebuild;
-                        }
-                        if lazy.dirty {
-                            if lazy.refresh_lowering(&mut built, &program, &tables, &call_locations)
-                            {
-                                continue;
-                            }
-                            continue 'rebuild;
-                        }
-                        match judge_fatal(&mut lazy, &bodies, &front.sources) {
-                            FatalVerdict::Clean => {}
-                            FatalVerdict::Fatal(code) => return Err(code),
-                            FatalVerdict::NeedsEager => {
-                                return finish_eagerly(
-                                    &rt,
-                                    checker,
-                                    &lazy.stop,
-                                    &lazy.paused,
-                                    lazy.events,
-                                    &label,
-                                    &src,
-                                    &root,
-                                );
-                            }
-                        }
-                    } else {
-                        if lazy.dirty {
-                            if lazy.refresh_lowering(&mut built, &program, &tables, &call_locations)
-                            {
-                                continue;
-                            }
-                            // A method or initializer changed: rebuild the subset
-                            // base before trusting the successful mono pass.
-                            continue 'rebuild;
-                        }
-                    }
-                    break 'rebuild built;
-                }
-                Err(brass_engine::MonoStop::MissingBodies(demands)) => {
-                    tracing::debug!(target: "brass::perf", count = demands.len(), "lazy: missing bodies");
-                    let mut supplied_bodies = 0;
-                    let mut fresh: Vec<(String, Vec<brass_hir::Type>, bool)> = Vec::new();
-                    for (symbol, type_args, needs_body) in demands {
-                        if !program.functions.contains_key(&symbol) {
-                            continue;
-                        }
-                        if demanded.contains(&symbol) {
-                            // Checked before, but the body was withheld: the
-                            // first demand was answered with a deferral
-                            // contract alone. A repeat demand means a site
-                            // needs the real body after all (a second
-                            // instance, a non-deferrable site, a contract
-                            // the deferral rules rejected): lower it now --
-                            // the next rebuilt mono pass re-derives every
-                            // call against the lowered body.
-                            if built.is_lowered(&symbol) {
-                                continue;
-                            }
-                            let channels = lazy.channels(&call_locations);
-                            if built.add_function(&program, &tables, &symbol, &channels) {
-                                lazy.mark_lowered(&symbol);
-                                supplied_bodies += 1;
-                            }
-                            continue;
-                        }
-                        if let Some((_, _, existing_needs_body)) = fresh
-                            .iter_mut()
-                            .find(|(existing, _, _)| existing == &symbol)
-                        {
-                            *existing_needs_body |= needs_body;
-                        } else {
-                            fresh.push((symbol, type_args, needs_body));
-                        }
-                    }
-                    let batch: Vec<_> = fresh
-                        .iter()
-                        .map(|(symbol, type_args, _)| (symbol.clone(), type_args.clone()))
-                        .collect();
-                    let mut newly_settled = 0;
-                    let result = (!batch.is_empty()).then(|| lazy.demand_all(&batch));
-                    if let Some(result) = &result {
-                        newly_settled = result.newly_settled;
-                    }
-                    if result.as_ref().is_some_and(|result| !result.complete) {
-                        if lazy.needs_eager {
-                            return finish_eagerly(
-                                &rt,
-                                checker,
-                                &lazy.stop,
-                                &lazy.paused,
-                                lazy.events,
-                                &label,
-                                &src,
-                                &root,
-                            );
-                        }
-                        match judge_fatal(&mut lazy, &bodies, &front.sources) {
-                            FatalVerdict::Clean => {}
-                            FatalVerdict::Fatal(code) => return Err(code),
-                            FatalVerdict::NeedsEager => {
-                                return finish_eagerly(
-                                    &rt,
-                                    checker,
-                                    &lazy.stop,
-                                    &lazy.paused,
-                                    lazy.events,
-                                    &label,
-                                    &src,
-                                    &root,
-                                );
-                            }
-                        }
-                        let symbols = batch
-                            .iter()
-                            .map(|(symbol, _)| symbol.as_str())
-                            .collect::<Vec<_>>()
-                            .join("`, `");
-                        eprintln!("error: lazy compilation cannot supply `{symbols}`");
-                        return Err(1);
-                    }
-                    if !batch.is_empty() {
-                        // Every requested body is now settled. Judge their
-                        // held diagnostics together before lowering any code.
-                        match judge_fatal(&mut lazy, &bodies, &front.sources) {
-                            FatalVerdict::Clean => {}
-                            FatalVerdict::Fatal(code) => return Err(code),
-                            FatalVerdict::NeedsEager => {
-                                return finish_eagerly(
-                                    &rt,
-                                    checker,
-                                    &lazy.stop,
-                                    &lazy.paused,
-                                    lazy.events,
-                                    &label,
-                                    &src,
-                                    &root,
-                                );
-                            }
-                        }
-                    }
-                    let append_started = std::time::Instant::now();
-                    let append_count = fresh.len();
-                    for (symbol, _, needs_body) in fresh {
-                        // A deferral candidate's first demand only CHECKS the
-                        // body: the checker's instance-return contract (just
-                        // merged from its delta) lets the next mono pass
-                        // compile the call as a runtime-deferred site, so a
-                        // statically live but never-executed tree is neither
-                        // lowered nor compiled. When the contract did not
-                        // materialize, the next round's repeat demand lowers
-                        // the body through the branch above.
-                        if needs_body {
-                            let channels = lazy.channels(&call_locations);
-                            if built.add_function(&program, &tables, &symbol, &channels) {
-                                lazy.mark_lowered(&symbol);
-                                supplied_bodies += 1;
-                            }
-                        }
-                        demanded.push(symbol);
-                    }
-                    tracing::debug!(
-                        target: "brass::perf",
-                        count = append_count,
-                        elapsed_ms = append_started.elapsed().as_secs_f64() * 1000.0,
-                        "lazy: lowering append"
-                    );
-                    if let Err(error) =
-                        demand_loop_progress(append_count, newly_settled, supplied_bodies)
-                    {
-                        eprintln!("error: {error}");
-                        // The checker may be parked waiting for another demand;
-                        // wake it so the runtime can join the stopped task.
-                        lazy.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                        lazy.resume_background();
-                        return Err(1);
-                    }
-                }
-                Err(brass_engine::MonoStop::Fail(e)) => {
-                    // Monomorphization can fail TRANSIENTLY under lazy
-                    // checking: an entry a later body pins (or a whole delta
-                    // still in flight) may be exactly what the failed
-                    // inference needed. Wait for more of the check and
-                    // retry; only a failure against the checker's FINAL
-                    // state -- where eager would have failed identically --
-                    // is real. Diagnostics, when the checker found any,
-                    // explain the program better than the mono error does;
-                    // prefer them.
-                    if !lazy.closed {
-                        // Waiting on the checker's own progress: run its
-                        // queue, or no event would ever come.
-                        lazy.resume_background();
-                        lazy.pump_blocking();
-                        lazy.pump_pending();
-                        if lazy.needs_eager {
-                            return finish_eagerly(
-                                &rt,
-                                checker,
-                                &lazy.stop,
-                                &lazy.paused,
-                                lazy.events,
-                                &label,
-                                &src,
-                                &root,
-                            );
-                        }
-                        match judge_fatal(&mut lazy, &bodies, &front.sources) {
-                            FatalVerdict::Clean => {}
-                            FatalVerdict::Fatal(code) => return Err(code),
-                            FatalVerdict::NeedsEager => {
-                                return finish_eagerly(
-                                    &rt,
-                                    checker,
-                                    &lazy.stop,
-                                    &lazy.paused,
-                                    lazy.events,
-                                    &label,
-                                    &src,
-                                    &root,
-                                );
-                            }
-                        }
-                        continue 'rebuild;
-                    }
-                    if lazy.dirty {
-                        if lazy.refresh_lowering(&mut built, &program, &tables, &call_locations) {
-                            continue;
-                        }
-                        continue 'rebuild;
-                    }
-                    match judge_fatal(&mut lazy, &bodies, &front.sources) {
-                        FatalVerdict::Clean => {}
-                        FatalVerdict::Fatal(code) => return Err(code),
-                        FatalVerdict::NeedsEager => {
-                            return finish_eagerly(
-                                &rt,
-                                checker,
-                                &lazy.stop,
-                                &lazy.paused,
-                                lazy.events,
-                                &label,
-                                &src,
-                                &root,
-                            );
-                        }
-                    }
-                    // A rejection against the checker's final state: held
-                    // diagnostics elsewhere (a broken method the entry
-                    // needs) usually explain it better than the mono error.
-                    let held = lazy.held_all();
-                    if !held.is_empty() {
-                        for line in render_errors(&held, &front.sources) {
-                            eprintln!("{line}");
-                        }
-                        return Err(1);
-                    }
-                    report_runtime_error(&format!("typed lowering failed: {e}"));
-                    return Err(1);
-                }
-            }
-        }
-    };
-    // Deterministic inputs: the re-run reproduces the loop's successful pass
-    // (the same instance-return contracts included -- without them a
-    // deferred unannotated call would re-demand its body here).
-    let Ok(mono) = brass_engine::monomorphize_entry_with_returns(
-        &lowering.mir,
-        &program,
-        true,
-        lazy.merged.instance_returns.clone(),
-    ) else {
-        eprintln!("error: lazy compilation diverged between passes");
-        // The checker may still be paused; a plain return would deadlock the
-        // runtime drop joining its blocking task.
-        lazy.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        return Err(1);
-    };
-
-    // Everything execution can reach is settled. A diagnostic on the needed
-    // path that arrived meanwhile aborts before the program runs; held
-    // diagnostics elsewhere stay held -- lazy checking ignores code the run
-    // never executes.
-    lazy.need_monomorphized_methods(&lowering.mir, &mono);
-    lazy.pump_pending();
-    if lazy.needs_eager {
-        drop(mono);
-        return finish_eagerly(
-            &rt,
-            checker,
-            &lazy.stop,
-            &lazy.paused,
-            lazy.events,
-            &label,
-            &src,
-            &root,
-        );
-    }
-    match judge_fatal(&mut lazy, &bodies, &front.sources) {
-        FatalVerdict::Clean => {}
-        FatalVerdict::Fatal(code) => return Err(code),
-        FatalVerdict::NeedsEager => {
-            return finish_eagerly(
-                &rt,
-                checker,
-                &lazy.stop,
-                &lazy.paused,
-                lazy.events,
-                &label,
-                &src,
-                &root,
-            );
-        }
-    }
-    install_jit_panic_guard();
-    // The deferred runtime: reject an untypeable `main` exactly as `run_mono`
-    // would, compile the startup set, then run with the resolver installed --
-    // a deferred site's first call lands there.
-    if program.functions.contains_key("main") && mono.lookup("main").is_none() {
-        // A rejected entry may have prevented monomorphization from exposing
-        // its method dependencies. Prefer the completed source verdict over
-        // a secondary lowering failure, as for MonoStop::Fail above.
-        let held = lazy.held_all();
-        if !held.is_empty() {
-            return Err(print_diags(render_errors(&held, &front.sources)));
-        }
-        let reason = match &mono.main_skip {
-            Some(reason) => {
-                format!("program uses constructs outside the typed (Value-free) subset: {reason}")
-            }
-            None => "program uses constructs outside the typed (Value-free) subset".to_string(),
-        };
-        report_runtime_error(&reason);
-        return Err(1);
-    }
-    let codegen_started = std::time::Instant::now();
-    let context = brass_jit_llvm::OrcContext::new();
-    let mut backend = brass_jit_llvm::LlvmCodegen::new_orc_backend(&context, &program);
-    let _resolved_session = brass_jit_llvm::resolved_session();
-    let prepared = backend.prepare_lazy_orc(&mono);
-    tracing::debug!(
-        target: "brass::perf",
-        elapsed_ms = codegen_started.elapsed().as_secs_f64() * 1000.0,
-        "lazy: codegen startup"
-    );
-    let mut targets: HashMap<String, brass_engine::DeferredSig> = mono.deferred.clone();
-    // The startup run typed every init, so its global table is complete;
-    // runtime single-instance monos read module globals through it.
-    let globals: Vec<(String, brass_hir::Type)> = mono.globals.clone();
-    let startup_spawns = brass_engine::batch_spawns(&mono);
-    // Free the lowering for the resolver's on-demand additions.
-    drop(mono);
-    let finalize_started = std::time::Instant::now();
-    let finalized = prepared.and_then(|()| backend.precompile_spawn());
-    tracing::debug!(
-        target: "brass::perf",
-        elapsed_ms = finalize_started.elapsed().as_secs_f64() * 1000.0,
-        "lazy: finalize startup"
-    );
-    let execution_started = std::time::Instant::now();
-    let result = match finalized {
-        Ok(()) => {
-            // The startup set spawns: compile and prime every recorded
-            // target BEFORE anything runs, so worker threads -- which can
-            // only read the resolved-address cache -- never reach an
-            // unresolved site.
-            let drained = !startup_spawns
-                || drain_targets_for_spawn(
-                    &mut backend,
-                    &program,
-                    &tables,
-                    &call_locations,
-                    &front.sources,
-                    &bodies,
-                    &globals,
-                    &mut lowering,
-                    &mut lazy,
-                    &mut targets,
-                );
-            if drained {
-                // Execution begins: from here the background queue fills the
-                // wait on the running program.
-                lazy.resume_background();
-                let mut resolve = |backend: &mut brass_jit_llvm::LlvmCodegen, symbol: &str| {
-                    resolve_deferred(
-                        backend,
-                        symbol,
-                        &program,
-                        &tables,
-                        &call_locations,
-                        &front.sources,
-                        &bodies,
-                        &globals,
-                        &mut lowering,
-                        &mut lazy,
-                        &mut targets,
-                    )
-                };
-                backend.execute_with_resolver(&mut resolve)
-            } else {
-                Err("lazy compilation could not pre-compile the spawned code".to_string())
-            }
-        }
-        Err(e) => Err(e),
-    };
-    tracing::debug!(
-        target: "brass::perf",
-        elapsed_ms = execution_started.elapsed().as_secs_f64() * 1000.0,
-        "lazy: execute"
-    );
-    // The program finished (or failed at runtime); the checker may still be
-    // working through code this run never executed, and lazy checking
-    // ignores whatever it would find there -- the complete verdict is
-    // `brass check`'s job. Stop it at the next body boundary and reclaim the
-    // thread; held diagnostics are discarded by policy.
-    let stop_started = std::time::Instant::now();
-    stop_checker(&rt, checker, &mut lazy);
-    tracing::debug!(
-        target: "brass::perf",
-        elapsed_ms = stop_started.elapsed().as_secs_f64() * 1000.0,
-        "lazy: stop checker"
-    );
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            report_runtime_error(&e);
-            Err(1)
-        }
-    }
-}
-
-/// Stop the checker and reclaim its thread. The stop flag is polled at body
-/// boundaries, so the join is bounded by the body in flight; the drain runs
-/// the event channel to close so the join never waits on a full buffer.
-#[cfg(jit_backend)]
-fn stop_checker(
-    rt: &tokio::runtime::Runtime,
-    checker: tokio::task::JoinHandle<Result<AnalyzedProgram, Vec<String>>>,
-    lazy: &mut LazyState,
-) {
-    lazy.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    lazy.resume_background();
-    while !lazy.closed {
-        lazy.pump_blocking();
-    }
-    let _ = rt
-        .block_on(checker)
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()));
 }
 
 /// Interpreter-only builds never take the lazy path (`drive` gates it on
@@ -2596,7 +897,7 @@ fn stop_checker(
 /// behaves exactly like an eager run.
 #[cfg(not(jit_backend))]
 fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), u8> {
-    let checked = match analyze(&label, &src, &root) {
+    let checked = match analyze(&label, &src, &root, LocationTables::Execution) {
         Ok(c) => c,
         Err(diags) => return Err(print_diags(diags)),
     };
@@ -2618,11 +919,12 @@ fn analyze_fresh(
     main_label: &str,
     main_src: &str,
     root: &Path,
+    locations: LocationTables,
     sched: Option<&mut dyn brass_typeck::stream::Scheduler>,
 ) -> Result<AnalyzedProgram, Vec<String>> {
     let search = brass_resolve::SearchPaths::from_env();
     let front = front_load(main_label, main_src, root, &search)?;
-    check_front(front, &search, sched)
+    check_front(front, &search, locations, sched)
 }
 
 /// The assembled front end, ready to check: the final module graph
@@ -2631,7 +933,7 @@ fn analyze_fresh(
 /// lazy runner can keep one copy to execute and hand an identical one to the
 /// checker thread -- assembling once instead of parsing the program twice.
 #[derive(Clone)]
-struct FrontEnd {
+pub(crate) struct FrontEnd {
     modules: Vec<LoadedModule>,
     sources: brass_resolve::SourceMap,
     /// Qualified-use and spawn-ownership diagnostics: not fatal on their own
@@ -2645,8 +947,8 @@ struct FrontEnd {
 /// [`analyze_fresh`]. Aborts (rendered) on syntax errors and a broken module
 /// graph -- the driver's error policy is per problem class, and checking a
 /// recovered AST would bury the real problem under cascading name/type
-/// errors. Also prints the spawn warnings, once.
-fn front_load(
+/// errors. Also prints the spawn warnings, once, unless a spawn was rejected.
+pub(crate) fn front_load(
     main_label: &str,
     main_src: &str,
     root: &Path,
@@ -2679,14 +981,19 @@ fn front_load(
 
     // The spawn-ownership pass only matters for the JIT runtime (the REPL does not
     // execute concurrency); it lives in the LLVM crate, so it is feature-gated.
-    // The pass may reject a `spawn` it cannot analyze; those diagnostics join the
-    // analysis errors.
+    // The pass may reject a `spawn` it cannot analyze (or a task that reassigns
+    // a capture); those diagnostics join the analysis errors, and the ownership
+    // warnings -- which describe how an accepted spawn is compiled -- are then
+    // withheld.
     #[cfg(jit_backend)]
     {
-        for w in report_spawn_ownership(&modules) {
-            eprintln!("{w}");
+        let (spawn_errors, warnings) = auto_acquire_modules(&mut modules);
+        if spawn_errors.is_empty() {
+            for w in warnings {
+                eprintln!("{w}");
+            }
         }
-        errors.extend(auto_acquire_modules(&mut modules));
+        errors.extend(spawn_errors);
     }
 
     Ok(FrontEnd {
@@ -2699,9 +1006,10 @@ fn front_load(
 /// Statically check an assembled front end and package the result: the check
 /// half of [`analyze_fresh`], and what the lazy runner's checker thread
 /// executes over its copy of the modules.
-fn check_front(
+pub(crate) fn check_front(
     front: FrontEnd,
     search: &brass_resolve::SearchPaths,
+    locations: LocationTables,
     mut sched: Option<&mut dyn brass_typeck::stream::Scheduler>,
 ) -> Result<AnalyzedProgram, Vec<String>> {
     let phase = |name: &'static str, at: std::time::Instant| {
@@ -2716,8 +1024,8 @@ fn check_front(
 
     // The context seed: the analysis tables of every module EXCEPT the entry
     // (the last one loaded), reused so the full check below re-infers only the
-    // entry. A context with diagnostics yields no seed (or a partial one) and
-    // the full run reports everything as before.
+    // entry. A context with diagnostics yields no seed (or a partial one), and
+    // the full run reports every diagnostic itself.
     let ctx_end = modules.len() - 1;
     let ctx_seed = context_seed(&modules[..ctx_end], &sources, "front/context-check");
 
@@ -2764,59 +1072,72 @@ fn check_front(
     // checker reuses the completed first pass's tables and visits only the new
     // method bodies; source ASTs and existing HIR items remain untouched.
     let mut program = program;
-    let (generated, keyed_dispatch) =
-        if analysis.keyed_calls.is_empty() || sched.as_deref().is_some_and(|s| s.stopped()) {
-            (Vec::new(), HashMap::default())
-        } else {
-            let t = std::time::Instant::now();
-            match specialize_keyed(&mut program, &mut analysis) {
-                Ok((generated, keyed_dispatch)) => {
-                    phase("front/keyed-continuation", t);
-                    if let Some(s) = sched {
-                        let mut delta = analysis_channel_delta(&analysis, &program);
-                        delta.errors.extend(errors.iter().map(|(message, span)| {
-                            brass_typeck::TypeError {
+    let (generated, keyed_dispatch, instance_dispatch) = if analysis.keyed_calls.is_empty()
+        || sched.as_deref().is_some_and(|s| s.stopped())
+    {
+        (Vec::new(), HashMap::default(), HashMap::default())
+    } else {
+        let t = std::time::Instant::now();
+        match specialize_keyed(&mut program, &mut analysis) {
+            Ok((generated, keyed_dispatch, instance_dispatch)) => {
+                phase("front/keyed-continuation", t);
+                if let Some(s) = sched {
+                    let mut delta = analysis_channel_delta(&analysis, &program);
+                    delta.instance_dispatch = instance_dispatch
+                        .iter()
+                        .map(|(span, targets)| {
+                            (
+                                *span,
+                                targets
+                                    .iter()
+                                    .map(|(instance, target)| (instance.clone(), target.clone()))
+                                    .collect(),
+                            )
+                        })
+                        .collect();
+                    delta.errors.extend(errors.iter().map(|(message, span)| {
+                        brass_typeck::TypeError {
+                            message: message.clone(),
+                            span: *span,
+                        }
+                    }));
+                    s.emit(brass_typeck::stream::CheckEvent::KeyedReady(
+                        generated.clone(),
+                        keyed_dispatch
+                            .iter()
+                            .map(|(span, symbol)| (*span, symbol.clone()))
+                            .collect(),
+                        delta,
+                    ));
+                }
+                (generated, keyed_dispatch, instance_dispatch)
+            }
+            Err(error) => {
+                // A streaming consumer cannot observe this function's
+                // returned Result while executing a runtime demand. Send
+                // the final snapshot so provisional errors removed by
+                // specialization cannot survive in the consumer either.
+                if let Some(s) = sched {
+                    let mut delta = analysis_channel_delta(&analysis, &program);
+                    delta
+                        .errors
+                        .extend(errors.iter().chain(std::iter::once(&error)).map(
+                            |(message, span)| brass_typeck::TypeError {
                                 message: message.clone(),
                                 span: *span,
-                            }
-                        }));
-                        s.emit(brass_typeck::stream::CheckEvent::KeyedReady(
-                            generated.clone(),
-                            keyed_dispatch
-                                .iter()
-                                .map(|(span, symbol)| (*span, symbol.clone()))
-                                .collect(),
-                            delta,
+                            },
                         ));
-                    }
-                    (generated, keyed_dispatch)
+                    s.emit(brass_typeck::stream::CheckEvent::KeyedReady(
+                        Vec::new(),
+                        Vec::new(),
+                        delta,
+                    ));
                 }
-                Err(error) => {
-                    // A streaming consumer cannot observe this function's
-                    // returned Result while executing a runtime demand. Send
-                    // the final snapshot so provisional errors removed by
-                    // specialization cannot survive in the consumer either.
-                    if let Some(s) = sched {
-                        let mut delta = analysis_channel_delta(&analysis, &program);
-                        delta
-                            .errors
-                            .extend(errors.iter().chain(std::iter::once(&error)).map(
-                                |(message, span)| brass_typeck::TypeError {
-                                    message: message.clone(),
-                                    span: *span,
-                                },
-                            ));
-                        s.emit(brass_typeck::stream::CheckEvent::KeyedReady(
-                            Vec::new(),
-                            Vec::new(),
-                            delta,
-                        ));
-                    }
-                    errors.push(error);
-                    (Vec::new(), HashMap::default())
-                }
+                errors.push(error);
+                (Vec::new(), HashMap::default(), HashMap::default())
             }
-        };
+        }
+    };
     for e in &analysis.errors {
         errors.push((e.message.clone(), e.span));
     }
@@ -2841,12 +1162,26 @@ fn check_front(
     }
 
     let expr_types = brass_typeck::stream::aggregate_result_types(&analysis.typed, &program);
+    let instance_seeds = brass_typeck::stream::aggregate_instance_seeds(
+        &analysis.instance_typed,
+        &analysis.typed,
+        &expr_types,
+        &program,
+    );
     let receiver_types = brass_typeck::stream::method_receiver_types(&analysis.typed, &program);
-    let call_locations = call_site_locations(&modules, &sources, search);
+    let receiver_owners = brass_typeck::stream::method_receiver_owners(&analysis.typed, &program);
+    let call_locations = match locations {
+        LocationTables::Execution => call_site_locations(&modules, &sources, search),
+        LocationTables::Omit => HashMap::default(),
+    };
     let channels = OwnedChannels {
         expr_types,
+        instance_seeds,
         receiver_types,
+        receiver_owners,
         view_args: analysis.view_args,
+        numeric_calls: analysis.numeric_calls,
+        field_calls: analysis.field_calls,
         sum_views: analysis.sum_views,
         call_locations,
         lift_errs: analysis.lift_errs,
@@ -2856,6 +1191,8 @@ fn check_front(
         null_props: analysis.null_props,
         type_tests: analysis.type_tests,
         keyed_dispatch,
+        instance_dispatch,
+        instance_returns: analysis.instance_returns,
     };
     Ok(AnalyzedProgram {
         modules,
@@ -2871,14 +1208,36 @@ fn analysis_channel_delta(
     analysis: &brass_typeck::Analysis,
     program: &Program,
 ) -> brass_typeck::stream::ChannelDelta {
+    let expr_types = brass_typeck::stream::aggregate_result_types(&analysis.typed, program);
+    let instance_seeds = brass_typeck::stream::aggregate_instance_seeds(
+        &analysis.instance_typed,
+        &analysis.typed,
+        &expr_types,
+        program,
+    )
+    .into_iter()
+    .map(|(span, seeds)| (span, seeds.into_iter().collect()))
+    .collect();
     brass_typeck::stream::ChannelDelta {
-        expr_types: brass_typeck::stream::aggregate_result_types(&analysis.typed, program)
-            .into_iter()
-            .collect(),
+        expr_types: expr_types.into_iter().collect(),
+        instance_seeds,
         receiver_types: brass_typeck::stream::method_receiver_types(&analysis.typed, program)
             .into_iter()
             .collect(),
+        receiver_owners: brass_typeck::stream::method_receiver_owners(&analysis.typed, program)
+            .into_iter()
+            .collect(),
         view_args: analysis.view_args.iter().copied().collect(),
+        numeric_calls: analysis
+            .numeric_calls
+            .iter()
+            .map(|(key, ty)| (key.clone(), ty.clone()))
+            .collect(),
+        field_calls: analysis
+            .field_calls
+            .iter()
+            .map(|(span, receivers)| (*span, receivers.clone()))
+            .collect(),
         lift_errs: analysis.lift_errs.iter().copied().collect(),
         null_props: analysis.null_props.iter().copied().collect(),
         fields_loops: analysis
@@ -2912,18 +1271,27 @@ fn analysis_channel_delta(
     }
 }
 
+/// What [`specialize_keyed`] produces: the generated declarations, the keyed
+/// call sites every instance routes to one specialization (span -> generated
+/// method), and those whose instances route to different ones (span ->
+/// instance -> generated method).
+type KeyedSpecializationResult = (
+    Vec<brass_hir::GeneratedDecl>,
+    HashMap<Span, String>,
+    brass_hir::InstanceChannel<String>,
+);
+
 /// Append and check every keyed specialization requested by `analysis`.
 /// Nested requests discovered while checking generated bodies repeat the same
 /// append-only step; already generated `(receiver, method, key)` triples make
 /// the loop finite for recursive type graphs.
-type KeyedSpecializationResult = (Vec<brass_hir::GeneratedDecl>, HashMap<Span, String>);
-
 fn specialize_keyed(
     program: &mut Program,
     analysis: &mut brass_typeck::Analysis,
 ) -> Result<KeyedSpecializationResult, (String, Span)> {
     let seed = analysis.context_tables.clone();
     let mut pending = analysis.keyed_calls.clone();
+    let mut pending_instances = analysis.instance_keyed_calls.clone();
     let keyed_spans: HashSet<Span> = pending.keys().copied().collect();
     let provisional_spans = keyed_provisional_spans(program, &keyed_spans);
     // A keyed call is initially elaborated against the generic template, so
@@ -2934,16 +1302,33 @@ fn specialize_keyed(
     let mut generated_all = Vec::new();
     let mut generated_symbols = fxhash::FxHashSet::default();
     let mut keyed_dispatch = HashMap::default();
+    let mut instance_dispatch: brass_hir::InstanceChannel<String> = HashMap::default();
 
     for _ in 0..64 {
-        if pending.is_empty() {
-            return Ok((generated_all, keyed_dispatch));
+        if pending.is_empty() && pending_instances.is_empty() {
+            return Ok((generated_all, keyed_dispatch, instance_dispatch));
+        }
+        // A call whose instances key it differently dispatches per instance;
+        // its span-level entry only marks it reflective.
+        for (span, per_instance) in &pending_instances {
+            keyed_dispatch.remove(span);
+            let targets = instance_dispatch.entry(*span).or_default();
+            for (instance, (_, method, key)) in per_instance {
+                targets.insert(instance.clone(), brass_typesys::mangled_name(method, key));
+            }
         }
         for (span, (_, method, key)) in &pending {
-            keyed_dispatch.insert(*span, brass_typesys::mangled_name(method, key));
+            if !instance_dispatch.contains_key(span) {
+                keyed_dispatch.insert(*span, brass_typesys::mangled_name(method, key));
+            }
         }
         let mut roots: Vec<brass_typesys::KeyedNeed> = pending
             .values()
+            .chain(
+                pending_instances
+                    .values()
+                    .flat_map(|targets| targets.values()),
+            )
             .map(|(recv, method, key)| brass_typesys::KeyedNeed {
                 recv: recv.clone(),
                 method: method.clone(),
@@ -2992,16 +1377,27 @@ fn specialize_keyed(
             (error.message.clone(), brass_hir::unshift_span(error.span))
         })?;
         let mut next_pending = HashMap::default();
+        let mut next_pending_instances: brass_hir::InstanceChannel<_> = HashMap::default();
         for generated in &fresh {
             let continuation =
                 brass_typeck::analyze_generated(program, &seed, std::slice::from_ref(generated));
             next_pending.extend(continuation.keyed_calls.clone());
+            next_pending_instances.extend(continuation.instance_keyed_calls.clone());
             analysis.keyed_calls.extend(continuation.keyed_calls);
+            analysis
+                .instance_keyed_calls
+                .extend(continuation.instance_keyed_calls);
+            let typed_offset = analysis.typed.expressions.len();
             analysis
                 .typed
                 .expressions
                 .extend(continuation.typed.expressions);
+            analysis
+                .instance_typed
+                .append(continuation.instance_typed, typed_offset);
             analysis.view_args.extend(continuation.view_args);
+            analysis.numeric_calls.extend(continuation.numeric_calls);
+            analysis.field_calls.extend(continuation.field_calls);
             analysis.sum_views.extend(continuation.sum_views);
             analysis.lift_errs.extend(continuation.lift_errs);
             analysis.fields_loops.extend(continuation.fields_loops);
@@ -3027,6 +1423,7 @@ fn specialize_keyed(
                 }));
         }
         pending = next_pending;
+        pending_instances = next_pending_instances;
         generated_all.extend(fresh);
     }
     Err((
@@ -3085,190 +1482,11 @@ fn remove_provisional_keyed_diagnostics(
     });
 }
 
-/// Every call expression's span mapped to its source position (diagnostic
-/// label, 1-based line and column). MIR lowering reads this to fill a
-/// callee's implicit trailing `Location` parameter with the call site;
-/// computing it here keeps source access out of the type-free lowering.
-fn call_site_locations(
-    modules: &[LoadedModule],
-    sources: &brass_resolve::SourceMap,
-    search: &brass_resolve::SearchPaths,
-) -> HashMap<Span, (String, u32, u32)> {
-    let mut spans: Vec<Span> = Vec::new();
-    for m in modules {
-        for item in &m.ast.items {
-            match item {
-                brass_parser::ast::TopLevel::Fun(f) => {
-                    collect_call_spans_block(&f.body, &mut spans)
-                }
-                brass_parser::ast::TopLevel::Stmt(st) => collect_call_spans_stmt(st, &mut spans),
-                brass_parser::ast::TopLevel::Type(_) => {}
-            }
-        }
-    }
-    // Labels are relativized against the working directory and the include
-    // roots' parents, so a baked expectation (an e2e `.out`) does not embed a
-    // machine-specific absolute path.
-    let mut prefixes: Vec<String> = Vec::new();
-    if let Ok(cwd) = std::env::current_dir()
-        && let Ok(c) = cwd.canonicalize()
-    {
-        prefixes.push(format!("{}/", c.display()));
-    }
-    for root in &search.includes {
-        if let Ok(c) = root.canonicalize()
-            && let Some(parent) = c.parent()
-        {
-            prefixes.push(format!("{}/", parent.display()));
-        }
-    }
-    // A package root serves modules under `<root>/<name>/...`, so the root
-    // itself is the prefix to strip (`std=/toolchain` renders the standard
-    // library as `std/fs.cz`).
-    for root in search.packages.values() {
-        if let Ok(c) = root.canonicalize() {
-            prefixes.push(format!("{}/", c.display()));
-        }
-    }
-    let plugin_labels: Vec<(String, String)> = sources
-        .plugins()
-        .map(|(module, library)| {
-            let library = library
-                .canonicalize()
-                .unwrap_or_else(|_| library.to_path_buf())
-                .display()
-                .to_string();
-            (library, format!("<plugin:{}>", module.join(".")))
-        })
-        .collect();
-    let relativize = |label: &str| -> String {
-        // Canonicalize the label's path first (a plugin label wraps one), so
-        // the caller's spelling (`../../x.cz`) does not leak into the
-        // recorded position.
-        let mut label = if let Some(inner) = label
-            .strip_prefix("<plugin:")
-            .and_then(|r| r.strip_suffix('>'))
-        {
-            match std::fs::canonicalize(inner) {
-                Ok(c) => {
-                    let path = c.display().to_string();
-                    plugin_labels
-                        .iter()
-                        .find_map(|(library, label)| (library == &path).then(|| label.clone()))
-                        .unwrap_or_else(|| format!("<plugin:{path}>"))
-                }
-                Err(_) => label.to_string(),
-            }
-        } else {
-            match std::fs::canonicalize(label) {
-                Ok(c) => c.display().to_string(),
-                Err(_) => label.to_string(),
-            }
-        };
-        for p in &prefixes {
-            label = label.replace(p.as_str(), "");
-        }
-        label
-    };
-    let mut out = HashMap::default();
-    for span in spans {
-        if let Some(loc) = sources.locate(span.lo) {
-            let (line, col) = brass_parser::line_col(loc.src, loc.local);
-            out.insert(span, (relativize(loc.label), line as u32, col as u32));
-        }
-    }
-    out
-}
-
-fn collect_call_spans_block(b: &brass_parser::ast::Block, out: &mut Vec<Span>) {
-    for s in &b.stmts {
-        collect_call_spans_stmt(s, out);
-    }
-}
-
-fn collect_call_spans_stmt(s: &Stmt, out: &mut Vec<Span>) {
-    match s {
-        Stmt::Let { value: Some(v), .. } => collect_call_spans_expr(v, out),
-        Stmt::Assign { target, value, .. } => {
-            collect_call_spans_expr(target, out);
-            collect_call_spans_expr(value, out);
-        }
-        Stmt::Expr(e) | Stmt::Return(Some(e), _) => collect_call_spans_expr(e, out),
-        Stmt::While { cond, body, .. } => {
-            collect_call_spans_expr(cond, out);
-            collect_call_spans_block(body, out);
-        }
-        Stmt::For { iter, body, .. } => {
-            collect_call_spans_expr(iter, out);
-            collect_call_spans_block(body, out);
-        }
-        _ => {}
-    }
-}
-
-fn collect_call_spans_expr(e: &brass_parser::ast::Expr, out: &mut Vec<Span>) {
-    use brass_parser::ast::{Expr, StrSeg};
-    match e {
-        Expr::Call(callee, args, span) => {
-            out.push(*span);
-            collect_call_spans_expr(callee, out);
-            for a in args {
-                collect_call_spans_expr(&a.expr, out);
-            }
-        }
-        Expr::Field(b, _, _) | Expr::Unary(_, b, _) => collect_call_spans_expr(b, out),
-        // `!` sites need positions too: a lifted propagation stamps its own.
-        Expr::ErrorProp(b, span) => {
-            out.push(*span);
-            collect_call_spans_expr(b, out);
-        }
-        Expr::Binary(_, l, r, _) | Expr::Index(l, r, _) | Expr::Range(l, r, _) => {
-            collect_call_spans_expr(l, out);
-            collect_call_spans_expr(r, out);
-        }
-        Expr::Array(es, _) => es.iter().for_each(|e| collect_call_spans_expr(e, out)),
-        // Construction spans are collected too: a lifted forwarded return
-        // stamps the construction's own position into the wrapped Error.
-        Expr::TypeLit(_, fs, span) | Expr::VariantLit(_, _, fs, span) => {
-            out.push(*span);
-            fs.iter().for_each(|(_, e)| collect_call_spans_expr(e, out))
-        }
-        Expr::Str(segs, _) => segs.iter().for_each(|seg| {
-            if let StrSeg::Expr(e) = seg {
-                collect_call_spans_expr(e, out);
-            }
-        }),
-        Expr::If(c, t, els, _) => {
-            collect_call_spans_expr(c, out);
-            collect_call_spans_block(t, out);
-            if let Some(e) = els {
-                collect_call_spans_expr(e, out);
-            }
-        }
-        Expr::IfLet(_, scrut, t, els, _) => {
-            collect_call_spans_expr(scrut, out);
-            collect_call_spans_block(t, out);
-            if let Some(e) = els {
-                collect_call_spans_expr(e, out);
-            }
-        }
-        Expr::Match(scrut, arms, _) => {
-            collect_call_spans_expr(scrut, out);
-            for arm in arms {
-                collect_call_spans_expr(&arm.body, out);
-            }
-        }
-        Expr::Block(b, _) => collect_call_spans_block(b, out),
-        Expr::Closure(_, b, _) => collect_call_spans_expr(b, out),
-        _ => {}
-    }
-}
-
 /// Print a runtime failure. A message that is already a rendered error trace
 /// (the prelude's unhandled-`!` rendering, whose lines carry their own
 /// `[file:line:col] unhandled error:` framing) prints verbatim; every other
 /// failure uses the same `runtime error:` prefix as the native runtime.
-fn report_runtime_error(e: &str) {
+pub(crate) fn report_runtime_error(e: &str) {
     if e.starts_with('[') && e.contains("unhandled error:") {
         eprintln!("{e}");
     } else {
@@ -3279,11 +1497,19 @@ fn report_runtime_error(e: &str) {
 /// Render each `(message, span)` diagnostic as `path:line:col: error: message`,
 /// locating the span's file by its globally-unique offset (or a bare `error:`
 /// line when no source contains it).
-fn render_errors(errors: &[(String, Span)], sources: &brass_resolve::SourceMap) -> Vec<String> {
+/// Render source-attributed errors in their supplied order.
+pub(crate) fn render_errors(
+    errors: &[(String, Span)],
+    sources: &brass_resolve::SourceMap,
+) -> Vec<String> {
     render_diagnostics(errors, sources, "error")
 }
 
-fn render_warnings(warnings: &[(String, Span)], sources: &brass_resolve::SourceMap) -> Vec<String> {
+/// Render source-attributed warnings in their supplied order.
+pub(crate) fn render_warnings(
+    warnings: &[(String, Span)],
+    sources: &brass_resolve::SourceMap,
+) -> Vec<String> {
     render_diagnostics(warnings, sources, "warning")
 }
 
@@ -3296,12 +1522,12 @@ fn render_diagnostics(
     for (msg, span) in items {
         let msg = brass_typeck::render_diagnostic_message(msg, |offset| {
             let loc = sources.locate(offset)?;
-            let (line, col) = line_col(loc.src, loc.local);
+            let (line, col) = loc.line_col();
             Some(format!("{}:{line}:{col}", loc.label))
         });
         match sources.locate(span.lo) {
             Some(loc) => {
-                let (line, col) = line_col(loc.src, loc.local);
+                let (line, col) = loc.line_col();
                 out.push(format!("{}:{line}:{col}: {level}: {msg}", loc.label));
             }
             None => out.push(format!("{level}: {msg}")),
@@ -3314,9 +1540,10 @@ fn render_diagnostics(
 
 /// Run an interactive REPL session. Top-level definitions (functions, types,
 /// imports) and statements accumulate for static checking. Each accepted input
-/// executes once; prior bindings with side-effect-free initializers are replayed
-/// only to provide values required by the new statement. A bare expression is
-/// echoed by wrapping it in `println`.
+/// executes once; the earlier statements that only rebuild values -- bindings
+/// and updates free of side effects -- run again ahead of it to provide the
+/// values it reads (see [`repl_replay::plan`]). A bare expression is echoed by
+/// wrapping it in `println`.
 fn repl_interactive() -> ExitCode {
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let stdin = io::stdin();
@@ -3360,23 +1587,23 @@ fn repl_interactive() -> ExitCode {
         let mut last_err = String::new();
         for cand in candidates {
             body.push(cand.clone());
-            if let Err(e) = check_capture(&defs, &body, &root) {
-                body.pop();
-                last_err = e;
-                continue;
-            }
+            let session = match check_capture(&defs, &body, &root) {
+                Ok(checked) => checked,
+                Err(e) => {
+                    body.pop();
+                    last_err = e;
+                    continue;
+                }
+            };
 
-            let mut execution: Vec<String> = body[..body.len() - 1]
-                .iter()
-                .filter(|prior| is_replay_safe_binding(prior))
-                .cloned()
-                .collect();
+            let replay = repl_replay::plan(&body[..body.len() - 1], &session.program);
+            let mut execution = replay.statements.clone();
             execution.push(cand);
             let execution = match check_capture(&defs, &execution, &root) {
                 Ok(checked) => checked,
                 Err(e) => {
                     body.pop();
-                    last_err = e;
+                    last_err = replay.explain(&e).unwrap_or(e);
                     continue;
                 }
             };
@@ -3418,53 +1645,7 @@ fn run_checked_capture(checked: &Checked) -> Result<String, String> {
 /// Check an accumulated REPL program without evaluating it.
 fn check_capture(defs: &[String], body: &[String], root: &Path) -> Result<Checked, String> {
     let src = assemble(defs, body);
-    analyze("<repl>", &src, root).map_err(|d| d.join("\n"))
-}
-
-/// Whether replaying an earlier binding can only reconstruct local values.
-fn is_replay_safe_binding(item: &str) -> bool {
-    let Ok(module) = parse(item) else {
-        return false;
-    };
-    let [TopLevel::Stmt(Stmt::Let { value, .. })] = module.items.as_slice() else {
-        return false;
-    };
-    value.as_ref().is_none_or(replay_safe_expr)
-}
-
-/// Recognize the conservative expression subset whose evaluation performs no
-/// calls or control-flow effects.
-fn replay_safe_expr(expr: &brass_parser::ast::Expr) -> bool {
-    use brass_parser::ast::{Expr, StrSeg};
-
-    match expr {
-        Expr::Int(..)
-        | Expr::Float(..)
-        | Expr::Bool(..)
-        | Expr::Null(..)
-        | Expr::Ident(..)
-        | Expr::SelfExpr(..)
-        | Expr::Closure(..) => true,
-        Expr::Str(segments, _) => segments
-            .iter()
-            .all(|segment| matches!(segment, StrSeg::Lit(_))),
-        Expr::Array(items, _) => items.iter().all(replay_safe_expr),
-        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => {
-            fields.iter().all(|(_, value)| replay_safe_expr(value))
-        }
-        Expr::Unary(..)
-        | Expr::Binary(..)
-        | Expr::Call(..)
-        | Expr::Field(..)
-        | Expr::Index(..)
-        | Expr::ErrorProp(..)
-        | Expr::Range(..)
-        | Expr::If(..)
-        | Expr::IfLet(..)
-        | Expr::TypeTest(..)
-        | Expr::Match(..)
-        | Expr::Block(..) => false,
-    }
+    analyze("<repl>", &src, root, LocationTables::Execution).map_err(|d| d.join("\n"))
 }
 
 /// Build a single source unit from accumulated top-level definitions and an
@@ -3556,9 +1737,6 @@ fn brace_balanced(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_replay_safe_binding;
-    #[cfg(jit_backend)]
-    use super::{CheckerCleanup, CheckerPause, demand_loop_progress};
     use super::{
         module_path_at, program_file_index, remove_provisional_keyed_diagnostics,
         retain_diagnostic_free_context,
@@ -3589,36 +1767,6 @@ mod tests {
         );
     }
 
-    #[cfg(jit_backend)]
-    #[test]
-    fn demand_loop_rejects_a_retry_without_state_change() {
-        // This is the synthetic stuck round: mono returned a missing body, but
-        // the driver neither queued, settled, nor lowered anything before retry.
-        let error = demand_loop_progress(0, 0, 0).expect_err("stuck retry must abort");
-        assert!(error.contains("demand loop made no progress"));
-    }
-
-    #[cfg(jit_backend)]
-    #[test]
-    fn checker_cleanup_wakes_a_paused_checker() {
-        // Every post-startup return must make the request wait observable.
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (requests, mut receiver) = tokio::sync::mpsc::unbounded_channel::<
-            Option<Vec<brass_typeck::stream::BodyRequest>>,
-        >();
-        let paused = std::sync::Arc::new(CheckerPause {
-            paused: std::sync::atomic::AtomicBool::new(true),
-            requests,
-        });
-        drop(CheckerCleanup {
-            stop: stop.clone(),
-            paused,
-        });
-
-        assert!(stop.load(std::sync::atomic::Ordering::Relaxed));
-        assert!(matches!(receiver.try_recv(), Ok(None)));
-    }
-
     #[test]
     fn keyed_cleanup_preserves_nearby_diagnostics() {
         // Only the diagnostic emitted at the provisional call span is removed.
@@ -3646,18 +1794,17 @@ mod tests {
     }
 
     #[test]
-    fn repl_replays_only_inert_bindings() {
-        // Literal bindings remain available, while calls are never repeated.
-        assert!(is_replay_safe_binding("let answer = 42"));
-        assert!(!is_replay_safe_binding("let line = input()!"));
-        assert!(!is_replay_safe_binding("println(42)"));
-    }
-
-    #[test]
     fn option_terminator_makes_subcommand_words_file_names() {
         // After `--`, clap treats every token positionally. The manual split
         // must make the same choice or a file literally named `repl` is lost.
-        assert_eq!(program_file_index(&argv(&["--", "repl", "arg"])), Some(2));
+        for word in ["repl", "check", "cache", "help"] {
+            assert_eq!(program_file_index(&argv(&["--", word, "arg"])), Some(2));
+        }
+        assert_eq!(program_file_index(&argv(&["cache", "info"])), None);
+        assert_eq!(
+            program_file_index(&argv(&["--no-jit-cache", "cache", "info"])),
+            None
+        );
     }
 
     fn loaded(path: &str, base: usize) -> LoadedModule {

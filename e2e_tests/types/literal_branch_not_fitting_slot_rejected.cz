@@ -1,0 +1,8 @@
+// Literal branches adapt to a numeric slot only when every one of them fits
+// it: with `300` among them the branches join at `int32`, which does not
+// flow into a `uint8` slot.
+fun main() {
+    let c = true
+    let a: uint8 = if c { 300 } else { 7 }
+    println(a)
+}

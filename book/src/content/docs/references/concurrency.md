@@ -32,15 +32,23 @@ programmer never writes `move`/`freeze`/`cown`:
 - a captured **heap object** (record, array, ...) that is shared with (and
   mutated by) concurrent code is promoted to a _cown_ (concurrent owner): a
   guarded object whose accesses are serialized by its lock;
-- when the spawning function itself keeps using a promoted object, every one
-  of its accesses is auto-guarded by the same lock, and the compiler emits a
-  warning suggesting explicit `with(cown, f)` acquisition for finer-grained
-  control. The lock is reentrant, so nested guarded accesses (including
-  methods that mutate `self`) do not deadlock.
+- when the spawning function itself keeps using a promoted object outside
+  `with`, each such access is auto-guarded by the same lock, and the compiler
+  warns once per function (or spawned task body) and object, suggesting
+  explicit `with(cown, f)` acquisition for finer-grained control. An access
+  through an alias counts as an access to the object; the capture itself and
+  explicit `with` accesses do not warn. The lock is reentrant, so
+  nested guarded accesses (including methods that mutate `self`) do not
+  deadlock.
 
-`with(c, f)` acquires `c`'s lock for the duration of `f`. The group form used
-internally acquires multiple cowns in address order, so a consistent lock
-order is maintained.
+`with(c, f)` acquires `c`'s lock for the duration of `f`. The parameter of a
+closure literal written as `f` is the shared object itself, so mutations made
+through it are the object's (unlike an ordinary closure parameter, which a
+mutating body receives as a private copy). The parameter has `c`'s type and
+the call has `f`'s result type, checked like any value; an access the
+compiler auto-guards keeps the type it had. The group form used internally
+acquires multiple cowns in address order, so a consistent lock order is
+maintained.
 
 A single-cown `with` scope is also a **region**: objects stored into the
 guarded object while the scope runs belong to it, and references reaching into
@@ -53,7 +61,7 @@ the scope ends releases the reference, and the scope closes normally.
 
 ## Static restrictions
 
-These are compile errors today:
+These are compile errors:
 
 - `spawn`'s argument must be a **closure literal**, or a local variable
   directly bound to one, not a function reference, a call result, or a
@@ -62,6 +70,11 @@ These are compile errors today:
   open return type); `with`'s closure takes exactly one parameter.
 - A spawned task may not read or write a **module global** that any code
   writes; share state through captured objects instead.
+- A spawned task may not **reassign a captured variable** (`n = 5`,
+  `s += "b"`, `p = Point { .. }`): the task works on a copy of a captured
+  primitive and on the object a captured heap binding refers to, so the
+  rebinding would be lost. Mutate a shared object instead (`p.x = 5`,
+  `xs.push(v)`); variables the task declares itself may be reassigned freely.
 - `spawn` at the top level (in a module initializer, outside any function) is
   unsupported.
 - Nested spawns inside an already-spawned closure are analyzed like the outer

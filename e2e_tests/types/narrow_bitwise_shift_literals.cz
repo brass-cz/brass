@@ -1,0 +1,24 @@
+// @backends: all
+// Bitwise and shift operators follow the same literal rule as arithmetic: a
+// fitting literal takes the narrow operand's type, so masking and shifting a
+// byte stays a byte on every back end. A literal that does not fit meets the
+// operand at the common type (`b & 300` is int32).
+fun main() {
+    let b: uint8 = 200
+    println(b & 15)
+    println(typeof(b & 15))
+    println(b << 1)
+    println(b >> 4)
+    println(b | 1)
+    println(b ^ 255)
+    println(b & 300)
+    println(typeof(b & 300))
+    let c: int16 = 1000
+    println(c | 1)
+    println(c >> 2)
+    let e: int8 = -16
+    println(e >> 2)
+    println(typeof(e >> 2))
+    let u: uint16 = 0xF0F0
+    println(u & 0xFF)
+}

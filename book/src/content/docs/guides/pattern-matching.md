@@ -72,6 +72,23 @@ for n in [0, 1, 2, 9] {
 Matching on strings works the same way; see the expression-tree example in
 [Types and methods](/guides/types/#sum-types), which matches on `"+"` and `"*"`.
 
+An integer literal pattern (a negative one like `-1` included) is typed like
+a literal flowing into a variable of the scrutinee's type: it must fit that
+type. On a nullable scrutinee a value literal matches a present value equal to
+it, and `null` matches the absent one (a variant or record pattern likewise
+matches only a present value, and a `match` over a nullable sum needs a
+`null` or `_` arm):
+
+```brass
+fun classify(n: int64?) -> string {
+    return match n {
+        -1 => "minus one",
+        null => "none",
+        _ => "other",
+    }
+}
+```
+
 ## `if let`
 
 When you only care about a single variant, `if let` matches it and binds its

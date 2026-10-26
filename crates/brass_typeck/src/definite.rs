@@ -8,7 +8,9 @@
 //! are compile errors. The analysis is a structured dataflow walk over the
 //! body: branches join by intersection, terminated paths (return/break/
 //! continue) drop out of the join, and loop bodies are checked but do not
-//! contribute facts (they may run zero times).
+//! contribute facts (they may run zero times) -- except a `fields(x)` loop
+//! over the binding itself, which visits every field, so a body whose every
+//! completing path assigns `x[f]` initializes all of `x`.
 
 use fxhash::FxHashMap as HashMap;
 use std::collections::BTreeSet;
@@ -25,6 +27,7 @@ pub fn check(program: &Program) -> Vec<TypeError> {
     check_in(program, crate::AnalysisModules::all())
 }
 
+/// [`check`] over the modules `modules` checks.
 pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -> Vec<TypeError> {
     let mut errors = Vec::new();
     for f in program.functions.values() {

@@ -1,6 +1,6 @@
 // A `ref(mut(T))` parameter exposes the underlying record's fields: storing a
-// value of the wrong type through the reference must be a type error, not a
-// silently unchecked write (which would corrupt the unboxed layout).
+// value of the wrong type through the reference is a type error, exactly as
+// a direct store of it into the field would be.
 type Point = { x: int32 }
 
 fun poke(p: ref(mut(Point))) {

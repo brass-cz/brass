@@ -1,0 +1,8 @@
+// `x op= e` is typed as `x = x op e`: 300 does not fit uint8, so the sum is
+// the common type int32, and storing it back into the uint8 would narrow --
+// a compile error, never a silent wrap.
+fun main() {
+    let u: uint8 = 1
+    u += 300
+    println(u)
+}

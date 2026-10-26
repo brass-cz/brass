@@ -1,9 +1,9 @@
 //! The LSP server: glue between the protocol and the analysis layer.
 //!
 //! One [`DocState`] per open document holds its text and its incremental
-//! analyzer. Requests (`hover`, `definition`, `semantic_tokens`) read the
-//! analysis; each handler does its synchronous analysis under the document's map
-//! entry, then releases it before awaiting the client.
+//! analyzer. Requests (`hover`, `definition`, `completion`, `semantic_tokens`)
+//! read the analysis; each handler does its synchronous analysis under the
+//! document's map entry, then releases it before awaiting the client.
 //!
 //! Diagnostics are published on `did_open` and `did_save` (the full check) and on
 //! `did_change` (SYNTAX ONLY). Type inference re-checks the whole module graph,

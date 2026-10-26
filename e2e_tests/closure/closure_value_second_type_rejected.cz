@@ -1,0 +1,30 @@
+// Only a closure literal bound to a never-reassigned `let`/`const` is
+// let-polymorphic. A closure VALUE reached any other way -- returned from a
+// function, read from a record field or an array element, received as a
+// parameter -- is monomorphic: its first application fixes its parameter
+// type, and a later argument that does not flow into that type is rejected
+// (the back ends compile one body for it).
+type Holder = { f }
+
+fun make() {
+    return (x) -> [x]
+}
+
+fun twice(f) {
+    println(f(1))
+    println(f("s"))
+}
+
+fun main() {
+    let returned = make()
+    println(returned(1)[0])
+    println(returned("s")[0])
+    let h = Holder { f: (x) -> x }
+    println(h.f(1))
+    println(h.f("s"))
+    let fs = [(x) -> x]
+    let g = fs[0]
+    println(g(1))
+    println(g("s"))
+    twice((x) -> x)
+}

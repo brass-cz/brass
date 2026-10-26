@@ -1,0 +1,4 @@
+ok: hi
+err: invalid UTF-8 byte sequence
+err: invalid UTF-8 byte sequence
+true

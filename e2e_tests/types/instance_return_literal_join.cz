@@ -1,0 +1,80 @@
+// @backends: all
+// The returns of one instantiation join by value-preserving widening, and an
+// integer literal return adapts to the joined type when its value fits it --
+// otherwise the literal keeps its default type and takes part in the join.
+// The result never depends on the order of the returns.
+fun pick(c, n) {
+    if c {
+        return 1
+    }
+    return n
+}
+
+fun sum(xs, i) {
+    if i >= xs.len() {
+        return 0
+    }
+    return xs[i] + sum(xs, i + 1)
+}
+
+fun widen(c, a, b) {
+    if c {
+        return a
+    }
+    return b
+}
+
+// 300 does not fit `int8`, so it joins as `int32` in either order.
+fun small_first(c: bool) {
+    let small: int8 = 3
+    if c {
+        return small
+    }
+    return 300
+}
+
+fun small_last(c: bool) {
+    if c {
+        return 300
+    }
+    let small: int8 = 3
+    return small
+}
+
+// 100 fits `int8`, so it adapts in either order.
+fun fits_first(c: bool) {
+    let small: int8 = 3
+    if c {
+        return small
+    }
+    return 100
+}
+
+fun fits_last(c: bool) {
+    if c {
+        return 100
+    }
+    let small: int8 = 3
+    return small
+}
+
+fun main() {
+    let big: int64 = 5000000000
+    println(pick(false, big))
+    println(pick(true, big))
+    println(typeof(pick(true, big)))
+    println(sum([1.5, 2.5], 0))
+    println(typeof(sum([1.5, 2.5], 0)))
+    let small: int32 = 1
+    println(widen(false, small, big))
+    println(typeof(widen(true, small, big)))
+    let m = HashMap.new()
+    m.set("a", big)
+    println(m.get_or("a", 0))
+    println(m.get_or("missing", 7))
+    println(typeof(m.get_or("missing", 7)))
+    println("{typeof(small_first(true))} {typeof(small_last(true))}")
+    println("{small_first(true)} {small_first(false)} {small_last(true)} {small_last(false)}")
+    println("{typeof(fits_first(true))} {typeof(fits_last(true))}")
+    println("{fits_first(false)} {fits_last(true)}")
+}

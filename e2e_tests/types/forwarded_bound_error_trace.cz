@@ -1,0 +1,7 @@
+// @backends: all
+// An entry-point failure renders the location of the forwarding return expression.
+fun forward() -> int32! {
+    let r = int32.parse("zz")
+    return r
+}
+forward()!

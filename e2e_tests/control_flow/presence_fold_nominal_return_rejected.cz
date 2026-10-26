@@ -1,0 +1,21 @@
+// @backends: all
+// A member-presence test folds on the condition alone: a present,
+// non-nullable field of a NOMINAL record is truthy in every back end, so the
+// then-arm runs and its `return` must fit the declared return type. The
+// checker reports the mismatch instead of pruning an arm that executes (only
+// an anonymous structural argument, whose call-site view drops a field that
+// does not fit, degrades to the fallback).
+type S = {
+    n
+}
+
+fun g(p) -> int64 {
+    if p.n {
+        return p.n
+    }
+    return -1
+}
+
+fun main() {
+    println(g(S { n: "five" }))
+}

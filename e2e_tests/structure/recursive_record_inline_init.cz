@@ -1,7 +1,7 @@
 // A non-null value initializing a declared-nullable field inline (building a
 // linked list front-to-back in a loop, inside a function) keeps the field's
-// declared nullable type: the value is wrapped into the nullable cell at the
-// store, and destructors/readers see the cell layout they expect.
+// declared nullable type: each `next` reads back as a present `Node?`, so the
+// list sums as built.
 type Node = { value: int64, next: Node? }
 
 fun build(n: int64) -> Node {

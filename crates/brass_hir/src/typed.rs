@@ -1,9 +1,10 @@
-//! Typed HIR sidecar data produced by type checking.
+//! Typed sidecar data produced by type checking.
 //!
-//! The current executable HIR still keeps parsed AST nodes for code generation.
-//! This module is the migration surface toward a fully typed HIR: every checked
-//! expression can be represented by its source span, inferred type, and
-//! constness until expression kinds are fully lowered into HIR-owned nodes.
+//! The HIR keeps function bodies as parsed AST nodes, so the checker records
+//! what it decides about each checked expression beside them: its source
+//! span, a node kind, its inferred type and constness ([`TypedProgram`]). The
+//! checker derives the span-keyed channels MIR lowering and monomorphization
+//! read from these records; editor tooling reads them directly.
 
 use brass_parser::Span;
 use brass_parser::ast::{BinOp, Expr, UnaryOp};
@@ -18,34 +19,9 @@ pub enum Constness {
     Unknown,
 }
 
-/// A region identifier: the unit of mutable-object ownership a
-/// `with` scope establishes. Matches the runtime's 1-based region ids.
-pub type RegionId = u32;
-
-/// The ownership class of a checked expression's value. Most
-/// values are `Local` (the thread's implicit region); `Immutable`/`Cown`/`InRegion`
-/// are established by freeze/cown/region operations. Several of these are only
-/// settled once concrete types are known at JIT time, so an
-/// expression whose ownership the front end has not resolved carries `Unknown`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Ownership {
-    /// The thread's local region (the default for newly created values).
-    Local,
-    /// Deeply frozen and shareable across threads.
-    Immutable,
-    /// Held in a cown, reached only under its lock.
-    Cown,
-    /// Inside an explicit region.
-    InRegion(RegionId),
-    /// Not yet determined (settled at JIT time once types are concrete).
-    Unknown,
-}
-
-/// The HIR-owned shape of a checked expression.
-///
-/// This intentionally stores only stable expression identity, not child nodes.
-/// It lets the typed sidecar move toward a fully typed HIR while the executable
-/// HIR still keeps parser AST nodes for code generation.
+/// The HIR-owned shape of a checked expression: its node kind and the
+/// identity a consumer needs (an identifier's name, an operator), never child
+/// nodes -- the expression itself is the AST node at the record's span.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TypedExprKind {
     Int,
@@ -62,6 +38,21 @@ pub enum TypedExprKind {
     /// by the enclosing call span. MIR consumes it to complete that call's
     /// omitted arguments without aggregating unrelated same-named methods.
     MethodReceiver,
+    /// The resolved type of a local annotation containing `typeof`, keyed by
+    /// the annotation span. Slot seeds retain the enclosing callable instance.
+    TypeOfAnnotation,
+    /// The numeric storage type of an unannotated binding, keyed by its
+    /// declaration's binding span. Captured cells use this as their element type.
+    /// Non-numeric instances also record their type to prevent a shared numeric seed.
+    NumericBinding,
+    /// The effective numeric type supplied to an unannotated parameter,
+    /// keyed by the argument expression's span in the enclosing instance.
+    /// Other argument types invalidate numeric seeds shared across instances.
+    NumericArgument,
+    /// Numeric storage valid only in the recorded callable instance.
+    InstanceNumericBinding,
+    /// Numeric argument storage valid only in the recorded callable instance.
+    InstanceNumericArgument,
     Field(String),
     Index,
     ErrorPropagate,
@@ -72,6 +63,9 @@ pub enum TypedExprKind {
         /// checked type is the back end's only source (the seeding channel).
         empty: bool,
     },
+    /// A range `[lo..hi]`: an array-valued expression whose element type (the
+    /// type its counter runs at) the checker decides from both bounds.
+    Range,
     TypeLiteral(String),
     VariantLiteral {
         ty: String,
@@ -81,6 +75,12 @@ pub enum TypedExprKind {
     IfLet,
     Match,
     Block,
+    /// Checker evidence keyed by an `if`/`if let`/`match` span: the numeric
+    /// type its value joins at because its literal branches adapted to the
+    /// requirement the value flows into (`let b: uint8 = if c { 200 } else
+    /// { 7 }`). The back end types the join with it; the bare literal values
+    /// would join at their default type.
+    LiteralBranchJoin,
     Unknown,
 }
 
@@ -104,9 +104,7 @@ impl TypedExprKind {
             Expr::Array(es, _) => Self::Array {
                 empty: es.is_empty(),
             },
-            // A range is an array-valued expression; it always has bounds, so
-            // it is never an empty literal.
-            Expr::Range(..) => Self::Array { empty: false },
+            Expr::Range(..) => Self::Range,
             Expr::TypeLit(name, ..) => Self::TypeLiteral(name.clone()),
             Expr::VariantLit(ty, variant, ..) => Self::VariantLiteral {
                 ty: ty.clone(),
@@ -123,15 +121,13 @@ impl TypedExprKind {
     }
 }
 
-/// Type information for one expression node in the lowered program. Pairs the
-/// expression's inferred type with its `ownership` class.
+/// The inferred type, node kind, source extent, and constness of an expression.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypedExpr {
     pub kind: TypedExprKind,
     pub span: Span,
     pub ty: Type,
     pub constness: Constness,
-    pub ownership: Ownership,
 }
 
 /// Typed expression data collected for a program.
@@ -150,47 +146,11 @@ impl TypedProgram {
     }
 
     pub fn push_kind(&mut self, kind: TypedExprKind, span: Span, ty: Type, constness: Constness) {
-        // The front end records the default ownership: a literal value is born in
-        // the local region; anything else is settled at JIT time once concrete
-        // types are known, so it stays `Unknown` here.
-        let ownership = match kind {
-            TypedExprKind::Int
-            | TypedExprKind::Float
-            | TypedExprKind::String
-            | TypedExprKind::Bool
-            | TypedExprKind::Array { .. }
-            | TypedExprKind::TypeLiteral(_)
-            | TypedExprKind::VariantLiteral { .. } => Ownership::Local,
-            _ => Ownership::Unknown,
-        };
         self.expressions.push(TypedExpr {
             kind,
             span,
             ty,
             constness,
-            ownership,
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A literal value is born in the local region; a non-literal expression's
-    /// ownership is settled at JIT time, so the front end records `Unknown`.
-    #[test]
-    fn literals_are_local_others_unknown() {
-        let mut prog = TypedProgram::default();
-        let span = Span::new(0, 0);
-        prog.push_kind(TypedExprKind::Int, span, Type::Unknown(0), Constness::Const);
-        prog.push_kind(
-            TypedExprKind::Ident("x".into()),
-            span,
-            Type::Unknown(1),
-            Constness::Mutable,
-        );
-        assert_eq!(prog.expressions[0].ownership, Ownership::Local);
-        assert_eq!(prog.expressions[1].ownership, Ownership::Unknown);
     }
 }

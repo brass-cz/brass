@@ -1,0 +1,22 @@
+// @backends: all
+// A method's returns join per instantiation like a function's: the literal
+// `return 0` adapts to the `int64` argument returned on the other path, so the
+// `int64` instance returns the full value whichever path runs.
+type Box = {
+    v: int64
+}
+
+fun Box.pick(self, b, x) {
+    if b {
+        return 0
+    }
+    return x
+}
+
+fun main() {
+    let bx = Box { v: 1 }
+    let big: int64 = 5000000000
+    println(bx.pick(false, big))
+    println(bx.pick(true, big))
+    println(typeof(bx.pick(true, big)))
+}

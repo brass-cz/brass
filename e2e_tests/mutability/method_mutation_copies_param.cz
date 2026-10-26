@@ -2,8 +2,6 @@
 // mutating the parameter, exactly like a direct field store or a builtin
 // `push`: the callee works on a private deep copy and the caller's value is
 // untouched. Write-through stays opt-in via an explicit `ref(mut(T))`.
-// (Previously a method receiver slipped past the mutation analysis, so the
-// callee mutated the caller's value through the shared reference.)
 type Counter = {
     value: int64
 }

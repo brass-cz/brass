@@ -1,8 +1,7 @@
 // Pins: a local bound INSIDE an outer spawn closure and shared with a nested
-// spawn is a capture of the INNER scope, not of the enclosing function. The old
-// pass only collected function-level locals, so `local` was never promoted or
-// guarded (rc race + data race). Each spawned closure body is now processed as
-// its own scope with its own locals.
+// spawn is a capture of the INNER scope, not of the enclosing function: each
+// spawned closure body is its own scope with its own locals, so `local` is
+// promoted and guarded there and the total is exact.
 type Counter = {
     value: int64
 }

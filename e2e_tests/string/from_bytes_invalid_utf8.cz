@@ -1,0 +1,24 @@
+// @backends: all
+// Decoding bytes that are not valid UTF-8 fails with the same `Err` payload
+// text on every back end -- the payload is an ordinary value a program can
+// print or compare, so the back ends must agree on it. Valid bytes decode.
+
+fun decode(bytes: uint8[]) -> string {
+    return match _string_from_bytes(bytes) {
+        Ok { value } => "ok: {value}",
+        Err { error } => "err: {error}",
+    }
+}
+
+fun main() {
+    let good: uint8[] = [104, 105]
+    let bad: uint8[] = [255, 254]
+    let cut: uint8[] = [195]
+    println(decode(good))
+    println(decode(bad))
+    println(decode(cut))
+    match to_text(bad) {
+        Ok { value } => println(value),
+        Err { error } => println(error.value == "invalid UTF-8 byte sequence"),
+    }
+}

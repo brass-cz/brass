@@ -1,0 +1,5 @@
+let_closure_parameter_join_rejected.cz:14:21: error: cannot use `int32[]` where `string` is required
+let_closure_parameter_join_rejected.cz:22:19: error: cannot implicitly convert `int64` to `int32`
+let_closure_parameter_join_rejected.cz:26:25: error: cannot implicitly convert `int64` to `int32`
+let_closure_parameter_join_rejected.cz:31:19: error: cannot implicitly convert `int64` to `int32`
+let_closure_parameter_join_rejected.cz:35:24: error: cannot use `string` where `int32` is required

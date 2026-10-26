@@ -1,0 +1,31 @@
+// @backends: all
+// Records of the same shape and function values of the same signature join,
+// including nullable results and named record instances.
+type A = { n: int32 }
+fun record(c: bool) {
+    if c { return { n: 1, label: "first" } }
+    return { n: 2, label: "second" }
+}
+fun named(c: bool) {
+    if c { return A { n: 3 } }
+    return A { n: 4 }
+}
+fun function(c: bool) {
+    if c { return (n: int32) -> n + 1 }
+    return (n: int32) -> n + 2
+}
+fun nullable(c: bool) {
+    if c { return { n: 5 } }
+    return null
+}
+fun main() {
+    println(record(true).n)
+    println(record(false).label)
+    println(named(false).n)
+    let f = function(true)
+    let g = function(false)
+    println(f(10))
+    println(g(10))
+    println(nullable(true))
+    println(nullable(false))
+}

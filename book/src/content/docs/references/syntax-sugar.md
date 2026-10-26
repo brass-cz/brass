@@ -35,8 +35,9 @@ Every fallibility construct is sugar over it:
 - A bare `return v` in a fallible function wraps as `Ok { value: v }`; a
   `Result`-typed value flows whole.
 - `expr!` matches the operand: the `Ok` payload is the expression's value,
-  an `Err` returns from the enclosing callable unchanged, or aborts with a
-  rendered trace at the program's top level or in the entry `main`.
+  and an `Err` returns from the enclosing callable (its payload
+  [lifted](#error-traces) into an `Error`) or, at the program's top level or
+  in the entry `main`, aborts the program with the rendered error.
 
 The name `Result` resolves through normal scoping at each sugar site, so a
 module may **shadow** it with its own declaration:
@@ -87,9 +88,11 @@ identifier.
 
 An anonymous record needs no leading `name:`: a `{` followed by `name,` or
 `name }` also opens a literal, so `const a = { x }` builds `{ x: x }`. The
-exception is a closure body: `->` followed by `{` always opens a block, so
-`(x) -> { x }` is a block that yields nothing (a block's value comes only
-from `return`). Parenthesize to return a record: `(x) -> ({ x })`.
+exceptions are a closure body and a match arm: `->` or `=>` followed by `{`
+always opens a block, so `(x) -> { x }` is a block that yields nothing (a
+closure's block body yields only through `return`) and the arm `1 => { x }`
+yields `x` itself. Parenthesize to produce a record: `(x) -> ({ x })`,
+`1 => ({ x })`.
 
 ## Error traces
 
@@ -141,20 +144,22 @@ Two mechanisms make this work:
   `context` declare one (`loc: Location`), which is how they know where they
   were called. The parameter is ordinary: visible in the signature, and a
   caller may pass it explicitly.
-- **Error lifting at `!`.** A propagated payload that is not already an
-  `Error` (a plugin's or builtin's plain string, for example) is re-raised
-  wrapped into one, stamped with the propagation site. This is what lets one
-  body mix `error(..)` with `!`-forwarded builtin failures. A chain that
-  never touches `error(..)`/`context` and aborts directly keeps the plain
-  `unhandled error: <payload>` form.
+- **Error lifting.** A payload that is not already an `Error` (a plugin's or
+  builtin's plain string, for example) is wrapped into one, stamped with the
+  site, wherever a fallible function hands it on: at a `!` that propagates
+  it, and at a `return` that forwards a `Result` from a function whose return
+  annotation ends in `!`. This is what lets one body mix `error(..)` with
+  forwarded builtin failures. A payload that reaches an entry point's `!`
+  unwrapped aborts with the plain `unhandled error: <payload>` form.
 
-Two accepted deviations from the pure-sugar reading: `error` is reserved in
-call position (a `match`'s `Err { error }` binding does not shadow the
-function), and the checker types `error(..)` itself (each call's `Ok` payload
-is taken from the position the call flows into) while the prelude body is
-what runs. The reserved path still validates the prelude signature: it accepts
-one payload argument and the optional trailing `Location`, and rejects other
-arities or an explicit argument of the wrong type.
+One accepted deviation from the pure-sugar reading: the checker types a call
+of the prelude `error` itself (each call's `Ok` payload is taken from the
+position the call flows into) while the prelude body is what runs. That typing
+still validates the prelude signature: it accepts one payload argument and the
+optional trailing `Location`, and rejects other arities or an explicit
+argument of the wrong type. `error(..)` always means the raise construct,
+even with a same-named binding (see
+[Identifiers and keywords](/references/syntax/#identifiers-and-keywords)).
 
 ## Methods are `Default` fields
 
@@ -214,9 +219,10 @@ fun tag(s: Shape) -> string {
 }
 ```
 
-Satisfaction by a method compares the whole signature: parameter types are
-contravariant, passing modes must match, and the return type is covariant. A
-matching name and arity alone are not enough. The compiler-provided `debug`
+Satisfaction by a method compares the whole signature: parameter types and
+passing modes must match exactly, and the return type may be a structural
+subtype of the required one (see [Interfaces](/references/types/#interfaces)).
+A matching name and arity alone are not enough. The compiler-provided `debug`
 behavior remains available as a built-in exception to ordinary protocol
 satisfaction.
 
@@ -255,9 +261,13 @@ fun a() -> infer! {
 ```
 
 At every flow site that accepts the child where the parent is required (a
-`return`, a binding, an argument, a `!` operand), the value is **rebuilt** as
-the parent: the extra width fields are dropped and the result is a new
-value (identity and aliasing do not survive the coercion). Subtyping is
+`return`, a binding, an argument, an array literal's element, a `!` operand),
+the value is **rebuilt** as the parent: the extra width fields are dropped and
+the result is a new value (identity and aliasing do not survive the
+coercion). A nullable parent slot (`Parent?`) rebuilds and wraps the child
+the same way. Only a value that flows itself is rebuilt: a child inside
+another value (the elements of a `Child[]`, a `Result` payload) or in a
+function type (`() -> Child`) is not usable as the parent there. Subtyping is
 gated on the declaration; two structurally identical sums that do not
 declare the relationship stay unrelated, and the relationship never
 participates in unification, only in one-directional flow.

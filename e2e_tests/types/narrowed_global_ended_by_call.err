@@ -1,0 +1,6 @@
+narrowed_global_ended_by_call.cz:23:17: error: nullable value must be checked for null before use
+narrowed_global_ended_by_call.cz:30:21: error: nullable value must be checked for null before use: `g` was checked before this loop, but the loop can make it null again before a later iteration; check it inside the loop
+narrowed_global_ended_by_call.cz:40:17: error: nullable value must be checked for null before use
+narrowed_global_ended_by_call.cz:46:17: error: nullable value must be checked for null before use
+narrowed_global_ended_by_call.cz:52:17: error: nullable value must be checked for null before use
+narrowed_global_ended_by_call.cz:59:17: error: nullable value must be checked for null before use

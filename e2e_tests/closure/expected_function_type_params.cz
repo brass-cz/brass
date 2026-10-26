@@ -1,0 +1,59 @@
+// @backends: all
+// A closure literal checked against an expected function type takes its
+// parameter types from that type, and the back ends instantiate it at exactly
+// those types: a `float32` or `uint8` parameter keeps its width in the body
+// (`x * half`, `x + one`), and a record, array or string-array parameter
+// types the body like a primitive one does. The same holds for an annotated
+// binding, a named function passed as the value, and a callee that never
+// calls the function it receives.
+type Dog = {
+    age: int32
+    name: string
+}
+
+fun applyf(f: (float32) -> float32, v: float32) -> float32 {
+    return f(v)
+}
+
+fun apply8(f: (uint8) -> uint8, v: uint8) -> uint8 {
+    return f(v)
+}
+
+fun run1(f: (Dog) -> int32) -> int32 {
+    return f(Dog { age: 3, name: "rex" })
+}
+
+fun ignore(f: (Dog) -> int32, d: Dog) -> int32 {
+    return d.age
+}
+
+fun ignoref(f: (float32) -> float32, v: float32) -> float32 {
+    return v
+}
+
+fun count(f: (int32[]) -> int64) -> int64 {
+    return f([1, 2, 3])
+}
+
+fun first(f: (string[]) -> string) {
+    println(f(["a", "b"]))
+}
+
+fun dog_age(d: Dog) -> int32 {
+    return d.age * 10
+}
+
+fun main() {
+    const half: float32 = 0.5
+    println(applyf((x) -> x * half, 3.0))
+    const one: uint8 = 1
+    println(apply8((x) -> x + one, 200))
+    println(run1((a) -> a.age))
+    let c: (Dog) -> int32 = (a) -> a.age + 1
+    println(run1(c))
+    println(run1(dog_age))
+    println(ignore((a) -> a.age, Dog { age: 7, name: "x" }))
+    println(ignoref((x) -> x, 2.5))
+    println(count((xs) -> xs.len()))
+    first((xs) -> xs[1])
+}

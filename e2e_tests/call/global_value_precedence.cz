@@ -1,0 +1,24 @@
+// @backends: all
+// Module bindings precede prelude functions as values and callees; inner
+// bindings win in their scope, and unshadowed function values remain callable.
+let error = 3
+let print = (x: int32) -> x + 1
+println(error)
+println(print(3))
+fun increment(x: int32) -> int32 { return x + 1 }
+fun main() {
+    println(error)
+    println(print(4))
+    let f = print
+    println(f(5))
+    if true {
+        let error = 7
+        let print = (x: int32) -> x + 10
+        println(error)
+        println(print(3))
+    }
+    println(error)
+    println(print(3))
+    let f = increment
+    println(f(8))
+}

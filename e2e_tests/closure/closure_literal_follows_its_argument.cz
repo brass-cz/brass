@@ -1,0 +1,29 @@
+// @backends: all
+// A closure parameter next to a numeric literal types the operation by the
+// argument (the literal adapts), so a closure built once by a higher-order
+// function works at the argument's width; a bracket pair of two parameters
+// takes its element join at each instantiation; and an `int32` argument widens into an
+// annotated `int64` closure parameter like any call argument.
+fun twice(f) {
+    return (x) -> f(f(x))
+}
+
+fun compose(f, g) {
+    return (x) -> g(f(x))
+}
+
+fun main() {
+    let big: int64 = 5000000000
+    println(twice((x) -> x * 2)(big))
+    println(twice((x) -> x + 1)(5))
+    println(twice((s) -> s + s)("ab"))
+    println(compose((s) -> s.len(), (n) -> n * 2)("abc"))
+    const pair = (a, b) -> [a, b]
+    println(pair(1, 2))
+    println(typeof(pair(1, 2)))
+    println(pair("a", "b"))
+    println(typeof(pair("a", "b")))
+    let widen = (x: int64) -> x * 2
+    let small: int32 = 21
+    println(widen(small))
+}

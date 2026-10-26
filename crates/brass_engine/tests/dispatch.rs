@@ -100,6 +100,13 @@ impl Codegen for TextBackend {
     fn to_string(&mut self, v: usize, ty: &Type) -> usize {
         self.val(format!("to_string v{v}:{}", ty.display()))
     }
+    fn display_nullable(&mut self, v: usize, inner: &Type, symbol: &str, ret: &Type) -> usize {
+        self.val(format!(
+            "display_nullable v{v}:{} {symbol} -> {}",
+            inner.display(),
+            ret.display()
+        ))
+    }
     fn string_slice(&mut self, s: usize, start: usize, end: usize) -> usize {
         self.val(format!("slice v{s}[v{start}..v{end}]"))
     }
@@ -178,10 +185,6 @@ impl Codegen for TextBackend {
         self.val(format!("call {symbol} {args:?} -> {}", ret.display()))
     }
 
-    fn deferred_dispatch(&mut self, consumer: &str, type_name: &str, value: usize) -> usize {
-        self.val(format!("dispatch {consumer} type={type_name} v{value}"))
-    }
-
     fn make_record(&mut self, record_ty: &Type, fields: &[(&str, usize)]) -> usize {
         let fs: Vec<String> = fields.iter().map(|(n, v)| format!("{n}=v{v}")).collect();
         self.val(format!(
@@ -251,6 +254,7 @@ impl Codegen for TextBackend {
         &mut self,
         fun_ty: &Type,
         id: brass_mir::ClosureId,
+        _target: Option<&str>,
         captures: &[(Type, usize)],
     ) -> usize {
         let cs: Vec<String> = captures.iter().map(|(_, v)| format!("v{v}")).collect();

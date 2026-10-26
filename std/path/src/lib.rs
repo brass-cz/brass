@@ -82,6 +82,16 @@ export! {
         Ok(names)
     }
 
+    /// Whole seconds since this entry was modified, without following a final
+    /// symlink. Future timestamps have age zero; metadata errors are reported.
+    fn path_modified_age(p: String) -> Result<i64, String> {
+        let modified = fs::symlink_metadata(&p)
+            .and_then(|metadata| metadata.modified())
+            .map_err(|e| format!("{p}: {e}"))?;
+        let seconds = modified.elapsed().unwrap_or_default().as_secs();
+        i64::try_from(seconds).map_err(|_| format!("{p}: modification age does not fit in an int64"))
+    }
+
     /// The size of the file at `p` in bytes.
     fn path_file_size(p: String) -> Result<i64, String> {
         let len = fs::metadata(&p).map_err(|e| format!("{p}: {e}"))?.len();
@@ -113,6 +123,7 @@ impl BrassLib for PathLib {
         reg.export(decl!(path_read_link));
         reg.export(decl!(path_read_dir));
         reg.export(decl!(path_file_size));
+        reg.export(decl!(path_modified_age));
     }
 }
 

@@ -1,0 +1,37 @@
+// @backends: all
+// `typeof` reports one canonical source name for a type, however the value
+// reached it: a record or sum is its declared name with the substitution
+// dropped at every depth, so a value that flowed through an annotation
+// (`R?`, which pins the field types) reads exactly like a constructed one,
+// and the same holds inside arrays, tuples and nullables. An anonymous
+// record reads as its written `anonymous { .. }` form.
+type R = { v: int32 }
+type Box = { item }
+type S = | A { x } | B
+
+fun annotated(t: R?) -> string {
+    return typeof(t)
+}
+
+fun plain(t: R) -> string {
+    return typeof(t)
+}
+
+fun main() {
+    let x = R { v: 1 }
+    println(typeof(x))
+    let y: R? = x
+    println(typeof(y))
+    println(plain(x))
+    println(annotated(x))
+    println(annotated(null))
+    let rs: R?[] = [x, null]
+    println(typeof(rs))
+    let pair = [x, 2]
+    println(typeof(pair))
+    println(typeof(Box { item: "s" }))
+    let boxes: Box[] = [Box { item: 1 }]
+    println(typeof(boxes))
+    println(typeof(S.A { x: 1.5 }))
+    println(typeof({ v: 1, w: "s" }))
+}

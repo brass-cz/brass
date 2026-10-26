@@ -1,0 +1,54 @@
+// @backends: all
+// A module-qualified type name (`kinds.Mode` after `import kinds`) resolves
+// in every annotation position exactly as on a `let`: function and method
+// parameters and returns, record and variant fields, alias right-hand sides
+// and closure parameters, for nominal types and for non-nominal aliases.
+import kinds
+
+type Holder = { m: kinds.Mode, p: kinds.Pt }
+type LocalMode = kinds.Mode
+type Wrapped = | One { m: kinds.Mode } | Two
+
+fun rank(m: kinds.Mode) -> int32 {
+    return match m {
+        fast => 1,
+        slow => 2,
+    }
+}
+
+fun origin(p: kinds.Pt?) -> kinds.Pt {
+    if let q = p {
+        return q
+    }
+    return kinds.Pt { x: 0, y: 0 }
+}
+
+fun twice(n: kinds.Num) -> kinds.Num {
+    return n * 2
+}
+
+fun Holder.swap(self, other: kinds.Mode) -> kinds.Mode {
+    return other
+}
+
+fun main() {
+    println(rank(kinds.pick()))
+    let h = Holder { m: kinds.pick(), p: kinds.Pt { x: 1, y: 2 } }
+    println(rank(h.swap(kinds.Mode.slow)))
+    println(origin(null).x)
+    println(origin(h.p).y)
+    let local: LocalMode = kinds.Mode.slow
+    println(rank(local))
+    let w = Wrapped.One { m: kinds.Mode.fast }
+    let label = match w {
+        One { m } => rank(m),
+        Two => 0,
+    }
+    println(label)
+    let n: kinds.Num = 5000000000
+    println(twice(n))
+    let ps: kinds.Pts = [kinds.Pt { x: 3, y: 4 }]
+    println(ps.len())
+    let r = (m: kinds.Mode) -> rank(m) * 10
+    println(r(kinds.Mode.slow))
+}

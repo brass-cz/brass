@@ -282,7 +282,7 @@ fn type_diagnostics_arrive_on_save_and_syntax_diagnostics_on_change() {
     let _ = child.wait();
 
     // `save` must be advertised, or the client never sends the notification the
-    // type check now hangs off.
+    // type check hangs off.
     let sync = &response(&seen, 1)["capabilities"]["textDocumentSync"];
     assert_eq!(sync["save"], json!(true), "save must be advertised: {sync}");
 

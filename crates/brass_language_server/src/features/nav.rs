@@ -453,10 +453,9 @@ pub fn local_var_type(full: &FullAnalysis, global_off: usize, name: &str) -> Opt
 /// Failing that, the type is recovered from the call sites in the file being
 /// edited: each `name(...)` call's typed result *is* the return type, so this
 /// takes the one they all agree on, and `None` when they disagree (a genuinely
-/// polymorphic return has no single type to show). That fallback is all there
-/// used to be, and it can only work while the open file happens to CALL the
-/// function -- open the module that DEFINES it and there is nothing to read,
-/// which is why `http`'s `fetch` rendered as `unknown` in its own file.
+/// polymorphic return has no single type to show). The fallback only works
+/// while the open file happens to CALL the function -- the module that DEFINES
+/// it has no call to read.
 pub fn inferred_return(full: &FullAnalysis, symbol: &str, name: &str) -> Option<Type> {
     if let Some(ty) = full.function_returns.get(symbol)
         && brass_hir::is_fully_known(ty)
@@ -559,7 +558,7 @@ pub fn call_args_at_span(full: &FullAnalysis, call_span: Span) -> Option<Vec<Typ
             && *span == call_span
         {
             let mut types = Vec::new();
-            // A method/UFCS call `recv.f(args)` passes `recv` as the first
+            // A method call `recv.f(args)` passes `recv` as the first
             // argument (`f`'s first parameter), so include the receiver's type
             // before the explicit arguments -- otherwise the arguments map to the
             // wrong parameters and the receiver-typed first parameter (e.g.

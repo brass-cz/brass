@@ -1,0 +1,26 @@
+// @backends: all
+// A call may omit a trailing run of optional parameters that mixes nullable
+// parameters and the implicit caller `Location`: both are filled in (`null`,
+// the call site), for functions and methods alike.
+fun where_am_i(tag: string?, loc: Location) -> string {
+    if let t = tag {
+        return "{t}@{loc.line}"
+    }
+    return "anon@{loc.line}"
+}
+
+type K = {
+    v: int32
+}
+
+fun K.at(self, extra: int32?, loc: Location) -> int32 {
+    return self.v + loc.line
+}
+
+fun main() {
+    println(where_am_i())
+    println(where_am_i("x"))
+    println(where_am_i(null))
+    let k = K { v: 1 }
+    println(k.at())
+}

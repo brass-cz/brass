@@ -1,5 +1,7 @@
-// An empty array literal whose element type nothing ever fixes is rejected
-// with a diagnostic naming the binding and the enclosing function.
+// An empty array literal whose element type nothing ever fixes -- no
+// annotation, no push, no use that pins it -- is rejected by the checker at
+// the literal, before anything runs (a back end has no element type to build
+// it with).
 fun main() {
     let xs = []
     println(xs.len())

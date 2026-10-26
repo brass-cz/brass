@@ -1,0 +1,27 @@
+// @backends: all
+// `if let v = p.f` is a presence test of `f` exactly like `if p.f`: for an
+// anonymous record argument whose `f` is absent, or of a type the guarded
+// use cannot take (`let s: string = v`), the parameter's view holds `null`
+// there and the body takes its fallback path, in either form.
+fun bound(p) -> string {
+    if let v = p.label {
+        let s: string = v
+        return "label {s}"
+    }
+    return "none"
+}
+
+fun tested(p) -> string {
+    if p.label {
+        let s: string = p.label
+        return "label {s}"
+    }
+    return "none"
+}
+
+println(bound({ label: "hi" }))
+println(bound({ other: 3 }))
+println(bound({ label: 3 }))
+println(tested({ label: "hi" }))
+println(tested({ other: 3 }))
+println(tested({ label: 3 }))

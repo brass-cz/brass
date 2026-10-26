@@ -1,0 +1,413 @@
+// Offline inspection and removal of package-store entries. Source paths and
+// publication names belong to cache.cz; manifests supply labels, never fetches.
+
+import std.path.Path
+import std.env
+import std.fs.{ read_file, remove_dir }
+import manifest.{ Manifest, Dependency, Dependencies }
+import cache.{
+    packages_dir,
+    git_entry,
+    tarball_entry,
+    valid_digest,
+    is_staging_name,
+    store_available,
+    store_directory,
+    entry_available,
+}
+
+/** An owned tree's regular-file bytes and youngest modification age in seconds. */
+type TreeUsage = {
+    bytes: int64
+    age: int64
+}
+
+/** One published package or stale staging directory; links are never entries. */
+type CacheEntry = {
+    kind: string
+    path: Path
+    bytes: int64
+    staging: bool
+}
+
+/** A declared dependency's source and local root, whether cached or used in place. */
+type LocalDependency = {
+    name: string
+    source: string
+    path: Path
+    cached: bool
+}
+
+// Clones and extraction can take time. Require a full day without modification
+// anywhere in the tree, leaving fresh and actively populated staging alone.
+const _STALE_SECONDS: int64 = 24 * 60 * 60
+
+/** Compare UTF-8 bytes to keep cache listings independent of directory order. */
+fun _before(left: string, right: string) -> bool {
+    const a = to_bytes(left)
+    const b = to_bytes(right)
+    let i: int64 = 0
+    while i < a.len() && i < b.len() {
+        if a[i] != b[i] {
+            return a[i] < b[i]
+        }
+        i += 1
+    }
+    return a.len() < b.len()
+}
+
+/** Return strings in byte order without changing the caller's array. */
+fun _sorted(values: string[]) -> string[] {
+    let result = values.slice(0, values.len())
+    let i: int64 = 1
+    while i < result.len() {
+        const key = result[i]
+        let j = i
+        while j > 0 && _before(key, result[j - 1]) {
+            result[j] = result[j - 1]
+            j -= 1
+        }
+        result[j] = key
+        i += 1
+    }
+    return result
+}
+
+/** Sum regular files without following links; retain the youngest tree timestamp. */
+fun _tree_usage(root: Path) -> TreeUsage! {
+    let bytes: int64 = 0
+    let age = root.modified_age()!
+    let pending: Path[] = [root]
+    let index: int64 = 0
+    while index < pending.len() {
+        const path = pending[index]
+        index += 1
+        for child in path.entries()! {
+            if child.is_sym_link() {
+                continue
+            }
+            const child_age = child.modified_age()!
+            if child_age < age {
+                age = child_age
+            }
+            if child.is_dir() {
+                pending.push(child)
+            } else if child.is_file() {
+                bytes += child.file_size()!
+            }
+        }
+    }
+    return TreeUsage { bytes, age }
+}
+
+/** Scan only owned directories; missing stores are empty and fresh stages are omitted. */
+fun _entries() -> CacheEntry[]! {
+    let entries: CacheEntry[] = []
+    if !store_available()! {
+        return entries
+    }
+    const root = packages_dir()!
+    for kind in ["git", "tarball"] {
+        const parent = root.join(kind)
+        if !store_directory(parent)! {
+            continue
+        }
+        let names: string[] = []
+        for path in parent.entries()! {
+            names.push(path.basename().to_string())
+        }
+        for name in _sorted(names) {
+            const staging = is_staging_name(name)
+            if !valid_digest(name) && !staging {
+                continue
+            }
+            const path = parent.join(name)
+            if path.is_sym_link() || !path.is_dir() {
+                continue
+            }
+            const usage = _tree_usage(path)!
+            if !staging || usage.age > _STALE_SECONDS {
+                entries.push(
+                    CacheEntry { kind, path, bytes: usage.bytes, staging },
+                )
+            }
+        }
+    }
+    return entries
+}
+
+/** Map a declaration to its local path without verifying revisions or contacting a server. */
+fun _local(name: string, dep: Dependency, base: Path) -> LocalDependency! {
+    return match dep {
+        Git { git, rev } => LocalDependency {
+            name,
+            source: "git {git} @ {rev}",
+            path: git_entry(git, rev)!,
+            cached: true,
+        },
+        Tarball { tarball, hash } => LocalDependency {
+            name,
+            source: "tarball {tarball} # {hash}",
+            path: tarball_entry(hash)!,
+            cached: true,
+        },
+        Path { path } => LocalDependency {
+            name,
+            source: "path {path.to_string()}",
+            path: base.join(path).normalize(),
+            cached: false,
+        },
+        _ => error("dependency `{name}` has an unsupported source")!,
+    }
+}
+
+/**
+ * Walk manifests that exist locally, including path dependencies. A missing or
+ * unreadable child manifest ends that branch. Canonical roots terminate cycles.
+ * The current manifest must parse when present, or when `required` is true.
+ */
+fun _graph(required: bool) -> LocalDependency[]! {
+    let result: LocalDependency[] = []
+    const root = Path.current_dir()!
+    const file = root.join("package.toml")
+    if !file.exists() {
+        if required {
+            return error(
+                "named cache cleanup requires package.toml in the current directory",
+            )
+        }
+        return result
+    }
+    const manifest = Manifest
+        .parse(read_file(file)!)
+        .context("reading current package.toml")!
+    let pending: Path[] = [root]
+    let dependencies: Dependencies[] = [manifest.dependencies]
+    let visited: string[] = []
+    let index: int64 = 0
+    while index < pending.len() {
+        const base = pending[index]
+        const deps = dependencies[index]
+        index += 1
+        const canonical = base.canonicalize()!.to_string()
+        if visited.contains(canonical) {
+            continue
+        }
+        visited.push(canonical)
+        for [name, dep] in deps.pairs() {
+            const local = _local(name, dep, base)!
+            result.push(local)
+            const available = if local.cached {
+                entry_available(local.path)!
+            } else {
+                local.path.is_dir()
+            }
+            if available {
+                if let Ok { value: text } = read_file(
+                    local.path.join("package.toml"),
+                ) {
+                    if let Ok { value: child } = Manifest.parse(text) {
+                        pending.push(local.path)
+                        dependencies.push(child.dependencies)
+                    }
+                }
+            }
+        }
+    }
+    return result
+}
+
+/** Labels for every locally known name referring to this store entry, in stable order. */
+fun _label(entry: CacheEntry, graph: LocalDependency[]) -> string {
+    let labels: string[] = []
+    for dep in graph {
+        if dep.cached && dep.path.to_string() == entry.path.to_string() {
+            const label = "{dep.name} ({dep.source})"
+            if !labels.contains(label) {
+                labels.push(label)
+            }
+        }
+    }
+    const digest = entry.path.basename().to_string()
+    if labels.len() == 0 {
+        return digest
+    }
+    return "{digest} [{_sorted(labels).join(", ")}]"
+}
+
+/** Human-readable binary units with exact bytes, avoiding loss of integer precision. */
+fun _size(bytes: int64) -> string {
+    let unit = "B"
+    let divisor: int64 = 1
+    for next in ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB"] {
+        if bytes / divisor >= 1024 {
+            divisor *= 1024
+            unit = next
+        }
+    }
+    return "{bytes / divisor} {unit} ({bytes} bytes)"
+}
+
+/** Print per-kind entries and totals, with stale staging reported separately. */
+fun _info(entries: CacheEntry[], graph: LocalDependency[]) {
+    let total: int64 = 0
+    let count: int64 = 0
+    let stages: int64 = 0
+    let stage_bytes: int64 = 0
+    for kind in ["git", "tarball"] {
+        let bytes: int64 = 0
+        let found: int64 = 0
+        println("{kind}:")
+        for entry in entries {
+            if entry.kind != kind || entry.staging {
+                continue
+            }
+            println("  {_label(entry, graph)}: {_size(entry.bytes)}")
+            bytes += entry.bytes
+            found += 1
+        }
+        println("  Entries: {found}")
+        println("  Size: {_size(bytes)}")
+        total += bytes
+        count += found
+    }
+    for entry in entries {
+        if entry.staging {
+            println(
+                "Stale staging: {entry.kind}/{entry.path.basename().to_string()}: {_size(entry.bytes)}",
+            )
+            stages += 1
+            stage_bytes += entry.bytes
+        }
+    }
+    println("Total entries: {count}")
+    println("Total size: {_size(total)}")
+    println("Stale staging directories: {stages}")
+    println("Stale staging size: {_size(stage_bytes)}")
+}
+
+/**
+ * Validate all requested names before returning a deletion list. Duplicate
+ * requests coalesce; missing and conflicting names fail without removing anything.
+ */
+fun _select(
+    names: string[],
+    graph: LocalDependency[],
+    entries: CacheEntry[],
+) -> CacheEntry[]! {
+    let selected: CacheEntry[] = []
+    let paths: string[] = []
+    let local_names: string[] = []
+    for name in names {
+        let matches: LocalDependency[] = []
+        for dep in graph {
+            if dep.name == name {
+                if matches.len() == 0 {
+                    matches.push(dep)
+                } else if matches[0].path.to_string() != dep.path.to_string() ||
+                    matches[0].cached != dep.cached {
+                    return error(
+                        "dependency `{name}` maps to more than one source",
+                    )
+                }
+            }
+        }
+        if matches.len() == 0 {
+            return error(
+                "unknown or unavailable dependency `{name}` (local manifests only)",
+            )
+        }
+        const dep = matches[0]
+        if !dep.cached {
+            if !local_names.contains(name) {
+                local_names.push(name)
+            }
+            continue
+        }
+        let found = false
+        for entry in entries {
+            if !entry.staging &&
+                entry.path.to_string() == dep.path.to_string() {
+                found = true
+                if !paths.contains(entry.path.to_string()) {
+                    selected.push(entry)
+                    paths.push(entry.path.to_string())
+                }
+            }
+        }
+        if !found {
+            return error("dependency `{name}` has no cached entry")
+        }
+    }
+    for name in local_names {
+        println("{name}: path dependency (nothing cached)")
+    }
+    return selected
+}
+
+/** Remove only selected owned trees; report completed removals and propagate I/O errors. */
+fun _clean(entries: CacheEntry[]) {
+    let count: int64 = 0
+    let bytes: int64 = 0
+    let stages: int64 = 0
+    let stage_bytes: int64 = 0
+    for entry in entries {
+        // Recheck the layout and root entry before removal. Directory contents
+        // may include symlinks; remove_dir removes those links, not their targets.
+        if !store_available()! ||
+            !store_directory(entry.path.parent())! ||
+            entry.path.is_sym_link() {
+            continue
+        }
+        if !entry.path.exists() {
+            continue
+        }
+        if entry.staging && _tree_usage(entry.path)!.age <= _STALE_SECONDS {
+            continue
+        }
+        remove_dir(entry.path)!
+        println(
+            "Removed {entry.kind}/{entry.path.basename().to_string()}: {_size(entry.bytes)}",
+        )
+        if entry.staging {
+            stages += 1
+            stage_bytes += entry.bytes
+        } else {
+            count += 1
+            bytes += entry.bytes
+        }
+    }
+    println("Removed entries: {count}")
+    println("Removed size: {_size(bytes)}")
+    println("Removed stale staging directories: {stages}")
+    println("Removed stale staging size: {_size(stage_bytes)}")
+}
+
+/** Execute info or clean against the package store only; no action fetches dependencies. */
+fun run(args: string[]) -> void! {
+    if args.len() == 0 ||
+        (args[0] != "info" && args[0] != "clean") ||
+        (args[0] == "info" && args.len() != 1) {
+        return error("usage: czpm cache info | czpm cache clean [NAME...]")
+    }
+    const entries = _entries()!
+    if args[0] == "info" {
+        const graph = _graph(false)!
+        println("Package store: {packages_dir()!.to_string()}")
+        _info(entries, graph)
+    } else {
+        const selected = if args.len() == 1 {
+            entries
+        } else {
+            _select(args.slice(1, args.len()), _graph(true)!, entries)!
+        }
+        println("Package store: {packages_dir()!.to_string()}")
+        _clean(selected)!
+    }
+}
+
+/** Dispatch a cache command with inherited environment and working directory. */
+fun main() {
+    const args = env.args()
+    run(args.slice(1, args.len()))!
+}

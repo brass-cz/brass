@@ -1,12 +1,10 @@
-Result.Ok {
-    value: 4,
-}
+4
 Result.Err {
     error: Error {
         value: "null",
         location: Location {
             file: "e2e_tests/control_flow/null_condition_dead_arm.cz",
-            line: 10,
+            line: 12,
             col: 16,
         },
         frames: [],

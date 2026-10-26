@@ -11,18 +11,23 @@ use brass_hir::LoadedModule;
 
 /// The display example from the design memo: `first_name` is Guarded (its only
 /// uses are the truthiness test and the guarded return), `last_name` Required,
-/// and both are forced to `string` by the `-> string` returns, so every shape
-/// maps to the single view `{ first_name: string?, last_name: string }`.
+/// and both are forced to `string` by the `-> string` returns. A view keeps
+/// exactly the row's fields at the argument's own field types, so the three
+/// shapes that carry both names (with different extra fields) map to the
+/// single view `{ first_name: string, last_name: string }`, while the shape
+/// lacking the guarded `first_name` gets the second view
+/// `{ first_name: never?, last_name: string }`.
 const DISPLAY: &str = "fun display(obj) -> string {\n\
                        \x20 if obj.first_name {\n    return obj.first_name\n  }\n\
                        \x20 return obj.last_name\n}\n\
                        fun main() {\n\
                        \x20 let a = display({ first_name: \"Ada\", last_name: \"Lovelace\" })\n\
                        \x20 let b = display({ first_name: \"Alan\", last_name: \"Turing\", age: 41 })\n\
-                       \x20 let c = display({ last_name: \"Euler\", country: \"CH\" })\n}\n";
+                       \x20 let c = display({ first_name: \"Leonhard\", last_name: \"Euler\", country: \"CH\" })\n\
+                       \x20 let d = display({ last_name: \"Gauss\", country: \"DE\" })\n}\n";
 
 #[test]
-fn three_shapes_collapse_to_one_display_instance() {
+fn shapes_with_the_same_view_share_one_display_instance() {
     let ast = brass_parser::parse(DISPLAY).expect("parse");
     let modules = [LoadedModule {
         is_prelude: false,
@@ -39,8 +44,8 @@ fn three_shapes_collapse_to_one_display_instance() {
     );
     assert_eq!(
         analysis.view_args.len(),
-        3,
-        "all three anonymous arguments must be view-convertible"
+        4,
+        "all four anonymous arguments must be view-convertible"
     );
     // Lower with the checker's view-argument spans (no aggregate seeding is
     // needed here) and monomorphize from the zero-parameter roots.
@@ -49,7 +54,10 @@ fn three_shapes_collapse_to_one_display_instance() {
         &brass_mir::CheckerChannels {
             expr_types: &fxhash::FxHashMap::default(),
             receiver_types: &fxhash::FxHashMap::default(),
+            receiver_owners: &fxhash::FxHashMap::default(),
+            field_calls: &fxhash::FxHashMap::default(),
             view_args: &analysis.view_args,
+            numeric_calls: &analysis.numeric_calls,
             sum_views: &analysis.sum_views,
             call_locations: &fxhash::FxHashMap::default(),
             lift_errs: &fxhash::FxHashSet::default(),
@@ -59,6 +67,9 @@ fn three_shapes_collapse_to_one_display_instance() {
             null_props: &analysis.null_props,
             type_tests: &analysis.type_tests,
             keyed_dispatch: &fxhash::FxHashMap::default(),
+            instance_seeds: &fxhash::FxHashMap::default(),
+            instance_dispatch: &fxhash::FxHashMap::default(),
+            instance_returns: &fxhash::FxHashMap::default(),
         },
     );
     let mono = monomorphize(&mir, &program).expect("monomorphize");
@@ -70,7 +81,8 @@ fn three_shapes_collapse_to_one_display_instance() {
         .collect();
     assert_eq!(
         display_instances.len(),
-        1,
-        "the three shapes must share one view-typed instance: {display_instances:?}"
+        2,
+        "the three shapes with both names must share one view-typed instance, \
+         and the shape lacking `first_name` must get the other: {display_instances:?}"
     );
 }

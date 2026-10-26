@@ -7,10 +7,36 @@
 use super::*;
 
 impl<'a> Checker<'a> {
+    /// Reject calling a function binding by a language construct's name.
+    /// Non-function bindings remain available as ordinary values.
+    pub(super) fn check_construct_binding(
+        &mut self,
+        name: &str,
+        span: brass_parser::Span,
+        scopes: &ScopeStack,
+    ) {
+        if matches!(name, "error" | "typeof" | "fields" | "spawn" | "with")
+            && let Some(ty) = self.lookup(scopes, name)
+            && matches!(peel_modes(&self.resolve(&ty)), Type::Fun(..))
+        {
+            self.errors.push(TypeError {
+                message: format!(
+                    "`{name}(..)` means the language construct; rename the function binding `{name}` to call it"
+                ),
+                span,
+            });
+        }
+    }
+
+    /// The declarations a call of `method` on a value of type `ty` reaches: a
+    /// record's own method (with the receiver instance's substitution
+    /// applied), or one candidate per variant of a sum (keyed
+    /// `Sum.Variant`), all of which must declare it. `None` for any other
+    /// receiver or when the method is missing.
     pub(super) fn methods_for_type(&self, ty: &Type, method: &str) -> Option<Vec<ResolvedMethod>> {
         // Mode wrappers expose the underlying value's methods: a call through a
-        // `ref(mut(T))` parameter must resolve (and type-check its arguments
-        // against) `T`'s methods rather than deferring to runtime dispatch.
+        // `ref(mut(T))` parameter resolves (and type-checks its arguments
+        // against) `T`'s methods.
         match brass_hir::peel_modes(&self.resolve(ty)).clone() {
             Type::Record(name) => {
                 // Resolve by the receiver's unique id, and key the resolved
@@ -59,6 +85,10 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The method a static call `qualifier.method(..)` names: a variant's
+    /// method for a `Sum.Variant` qualifier, else the method of the record or
+    /// sum the qualifier (a type name, `Self`, an alias or a storage symbol)
+    /// resolves to from the current module.
     pub(super) fn method_for_qualifier(
         &self,
         qualifier: &str,
@@ -116,10 +146,8 @@ impl<'a> Checker<'a> {
             // reach a sum's STATIC method: with no `self` there is no receiver to
             // dispatch through, so `methods_for_type` never runs. Keying the
             // resolution as `Sum.Variant` matches what the receiver path and
-            // `precompute_method_returns` file sum methods under, so the call
-            // mangles to the same symbol. Without this the call typed as an
-            // unknown, and anything reading the result's type -- notably keying a
-            // reflective `-> infer!` call on it -- silently lost the receiver.
+            // `precompute_returns` file sum methods under, so the call reads
+            // the same `method_returns` entry.
             TypeKind::Sum { variants } => {
                 let variant = variants.iter().find(|v| v.methods.contains_key(method))?;
                 let m = variant.methods.get(method)?;
@@ -133,6 +161,9 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Report a call that resolved to several variant methods (a sum
+    /// receiver) whose signatures do not satisfy each other: one call must
+    /// type the same way whichever variant the value is.
     pub(super) fn check_common_method_signatures(
         &mut self,
         methods: &[ResolvedMethod],
@@ -163,6 +194,41 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The static-call qualifier of the receiver `expr` of a call to
+    /// `method`, or `None` when the call is an instance call. This is
+    /// [`Self::static_qualifier`] except for a UNIT variant naming an
+    /// instance method (`L.Nil.size()`): the unit variant is a value of its
+    /// sum, so the call dispatches on that value, exactly like
+    /// `let n = L.Nil` followed by `n.size()`. A static method reached
+    /// through a variant qualifier (`Token.Ident.make()`) stays static.
+    pub(super) fn static_call_qualifier(
+        &self,
+        expr: &Expr,
+        method: &str,
+        scopes: &ScopeStack,
+    ) -> Option<String> {
+        let qualifier = self.static_qualifier(expr, scopes)?;
+        if let Expr::Field(base, variant, _) = expr
+            && matches!(&**base, Expr::Ident(..))
+            && let Some((sum, _)) = qualifier.rsplit_once('.')
+            && let Some(info) = self.program.types.get(sum)
+            && info.variant(variant).is_some_and(|v| {
+                v.fields.is_empty()
+                    && v.methods.get(method).is_some_and(|m| {
+                        m.signature.params.first().is_some_and(|p| p.name == "self")
+                    })
+            })
+        {
+            return None;
+        }
+        Some(qualifier)
+    }
+
+    /// The type a receiver expression names when it is a static-call
+    /// qualifier rather than a value: a type word not shadowed by a local
+    /// binding (`Self` resolved), `typeof(v)` of a binding whose type is
+    /// known, or `Type.Variant` (as `<sum symbol>.<variant>`). `None` for a
+    /// value receiver.
     pub(super) fn static_qualifier(&self, expr: &Expr, scopes: &ScopeStack) -> Option<String> {
         match expr {
             Expr::Ident(name, _)
@@ -180,14 +246,7 @@ impl<'a> Checker<'a> {
                     return None;
                 };
                 let ty = self.static_arg_type(&arg.expr, scopes)?;
-                match brass_hir::peel_modes(&self.resolve(&ty)) {
-                    Type::Record(n) | Type::Sum(n) => self
-                        .program
-                        .type_by_id(n.id)
-                        .map(|info| info.symbol.clone()),
-                    Type::Unknown(_) => None,
-                    other => Some(other.type_name()),
-                }
+                self.type_qualifier(&ty)
             }
             Expr::Field(base, variant, _) => {
                 let Expr::Ident(type_name, _) = &**base else {
@@ -213,10 +272,6 @@ impl<'a> Checker<'a> {
         }
     }
 
-    pub(super) fn lookup(&self, scopes: &ScopeStack, name: &str) -> Option<Type> {
-        scopes.iter().rev().find_map(|s| s.get(name).cloned())
-    }
-
     /// The type of a module-level global reached through a module QUALIFIER
     /// (`m.VERSION`, which the resolve pass rewrote to the dotted marker
     /// `m.VERSION`). The qualifier names no import of the global itself, so the
@@ -232,6 +287,20 @@ impl<'a> Checker<'a> {
             .get(&self.current_module)?
             .get(alias)?;
         self.global_defs.get(origin)?.get(bare).cloned()
+    }
+
+    /// The static-call qualifier naming the type `ty` (the receiver a
+    /// `typeof(v)` stands for): a declared record or sum's table symbol, a
+    /// primitive's name. `None` while the type is still open.
+    pub(super) fn type_qualifier(&self, ty: &Type) -> Option<String> {
+        match brass_hir::peel_modes(&self.resolve(ty)) {
+            Type::Record(n) | Type::Sum(n) => self
+                .program
+                .type_by_id(n.id)
+                .map(|info| info.symbol.clone()),
+            Type::Unknown(_) => None,
+            other => Some(other.type_name()),
+        }
     }
 
     /// The type of a `typeof(arg)` argument for static-qualifier resolution,
@@ -256,6 +325,43 @@ impl<'a> Checker<'a> {
         self.is_function_visible(name) || is_runtime_builtin_value(name)
     }
 
+    /// The function type of the free function `name` used as a value, when its
+    /// signature fixes that type: every parameter is annotated with a fully
+    /// known type, so the function is monomorphic. A function value is compiled
+    /// once for exactly this signature, so a flow of it is checked against the
+    /// signature rather than left open -- including the passing mode of each
+    /// parameter (a `ref(mut(T))` parameter writes through). `None` for a
+    /// generic (partly unannotated) function, whose type each call recovers,
+    /// and for one with an implicit trailing `Location` (a call fills it, a
+    /// value cannot).
+    ///
+    /// An omitted return is inferred from the body, and a `T!` return names
+    /// only the Ok payload; the return table completes either (a caller
+    /// forwarding the value's Result needs that error type). A return the
+    /// table has not settled leaves the value open.
+    pub(super) fn annotated_function_value_type(&self, name: &str) -> Option<Type> {
+        let info = self.lookup_function(name)?;
+        let signature = &info.signature;
+        if signature
+            .params
+            .iter()
+            .any(|p| p.ty.is_none() || param_is_location(self.program, p))
+        {
+            return None;
+        }
+        let params = signature
+            .params
+            .iter()
+            .map(|p| p.resolved_ty.clone())
+            .collect::<Option<Vec<_>>>()?;
+        let ret = match &signature.ret_ty {
+            Some(declared) if brass_hir::is_fully_known(declared) => declared.clone(),
+            _ => self.resolve(self.function_returns.get(&info.symbol)?),
+        };
+        let fun = Type::Fun(params, Box::new(ret));
+        brass_hir::is_fully_known(&fun).then_some(fun)
+    }
+
     /// Whether a program free function `name` is visible from the module being
     /// checked: defined in that module, implicitly imported as
     /// part of the standard-library prelude, or brought in by an `import`.
@@ -264,54 +370,33 @@ impl<'a> Checker<'a> {
     }
 
     /// Resolve a bare free-function name to its definition from the current
-    /// module. A name defined in a single module keeps
-    /// its bare symbol, so the common case is a direct map hit gated by
-    /// visibility. A name defined in several modules has only module-qualified
-    /// symbols, so resolution prefers this module's own definition, then the one
-    /// brought in by an `import`.
+    /// module, by the program's one resolution rule
+    /// ([`brass_hir::Program::resolve_function`], which MIR lowering and the
+    /// back ends use too): this module's own definition first -- so a module
+    /// declaring a prelude name such as `println` shadows the prelude there
+    /// -- then the one brought in by an `import`, then a visible unique or
+    /// prelude definition. A `_`-prefixed prelude helper is private to its
+    /// module and never resolves from user code.
     pub(super) fn lookup_function(&self, name: &str) -> Option<&brass_hir::FunInfo> {
-        // A dotted marker from the qualified-use rewrite: resolve through the
-        // alias table directly; visibility is already validated by the pass.
-        if name.contains('.') {
-            return self.program.resolve_function(&self.current_module, name);
-        }
-        // A renamed import: the local name is only this module's alias for the
-        // origin's remote name, so it must not fall through to the bare table,
-        // where an unrelated module's function of the same name would capture
-        // it. Renames colliding with local declarations are rejected upstream.
-        if let Some(remote) = self.import_remote(name) {
-            let origin = self.import_origin(name)?;
-            return self
-                .program
-                .functions
-                .get(&brass_hir::qualify(remote, origin))
-                .or_else(|| self.program.functions.get(remote));
-        }
-        if let Some(info) = self.program.functions.get(name) {
-            return self
-                .is_module_name_visible(&info.module, name)
-                .then_some(info);
-        }
-        if let Some(info) = self
-            .program
-            .functions
-            .get(&brass_hir::qualify(name, &self.current_module))
-        {
-            return Some(info);
-        }
-        let origin = self.import_origin(name)?;
-        self.program
-            .functions
-            .get(&brass_hir::qualify(name, origin))
+        let info = self.program.resolve_function(&self.current_module, name)?;
+        let private_prelude = name.starts_with('_')
+            && info.module != self.current_module
+            && self.program.prelude_modules.contains(&info.module);
+        (!private_prelude).then_some(info)
     }
 
-    /// The origin module path of an imported local name in the current module.
-    fn import_origin(&self, name: &str) -> Option<&[String]> {
-        self.program
-            .import_origins
-            .get(&self.current_module)?
-            .get(name)
-            .map(Vec::as_slice)
+    /// Whether a call of `name` is the implicit prelude's function of that
+    /// name (or, in a program without the prelude, the runtime builtin the
+    /// name denotes): no local binding and no user definition visible here
+    /// shadows it. The checker types a few prelude calls (`print`,
+    /// `println`, `assert`, `input`) directly instead of elaborating their
+    /// bodies; that shortcut applies only when the call really reaches the
+    /// prelude, exactly as MIR lowering resolves it.
+    pub(super) fn calls_prelude_function(&self, name: &str, local: bool) -> bool {
+        !local
+            && self
+                .lookup_function(name)
+                .is_none_or(|info| self.program.prelude_modules.contains(&info.module))
     }
 
     /// The remote (original) name for an imported local name in the current
@@ -324,30 +409,6 @@ impl<'a> Checker<'a> {
             .map(String::as_str)
     }
 
-    /// The per-module visibility rule shared by functions and types: a name
-    /// declared in `defining` is visible from `current_module` when it is the
-    /// same module, a compiler builtin (empty module path, e.g. `Result`), a
-    /// public standard-library name (implicit prelude), or
-    /// explicitly imported into the current module FROM `defining` under this
-    /// very name. An import of the same name from a different module, or a
-    /// rename whose local happens to equal `name`, does not make this
-    /// definition visible.
-    pub(super) fn is_module_name_visible(&self, defining: &[String], name: &str) -> bool {
-        if defining == self.current_module.as_slice() || defining.is_empty() {
-            return true;
-        }
-        // Only the implicit-prelude modules are visible with no import; the
-        // core-library modules (`core.collections`, ...) follow the same
-        // import rule as user modules.
-        if self.program.prelude_modules.contains(defining) && !name.starts_with('_') {
-            return true;
-        }
-        self.import_remote(name).is_none()
-            && self
-                .import_origin(name)
-                .is_some_and(|origin| origin == defining)
-    }
-
     /// Whether the nominal type declared in `defining` as `name` can be named
     /// from the current module: same module, builtin, std prelude, or imported
     /// under ANY local name -- an `as` rename still makes the type itself
@@ -358,7 +419,9 @@ impl<'a> Checker<'a> {
         if defining == self.current_module.as_slice() || defining.is_empty() {
             return true;
         }
-        // Prelude only, as in `is_module_name_visible`.
+        // Only the implicit-prelude modules are visible with no import; the
+        // core-library modules (`core.collections`, ...) follow the same
+        // import rule as user modules.
         if self.program.prelude_modules.contains(defining) && !name.starts_with('_') {
             return true;
         }
@@ -385,9 +448,10 @@ impl<'a> Checker<'a> {
     }
 
     /// Record a deferred structural constraint on `ty` if it resolves to an
-    /// inference variable. Used while checking a closure body that operates on
-    /// an unknown-typed parameter; the constraint is verified when the variable
-    /// is solved at a call site (see `crate::constraint`).
+    /// inference variable. Used while checking a body that operates on an
+    /// unknown-typed value (a closure parameter); the constraint is verified
+    /// when the variable is solved at an application (see
+    /// `crate::constraint`).
     pub(super) fn record_shape(&mut self, ty: &Type, constraint: ShapeConstraint) {
         if let Type::Unknown(id) = self.resolve_head(ty) {
             self.journal_elaboration_shape(Type::Unknown(id), constraint.clone());
@@ -398,11 +462,19 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Record an equality constraint for an unknown operand when the operator
-    /// needs an exact non-convertible type. Numeric operands are resolved at the
-    /// call site through the common numeric type, so this mainly preserves
-    /// constraints such as string concatenation.
-    pub(super) fn record_binary_shape(&mut self, op: BinOp, left: &Type, right: &Type) {
+    /// Record what a binary operator requires of an operand whose type is
+    /// still unknown, next to a concrete `string` or number: string
+    /// concatenation needs the same type; a numeric operator needs a type the
+    /// shared operator rule accepts with the other operand -- yielding the
+    /// `result` the body was typed with, when that is a concrete number. Each
+    /// operand is its type and, for an integer literal, its value.
+    pub(super) fn record_binary_shape(
+        &mut self,
+        op: BinOp,
+        (left, left_literal): (&Type, Option<brass_typesys::NumericLiteral>),
+        (right, right_literal): (&Type, Option<brass_typesys::NumericLiteral>),
+        result: &Type,
+    ) {
         let same_typed = matches!(
             op,
             BinOp::Add
@@ -423,13 +495,39 @@ impl<'a> Checker<'a> {
         if !same_typed {
             return;
         }
-        let is_operand = |t: &Type| matches!(t, Type::Int(_) | Type::Float(_) | Type::Str);
+        let comparison = matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge);
+        let result = self.resolve(result);
+        // The operation was typed as yielding a concrete number, or the open
+        // operand itself (next to an adapting literal): either way the
+        // concrete operation must yield exactly that.
+        let open_operand = [left, right]
+            .into_iter()
+            .find(|t| matches!(t, Type::Unknown(_)))
+            .cloned();
+        let pinned = !comparison
+            && (matches!(result, Type::Int(_) | Type::Float(_))
+                || open_operand.as_ref() == Some(&result));
+        let constraint = |other: &Type, literal: Option<brass_typesys::NumericLiteral>| match other
+        {
+            Type::Str => Some(ShapeConstraint::Equals(Type::Str)),
+            Type::Int(_) | Type::Float(_) => Some(ShapeConstraint::Operand {
+                op,
+                other: other.clone(),
+                literal,
+                result: pinned.then(|| result.clone()),
+            }),
+            _ => None,
+        };
         match (left, right) {
-            (Type::Unknown(_), other) if is_operand(other) => {
-                self.record_shape(left, ShapeConstraint::Equals(other.clone()));
+            (Type::Unknown(_), other) => {
+                if let Some(c) = constraint(other, right_literal) {
+                    self.record_shape(left, c);
+                }
             }
-            (other, Type::Unknown(_)) if is_operand(other) => {
-                self.record_shape(right, ShapeConstraint::Equals(other.clone()));
+            (other, Type::Unknown(_)) => {
+                if let Some(c) = constraint(other, left_literal) {
+                    self.record_shape(right, c);
+                }
             }
             _ => {}
         }
@@ -465,6 +563,37 @@ impl<'a> Checker<'a> {
                         });
                     }
                 }
+                ShapeConstraint::Operand {
+                    op,
+                    other,
+                    literal,
+                    result,
+                } => {
+                    let operand = peel_value_wrappers(&got);
+                    let typing = brass_typesys::numeric_binary(
+                        op,
+                        brass_typesys::NumericOperand::value(operand),
+                        brass_typesys::NumericOperand::new(&other, literal),
+                    );
+                    // An operation typed by this very operand (next to an
+                    // adapting literal) must yield the argument's own type.
+                    let result = result.map(|r| match self.resolve(&r) {
+                        Type::Unknown(v) if v == id => operand.clone(),
+                        r => r,
+                    });
+                    let accepted = typing
+                        .is_ok_and(|typing| result.as_ref().is_none_or(|r| *r == typing.result));
+                    if !accepted {
+                        // An operation pinned to its own operand's type names
+                        // the other operand's type as the requirement.
+                        let expected = result.filter(|r| *r != got).unwrap_or(other);
+                        let (got, expected) = brass_hir::mismatch_display(&got, &expected);
+                        self.errors.push(TypeError {
+                            message: format!("cannot use `{got}` where `{expected}` is required"),
+                            span,
+                        });
+                    }
+                }
                 ShapeConstraint::HasMethod(name) => {
                     if !self.concrete_type_has_method(&got, &name) {
                         self.errors.push(TypeError {
@@ -493,14 +622,22 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Whether a resolved concrete type definitely exposes a callable method,
-    /// considering user methods and builtin collection/file/string methods.
-    /// Conservative: a non-concrete type (an unsolved
-    /// variable, nullable, function, ...) returns `true` so only a method that
-    /// is genuinely absent on a concrete receiver is rejected.
+    /// Whether a resolved type exposes `method`, for a deferred `HasMethod`
+    /// shape: a declared record method, a method every variant of a sum
+    /// declares, or the builtin `len` / growable-array mutators. A type that
+    /// is not concrete (an unsolved variable, a nullable, a function, ...)
+    /// answers `true`, so only a concrete receiver is judged.
     fn concrete_type_has_method(&self, ty: &Type, method: &str) -> bool {
         let resolved = self.resolve(ty);
-        let has_declared_method = match brass_hir::peel_modes(&resolved) {
+        let resolved = brass_hir::peel_modes(&resolved);
+        if resolved.primitive_class().is_some_and(|class| {
+            self.program
+                .primitive_methods
+                .contains_key(&(class.to_string(), method.to_string()))
+        }) {
+            return true;
+        }
+        let has_declared_method = match resolved {
             Type::Record(name) => self
                 .program
                 .type_by_id(name.id)
@@ -538,6 +675,7 @@ impl<'a> Checker<'a> {
             | Type::Int(_)
             | Type::Float(_)
             | Type::Bool
+            | Type::Fun(..)
             | Type::Void => false,
             _ => true,
         }
@@ -586,6 +724,18 @@ impl<'a> Checker<'a> {
             .map(|t| t.symbol.clone())
     }
 
+    /// The storage symbol of the sum type a variant construction or unit
+    /// variant names (`S.Variant`, `S.Variant { .. }`), resolved from the
+    /// current module like [`Self::resolve_type_symbol`] and additionally
+    /// through a `type A = S` alias. A sum alias is never a refinement, so
+    /// the alias denotes exactly its target sum.
+    pub(super) fn resolve_sum_head_symbol(&self, name: &str) -> Option<String> {
+        self.program
+            .resolve_type_or_alias(&self.current_module, name)
+            .filter(|t| t.is_sum())
+            .map(|t| t.symbol.clone())
+    }
+
     /// The `Type` of a user type named `name`, resolved from the current module.
     pub(super) fn resolve_type_ref(&self, name: &str) -> Option<Type> {
         self.program
@@ -593,6 +743,10 @@ impl<'a> Checker<'a> {
             .map(|t| t.type_ref())
     }
 
+    /// Whether `name` names a type rather than a value: a declared type or
+    /// alias (dotted, renamed on import, or bare), `Self`, or a primitive
+    /// type word. Local bindings are not consulted: a caller rules out a
+    /// shadowing local first.
     pub(super) fn is_type_word(&self, name: &str) -> bool {
         if name.contains('.') {
             return self
@@ -609,34 +763,63 @@ impl<'a> Checker<'a> {
                 .is_some();
         }
         self.program.has_type_named(name)
-            || self.program.type_aliases.contains_key(name)
-            || self
-                .program
-                .type_aliases
-                .keys()
-                .any(|k| k.starts_with(name) && k[name.len()..].starts_with('@'))
+            || self.program.has_type_alias_named(name)
             || name == "Self"
             || IntKind::from_name(name).is_some()
             || matches!(name, "float32" | "float64" | "string" | "bool")
     }
 
+    /// Whether an unqualified bare-name pattern `name` is a unit-variant test
+    /// in the current module rather than a binding (the shared scoping rule,
+    /// [`brass_hir::Program::is_unit_variant_in_scope`]).
     pub(super) fn is_unit_variant_name(&self, name: &str) -> bool {
-        self.program.types.values().any(|info| match &info.kind {
-            TypeKind::Sum { variants } => variants
-                .iter()
-                .any(|v| v.name == name && v.fields.is_empty()),
-            TypeKind::Record { .. } => false,
-        })
+        self.program
+            .is_unit_variant_in_scope(&self.current_module, name)
     }
 
     /// A sum type defining a variant named `variant`, when one exists. Several
-    /// sums may share a variant name; the first of the deterministic order is
-    /// returned (used for messages and as a fallback when the scrutinee's own
-    /// type is unknown), so results never depend on type-table hash order.
+    /// sums may share a variant name; a sum in scope in the current module is
+    /// preferred, then the first of the deterministic order is returned (used
+    /// for messages and as a fallback when the scrutinee's own type is
+    /// unknown), so results never depend on type-table hash order.
     pub(super) fn variant_owner(&self, variant: &str) -> Option<String> {
         self.program
-            .sums_containing_variant(variant)
-            .first()
+            .pattern_scope(&self.current_module)
+            .first_owner(variant, true)
             .map(|info| info.symbol.clone())
+    }
+
+    /// The owner of the variant an unqualified bare-name pattern `name`
+    /// tests, when `name` is a variant of a sum in scope (unit or not); `None`
+    /// when the name binds. Unlike [`Self::variant_owner`] an out-of-scope
+    /// sum is never consulted, so a binding is never mistaken for one of its
+    /// variants.
+    pub(super) fn scoped_variant_owner(&self, name: &str) -> Option<String> {
+        self.program
+            .pattern_scope(&self.current_module)
+            .first_owner(name, false)
+            .map(|info| info.symbol.clone())
+    }
+
+    /// Whether the unqualified braced pattern head `name { .. }` destructures
+    /// a matched value of type `scrutinee` as a sum variant rather than as a
+    /// plain record (the shared rule,
+    /// [`brass_hir::Program::braced_pattern_head`]): a head that is both a
+    /// record type in scope and a variant is the record exactly when the
+    /// value is that record; an open value is taken as the variant until its
+    /// instance is known.
+    pub(super) fn braced_head_is_variant(&self, name: &str, scrutinee: &Type) -> bool {
+        match self.program.braced_pattern_head(&self.current_module, name) {
+            brass_hir::BracedHead::Record => false,
+            brass_hir::BracedHead::Variant => true,
+            brass_hir::BracedHead::RecordOrVariant(record) => {
+                let resolved = self.resolve_head(scrutinee);
+                let value = match peel_modes(&resolved) {
+                    Type::Nullable(inner) => peel_modes(inner).clone(),
+                    other => other.clone(),
+                };
+                !matches!(value, Type::Record(n) if n.id == record.id)
+            }
+        }
     }
 }

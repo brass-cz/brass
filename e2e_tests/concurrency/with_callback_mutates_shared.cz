@@ -1,0 +1,28 @@
+// The closure literal of a `with(c, f)` call receives the guarded shared
+// object itself, not a private copy: mutations made through its parameter
+// (directly or through a self-mutating method) are visible after the scope.
+
+type Counter = {
+    count: int32
+}
+
+fun Counter.add(self) {
+    self.count += 1
+}
+
+fun main() {
+    let counter = Counter { count: 0 }
+    spawn(() -> {
+        for i in [0..100] {
+            counter.add()
+        }
+    })
+    sync()
+    with(counter, (c) -> {
+        c.add()
+        c.count = c.count + 10
+    })
+    with(counter, (c) -> {
+        println(c.count)
+    })
+}

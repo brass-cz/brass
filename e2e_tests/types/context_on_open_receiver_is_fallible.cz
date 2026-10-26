@@ -1,0 +1,15 @@
+// @backends: all
+// `m.get(k).context(..)!` on an unannotated map parameter propagates an
+// error at every instance where the map's `get` answers a nullable, so the
+// function is fallible there: its callers `!` and `match` its `Result`.
+fun lookup(m, k: string) {
+    return m.get(k).context("no key {k}")!
+}
+
+let m = HashMap.new()
+m.set("a", 1)
+println(lookup(m, "a")!)
+match lookup(m, "b") {
+    Ok { value } => println(value),
+    Err { error } => println("err {error.value}"),
+}

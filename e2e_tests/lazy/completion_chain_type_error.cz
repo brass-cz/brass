@@ -1,0 +1,90 @@
+// @lazy: fail
+// @eager: fail
+// A concrete expression chain crosses the elaboration cap before its error.
+// The type error gates entry; the runtime error preserves the preceding output.
+
+fun f0(x: int32) { return f1(x) }
+fun f1(x: int32) { return f2(x) }
+fun f2(x: int32) { return f3(x) }
+fun f3(x: int32) { return f4(x) }
+fun f4(x: int32) { return f5(x) }
+fun f5(x: int32) { return f6(x) }
+fun f6(x: int32) { return f7(x) }
+fun f7(x: int32) { return f8(x) }
+fun f8(x: int32) { return f9(x) }
+fun f9(x: int32) { return f10(x) }
+fun f10(x: int32) { return f11(x) }
+fun f11(x: int32) { return f12(x) }
+fun f12(x: int32) { return f13(x) }
+fun f13(x: int32) { return f14(x) }
+fun f14(x: int32) { return f15(x) }
+fun f15(x: int32) { return f16(x) }
+fun f16(x: int32) { return f17(x) }
+fun f17(x: int32) { return f18(x) }
+fun f18(x: int32) { return f19(x) }
+fun f19(x: int32) { return f20(x) }
+fun f20(x: int32) { return f21(x) }
+fun f21(x: int32) { return f22(x) }
+fun f22(x: int32) { return f23(x) }
+fun f23(x: int32) { return f24(x) }
+fun f24(x: int32) { return f25(x) }
+fun f25(x: int32) { return f26(x) }
+fun f26(x: int32) { return f27(x) }
+fun f27(x: int32) { return f28(x) }
+fun f28(x: int32) { return f29(x) }
+fun f29(x: int32) { return f30(x) }
+fun f30(x: int32) { return f31(x) }
+fun f31(x: int32) { return f32(x) }
+fun f32(x: int32) { return f33(x) }
+fun f33(x: int32) { return f34(x) }
+fun f34(x: int32) { return f35(x) }
+fun f35(x: int32) { return f36(x) }
+fun f36(x: int32) { return f37(x) }
+fun f37(x: int32) { return f38(x) }
+fun f38(x: int32) { return f39(x) }
+fun f39(x: int32) { return f40(x) }
+fun f40(x: int32) { return f41(x) }
+fun f41(x: int32) { return f42(x) }
+fun f42(x: int32) { return f43(x) }
+fun f43(x: int32) { return f44(x) }
+fun f44(x: int32) { return f45(x) }
+fun f45(x: int32) { return f46(x) }
+fun f46(x: int32) { return f47(x) }
+fun f47(x: int32) { return f48(x) }
+fun f48(x: int32) { return f49(x) }
+fun f49(x: int32) { return f50(x) }
+fun f50(x: int32) { return f51(x) }
+fun f51(x: int32) { return f52(x) }
+fun f52(x: int32) { return f53(x) }
+fun f53(x: int32) { return f54(x) }
+fun f54(x: int32) { return f55(x) }
+fun f55(x: int32) { return f56(x) }
+fun f56(x: int32) { return f57(x) }
+fun f57(x: int32) { return f58(x) }
+fun f58(x: int32) { return f59(x) }
+fun f59(x: int32) { return f60(x) }
+fun f60(x: int32) { return f61(x) }
+fun f61(x: int32) { return f62(x) }
+fun f62(x: int32) { return f63(x) }
+fun f63(x: int32) { return f64(x) }
+fun f64(x: int32) { return f65(x) }
+fun f65(x: int32) { return f66(x) }
+fun f66(x: int32) { return f67(x) }
+fun f67(x: int32) { return f68(x) }
+fun f68(x: int32) { return f69(x) }
+fun f69(x: int32) { return f70(x) }
+fun f70(x: int32) { return f71(x) + true }
+fun f71(x: int32) { return f72(x) }
+fun f72(x: int32) { return f73(x) }
+fun f73(x: int32) { return f74(x) }
+fun f74(x: int32) { return f75(x) }
+fun f75(x: int32) { return f76(x) }
+fun f76(x: int32) { return f77(x) }
+fun f77(x: int32) { return f78(x) }
+fun f78(x: int32) { return f79(x) }
+fun f79(x: int32) { return x }
+
+fun main() {
+    println("start")
+    println(f0(1))
+}

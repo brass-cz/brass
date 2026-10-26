@@ -1,0 +1,43 @@
+// @backends: all
+// A method whose body tests a type decides per instance which paths are
+// live, exactly like a free function: an `error(..)` on a dead path does not
+// make the instance fallible, so `Box { v: 5 }.get()` is a plain `int32`,
+// while the instance whose live path errors returns its `Result`. The call's
+// type comes from the instance, not from the method's open scheme.
+type Box = { v }
+
+fun Box.get(self) {
+    if self.v: string {
+        return error("strings not allowed")
+    }
+    return self.v
+}
+
+fun Box.copy(self) {
+    let y = self.v
+    if y: string {
+        return error("no strings")
+    }
+    return y
+}
+
+type K = { n: int32 }
+
+fun K.f(self, x) {
+    if x: string {
+        return error("bad")
+    }
+    return 7 + self.n
+}
+
+fun main() {
+    let n: int32 = Box { v: 5 }.get()
+    println(n + 1)
+    println(Box { v: 2.5 }.copy())
+    let k = K { n: 1 }
+    println(k.f(4))
+    match k.f("s") {
+        Ok { value } => println("ok"),
+        Err { error } => println("err {error.value}"),
+    }
+}

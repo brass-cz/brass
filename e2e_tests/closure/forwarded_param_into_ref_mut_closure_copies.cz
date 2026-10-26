@@ -1,0 +1,38 @@
+// @backends: all
+// A function that hands its unannotated parameter to a function value mutates
+// it when that value takes the argument by `ref(mut(T))`. By the
+// parameter-passing table the parameter is then a private deep copy at the
+// function's entry: the write is visible inside the function but never reaches
+// the caller, exactly as for a named `ref(mut)` callee called directly. A
+// `mut(T)` closure copies at its own entry instead. Because the function works
+// on its own copy, a `const` argument is safe there too.
+type Box = { v: int32 }
+
+fun setv(x: ref(mut(Box))) {
+    x.v = 30
+}
+
+fun call(f, b) {
+    f(b)
+    println(b.v)
+}
+
+fun direct(b) {
+    setv(b)
+    println(b.v)
+}
+
+fun main() {
+    let b1 = Box { v: 1 }
+    call((x: ref(mut(Box))) -> { x.v = 10 }, b1)
+    println(b1.v)
+    let b2 = Box { v: 2 }
+    call((x: mut(Box)) -> { x.v = 20 }, b2)
+    println(b2.v)
+    const b3 = Box { v: 3 }
+    call(setv, b3)
+    println(b3.v)
+    let b4 = Box { v: 4 }
+    direct(b4)
+    println(b4.v)
+}

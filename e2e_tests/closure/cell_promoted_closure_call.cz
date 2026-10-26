@@ -1,0 +1,23 @@
+// @backends: all
+// A closure binding that another closure reassigns is promoted to a shared
+// cell; calling it reads the closure out of the cell, so the call sees the
+// current value. The second binding is a recursive closure: it calls itself
+// through the cell its own body captures.
+fun main() {
+    let f = (x: int32) -> x + 1
+    let swap = () -> {
+        f = (x: int32) -> x + 2
+    }
+    println(f(1))
+    swap()
+    println(f(1))
+
+    let fact = (n: int32) -> 0
+    fact = (n: int32) -> {
+        if n == 0 {
+            return 1
+        }
+        return n * fact(n - 1)
+    }
+    println(fact(5))
+}

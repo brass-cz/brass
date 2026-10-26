@@ -1,0 +1,31 @@
+// @backends: all
+// A closure returned by a generic function is compiled with each instance
+// of that function: its parameter types are fixed by its body (`x + n` with
+// `n: int32` takes `int32`, with `n: float64` takes `float64`), so one
+// literal serves an `int32` and a `float64` instance. A closure returning a
+// closure and a typed field store work the same way.
+type Counter = {
+    n: int32
+    step: (int32) -> int32
+}
+
+fun adder(n) {
+    return (x) -> x + n
+}
+
+fun curried(n) {
+    return (x) -> (y) -> x + y + n
+}
+
+fun main() {
+    println(adder(1)(2))
+    println(adder(1.5)(2.5))
+    let a = adder(10)
+    println(a(5))
+    println(curried(1)(2)(3))
+    let c = Counter { n: 0, step: (x) -> x + 2 }
+    c.n = (c.step)(c.n)
+    c.step = (x) -> x * 10
+    c.n = (c.step)(c.n)
+    println(c.n)
+}

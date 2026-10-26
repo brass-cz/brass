@@ -1,12 +1,16 @@
-//! The Brass type representation and its mapping to the
-//! runtime value tags. `Unknown` models the parts inference leaves open, which
-//! the JIT handles via runtime tag dispatch (deferred monomorphization).
+//! The Brass type representation and its mapping to the runtime value tags.
+//! `Unknown` models the parts inference leaves open; monomorphization gives
+//! every value of a checked program a concrete type per instance before a back
+//! end sees it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use brass_parser::ast::TypeExpr;
 
+/// Type id and name of the prelude's `Result` (its id is fixed: lowering
+/// reserves 0 for it), and the substitution keys of its Ok and Err payload
+/// types.
 pub const RESULT_TYPE_ID: i32 = 0;
 pub const RESULT_TYPE_NAME: &str = "Result";
 pub const RESULT_OK_VALUE: &str = "Ok.value";
@@ -15,9 +19,9 @@ pub const RESULT_ERR_ERROR: &str = "Err.error";
 /// Type id and name of a *structural* record: one with no declaration, whose
 /// layout and identity come from its field substitution rather than a nominal
 /// definition. Used for anonymous structures (`{ f: v }` / `anonymous { f: T }`)
-/// and records built at the deserialize boundary; both share this
-/// id/name so structurally-identical values are the same type. Negative so it
-/// never collides with a declared type's id.
+/// and the views a structural parameter takes of them; all share this id/name
+/// so structurally-identical values are the same type. Negative so it never
+/// collides with a declared type's id.
 pub const STRUCTURAL_RECORD_ID: i32 = i32::MIN;
 pub const STRUCTURAL_RECORD_NAME: &str = "<structural>";
 
@@ -159,6 +163,11 @@ impl FloatKind {
     }
 }
 
+/// A Brass type, as the checker infers it and monomorphization concretizes it.
+/// `Unknown(n)` is inference variable `n`; `SelfType` is a `Self` not yet bound
+/// to its type (see [`substitute_self`]); `ConstOf`, `Mut` and `Ref` are
+/// mode wrappers that [`erase_modes`] removes before a type reaches a back
+/// end.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
     Bool,
@@ -172,8 +181,9 @@ pub enum Type {
     Array(Box<Type>, usize),
     Slice(Box<Type>),
     /// A fixed-length, heterogeneous tuple `[T0, T1, ...]` (written `[int32,
-    /// string]`). A bracket literal with elements of differing types is a tuple;
-    /// one whose elements share a type is an `Array`/`Slice`.
+    /// string]`). A bracket literal whose elements have no common type is a
+    /// tuple; one whose elements share a type, or join by the numeric rule
+    /// (`[1, 2.5]` is `float64[]`), is an `Array`/`Slice`.
     Tuple(Vec<Type>),
     Fun(Vec<Type>, Box<Type>),
     Nullable(Box<Type>),
@@ -297,28 +307,47 @@ impl NominalType {
     }
 }
 
+/// How much of a type a rendering shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rendering {
+    /// Diagnostics and hover: nominal substitutions without `_` members.
+    Pretty,
+    /// Every substitution member, `_` ones included.
+    Full,
+    /// The source name `typeof` reports: a nominal type's own name with its
+    /// substitution dropped, at any depth.
+    SourceName,
+}
+
+impl Rendering {
+    fn hides_private(self) -> bool {
+        self != Rendering::Full
+    }
+}
+
 impl NominalType {
     /// Render this reference with inference variables printed by `unknown`;
     /// see [`Type::display_with`] for the contract shared with the language
     /// server's hover renderer.
     pub fn display_with(&self, unknown: &mut dyn FnMut(u32) -> String) -> String {
-        self.render(unknown, true)
+        self.render(unknown, Rendering::Pretty)
     }
 
     /// Like [`Self::display_with`], but keeping the `_`-prefixed members. See
     /// [`Type::display_full`].
     pub fn display_full_with(&self, unknown: &mut dyn FnMut(u32) -> String) -> String {
-        self.render(unknown, false)
+        self.render(unknown, Rendering::Full)
     }
 
-    /// `hide_private` drops `_`-prefixed substitution members from the
-    /// rendering.
-    fn render(&self, unknown: &mut dyn FnMut(u32) -> String, hide_private: bool) -> String {
+    fn render(&self, unknown: &mut dyn FnMut(u32) -> String, mode: Rendering) -> String {
+        if mode == Rendering::SourceName && self.id != STRUCTURAL_RECORD_ID {
+            return self.name.clone();
+        }
         if let Some((ok, err)) = self.result_payloads() {
             return format!(
                 "Result<{}, {}>",
-                ok.render(unknown, hide_private),
-                err.render(unknown, hide_private)
+                ok.render(unknown, mode),
+                err.render(unknown, mode)
             );
         }
         // A structural/anonymous record has no declared name; render it as the
@@ -329,7 +358,7 @@ impl NominalType {
             let fields = self
                 .substitution
                 .iter()
-                .map(|(key, ty)| format!("{key}: {}", ty.render(unknown, hide_private)))
+                .map(|(key, ty)| format!("{key}: {}", ty.render(unknown, mode)))
                 .collect::<Vec<_>>()
                 .join(", ");
             return format!("anonymous {{ {fields} }}");
@@ -341,8 +370,8 @@ impl NominalType {
         let entries = self
             .substitution
             .iter()
-            .filter(|(key, _)| !hide_private || !key.starts_with('_'))
-            .map(|(key, ty)| format!("{key}={}", ty.render(unknown, hide_private)))
+            .filter(|(key, _)| !mode.hides_private() || !key.starts_with('_'))
+            .map(|(key, ty)| format!("{key}={}", ty.render(unknown, mode)))
             .collect::<Vec<_>>()
             .join(", ");
         if entries.is_empty() {
@@ -354,9 +383,14 @@ impl NominalType {
 
 impl fmt::Display for NominalType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.display_with(&mut |_| "?".into()))
+        f.write_str(&self.display_with(&mut |_| UNRESOLVED.into()))
     }
 }
+
+/// How a diagnostic spells a type that is not decided yet (an inference
+/// variable): `_`, as in `_[]` for an array whose element type is open. It
+/// cannot be confused with the nullable marker `?` (`int32?`).
+pub const UNRESOLVED: &str = "_";
 
 /// The HIR kind of a user-defined nominal type name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -419,6 +453,15 @@ impl Type {
 
     pub fn null() -> Self {
         Type::Nullable(Box::new(Type::Never))
+    }
+
+    /// `inner?`, collapsing a nullable `inner` (`T??` is `T?`: there is one
+    /// `null`, and a nested cell would change the value's representation).
+    pub fn nullable(inner: Type) -> Self {
+        match inner {
+            Type::Nullable(_) => inner,
+            other => Type::Nullable(Box::new(other)),
+        }
     }
 
     pub fn is_unknown(&self) -> bool {
@@ -491,17 +534,19 @@ impl Type {
         }
     }
 
+    /// Render this type for a diagnostic: an inference variable (a type not
+    /// decided yet) prints as `_` ([`UNRESOLVED`]).
     pub fn display(&self) -> String {
-        self.display_with(&mut |_| "?".into())
+        self.display_with(&mut |_| UNRESOLVED.into())
     }
 
     /// Render this type with inference variables printed by `unknown`. This is
     /// the single source of type syntax for user-facing output: compiler
-    /// diagnostics print every variable as `?` (via [`Self::display`]), while
+    /// diagnostics print every variable as `_` (via [`Self::display`]), while
     /// the language server numbers them `unknown_N` for hover. Everything else
     /// renders identically for both, so diagnostics and hover agree.
     pub fn display_with(&self, unknown: &mut dyn FnMut(u32) -> String) -> String {
-        self.render(unknown, true)
+        self.render(unknown, Rendering::Pretty)
     }
 
     /// Render including the `_`-prefixed members [`Self::display`] hides.
@@ -512,11 +557,11 @@ impl Type {
     /// private renders as its bare name. A diagnostic that must tell two types
     /// apart falls back to this; see [`mismatch_display`].
     pub fn display_full(&self) -> String {
-        self.render(&mut |_| "?".into(), false)
+        self.render(&mut |_| UNRESOLVED.into(), Rendering::Full)
     }
 
-    fn render(&self, unknown: &mut dyn FnMut(u32) -> String, hide_private: bool) -> String {
-        let mut sub = |t: &Type| t.render(unknown, hide_private);
+    fn render(&self, unknown: &mut dyn FnMut(u32) -> String, mode: Rendering) -> String {
+        let mut sub = |t: &Type| t.render(unknown, mode);
         match self {
             Type::Bool => "bool".into(),
             Type::Int(k) => k.name().into(),
@@ -524,19 +569,23 @@ impl Type {
             Type::Str => "string".into(),
             Type::Void => "void".into(),
             Type::Never => "never".into(),
-            Type::Record(n) | Type::Sum(n) => n.render(unknown, hide_private),
-            Type::Array(t, n) => format!("{}[{}]", sub(t), n),
-            Type::Slice(t) => format!("{}[]", sub(t)),
+            Type::Record(n) | Type::Sum(n) => n.render(unknown, mode),
+            Type::Array(t, n) => format!("{}[{}]", suffix_operand(t, sub(t)), n),
+            Type::Slice(t) => format!("{}[]", suffix_operand(t, sub(t))),
             Type::Tuple(ts) => format!("[{}]", ts.iter().map(sub).collect::<Vec<_>>().join(", ")),
             Type::Fun(ps, r) => format!(
                 "({}) -> {}",
                 ps.iter()
-                    .map(|p| p.render(unknown, hide_private))
+                    .map(|p| p.render(unknown, mode))
                     .collect::<Vec<_>>()
                     .join(", "),
-                r.render(unknown, hide_private)
+                r.render(unknown, mode)
             ),
-            Type::Nullable(t) => format!("{}?", sub(t)),
+            Type::Nullable(t) => format!("{}?", suffix_operand(t, sub(t))),
+            // A value's mode wrappers are not part of its source type name.
+            Type::ConstOf(t) | Type::Mut(t) | Type::Ref(t) if mode == Rendering::SourceName => {
+                sub(t)
+            }
             Type::ConstOf(t) => format!("const {}", sub(t)),
             Type::Mut(t) => format!("mut({})", sub(t)),
             Type::Ref(t) => format!("ref({})", sub(t)),
@@ -545,17 +594,27 @@ impl Type {
         }
     }
 
-    /// The bare source name of this type, as `typeof(x)` reports it: a
-    /// nominal type's own name (no substitution), a primitive's keyword, and
-    /// the structural forms of arrays/tuples/nullables. Distinct from
-    /// [`Self::display`] only for records/sums, where the substitution is
-    /// dropped so `typeof` is stable across instantiations.
+    /// The source name of this type, as `typeof(x)` reports it: a nominal
+    /// type's own name with its substitution dropped -- at every depth, so
+    /// `R`, `R?`, `R[]` and `[R, int32]` read the same whether the value was
+    /// constructed or flowed through an annotation that pinned its fields --
+    /// a primitive's keyword, the structural forms of arrays, tuples,
+    /// nullables and function types, and an anonymous record as
+    /// `anonymous { field: T, .. }`. Mode wrappers (`const`, `ref`, `mut`)
+    /// are not shown.
     pub fn type_name(&self) -> String {
-        match self {
-            Type::Record(n) | Type::Sum(n) => n.name.clone(),
-            Type::ConstOf(t) | Type::Mut(t) | Type::Ref(t) => t.type_name(),
-            _ => self.display(),
-        }
+        self.render(&mut |_| UNRESOLVED.into(), Rendering::SourceName)
+    }
+}
+
+/// The rendering of `ty` (already rendered as `rendered`) as the operand of a
+/// type suffix (`[]`, `[n]`, `?`). A suffix written after a function type
+/// reads as part of its return type -- `(int64) -> int64[]` returns an array --
+/// so a function type is parenthesized there: `((int64) -> int64)[]`.
+fn suffix_operand(ty: &Type, rendered: String) -> String {
+    match ty {
+        Type::Fun(..) => format!("({rendered})"),
+        _ => rendered,
     }
 }
 
@@ -686,11 +745,9 @@ fn resolve_inner(
                 .collect::<Result<_, _>>()?,
             Box::new(resolve_inner(ret, nominal_info, alias)?),
         )),
-        TypeExpr::Nullable(inner, _) => Ok(Type::Nullable(Box::new(resolve_inner(
-            inner,
-            nominal_info,
-            alias,
-        )?))),
+        TypeExpr::Nullable(inner, _) => {
+            Ok(Type::nullable(resolve_inner(inner, nominal_info, alias)?))
+        }
         // `T!` is the fallible Result in scope: success payload `T`, error payload
         // left open (an `infer` placeholder the caller freshens, so it is inferred
         // from the body's `error(...)` sites like an unannotated fallible return)
@@ -800,18 +857,6 @@ pub fn prim_method_symbol(class: &str, method: &str) -> String {
     format!("{method}@prim.{class}")
 }
 
-/// The default kind of an unconstrained integer literal: int32 when the value
-/// fits, otherwise int64. A literal like `9223372036854775807` can only be an
-/// int64; defaulting it to int32 (the canonical kind) would silently truncate
-/// the value the programmer wrote out.
-pub fn int_literal_kind(value: i64) -> IntKind {
-    if i32::try_from(value).is_ok() {
-        IntKind::I32
-    } else {
-        IntKind::I64
-    }
-}
-
 /// The type yielded by indexing into `ty`. Reference and mutability wrappers are
 /// seen through and re-applied to the element, so indexing a reference to an array
 /// yields a reference to the element of the same kind: `ref(T[])[i]` is `ref(T)`
@@ -846,6 +891,40 @@ pub fn primitive_kind_conflict(a: &Type, b: &Type) -> bool {
     matches!((kind(a), kind(b)), (Some(x), Some(y)) if x != y)
 }
 
+/// Whether an array or tuple literal's checked type must be carried to the
+/// back end instead of being re-derived from its element values. A literal's
+/// elements default to `int32` / `float64`, so the derived type differs
+/// whenever an element representation does: a nullable element is a heap
+/// cell, a non-`int32` integer has another width, a float element may be
+/// written as an integer literal (`[1, 2]` as `float64[]`) or mixed with one
+/// (`[1.5, 2]`, which would otherwise derive a tuple), and a tuple whose
+/// elements share one type would derive an array. Building the literal at
+/// the derived type and reading it at the checked one reinterprets every
+/// element. A fixed-length array (a `const`-bound literal, `int32[2]`) is
+/// carried too: the derived growable type drops the length its static type
+/// names (`typeof` reports it). The checker's span channel and MIR lowering
+/// share this rule.
+pub fn array_literal_needs_seed(ty: &Type) -> bool {
+    fn element_needs_seed(elem: &Type) -> bool {
+        match elem {
+            Type::Nullable(_) | Type::Float(_) => true,
+            Type::Int(k) => *k != IntKind::I32,
+            Type::Slice(inner) | Type::Array(inner, _) => element_needs_seed(inner),
+            Type::Tuple(elems) => elems.iter().any(element_needs_seed),
+            _ => false,
+        }
+    }
+    match ty {
+        Type::Array(..) => true,
+        Type::Slice(elem) => element_needs_seed(elem),
+        // A tuple whose elements share one type derives an array instead.
+        Type::Tuple(elems) => {
+            elems.iter().any(element_needs_seed) || elems.windows(2).all(|w| w[0] == w[1])
+        }
+        _ => false,
+    }
+}
+
 /// Whether `ty` contains no inference variable, recursing through every
 /// component (array elements, nominal substitutions, function and tuple parts).
 /// A bare nominal reference (empty substitution) is fully known: the name and id
@@ -866,6 +945,28 @@ pub fn is_fully_known(ty: &Type) -> bool {
     }
 }
 
+/// The part of `ty` that has no text rendering, if any: a `void` (no value at
+/// all) or a function value, on its own or as the payload of a nullable, the
+/// element of an array or a component of a tuple -- the shapes `print`,
+/// `println`, a `"{v}"` segment, `string.from` and the built-in `debug` render
+/// element by element. A record or sum always renders (a function-valued field
+/// shows as a placeholder), and an open inference variable is not decided
+/// here: the per-instantiation check of its generic body sees the concrete
+/// type. Mode wrappers are looked through.
+pub fn unrenderable_part(ty: &Type) -> Option<&Type> {
+    match ty {
+        Type::Void | Type::Fun(..) => Some(ty),
+        Type::Nullable(inner)
+        | Type::Slice(inner)
+        | Type::Array(inner, _)
+        | Type::ConstOf(inner)
+        | Type::Mut(inner)
+        | Type::Ref(inner) => unrenderable_part(inner),
+        Type::Tuple(elems) => elems.iter().find_map(unrenderable_part),
+        _ => None,
+    }
+}
+
 /// The value type behind parameter-passing mode wrappers: `ref(T)`, `mut(T)` and
 /// `const` views expose the underlying value's fields, elements and methods, so
 /// member access and member type checks must look through them. Without this a
@@ -876,6 +977,38 @@ pub fn peel_modes(ty: &Type) -> &Type {
     match ty {
         Type::Ref(t) | Type::Mut(t) | Type::ConstOf(t) => peel_modes(t),
         _ => ty,
+    }
+}
+
+/// `ty` with every parameter-passing mode wrapper (`ref`, `mut`, `const`)
+/// removed at every depth -- inside function parameters, elements and nominal
+/// substitutions too. The back ends represent values without modes (a
+/// reference is the same handle as the value), so a checker type handed to
+/// them as a representation is erased first; [`peel_modes`] only looks
+/// through the outermost layer.
+pub fn erase_modes(ty: &Type) -> Type {
+    match ty {
+        Type::Ref(t) | Type::Mut(t) | Type::ConstOf(t) => erase_modes(t),
+        Type::Array(inner, n) => Type::Array(Box::new(erase_modes(inner)), *n),
+        Type::Slice(inner) => Type::Slice(Box::new(erase_modes(inner))),
+        Type::Nullable(inner) => Type::Nullable(Box::new(erase_modes(inner))),
+        Type::Tuple(elems) => Type::Tuple(elems.iter().map(erase_modes).collect()),
+        Type::Fun(params, ret) => Type::Fun(
+            params.iter().map(erase_modes).collect(),
+            Box::new(erase_modes(ret)),
+        ),
+        Type::Record(n) | Type::Sum(n) => {
+            let mut erased = n.clone();
+            erased.substitution = Substitution::empty();
+            for (key, t) in n.substitution.iter() {
+                erased.substitution.insert(key.to_string(), erase_modes(t));
+            }
+            match ty {
+                Type::Record(_) => Type::Record(erased),
+                _ => Type::Sum(erased),
+            }
+        }
+        other => other.clone(),
     }
 }
 
@@ -1094,6 +1227,56 @@ pub fn collapse_nullable(ty: &Type) -> Type {
     }
 }
 
+/// Replace every `Self` in `ty` with `replacement`, the concrete type it
+/// names: recursing through composite types and nominal substitutions, so a
+/// `-> Self!` return (`Result` carrying `Self` as its Ok payload) and a
+/// `Self?[]` parameter both resolve. Used where `Self` denotes one known
+/// type -- a method implementation's own owner, a record literal's type --
+/// and never for a protocol member, whose `Self` stays abstract until a
+/// concrete type is checked against it.
+pub fn substitute_self(ty: &Type, replacement: &Type) -> Type {
+    replace_self(ty, replacement, true)
+}
+
+/// [`substitute_self`] for a data field's declared type: a `Self` outside any
+/// function type is the declaring type itself (`next: Self?` is a recursive
+/// `Node?`), while a `Self` inside a function type stays abstract -- a
+/// protocol member `show: (Self) -> string` names whichever concrete type is
+/// checked against the protocol, and a callback field is bound to the
+/// constructed type where the value is built.
+pub fn bind_data_self(ty: &Type, owner: &Type) -> Type {
+    replace_self(ty, owner, false)
+}
+
+fn replace_self(ty: &Type, replacement: &Type, through_functions: bool) -> Type {
+    let rec = |t: &Type| replace_self(t, replacement, through_functions);
+    match ty {
+        Type::SelfType => replacement.clone(),
+        Type::Array(e, n) => Type::Array(Box::new(rec(e)), *n),
+        Type::Slice(e) => Type::Slice(Box::new(rec(e))),
+        Type::Tuple(es) => Type::Tuple(es.iter().map(rec).collect()),
+        Type::Fun(ps, r) if through_functions => {
+            Type::Fun(ps.iter().map(rec).collect(), Box::new(rec(r)))
+        }
+        Type::Nullable(e) => Type::Nullable(Box::new(rec(e))),
+        Type::ConstOf(e) => Type::ConstOf(Box::new(rec(e))),
+        Type::Mut(e) => Type::Mut(Box::new(rec(e))),
+        Type::Ref(e) => Type::Ref(Box::new(rec(e))),
+        Type::Record(n) | Type::Sum(n) if !n.substitution.is_empty() => {
+            let mut subst = Substitution::empty();
+            for (k, v) in n.substitution.iter() {
+                subst.insert(k.to_string(), rec(v));
+            }
+            let n = NominalType::with_substitution(n.id, n.name.clone(), subst);
+            match ty {
+                Type::Record(_) => Type::Record(n),
+                _ => Type::Sum(n),
+            }
+        }
+        other => other.clone(),
+    }
+}
+
 fn collapse_nullable_nominal(n: &NominalType) -> NominalType {
     if n.substitution.is_empty() {
         return n.clone();
@@ -1296,6 +1479,34 @@ mod tests {
             subst
         });
         assert_eq!(wrapper.to_string(), "Wrapper<item=string>");
+    }
+
+    /// A suffix after a function type would read as part of its return type, so
+    /// a function type under `[]`, `[n]` or `?` renders parenthesized -- in
+    /// diagnostics and in the `typeof` name alike -- while a function returning
+    /// an array keeps the bare form.
+    #[test]
+    fn function_type_under_a_suffix_is_parenthesized() {
+        let fun = Type::Fun(
+            vec![Type::Int(IntKind::I64)],
+            Box::new(Type::Int(IntKind::I64)),
+        );
+        let slice_of_fun = Type::Slice(Box::new(fun.clone()));
+        assert_eq!(slice_of_fun.display(), "((int64) -> int64)[]");
+        assert_eq!(slice_of_fun.type_name(), "((int64) -> int64)[]");
+        assert_eq!(
+            Type::Array(Box::new(fun.clone()), 2).display(),
+            "((int64) -> int64)[2]"
+        );
+        assert_eq!(
+            Type::Nullable(Box::new(fun)).display_full(),
+            "((int64) -> int64)?"
+        );
+        let returns_slice = Type::Fun(
+            vec![Type::Int(IntKind::I64)],
+            Box::new(Type::Slice(Box::new(Type::Int(IntKind::I64)))),
+        );
+        assert_eq!(returns_slice.display(), "(int64) -> int64[]");
     }
 
     /// `_`-prefixed substitution entries are implementation details and stay out

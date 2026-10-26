@@ -1,10 +1,12 @@
-//! Closure typing for the monomorphizer: recovering a closure's concrete
-//! parameter types from how the closure is *used* -- a direct in-body call, a
-//! pass to a higher-order callee (probed by lightly inferring the callee's
-//! body), a store into a function-typed record field, its own annotations
-//! (an escaping closure), or an indirect call through a typed capture in its
-//! own body -- and instantiating the closure body once per
-//! (capture-types, param-types) tuple.
+//! Closure typing for the monomorphizer: a closure value takes the function
+//! type the checker fixed for it (seeded on its local, or the instance's
+//! settled return for a returned closure); without one its concrete
+//! parameter types are recovered from how the closure is *used* -- a direct
+//! in-body call, a pass to a higher-order callee (probed by lightly
+//! inferring the callee's body), a store into a function-typed record field,
+//! its own annotations, or an indirect call through a typed capture in its
+//! own body. The closure body is instantiated once per (capture-types,
+//! param-types) tuple.
 
 use super::*;
 
@@ -20,7 +22,7 @@ impl Monomorphizer<'_, '_> {
         ty: &str,
         field: &str,
     ) -> Option<Vec<Type>> {
-        let info = self.program.resolve_type(module, ty)?;
+        let info = self.program.resolve_type_or_alias(module, ty)?;
         let resolved = match &info.kind {
             TypeKind::Record { fields, .. } => fields.iter().find(|f| f.name == field),
             TypeKind::Sum { variants } => {
@@ -115,21 +117,25 @@ impl Monomorphizer<'_, '_> {
     }
 
     /// Type a closure local: its captures come from the creation site and its
-    /// parameter types from how it is used -- an in-body call (direct-call
-    /// closures), being passed to a higher-order function (the callee's use of
-    /// that parameter, recovered by probing), initializing a record field with a
-    /// declared function type (the field's signature), or, for an escaping
-    /// closure, its own parameter annotations. Also instantiates the closure
-    /// body. `None` while any operand type is still unresolved.
+    /// parameter types from the function type the checker fixed for the value
+    /// (`checked`, the local's declared type -- see `lower_closure_passing`),
+    /// or, without one, from how the closure is used -- an in-body call
+    /// (direct-call closures), being passed to a higher-order function (the
+    /// callee's use of that parameter, recovered by probing), initializing a
+    /// record field with a declared function type (the field's signature), or,
+    /// for an escaping closure, its own parameter annotations. Also
+    /// instantiates the closure body. `None` while any operand type is still
+    /// unresolved.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn closure_local_type(
         &mut self,
         id: ClosureId,
         captures: &[Operand],
         local: LocalId,
+        checked: Option<&Type>,
         module: &[String],
         indirect_args: &HashMap<LocalId, Vec<Vec<Operand>>>,
-        closure_passes: &HashMap<LocalId, (String, Vec<Operand>, usize)>,
+        closure_passes: &HashMap<LocalId, Vec<ClosurePass>>,
         record_field_closures: &HashMap<LocalId, (LocalId, String, String)>,
         local_types: &[Option<Type>],
     ) -> Result<Option<Type>, String> {
@@ -140,6 +146,22 @@ impl Monomorphizer<'_, '_> {
                 None => return Ok(None),
             }
         }
+        // The checker's function type is authoritative: it took the parameter
+        // types from the expected type the literal was checked against (an
+        // annotated parameter, field, binding or return) or from the closure's
+        // applications, with the language's conversions already applied -- a
+        // `float32` parameter stays `float32` although the caller's operand
+        // was an integer-typed literal. The uses in this body agree with it.
+        if let Some(Type::Fun(params, ret)) = checked {
+            let mut param_types: Vec<Type> = params
+                .iter()
+                .map(|p| resolve_nominal(self.program, p))
+                .collect();
+            self.apply_param_annotations(id, &mut param_types);
+            let ret = resolve_nominal(self.program, ret);
+            let ret = self.instantiate_closure(id, &capture_types, &param_types, Some(ret))?;
+            return Ok(Some(Type::Fun(param_types, Box::new(ret))));
+        }
         // Parameter types: from a direct in-body call, else from a higher-order
         // callee's use of the parameter the closure is passed as.
         let mut param_types = if let Some(call_sites) = indirect_args.get(&local) {
@@ -147,8 +169,8 @@ impl Monomorphizer<'_, '_> {
                 Some(pt) => pt,
                 None => return Ok(None),
             }
-        } else if let Some((base, pass_args, idx)) = closure_passes.get(&local) {
-            match self.probe_callee_param_types(base, pass_args, *idx, local_types)? {
+        } else if let Some(passes) = closure_passes.get(&local) {
+            match self.probe_passes(passes, local_types)? {
                 Some(pt) => pt,
                 // The probe cannot answer (the receiver is still untyped, or
                 // the callee never calls the parameter directly -- e.g. it only
@@ -194,20 +216,28 @@ impl Monomorphizer<'_, '_> {
             pt
         } else {
             return Err(format!(
-                "closure _{} is neither called nor passed to a function nor fully \
+                "internal error: closure _{} is neither called nor passed to a function nor fully \
                  annotated; unsupported on the typed backend",
                 local.index()
             ));
         };
-        // A parameter's own annotation is authoritative, and the use site does
-        // not have to agree with it: the checker accepts a `string` argument for
-        // a `(s: string?)` parameter, widening it. The body is typed against the
-        // annotation, so the closure's `Fun` type -- which the call site coerces
-        // its arguments to, and which keys the instance symbol -- has to carry
-        // the annotation too. Otherwise a bare `string` reaches a `string?`
-        // parameter unwrapped and the body reads the value as a nullable cell.
-        // The annotation loses no information the argument type has: it is the
-        // very type the instance ends up with either way.
+        self.apply_param_annotations(id, &mut param_types);
+        let ret = self.instantiate_closure(id, &capture_types, &param_types, None)?;
+        Ok(Some(Type::Fun(param_types, Box::new(ret))))
+    }
+
+    /// Overwrite each annotated parameter's type with its annotation.
+    ///
+    /// A parameter's own annotation is authoritative, and the use site does
+    /// not have to agree with it: the checker accepts a `string` argument for
+    /// a `(s: string?)` parameter, widening it. The body is typed against the
+    /// annotation, so the closure's `Fun` type -- which the call site coerces
+    /// its arguments to, and which keys the instance symbol -- has to carry
+    /// the annotation too. Otherwise a bare `string` reaches a `string?`
+    /// parameter unwrapped and the body reads the value as a nullable cell.
+    /// The annotation loses no information the argument type has: it is the
+    /// very type the instance ends up with either way.
+    fn apply_param_annotations(&self, id: ClosureId, param_types: &mut [Type]) {
         if let Some(annotations) = self.closure_param_annotations(id) {
             for (pt, annotated) in param_types.iter_mut().zip(annotations) {
                 if let Some(t) = annotated {
@@ -215,8 +245,40 @@ impl Monomorphizer<'_, '_> {
                 }
             }
         }
-        let ret = self.instantiate_closure(id, &capture_types, &param_types)?;
-        Ok(Some(Type::Fun(param_types, Box::new(ret))))
+    }
+
+    /// The parameter types the callees a closure is passed to use it at: the
+    /// first answer, which every other pass that answers must repeat (the
+    /// checker fixed one type for the value; a disagreement is an internal
+    /// error, never a silent pick).
+    fn probe_passes(
+        &self,
+        passes: &[ClosurePass],
+        local_types: &[Option<Type>],
+    ) -> Result<Option<Vec<Type>>, String> {
+        let mut found: Option<Vec<Type>> = None;
+        for (base, pass_args, idx) in passes {
+            let Some(pt) = self.probe_callee_param_types(base, pass_args, *idx, local_types)?
+            else {
+                continue;
+            };
+            match &found {
+                None => found = Some(pt),
+                Some(prev) if *prev != pt => {
+                    return Err(format!(
+                        "internal error: a closure is passed where it is called with \
+                         `{}` and with `{}`",
+                        prev.iter()
+                            .map(Type::display)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        pt.iter().map(Type::display).collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(found)
     }
 
     /// Recover the parameter types of a closure passed to free function `base` as
@@ -422,7 +484,24 @@ impl Monomorphizer<'_, '_> {
             any = true;
             for (i, t) in site.into_iter().enumerate() {
                 match joined.get_mut(i) {
-                    Some(cur) => *cur = merge_return_types(cur, &t),
+                    Some(cur) => {
+                        let both = [
+                            brass_typesys::JoinOperand::value(cur.clone()),
+                            brass_typesys::JoinOperand::value(t),
+                        ];
+                        match brass_typesys::join_values(self.program, &both) {
+                            Ok(Some(t)) => *cur = t,
+                            Ok(None) => {}
+                            Err(_) => {
+                                return Err(format!(
+                                    "internal error: a closure parameter receives values of \
+                                     incompatible types (`{}` and `{}`)",
+                                    both[0].ty.display(),
+                                    both[1].ty.display()
+                                ));
+                            }
+                        }
+                    }
                     None => joined.push(t),
                 }
             }
@@ -485,23 +564,96 @@ impl Monomorphizer<'_, '_> {
                 }
                 _ => None,
             },
+            // A parameter received by copy (`__deep_copy` at entry) is a value of
+            // the formal's own type: a higher-order callee that hands its copied
+            // parameter to the probed closure pins the closure's parameter.
+            Rvalue::Call(Callee::Builtin(name), args) if name == "__deep_copy" => {
+                self.operand_type(args.first()?, lt).ok().flatten()
+            }
             _ => None,
         }
     }
 
     /// Instantiate a closure body for one (capture-types, param-types) tuple
     /// (memoized), returning its return type.
+    ///
+    /// Select the exact checked body using normalized captures and its creation site.
+    pub(super) fn closure_contract(
+        &self,
+        id: ClosureId,
+        capture_types: &[Type],
+        param_types: &[Type],
+    ) -> Result<(String, Option<brass_hir::InstanceKey>), String> {
+        if self.numeric_calls.is_empty() {
+            return Ok((closure_symbol(id, capture_types, param_types), None));
+        }
+        let clo = self
+            .by_closure
+            .get(&id)
+            .ok_or_else(|| format!("internal error: unknown closure {}", id.index()))?;
+        let mut identity_args: Vec<_> = capture_types
+            .iter()
+            .zip(&clo.capture_cells)
+            .map(|(ty, cell)| {
+                if *cell && let Type::Array(inner, 1) = brass_hir::peel_modes(ty) {
+                    (**inner).clone()
+                } else {
+                    ty.clone()
+                }
+            })
+            .collect();
+        identity_args.extend_from_slice(param_types);
+        let mut identity = brass_hir::InstanceKey::new(
+            self.program,
+            brass_hir::InstanceCallable::Closure {
+                lo: clo.source.lo,
+                hi: clo.source.hi,
+            },
+            &identity_args,
+        );
+        let selected = clo
+            .created_at
+            .and_then(|site| {
+                self.numeric_calls
+                    .get(&(site, self.current_instance().cloned()))
+                    .or_else(|| self.numeric_calls.get(&(site, None)))
+            })
+            .or_else(|| self.numeric_calls.get(&(clo.source, identity.clone())))
+            .cloned();
+        let Some(layout) = selected else {
+            return Ok((closure_symbol(id, capture_types, param_types), None));
+        };
+        if let Some(key) = &mut identity {
+            key.numeric_layout = layout.clone();
+        }
+        let sym = brass_hir::numeric_instance_base(
+            &closure_symbol(id, capture_types, param_types),
+            layout.as_ref(),
+        );
+        Ok((sym, identity))
+    }
+
+    /// `checked_ret` is the result type the checker fixed for the closure
+    /// value. For a plain (non-fallible) closure it is the instance's return
+    /// annotation, so the body's returns are converted into it exactly as a
+    /// function's returns are into a declared return type: a closure checked
+    /// against `(int32) -> int32?` that returns a bare `int32` produces the
+    /// nullable representation its callers read. One closure id is one source
+    /// literal whose checked type every instantiation shares, so the instance
+    /// symbol needs no return component. A fallible closure keeps its
+    /// inferred `Result` (its error payload is the back end's own lifted form).
     fn instantiate_closure(
         &mut self,
         id: ClosureId,
         capture_types: &[Type],
         param_types: &[Type],
+        checked_ret: Option<Type>,
     ) -> Result<Type, String> {
         let clo = *self
             .by_closure
             .get(&id)
-            .ok_or_else(|| format!("unknown closure {}", id.index()))?;
-        let sym = closure_symbol(id, capture_types, param_types);
+            .ok_or_else(|| format!("internal error: unknown closure {}", id.index()))?;
+        let (sym, identity) = self.closure_contract(id, capture_types, param_types)?;
         tracing::debug!(
             closure = id.index(),
             captures = ?capture_types.iter().map(|t| t.display()).collect::<Vec<_>>(),
@@ -513,7 +665,9 @@ impl Monomorphizer<'_, '_> {
             return Ok(inst.ret.clone());
         }
         if self.in_progress.contains_key(&sym) {
-            return Err("recursive closures are unsupported on the typed backend".into());
+            return Err(
+                "internal error: recursive closures are unsupported on the typed backend".into(),
+            );
         }
         let capture_seed: Vec<(LocalId, Type)> = clo
             .captures
@@ -521,6 +675,8 @@ impl Monomorphizer<'_, '_> {
             .copied()
             .zip(capture_types.iter().cloned())
             .collect();
+        let ret_ann = checked_ret
+            .filter(|t| !clo.fallible && brass_hir::is_fully_known(t) && is_supported(t));
         // Closure bodies never defer (see `Monomorphizer::closure_depth`);
         // the depth must unwind on failure too, so `?` waits for the balance.
         self.closure_depth += 1;
@@ -529,7 +685,7 @@ impl Monomorphizer<'_, '_> {
             &clo.body,
             &clo.module,
             param_types.to_vec(),
-            None,
+            ret_ann,
             None,
             None,
             &capture_seed,
@@ -539,6 +695,7 @@ impl Monomorphizer<'_, '_> {
             // body-inferred fallible function: its result is `Result<ok, err>`
             // and codegen Ok-wraps its bare returns.
             clo.fallible,
+            identity,
         );
         self.closure_depth -= 1;
         let stored = stored?;

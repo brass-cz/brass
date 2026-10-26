@@ -1,0 +1,16 @@
+// @backends: all
+// An anonymous record passed to a parameter the callee only renders whole
+// gets the view of the fields the callee uses: none, so it renders as an
+// empty anonymous record (a field read adds that field to the view).
+fun say(s) {
+    print("[say] {s}\n")
+}
+
+fun say_a(s) {
+    print("[say_a] {s} {s.a}\n")
+}
+
+fun main() {
+    say({ a: 1, b: "x" })
+    say_a({ a: 2, b: "y" })
+}

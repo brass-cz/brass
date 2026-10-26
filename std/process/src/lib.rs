@@ -147,8 +147,8 @@ export! {
             .stdin(stdio(stdin))
             .stdout(stdio(stdout))
             .stderr(stdio(stderr));
-        for pair in env.chunks_exact(2) {
-            command.env(&pair[0], &pair[1]);
+        for [name, value] in env.as_chunks::<2>().0 {
+            command.env(name, value);
         }
         let child = command.spawn().map_err(|e| e.to_string())?;
         let entry = Entry { child: Some(child), ..Entry::default() };
@@ -177,8 +177,8 @@ export! {
         }
         let mut command = Command::new(&program);
         command.args(&args);
-        for pair in env.chunks_exact(2) {
-            command.env(&pair[0], &pair[1]);
+        for [name, value] in env.as_chunks::<2>().0 {
+            command.env(name, value);
         }
         #[cfg(unix)]
         {

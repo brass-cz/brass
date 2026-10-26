@@ -1,0 +1,44 @@
+// @backends: all
+// A fallible function's return type is assembled from its `return`s and error
+// sites. A name bound by a `match` arm or an `if let` pattern shadows an outer
+// local of the same name inside that arm, both for the value it returns and
+// for the payload it raises: the result here is a `string`, not the outer
+// `int32`, and the error carries the string.
+type P = { name: string }
+
+fun label(p: P, fail: bool) {
+    let name = 0
+    if fail {
+        error("boom")!
+    }
+    return match p {
+        P { name } => name,
+    }
+}
+
+fun check(p: P) {
+    let name = 0
+    if let P { name } = p {
+        error(name)!
+    }
+    return name
+}
+
+fun first_name(p: P) {
+    let name = 0
+    if let P { name } = p {
+        return name
+    }
+    return "?"
+}
+
+fun main() {
+    let s = label(P { name: "hello" }, false)!
+    println(typeof(s))
+    println(s)
+    match check(P { name: "bad input" }) {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.value}"),
+    }
+    println(first_name(P { name: "x" }))
+}

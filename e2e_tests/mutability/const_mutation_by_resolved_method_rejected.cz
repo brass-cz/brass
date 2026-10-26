@@ -1,0 +1,50 @@
+// Mutating a const value through a method is rejected whatever produced the
+// const -- an unannotated constructor call, an alias of a mutable value, an
+// identity call, the prelude's `HashMap.new()` -- and through a `let` alias:
+// the verdict is read from the method the call resolves to (it writes through
+// its receiver, or through the argument the const is passed in), not from a
+// type spelled in the source.
+type V = { x: int32 }
+
+fun V.bump(self) {
+    self.x += 1
+}
+
+type P = { x: int32 }
+
+type Sink = { total: int32 }
+
+fun Sink.absorb(self, p: ref(mut(P))) {
+    p.x = 0
+}
+
+fun mk() {
+    return V { x: 1 }
+}
+
+fun ident(b) {
+    return b
+}
+
+fun main() {
+    const w = mk()
+    w.bump()
+
+    let v = V { x: 10 }
+    const alias = v
+    alias.bump()
+
+    const d = ident(V { x: 3 })
+    d.bump()
+
+    const m = HashMap.new()
+    m.set("a", 1)
+
+    const c = mk()
+    let handle = c
+    handle.bump()
+
+    const o = P { x: 1 }
+    let s = Sink { total: 0 }
+    s.absorb(o)
+}

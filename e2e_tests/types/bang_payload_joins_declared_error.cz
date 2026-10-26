@@ -1,0 +1,64 @@
+// A `T!` function's error payload is the join of ALL its error sources: the
+// `error(..)` it raises and the payloads its `!` sites propagate from a
+// function's or a local closure's Result. A record payload never joins a
+// string one, so each body below is rejected at check time, whichever source
+// comes first; the diagnostic points at the later, conflicting source.
+type BadInput = {
+    code: int32
+}
+
+fun check(t: string) -> int32! {
+    if t == "" {
+        return error(BadInput { code: 1 })
+    }
+    return 10
+}
+
+// The propagated record payload comes first: the later string `error(..)`
+// is the conflicting source.
+fun propagate_first(s: string) -> int32! {
+    let a = check(s)!
+    if a > 3 {
+        return error("too big")
+    }
+    return a
+}
+
+// The string `error(..)` comes first: the `!` is the conflicting source.
+fun raise_first(s: string) -> int32! {
+    if s == "x" {
+        return error("too big")
+    }
+    let a = check(s)!
+    return a
+}
+
+// The same mix through a local closure's inferred Result.
+fun through_closure(s: string) -> int32! {
+    let validate = (t: string) -> {
+        if t == "" {
+            return error(BadInput { code: 1 })
+        }
+        return 10
+    }
+    let a = validate(s)!
+    if a > 3 {
+        return error("too big")
+    }
+    return a
+}
+
+fun main() {
+    match propagate_first("5") {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err"),
+    }
+    match raise_first("5") {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err"),
+    }
+    match through_closure("5") {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err"),
+    }
+}

@@ -1,0 +1,16 @@
+30C
+30C
+21C
+now 21C
+null
+now null
+21C
+Temp {
+    celsius: 21,
+}
+green for 30s
+light: null
+Plain {
+    n: 1,
+}
+null

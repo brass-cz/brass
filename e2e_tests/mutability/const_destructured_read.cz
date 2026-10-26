@@ -1,0 +1,20 @@
+// @backends: all
+// Destructured `const` names read like any const, and the names a
+// destructuring `let` binds stay mutable.
+type P = { xs: int32[] }
+type W = { inner: P }
+
+const [ga, gb] = [[1], [2, 3]]
+const W { inner } = W { inner: P { xs: [5] } }
+
+fun total() {
+    return len(ga) + len(gb) + len(inner.xs)
+}
+
+fun main() {
+    println(total())
+    let [a, b] = [[1], [2]]
+    a.push(4)
+    println(a)
+    println(b)
+}

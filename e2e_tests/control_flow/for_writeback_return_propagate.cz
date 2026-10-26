@@ -1,0 +1,94 @@
+// @backends: all
+// A `for` body that reassigns its loop variable writes the new value back
+// into the iterated element on every exit from the body: besides the
+// fall-through tail, `continue` and `break`, also a `return` (from any
+// nesting depth, writing back every enclosing loop) and a failed `!` that
+// propagates out of the callable. A `let` shadowing the loop variable does
+// not redirect the write-back.
+
+fun first_big(a: ref(mut(int32[]))) -> int32 {
+    for e in a {
+        e = e * 10
+        if e > 15 {
+            return e
+        }
+    }
+    return 0
+}
+
+fun nested(m: ref(mut(int32[][]))) -> int32 {
+    for row in m {
+        row = [row[0] + 1]
+        for x in row {
+            x = x * 2
+            if x > 2 {
+                return x
+            }
+        }
+    }
+    return 0
+}
+
+fun check(v: int32) -> int32! {
+    if v > 2 {
+        return error("too big: {v}")
+    }
+    return v
+}
+
+fun scale(a: ref(mut(int32[]))) -> int32! {
+    for e in a {
+        e = e + 100
+        check(e - 100)!
+    }
+    return 0
+}
+
+fun maybe(v: int32) -> int32? {
+    if v > 1 {
+        return null
+    }
+    return v
+}
+
+fun scale_nullable(a: ref(mut(int32[]))) -> int32? {
+    for e in a {
+        e = e * 3
+        maybe(e / 3)!
+    }
+    return 0
+}
+
+fun shadowed(a: ref(mut(int32[]))) -> int32 {
+    for e in a {
+        e = e + 1
+        let e = 0
+        return e
+    }
+    return 0
+}
+
+fun main() {
+    let a = [1, 2, 3]
+    println(first_big(a))
+    println(a)
+
+    let m = [[1], [5]]
+    println(nested(m))
+    println(m)
+
+    let b = [1, 2, 3, 4]
+    match scale(b) {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err"),
+    }
+    println(b)
+
+    let c = [1, 2, 3]
+    println(scale_nullable(c))
+    println(c)
+
+    let d = [7, 8]
+    println(shadowed(d))
+    println(d)
+}

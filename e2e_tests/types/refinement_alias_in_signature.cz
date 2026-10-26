@@ -1,17 +1,17 @@
-// A `type Alias = Base { .. }` refinement naming a concrete instance must resolve
-// in a callable's SIGNATURE, not just in a `let` annotation or a sum variant's
-// field. Signature annotations went through the plain resolver, which knows
-// nominal types but not aliases, so `_Tbl` failed as an unknown name and the
-// annotation was dropped. Two things broke:
+// A `type Alias = Base { .. }` refinement naming a concrete instance resolves
+// in a callable's SIGNATURE exactly as in a `let` annotation or a sum
+// variant's field, although the alias is not a nominal type:
 //
-//   * a parameter so annotated read back as `void` inside a METHOD, so the method
-//     could not touch it (``void` has no method `set``), and the collapse spread
-//     to every function sharing the alias;
-//   * a declared `-> _Tbl!` lost its `!`, so the caller's `!` had no `Result` to
-//     unwrap ("error propagation requires `Result` ... found `HashMap<..>`").
+//   * a parameter annotated `_Tbl` is the pinned map in a method and in a
+//     free function alike, so the body uses it as that map and a free
+//     function's `_Tbl` parameter accepts only that map;
+//   * a declared `-> _Tbl!` is a `Result`, so the caller's `!` and `match`
+//     unwrap it, also for a method with no error path of its own.
 //
-// A free function's parameter merely went untyped rather than void, so there the
-// annotation was silently ignored -- `total(t)` accepted any map at all.
+// The free function `_child` and the methods `Cursor.grow` and
+// `Cursor.fresh` cover parameters and fallible returns of both kinds of
+// callable; the duplicate key that `_child` reports reaches the caller of
+// `Cursor.grow` as an Err.
 
 type _Tbl = HashMap {
     key: string

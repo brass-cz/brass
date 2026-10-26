@@ -1,0 +1,12 @@
+y
+T.Q {
+    name: "renamed",
+}
+S.C {
+    a: 1,
+    b: 2,
+    label: "z",
+}
+b!
+a!
+c!

@@ -1,0 +1,10 @@
+// A recursive function that wraps its own result has no finite return type;
+// its inference is rejected with a request for an annotation instead of
+// looping or reaching the back end.
+fun g(n) {
+    return [g(n - 1)]
+}
+
+fun main() {
+    println(len(g(2)))
+}

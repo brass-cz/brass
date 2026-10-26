@@ -1,9 +1,8 @@
 // A closure's parameter annotation is authoritative, and a call site need not
 // match it exactly: the checker widens a value into a nullable parameter and
-// converts between numeric widths. The closure's function type has to carry the
-// annotation, because it is what the call site coerces its arguments to -- a
-// bare `string` reaching a `string?` parameter unwrapped would be read as a
-// nullable cell.
+// converts between numeric widths. The closure's function type carries the
+// annotation, so each call converts its arguments to the annotated types (a
+// `string` argument arrives as a present `string?`).
 type P = { x: int32 }
 
 fun main() {

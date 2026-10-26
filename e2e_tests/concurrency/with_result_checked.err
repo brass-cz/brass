@@ -1,0 +1,1 @@
+with_result_checked.cz:19:21: error: cannot use `int32` where `string` is required

@@ -1,0 +1,23 @@
+// @backends: all
+// The accepted counterparts of presence_fold_nominal_return_rejected: a
+// present field that fits the declared return is returned (widened), and an
+// absent one folds the test to false so the fallback runs.
+type S = {
+    n
+}
+
+type T = {
+    m: int32
+}
+
+fun g(p) -> int64 {
+    if p.n {
+        return p.n
+    }
+    return -1
+}
+
+fun main() {
+    println(g(S { n: 5 }))
+    println(g(T { m: 1 }))
+}

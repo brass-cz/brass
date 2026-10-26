@@ -1,0 +1,28 @@
+// @backends: all
+// Compound assignment `x op= e` is typed exactly as `x = x op e`: a literal
+// `e` adapts to `x`'s type, so `+= 1` and friends work on every integer kind,
+// narrow and 64-bit included, and the update wraps at `x`'s width. A float32
+// target takes an integer literal as a float32.
+fun main() {
+    let a: int8 = 127
+    a += 1
+    let b: int16 = 5
+    b -= 2
+    b *= 3
+    let c: int32 = 7
+    c %= 4
+    let d: int64 = 9223372036854775807
+    d += 1
+    let e: uint8 = 255
+    e += 1
+    let f: uint16 = 10
+    f /= 3
+    let g: uint32 = 0
+    g -= 1
+    let h: uint64 = 18446744073709551615
+    h += 2
+    let x: float32 = 1.5
+    x *= 2
+    println("{a} {b} {c} {d} {e} {f} {g} {h} {x}")
+    println(typeof(x))
+}

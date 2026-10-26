@@ -22,13 +22,19 @@ use brass_hir::{NominalType, Program, Type, TypeKind};
 /// reference (empty substitution -- a sum variant binding or a nested declared
 /// field type) the HIR declaration's field names and declared types are used,
 /// so the nominal still renders. A nominal unknown to the program (a
-/// structural record built at a deserialize boundary) renders its substitution
-/// in its sorted field-name order.
+/// structural record: an anonymous record or a view of one) renders its
+/// substitution in its sorted field-name order.
 ///
 /// The LLVM back end also derives a record's byte layout by walking this list,
 /// so a record is constructed, accessed, and rendered through one field order.
 pub fn render_record_fields(program: &Program, n: &NominalType) -> Option<Vec<(String, Type)>> {
     if n.substitution.is_empty() {
+        // A structural record without fields -- the view of an anonymous
+        // argument whose callee only renders the parameter whole -- has the
+        // empty layout, not an unavailable one.
+        if n.id == brass_hir::STRUCTURAL_RECORD_ID {
+            return Some(Vec::new());
+        }
         let info = program.type_by_id(n.id)?;
         let TypeKind::Record { fields, .. } = &info.kind else {
             return None;

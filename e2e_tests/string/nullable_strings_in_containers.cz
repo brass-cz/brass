@@ -1,0 +1,29 @@
+// @backends: all
+// Strings inside containers render the same on every back end, present
+// nullable strings exactly like plain ones: array and tuple elements unquoted
+// (`[a, null]`, as for a `string[]`), record and variant fields quoted
+// (`s: "q"`), with `null` for an absent value in either position.
+
+type R = {
+    s: string?
+    xs: string?[]
+}
+
+type S =
+    | V { s: string? }
+
+fun main() {
+    let xs: string?[] = ["a", null]
+    println(xs)
+    println("{xs}")
+    println(xs.debug())
+    println(["a", "b"])
+    println([1, "x"])
+    println(R { s: "q", xs: ["z", null] })
+    println(R { s: null, xs: [] })
+    println(S.V { s: "w" })
+    let nested: string?[][] = [["m", null]]
+    println(nested)
+    let os: string? = "plain"
+    println([os])
+}

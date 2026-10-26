@@ -6,6 +6,7 @@
 
 pub mod ast;
 pub mod lexer;
+mod line_index;
 pub mod newline;
 mod parser;
 
@@ -13,6 +14,7 @@ pub use lexer::{
     DocComment, LexError, Span, StrPart, Token, TokenKind, is_keyword, keyword_or_ident, lex,
     lex_with_docs, line_col,
 };
+pub use line_index::LineIndex;
 pub use parser::{ParseError, parse, parse_recovering, parse_with_base};
 
 #[cfg(test)]

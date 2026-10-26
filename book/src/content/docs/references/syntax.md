@@ -83,10 +83,24 @@ return break continue null true false self Self import
 ```
 
 Everything else is an ordinary identifier. In particular `ref`, `mut`,
-`infer`, `typeof`, `anonymous` are recognized contextually in type position;
-`print`, `println`, and `assert` are prelude functions. The compiler-owned
+`infer`, `typeof`, `anonymous` are recognized contextually in type position.
+Prelude functions such as `print`, `println`, and `assert` are ordinary names:
+a module's own declaration of one shadows it in that module only (see
+[Modules](/references/modules/#the-standard-library)). The compiler-owned
 function names `len`, `spawn`, `with`, `sync`, `error`, `fields`, and `typeof`
-cannot be redefined. There is no `loop`, `defer`, `pub`, `impl`, or `trait`.
+cannot be redefined by a function declaration.
+
+Calls written `error(..)`, `typeof(..)`, `fields(..)`, `spawn(..)`, or `with(..)`
+always mean the language constructs. Bindings with these names are allowed
+(`let`, `const`, patterns, parameters, and module globals) and can be read as
+values. For example, `Err { error } => error("message")` raises a new error,
+while `error.value` reads the payload. If a binding of one of these names is
+function-typed, calling it by that name is a compile error; rename the binding
+to call it. Bindings shadow the builtin functions `len` and `sync`, and
+ordinary prelude functions such as `print`, `println`, and `assert`, in their
+scope. Value names resolve to a local binding, then a module global, then a
+function or builtin.
+There is no `loop`, `defer`, `pub`, `impl`, or `trait`.
 
 ### Integer literals
 
@@ -100,11 +114,11 @@ let d = 0o755       // octal (0o / 0O)
 ```
 
 There are no type suffixes: the type of a literal is decided by inference
-(see [Type system](/references/types/#literals)). A literal too large for `int64` is a
-lexing error. A leading zero alone does not select octal: `0755` is decimal
-755. A numeric literal cannot be followed immediately by a letter, digit, or
-`_` that it cannot consume: `0b12`, `0o78`, and `0xFFg` are errors, not
-separate tokens. `_` separators remain allowed.
+(see [Type system](/references/types/#literals)). A literal too large for
+`uint64` is a lexing error. A leading zero alone does not select octal: `0755`
+is decimal 755. A numeric literal cannot be followed immediately by a letter,
+digit, or `_` that it cannot consume: `0b12`, `0o78`, and `0xFFg` are errors,
+not separate tokens. `_` separators remain allowed.
 
 ### Float literals
 
@@ -217,11 +231,18 @@ Notes:
 - **Anonymous record literal** `{ field: value, ... }`: a structural record
   with no declared type. An opening `{` otherwise starts a block; the literal
   form is recognized by the lookahead `{ name:`, `{ name,`, or `{ name }`. A
-  closure's `-> {` always opens a block body, so a closure returning a record
-  parenthesizes it: `(x) -> ({ x })`.
+  closure's `-> {` and a match arm's `=> {` always open a block body, so a
+  closure or arm yielding a record literal parenthesizes it:
+  `(x) -> ({ x })`, `1 => ({ x: 5, y: 6 })`.
 - **`if` / `else`** is an expression and yields a value; `else if` chains.
   The condition does not take a record literal directly (parenthesize if
-  needed).
+  needed). In statement position -- an expression statement, which includes
+  the last statement of a function or closure body (those return only what
+  they `return`) -- an `if`, `if let` or `match` yields no value: its arms'
+  trailing values are discarded, so `if c { f() }` needs no `else` and the
+  arms need not agree in type. Only a branching expression whose value is
+  used (bound, passed, returned, the trailing value of a block in
+  expression position) joins its arms.
 - **Type test** `if subject: Type { ... }` or `if !(subject: Type) { ... }`:
   tests the subject's static type at compile time (see
   [Type tests](/references/types/#type-tests)). The subject must be a
@@ -250,6 +271,10 @@ Notes:
   ```
 
   Arms are separated by commas or newlines. There are no match guards.
+  A new line that parses as `pattern =>` always starts the next arm, even
+  when it begins with a token that could continue the previous arm's
+  expression: `-1 => ..` is a negative literal pattern, not a subtraction,
+  and `[x, y] => ..` an array pattern, not an index.
 
 - **Closures** `(params) -> expr` or `(params) -> { block }`. Parameter
   annotations are optional; zero parameters are written `()`. A block body
@@ -263,6 +288,22 @@ Notes:
 Expressions, types, patterns, and prefix chains share one 64-level nesting
 budget, so mixing those forms does not reset the limit. Exceeding it reports a
 diagnostic instead of overflowing the parser stack.
+
+### Evaluation order
+
+Operands, call arguments (after the callee or method receiver), array and
+tuple elements, record and variant literal fields, and interpolation segments
+are evaluated left to right. Each operand's value is the value it had when it
+was evaluated: a later sibling that assigns the same variable does not change
+it, so with a global `x == 1`, `x + f()` is `2` when `f` sets `x = 10` and
+returns `1`. Records and arrays are references, so a later sibling that
+mutates the _object_ an earlier operand refers to is still visible through it.
+
+An assignment `place = value` first evaluates the place's parts (the
+receiver, then the index) left to right, then the value, then stores. A
+compound assignment `a[i()] += v()` evaluates `i()`, reads `a[i]`, evaluates
+`v()`, and stores the sum. A `for` loop evaluates its iterable once, before
+the first iteration; a range `[lo..hi]` evaluates `lo` and then `hi` once.
 
 ## Statements
 
@@ -280,9 +321,11 @@ let p: Point              // uninitialized: `let` + annotation only
 ```
 
 `const` requires an initializer. An unannotated `let` requires an
-initializer. An annotated `let` may omit it; the binding must then be
-definitely assigned before use (see
-[definite assignment](/references/types/#definite-assignment)).
+initializer. An annotated `let` inside a function or block may omit it; the
+binding must then be definitely assigned before use (see
+[definite assignment](/references/types/#definite-assignment)). A module-level
+`let` always needs one: it defines a global, which exists from its
+initializer's place in the module's initialization order.
 A `const` binding cannot be mutated at any depth of an evaluated expression:
 mutating calls nested in an assignment right-hand side or interpolation
 segment are rejected just like a direct mutation.
@@ -298,6 +341,12 @@ continue
 
 The `for` head accepts an irrefutable pattern, including record and tuple
 destructuring. `break` and `continue` are bare; there are no labels.
+
+A plain loop variable over an array stands for the current element: a body
+that reassigns it (`x = ..`, `x *= 2`) writes the new value back into that
+element when the iteration ends, on every exit from the body: the end of the
+body, `continue`, `break`, `return`, and a failed `!` that returns from the
+enclosing function. A range loop's variable is a copy of the counter.
 
 ### `return`
 
@@ -316,16 +365,28 @@ heads:
 | Pattern          | Example                                           | Notes                                                                          |
 | ---------------- | ------------------------------------------------- | ------------------------------------------------------------------------------ |
 | Wildcard         | `_`                                               | matches anything, binds nothing                                                |
-| Binding          | `x`                                               | binds the whole value; also matches a unit variant of that name                |
+| Binding          | `x`                                               | binds the whole value; matches a unit variant in scope of that name instead    |
 | Literal          | `0`, `-5`, `1.5`, `"s"`, `true`, `null`           | negative numeric literals allowed                                              |
 | Variant / record | `Circle { radius }`, `Shape.Circle { radius: r }` | field shorthand binds the field name; `field: subpattern` destructures further |
 | Rest             | `Full { data, .. }`                               | `..` ignores the remaining fields                                              |
 | Array            | `[a, b]`                                          | fixed length; no `..` rest inside arrays                                       |
 
+A bare name (`fast`) is a unit-variant test only where a sum declaring that
+unit variant is in scope: a sum declared in the same module, imported by name,
+exported by a module imported whole, or declared in the prelude. Anywhere else
+the name is an ordinary binding, even if some other module's sum declares a
+variant of that name. Matching a value of a sum that is not in scope with a
+bare name equal to one of its unit variants (in a `match` arm or `if let`) is
+rejected, since the arm would silently bind instead of testing the variant;
+import the sum or write the qualified `Sum.variant`.
+
 A variant pattern's type qualifier is optional: `Circle { radius }` and
-`Shape.Circle { radius }` both select a variant. When written, the qualifier
-must name the matched value's sum type and that type must declare the variant.
-Module paths and renamed imports are allowed (`vec.Shape.Circle { radius }`).
+`Shape.Circle { radius }` both select a variant. A braced head that names both
+a record type in scope and some sum's variant (`type P = { .. }` next to
+`| P { .. }`) destructures a value of that record as the record and any other
+value as the variant. When written, the qualifier must name the matched
+value's sum type and that type must declare the variant. Module paths and
+renamed imports are allowed (`vec.Shape.Circle { radius }`).
 A qualified bare name such as `Shape.Dot` is always a unit-variant test, never
 a binding; a misspelled type or variant is an error. A unit pattern requires a
 variant without fields. For an inferred scrutinee, the qualifier selects its
@@ -334,7 +395,12 @@ parent's qualifier; a value still typed as the child uses the child's qualifier.
 A module-qualified record pattern such as `pt.P { x, y }` instead names the
 record type `P` exported by module alias `pt`. Its nominal type must match the
 scrutinee's; if the scrutinee is still inferred, the pattern selects that record
-type. This form also works in `let` and nested field sub-patterns.
+type. This form also works in `let` and nested field sub-patterns. A qualifier
+may also name the sum through a `type A = S` alias (`A.Circle { radius }`).
+
+On a nullable scrutinee (`S?`, `P?`), a record, variant, or unit-variant
+pattern tests the present value, and `null` matches none of them: it takes a
+`null`, `_`, or binding arm, or the `else` of an `if let`.
 
 Every name may be bound only once within a pattern, including nested fields
 and array elements. Separate arms and separate declarations have separate
@@ -388,9 +454,9 @@ type Alias = Base { field: T, ... }     // refinement alias (see below)
 ```
 
 A member is either a **field** (`name` or `name: Type`, the annotation is
-optional), a **type slot** (`type name`, a type parameter with no storage,
-see [Type slots](/references/types/#type-slots-and-refinements); the older
-spelling `name: type` is also accepted), or a **method
+optional), a **type slot** (`type name`, or equivalently `name: type`, a type
+parameter with no storage, see
+[Type slots](/references/types/#type-slots-and-refinements)), or a **method
 signature** (`name(params) -> Ret` with no body). A method body inside a `type`
 block is a parse error: implementations go outside the type, as `fun T.m(...)`,
 in the same module. Members are separated by commas or newlines. A method
@@ -405,9 +471,9 @@ which may start a new line. A leading `|` is optional for a sum with two or
 more variants but **required** for a one-variant sum (`type X = | Only { .. }`),
 so that `type Alias = Base { .. }` reads as a refinement rather than a
 one-variant sum. Variant names must be plain undotted identifiers, excluding
-`Self` and all keywords, in either spelling. A right-hand side that is a plain type expression (a
-refinement, or any type) declares an **alias**: the name resolves to that type
-and is not a new nominal.
+`Self` and all keywords, in either spelling. A right-hand side that is a plain
+type expression (a refinement, or any type) declares an **alias**: the name
+resolves to that type and is not a new nominal.
 
 ### Imports
 
@@ -423,17 +489,20 @@ import geometry.vec as g                   // module with custom qualifier: g.do
 `import path.Name` imports the one trailing name; a bare `import path` imports
 the module, whose exports are then used qualified by the path's last segment
 (`vec.Vec2`, `vec.dot(a, b)`). `import path as name` overrides the qualifier.
-See
-[Modules](/references/modules/) for how the brace-less forms are
+See [Modules](/references/modules/) for how the brace-less forms are
 distinguished, path resolution, and visibility.
 
 ### Top level
 
 A module is a sequence of imports, `type` declarations, `fun` declarations,
-and bare statements, in any order. Functions and types may be referenced
-before their textual definition; a top-level _binding_ may not (using a global
-before its initializer runs is a compile error). Top-level statements execute
-in order when the module loads; `main`, if defined, runs afterwards.
+and bare statements, in any order. A top-level `let` or `const` binds module
+globals; a destructuring pattern there (`let P { x, y } = p`,
+`let [a, b] = pair`) binds each name as its own global, exactly as the local
+form binds locals. Every name a `const` pattern binds is const. Functions and
+types may be referenced before their textual definition; a top-level
+_binding_ may not (using a global before its initializer runs is a compile
+error). Top-level statements execute in order when the module loads; `main`,
+if defined, runs afterwards.
 
 Top-level statements may use the `!` operator: a failed propagation stops
 the program with the error instead of returning a Result (see
@@ -443,21 +512,27 @@ the program with the error instead of returning a Result (see
 
 Base forms:
 
-| Form                         | Meaning                                                                                                      |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `int32`, `Point`, ...        | named type (primitives are ordinary names)                                                                   |
-| `infer`                      | an inferred hole; each occurrence is independent                                                             |
-| `[T, U, ...]`                | tuple                                                                                                        |
-| `(T, U) -> R`                | function/closure type                                                                                        |
-| `Self`                       | the enclosing type, in methods                                                                               |
-| `mut(T)`                     | mutable deep-copy parameter only                                                              |
-| `ref(T)`                     | immutable-reference parameter only                                                                                          |
-| `ref(mut(T))`                | mutable-reference parameter only (writes through)                                                                           |
-| `typeof(expr)`               | the static type of `expr` (see [Reflection](/references/reflection/))                                        |
-| `anonymous { name: T, ... }` | inline structural record type                                                                                |
-| `type`                       | a type slot, only as a whole field's type (a type parameter)                                                 |
-| `Self.field`                 | the type of the enclosing type's field/slot named `field`                                                    |
-| `Base { field: T, ... }`     | a refinement pinning `Base`'s slots/fields (see [Type slots](/references/types/#type-slots-and-refinements)) |
+| Form                         | Meaning                                                                                                                 |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `int32`, `Point`, ...        | named type (primitives are ordinary names)                                                                              |
+| `infer`                      | an inferred hole; each occurrence is independent                                                                        |
+| `[T, U, ...]`                | tuple                                                                                                                   |
+| `(T, U) -> R`                | function/closure type                                                                                                   |
+| `Self`                       | the enclosing type, in methods and its own field types (`next: Self?`; see below)                                       |
+| `mut(T)`                     | mutable deep-copy parameter only                                                                                        |
+| `ref(T)`                     | immutable-reference parameter only                                                                                      |
+| `ref(mut(T))`                | mutable-reference parameter only (writes through)                                                                       |
+| `typeof(expr)`               | the static type of `expr` (see [Reflection](/references/reflection/))                                                   |
+| `anonymous { name: T, ... }` | inline structural record type                                                                                           |
+| `type`                       | a type slot, only as a whole field's type (a type parameter)                                                            |
+| `Self.field`                 | the type of the enclosing type's field/slot named `field`                                                               |
+| `Base { field: T, ... }`     | a refinement pinning the record `Base`'s slots/fields (see [Type slots](/references/types/#type-slots-and-refinements)) |
+
+`Self` means exactly what writing the enclosing type's name means: in a method's
+signature and body, and in a field or variant field of the type itself
+(`next: Self?` and `left: Self` declare recursive types). Inside a function
+type in a type body (`show: (Self) -> string`, a protocol member) it stays
+abstract and names whichever type is checked against the declaration.
 
 `ref(T)`, `ref(mut(T))`, and `mut(T)` are whole parameter annotations only,
 including closure/method parameters and parameters of function types.
@@ -474,8 +549,12 @@ Suffixes on value types, applicable repeatedly and in any order:
 | `T!`   | Result with success payload `T`                       |
 
 So `int32?[]` is an array of nullable int32, `int32[]?` a nullable array, and
-`infer?[]` and `(int32) -> int32?` combine as expected. A parameter may use
-`ref(mut(int32[]))`; `ref(int32)[]` is invalid.
+`infer?[]` combines as expected. A suffix after a function type belongs to its
+return type: `(int32) -> int32?` returns a nullable. An array or nullable of
+functions is written through an alias (`type F = (int32) -> int32`, then
+`F[]`); diagnostics and `typeof` render it parenthesized,
+`((int32) -> int32)[]`. A parameter may use `ref(mut(int32[]))`;
+`ref(int32)[]` is invalid.
 
 The primitive named types are `int8`, `int16`, `int32`, `int64`, `uint8`,
 `uint16`, `uint32`, `uint64`, `float32`, `float64`, `bool`, `string`, and

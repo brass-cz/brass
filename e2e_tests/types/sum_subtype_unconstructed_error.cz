@@ -1,0 +1,23 @@
+// @backends: all
+// Result subtypes unwrap when no construction constrains the Err payload,
+// including repeated calls and direct literals with a nested open record.
+type Box = { item }
+type MyResult: Result =
+    | Ok { value, message }
+    | Err { error }
+fun mk() { return MyResult.Ok { value: 2, message: "n" } }
+fun via_call() {
+    let w = mk()!
+    return w
+}
+fun direct() { return MyResult.Ok { value: 3, message: "d" }! }
+fun nested() {
+    let box = MyResult.Ok { value: Box { item: 4 }, message: "b" }!
+    return box.item
+}
+fun main() {
+    println(via_call())
+    println(via_call())
+    println(direct())
+    println(nested())
+}

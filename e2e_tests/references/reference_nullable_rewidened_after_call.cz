@@ -1,0 +1,19 @@
+// A narrowed `ref(T?)` or `ref(mut(T?))` parameter is re-widened after any
+// call: the caller owns its storage, so the callee could have reassigned it.
+fun noop() {}
+
+fun f(x: ref(int32?)) -> int32 {
+    if !x { return 0 }
+    noop()
+    return x + 1
+}
+
+fun g(x: ref(mut(int32?))) -> int32 {
+    if !x { return 0 }
+    noop()
+    return x + 1
+}
+
+let v: int32? = 2
+println(f(v))
+println(g(v))

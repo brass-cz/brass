@@ -1,0 +1,12 @@
+// @backends: all
+// `typeof` renders a function type under an array or nullable suffix in
+// parentheses, because a suffix right after a function type reads as part of
+// its return type: an array of closures is `((int64) -> int64)[]`, a closure
+// returning an array is `(int64) -> int64[]`.
+fun main() {
+    let fs = [(x: int64) -> x + 1, (x: int64) -> x * 2]
+    println(typeof(fs))
+    println(fs[1](4))
+    let g = (x: int64) -> [x, x]
+    println(typeof(g))
+}

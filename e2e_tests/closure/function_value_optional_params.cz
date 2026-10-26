@@ -1,0 +1,31 @@
+// @backends: all
+// A function named as a value has the arity its use needs when its trailing
+// parameters are optional, exactly as a direct call may omit them: `map`
+// applies `greet` to one argument and the omitted `title` is `null`; a use
+// expecting both parameters passes both.
+fun greet(name: string, title: string?) -> string {
+    if let t = title {
+        return "{t} {name}"
+    }
+    return name
+}
+
+fun twice(x: int32) -> int32 {
+    return x * 2
+}
+
+fun call_one(f: (string) -> string) -> string {
+    return f("one")
+}
+
+fun call_two(f: (string, string?) -> string) -> string {
+    return f("two", "Dr")
+}
+
+fun main() {
+    println(greet("a"))
+    println([1, 2].map(twice))
+    println(["x", "y"].map(greet))
+    println(call_one(greet))
+    println(call_two(greet))
+}

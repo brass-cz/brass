@@ -1,0 +1,16 @@
+// @backends: all
+// `Mode` is not in scope here (only `pick` is imported), so a bare `fast`
+// in a pattern is a binding, not a variant test. Matching a `Mode` value with
+// such a binding would silently turn the arm into a catch-all, so it is
+// rejected in `match` arms and `if let`.
+import speed.{ pick }
+
+fun main() {
+    let r = match pick() {
+        fast => 1,
+    }
+    if let slow = pick() {
+        println(slow)
+    }
+    println(r)
+}

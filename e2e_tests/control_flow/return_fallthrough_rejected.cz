@@ -1,0 +1,23 @@
+// @backends: all
+// Inferred functions, generic instances, and methods reject value returns with reachable void exits, including breakable final loops.
+fun partial(c: bool) {
+    if c { return 1 }
+}
+partial(false)
+
+fun breakable(c: bool) {
+    if c { return true }
+    while true { break }
+}
+breakable(false)
+
+fun generic(c: bool, value) {
+    if c { return value }
+}
+generic(false, "s")
+
+type Box = { value }
+fun Box.partial(self, c: bool) {
+    if c { return self.value }
+}
+Box { value: 1.5 }.partial(false)

@@ -1,0 +1,25 @@
+// @backends: all
+let offset = 3
+
+fun main() {
+    let f = (x) -> {
+        let y = x + 1
+        y += x
+        return y * 2
+    }
+    println(f(3))
+    println(f(4))
+    println(f(1.5))
+    println(f(2.5))
+    let g = (x) -> x - 1
+    println(g(3))
+    println(g(4))
+    let captured = (x) -> x + offset
+    println(captured(1))
+    offset = 4
+    println(captured(1))
+    let replace = (x) -> x
+    println(replace(1))
+    replace = (x) -> { return 1 }
+    println(replace(2147483648))
+}

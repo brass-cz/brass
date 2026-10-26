@@ -1,8 +1,8 @@
 // Several spawned TCP clients against one listener: every connect, write,
 // and read crosses the plugin boundary concurrently, so the native side must
-// hold up under threads -- the regression net-as-a-plugin is most exposed
-// to. Each client reads the echo back before closing, so every round trip
-// completes before the count is printed. Clients print only on failure.
+// serve calls from several threads at once. Each client reads the echo back
+// before closing, so every round trip completes before the count is printed.
+// Clients print only on failure.
 import std.net.{ Tcp, TcpListener }
 
 fun run_client(port: int64) {

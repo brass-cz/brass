@@ -1,0 +1,3 @@
+10:12: error: cannot store this record literal in a slot of type `Named`: a literal is built as `Named` only when its fields are exactly `Named`'s (unexpected field(s) `z`)
+14:20: error: cannot store this record literal in a slot of type `Named`: a literal is built as `Named` only when its fields are exactly `Named`'s (missing field(s) `name`)
+16:20: error: cannot store a `anonymous { id: int32, name: string }` in a slot of type `Named`: an anonymous record does not convert implicitly

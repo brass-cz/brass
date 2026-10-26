@@ -1,0 +1,2 @@
+cannot infer the return type of `a`: every value it returns comes from its own recursion; annotate the return type of `a` (mutual recursion)
+cannot infer the return type of `spin`: every value it returns comes from its own recursion; annotate the return type of `spin`

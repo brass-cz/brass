@@ -1,0 +1,16 @@
+// @backends: all
+// An `error(..)` a `T!` body evaluates without returning it is still one of
+// its error sources: the function's error payload is that call's
+// (`Error<int32>` here), not the `string` an error-free `T!` defaults to. The
+// checker and every back end agree on it.
+fun annotated(n: int32) -> int32! {
+    let unused = error(n)
+    return n
+}
+
+fun main() {
+    match annotated(3) {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.value + 1}"),
+    }
+}

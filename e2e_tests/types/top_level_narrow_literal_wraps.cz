@@ -1,0 +1,11 @@
+// @backends: all
+// Top-level code follows the operator rule of function bodies: with
+// `s: uint8`, `s + 10` is uint8 arithmetic because the literal 10 fits uint8,
+// so 250 + 10 wraps to 4 at the operation's own width (integer overflow
+// always wraps) and storing it into a uint8 needs no conversion. The literal
+// itself never wraps: `let t: uint8 = 260` would be a compile error.
+let s: uint8 = 250
+let t: uint8 = s + 10
+println(t)
+let u = s + 10
+println(typeof(u))

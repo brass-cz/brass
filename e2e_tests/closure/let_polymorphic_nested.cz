@@ -1,0 +1,21 @@
+// @backends: all
+// Let-polymorphic closures that use one another: a generalized binding whose
+// body applies another generalized binding is itself generalized, and a use
+// of it -- directly, inside another closure, or passed to `map` -- carries
+// the inner binding's captured environment along.
+fun main() {
+    let id = (x) -> x
+    let g = (y) -> id(y)
+    println(g(1))
+    println(g("s"))
+    let n = 10
+    let addn = (x) -> x + n
+    let twice = (x) -> addn(addn(x))
+    println(twice(1))
+    let k = () -> {
+        println(twice(5))
+        println(g(true))
+    }
+    k()
+    println([1, 2].map(g))
+}

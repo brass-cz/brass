@@ -20,6 +20,10 @@ println(grade(72))   // pass
 println(grade(31))   // fail
 ```
 
+The arms join into one value only where that value is used, as in the `let`
+above. An `if` written as a statement has no value: its arms' trailing values
+are discarded, so they need not agree in type and the `else` may be omitted.
+
 `else if` chains work as you would expect:
 
 ```brass
@@ -134,11 +138,12 @@ builds the half-open integer range `lo, lo+1, ..., hi-1`, so counting loops
 look like this:
 
 ```brass
+let end: int64 = 11
 let sum = 0
-for i in [1..11] {
+for i in [1..end] {
     sum += i
 }
-println(sum)   // 55
+println(sum)   // 55; sum is int64
 ```
 
 ## `break` and `continue`

@@ -1,0 +1,36 @@
+// @backends: all
+// A field use that forces a type (an annotated parameter, an annotated `let`)
+// only CHECKS the anonymous argument's field: the callee is compiled with the
+// field's own type, so its arithmetic matches the nominal record's. `p.n / 2`
+// stays an integer division, `%` works, and the return is the field's type.
+type N = { n: int32 }
+
+fun show(x: float64) {
+    println("as float: {x}")
+}
+
+fun half(p) {
+    show(p.n)
+    return p.n / 2
+}
+
+fun odd(p) {
+    show(p.n)
+    return p.n % 2 == 1
+}
+
+fun widened(p) {
+    let wide: int64 = p.n
+    println(typeof(p.n))
+    return wide + p.n
+}
+
+fun main() {
+    println(half({ n: 5 }))
+    println(half(N { n: 5 }))
+    let r: int32 = half({ n: 7 })
+    println(r + 1)
+    println(odd({ n: 5 }))
+    println(widened({ n: 20 }))
+    println(widened(N { n: 20 }))
+}

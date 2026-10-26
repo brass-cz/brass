@@ -3,7 +3,7 @@
 // present everywhere, so this stays portable.
 import std.process.{ Command, Stdio }
 
-const child = Command.new("echo")
+let child = Command.new("echo")
     .args(["hello", "from", "process"])
     .stdout(Stdio.Pipe)
     .spawn()!

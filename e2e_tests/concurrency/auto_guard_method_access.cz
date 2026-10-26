@@ -1,0 +1,12 @@
+// Guarded method-body accesses are attributed to the method scope.
+type Counter = { count: int32 }
+fun Counter.run(self: ref(mut(Self))) {
+    spawn(() -> { self.count += 1 })
+    println(self.count >= 0)
+}
+fun main() {
+    let counter = Counter { count: 0 }
+    counter.run()
+    sync()
+    with(counter, (c) -> println(c.count))
+}

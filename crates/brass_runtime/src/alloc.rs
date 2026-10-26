@@ -95,7 +95,7 @@ pub unsafe extern "C-unwind" fn pp_freeze(h: *mut Header) {
 
 /// Allocate a typed monomorphized heap object of `size` bytes (header + the
 /// back end's own typed field layout) and return its header pointer. The object
-/// has `KIND_TYPED`: the typed back end lays out and accesses the fields itself. Used by the unboxed codegen path.
+/// has `KIND_TYPED`: the typed back end lays out and accesses the fields itself.
 pub extern "C-unwind" fn pp_typed_alloc(size: i64) -> *mut Header {
     unsafe { init_header(pp_obj_alloc(size), KIND_TYPED, 0) }
 }
@@ -104,7 +104,7 @@ pub extern "C-unwind" fn pp_typed_alloc(size: i64) -> *mut Header {
 //
 // Layout: { header(16) | len: i64 @16 | cap: i64 @24 | data: *u8 @32 }, with a
 // separately-allocated element buffer of `cap * elem_size` bytes. Elements are
-// concrete typed values, not boxed `Value`.
+// stored unboxed, `elem_size` bytes each.
 
 /// `count * elem_size` as a byte length, accepting only positive element widths
 /// and a product representable by the allocator ABI. `pp_panic_str` exits the
@@ -248,7 +248,8 @@ pub unsafe extern "C-unwind" fn pp_arr_push(arr: *mut Header, elem: *const u8, e
     }
 }
 
-/// Insert `elem_size` bytes from `elem` at index `idx` (`_array_insert`), shifting the elements at and after `idx` one slot toward the end and
+/// Insert `elem_size` bytes from `elem` at index `idx` (`_array_insert`),
+/// shifting the elements at and after `idx` one slot toward the end and
 /// growing the buffer if full. `idx` is clamped to `[0, len]` (an `idx == len`
 /// insert is an append).
 ///
@@ -418,12 +419,12 @@ pub unsafe extern "C-unwind" fn pp_str_const(ptr: *const u8, len: i64) -> *mut H
 /// The string object for a compiled string LITERAL, interned by the literal's
 /// data pointer. A literal used in a non-owning position (a comparison, a call
 /// argument, an interpolation operand) has no release site in the generated
-/// code, so materializing a fresh object per evaluation grew without bound in
-/// loops; interning materializes each literal ONCE. The object is frozen (its
-/// count is atomic -- a literal may be evaluated from spawned tasks) and the
-/// count carries a permanent bias, so owning consumers may adopt and later
-/// release references under the fresh-constant convention without the count
-/// ever reaching zero.
+/// code, so materializing a fresh object per evaluation would grow without
+/// bound in loops; interning materializes each literal ONCE. The object is
+/// frozen (its count is atomic -- a literal may be evaluated from spawned
+/// tasks) and the count carries a permanent bias, so owning consumers may
+/// adopt and later release references under the fresh-constant convention
+/// without the count ever reaching zero.
 ///
 /// # Safety
 /// `ptr` must point to at least `len` readable bytes that stay valid and
@@ -443,8 +444,19 @@ pub unsafe extern "C-unwind" fn pp_str_intern(ptr: *const u8, len: i64) -> *mut 
         // interning (a fresh allocation) is still a correct string.
         Err(_) => return unsafe { pp_str_const(ptr, len) },
     };
+    // An address names one literal only while its compiled code is loaded:
+    // a process that compiles several programs (a test harness running one
+    // JIT session per case) may place another literal's data there later, so
+    // an entry is reused only while its bytes still match.
     if let Some(&h) = table.get(&key) {
-        return h as *mut Header;
+        let h = h as *mut Header;
+        let same = unsafe {
+            std::slice::from_raw_parts(str_bytes_ptr(h), len as usize)
+                == std::slice::from_raw_parts(ptr, len as usize)
+        };
+        if same {
+            return h;
+        }
     }
     let h = unsafe { pp_str_const(ptr, len) };
     unsafe {
@@ -495,7 +507,8 @@ pub unsafe extern "C-unwind" fn pp_str_eq(a: *mut Header, b: *mut Header) -> boo
     }
 }
 
-/// Lexicographic (byte-order) comparison of two strings (`_string_cmp`): -1 if `a < b`, 0 if equal, 1 if `a > b`.
+/// Lexicographic (byte-order) comparison of two strings (`_string_cmp`): -1 if
+/// `a < b`, 0 if equal, 1 if `a > b`.
 ///
 /// # Safety
 /// `a` and `b` must be string objects.
@@ -589,6 +602,19 @@ pub unsafe extern "C-unwind" fn pp_str_indent(s: *mut Header) -> *mut Header {
     unsafe {
         let indented = typed_str(s).replace('\n', "\n    ");
         pp_str_const(indented.as_ptr(), indented.len() as i64)
+    }
+}
+
+/// The quoted debug form of `s` (`brass_utils::debug_quote`) as a new string.
+/// The typed `to_string` of records and sums renders a string field with it,
+/// so the field reads like the string's own `debug` form.
+///
+/// # Safety
+/// `s` must be a string object.
+pub unsafe extern "C-unwind" fn pp_str_debug(s: *mut Header) -> *mut Header {
+    unsafe {
+        let quoted = brass_utils::debug_quote(typed_str(s));
+        pp_str_const(quoted.as_ptr(), quoted.len() as i64)
     }
 }
 
@@ -841,8 +867,8 @@ mod tests {
     }
 
     /// `pp_str_slice` clamps an out-of-range range to an empty slice instead of
-    /// aborting. A `start` past the end used to make the end-clamp `min > max`
-    /// and panic across the C-ABI boundary (a process abort mid-JIT-run).
+    /// aborting: a `start` past the end must not reach a `clamp(min > max)`,
+    /// which would panic across the C-ABI boundary (a process abort mid-JIT-run).
     #[test]
     fn str_slice_out_of_range_yields_empty_not_abort() {
         let _serial = serial();

@@ -1,0 +1,32 @@
+// @backends: all
+// Number literals inside a float-typed array or tuple literal are built as
+// that float type: integer literals alone (`[1, 2]`) or mixed with a float
+// literal (`[1.5, 2]`), nested, in a tuple slot and in a record field, and
+// float literals in a `float32[]`.
+
+fun sum(xs: float64[]) -> float64 {
+    let t = 0.0
+    for x in xs {
+        t += x
+    }
+    return t
+}
+fun first(t: [float64, string]) -> float64 {
+    return t[0]
+}
+fun grid() -> float64[][] {
+    return [[1, 2], [3]]
+}
+type Pt = { coords: float64[] }
+fun main() {
+    println(sum([1, 2, 3]))
+    let a: float64[] = [2, 3]
+    println(a)
+    println(sum([1.5, 2]))
+    println(first([3, "b"]))
+    println(grid())
+    let p = Pt { coords: [4, 5] }
+    println(p.coords[1])
+    let f: float32[] = [1.5, 2.5]
+    println(f)
+}

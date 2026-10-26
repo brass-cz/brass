@@ -1,0 +1,18 @@
+// @backends: all
+// Integer literals cover the whole uint64 range: a value above INT64_MAX
+// defaults to uint64 (int32, then int64, then uint64 by value), in decimal and
+// hex, and arithmetic with a small literal stays at uint64 and wraps there.
+// A negated literal is typed by its value, so -2147483648 is an int32.
+fun main() {
+    let m: uint64 = 18446744073709551615
+    println(m)
+    println(m - 1)
+    println(m + 1)
+    let d = 18446744073709551615
+    println(typeof(d))
+    println(d / 2)
+    println(0xFFFF_FFFF_FFFF_FFFF == m)
+    println(typeof(9223372036854775808))
+    println(typeof(-2147483648))
+    println(typeof(2147483648))
+}

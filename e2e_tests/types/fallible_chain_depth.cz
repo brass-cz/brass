@@ -1,0 +1,65 @@
+// @backends: all
+// A chain of unannotated functions that each propagate the next one's error
+// is fallible all the way up, however long the chain and whatever the
+// functions are called: the return inference settles independently of names
+// (a1..e1 call "forward" in sorted order, z5..z1 "backward") and of depth.
+fun a1(n) {
+    return b1(n)! + 1
+}
+
+fun b1(n) {
+    return c1(n)! + 1
+}
+
+fun c1(n) {
+    return d1(n)! + 1
+}
+
+fun d1(n) {
+    return e1(n)! + 1
+}
+
+fun e1(n) {
+    if n < 0 {
+        error("negative")!
+    }
+    return n
+}
+
+fun z5(n) {
+    return z4(n)! + 1
+}
+
+fun z4(n) {
+    return z3(n)! + 1
+}
+
+fun z3(n) {
+    return z2(n)! + 1
+}
+
+fun z2(n) {
+    return z1(n)! + 1
+}
+
+fun z1(n) {
+    if n < 0 {
+        error("negative")!
+    }
+    return n
+}
+
+fun show(r) {
+    match r {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.value}"),
+    }
+}
+
+fun main() {
+    show(a1(5))
+    show(a1(-5))
+    show(z5(5))
+    show(z5(-5))
+    println(typeof(a1(1)) == typeof(z5(1)))
+}

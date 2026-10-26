@@ -1,0 +1,46 @@
+// @backends: all
+// Type tests on recursive record types with methods. Deciding whether a
+// `Tree` passes `v: Node` compares the two records member by member, and
+// their `next` fields and `link` methods lead back to the same comparison.
+// The comparison assumes a pair that is already being compared, so it
+// terminates: `Tree` matches `Node` member for member and takes the `Node`
+// arm, while `Label` (whose `value` is a `string`) does not.
+type Node = {
+    value: int32,
+    next: Node?
+}
+
+fun Node.link(self, other: Node) -> Node {
+    return other
+}
+
+type Tree = {
+    value: int32,
+    next: Tree?
+}
+
+fun Tree.link(self, other: Tree) -> Tree {
+    return other
+}
+
+type Label = {
+    value: string,
+    next: Label?
+}
+
+fun Label.link(self, other: Label) -> Label {
+    return other
+}
+
+fun probe(v) {
+    if v: Node {
+        return "node {v.value}"
+    }
+    return "other"
+}
+
+fun main() {
+    println(probe(Node { value: 1, next: null }))
+    println(probe(Tree { value: 2, next: Tree { value: 3, next: null } }))
+    println(probe(Label { value: "x", next: null }))
+}

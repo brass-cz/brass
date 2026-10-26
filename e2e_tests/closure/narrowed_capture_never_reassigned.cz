@@ -1,0 +1,22 @@
+// @backends: all
+// A closure created while a local is narrowed sees it non-null when nothing
+// reassigns the local afterwards -- an assignment before the narrowing does
+// not count -- including closures passed straight to a method.
+fun pick(b: bool) -> string? {
+    if b { return "hello" }
+    return null
+}
+fun main() {
+    let x = pick(false)
+    x = pick(true)
+    if !x { return }
+    let f = () -> x.len()
+    println(f())
+    let xs = [1, 2, 3]
+    println(xs.map((v) -> "{x}{v}"))
+    let y = pick(true)
+    if y {
+        let g = (s: string) -> y.len() + s.len()
+        println(g("four"))
+    }
+}

@@ -1,0 +1,30 @@
+// @backends: all
+// The returns of one instantiation that are a declared sum subtype and its
+// parent join at the parent: the subtype value is rebuilt as the parent
+// where it is returned (its extra fields dropped), so every return hands back
+// the parent's layout.
+type Shape =
+    | Circle { r: int32 }
+    | Square { s: int32 }
+type Tagged: Shape =
+    | Circle { r: int32, tag: string }
+    | Square { s: int32 }
+fun either(c, a, b) {
+    if c {
+        return a
+    }
+    return b
+}
+fun show(s: Shape) {
+    match s {
+        Shape.Circle { r } => println("circle {r}"),
+        Shape.Square { s } => println("square {s}"),
+    }
+}
+fun main() {
+    const t = Tagged.Circle { r: 1, tag: "t" }
+    const p = Shape.Square { s: 2 }
+    println(typeof(either(true, t, p)))
+    show(either(true, t, p))
+    show(either(false, t, p))
+}

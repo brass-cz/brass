@@ -9,15 +9,20 @@
 //! deep copy (`mut`), and a mutated `self` is a mutable reference (`ref(mut)`).
 //!
 //! The analysis is a pure function of the HIR program (bodies are still parser
-//! AST) and is shared by const-checking, the back ends' copy machinery, and the
-//! language server's type display so all three agree on which arguments are
-//! borrowed and which are copied.
+//! AST) and is shared by const-checking, MIR lowering's callee-entry copies,
+//! and the language server's type display so all three agree on which
+//! arguments are borrowed and which are copied.
 
 use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use brass_parser::ast::{Arg, Block, Expr, Pattern, Stmt, StrSeg, TypeExpr};
 
 use crate::{ParamInfo, Program, Type, TypeInfo, TypeKind};
+
+mod function_values;
+
+pub use function_values::ParamDecl;
+use function_values::forwards_to_function_value;
 
 /// A call a function's body makes through one of its own function-valued
 /// parameters (`fun apply(f, v) { f(v) }`), recorded so a call site can check
@@ -36,7 +41,8 @@ pub struct ParamCall {
 /// callee could mutate it *through the reference* and so change the caller's
 /// value. Only a `ref(mut(T))` parameter writes through; an unannotated mutated
 /// parameter is a private deep copy (`mut`), so mutating it is const-safe and it
-/// is not recorded here.
+/// is not recorded here. The default value carries no facts at all.
+#[derive(Default)]
 pub struct MutationInfo {
     /// Free-function storage symbol -> indices of parameters that write through
     /// to the caller: a `ref(mut(T))` parameter, or one that forwards a place
@@ -82,6 +88,24 @@ impl MutationInfo {
                             .split_once('.')
                             .is_some_and(|(owner, _)| owner == symbol))
             })
+    }
+
+    /// The write-through call-site argument indices of method `method` on the
+    /// type with storage symbol `symbol` (the receiver excluded, so index 0 is
+    /// the first non-`self` argument). A sum includes every variant's method,
+    /// because the active tag is unknown.
+    pub fn method_write_through_args(&self, symbol: &str, method: &str) -> HashSet<usize> {
+        self.method_args
+            .iter()
+            .filter(|((qualifier, name), _)| {
+                name == method
+                    && (qualifier == symbol
+                        || qualifier
+                            .split_once('.')
+                            .is_some_and(|(owner, _)| owner == symbol))
+            })
+            .flat_map(|(_, indices)| indices.iter().copied())
+            .collect()
     }
 
     /// The union of write-through call-site argument indices of every method
@@ -507,22 +531,24 @@ pub fn annotated_type_passes_by_copy(program: &Program, module: &[String], t: &T
     }
 }
 
-/// Whether a non-`self` parameter receives a private deep copy at callee
-/// entry: an annotated parameter follows its annotation (see
-/// [`annotated_type_passes_by_copy`]); an unannotated one copies exactly when
-/// the body mutates the value it names (see [`mutates_value`]). A copied
-/// parameter's mutations are confined to the callee, so a `const` argument to
-/// it is fine and forwarding it never creates a write-through position.
-pub fn param_receives_copy(
+/// Whether a non-`self` parameter `p` of a callable with `params` receives a
+/// private deep copy at callee entry: an annotated parameter follows its
+/// annotation (see [`annotated_type_passes_by_copy`]); an unannotated one
+/// copies exactly when the body mutates the value it names (see
+/// [`mutates_value`]). A copied parameter's mutations are confined to the
+/// callee, so a `const` argument to it is fine and forwarding it never creates
+/// a write-through position.
+pub fn param_receives_copy<P: ParamDecl>(
     program: &Program,
     module: &[String],
-    p: &ParamInfo,
+    params: &[P],
+    p: &P,
     body: &Block,
     info: &MutationInfo,
 ) -> bool {
-    match &p.ty {
+    match p.annotation() {
         Some(t) => annotated_type_passes_by_copy(program, module, t),
-        None => mutates_value(program, module, body, &p.name, info),
+        None => mutates_value(program, module, params, body, p.name(), info),
     }
 }
 
@@ -533,28 +559,33 @@ fn param_is_reference(p: &ParamInfo) -> bool {
     matches!(&p.ty, Some(TypeExpr::Ref(..)))
 }
 
-/// The pass-mode mutation predicate for an unannotated parameter: whether
-/// `body` mutates the value `root` names, either DIRECTLY through the
-/// reference ([`mutates_root`]) or by handing a place rooted at it to a
-/// position that mutates through the reference it receives -- the receiver of
-/// a self-mutating method, an explicit `ref(mut(T))` parameter, or a
-/// reference parameter that forwards onward (per `info`'s fixpoint tables).
-/// Either way the body works on the caller's value, so the parameter must
-/// become a private deep copy; write-through stays opt-in via `ref(mut(T))`.
+/// The pass-mode mutation predicate for an unannotated parameter `root` of a
+/// callable with `params`: whether `body` mutates the value `root` names,
+/// either DIRECTLY through the reference ([`mutates_root`]) or by handing a
+/// place rooted at it to a position that mutates through the reference it
+/// receives -- the receiver of a self-mutating method, an explicit
+/// `ref(mut(T))` parameter, a reference parameter that forwards onward (per
+/// `info`'s fixpoint tables), or a function value that may take it by
+/// `ref(mut(T))` (see the `function_values` module). Either way the body works
+/// on the caller's value, so the parameter must become a private deep copy;
+/// write-through stays opt-in via `ref(mut(T))`.
 ///
 /// Method receivers are matched by name across all types (bodies are
 /// unchecked AST, so the receiver's type is unknown here) -- conservative,
 /// like the const checker: a parameter may copy because a same-named method
 /// of an unrelated type mutates. A spurious copy costs a copy; the mutation
 /// still stays local either way.
-pub fn mutates_value(
+pub fn mutates_value<P: ParamDecl>(
     program: &Program,
     module: &[String],
+    params: &[P],
     body: &Block,
     root: &str,
     info: &MutationInfo,
 ) -> bool {
-    mutates_root(body, root) || forwards_to_mutating(program, module, body, root, info)
+    mutates_root(body, root)
+        || forwards_to_mutating(program, module, body, root, info)
+        || forwards_to_function_value(params, body, root)
 }
 
 /// Whether a parameter is an immutable reference (`ref(T)`, not `ref(mut(T))`).
@@ -614,6 +645,10 @@ trait PlaceSink {
     fn call(&mut self, _callee: &Expr, _args: &[Arg], _roots: &Roots) -> bool {
         false
     }
+
+    /// A `let` binding `pattern` (to `value`, when initialized), after its
+    /// initializer was scanned, so a sink can follow what local names denote.
+    fn bind(&mut self, _pattern: &Pattern, _value: Option<&Expr>) {}
 }
 
 /// The tracked name a place expression is rooted at (`a.b[c]` -> `a` when `a`
@@ -684,6 +719,7 @@ fn scan_stmt(stmt: &Stmt, roots: &mut Roots, sink: &mut impl PlaceSink) -> bool 
                 // other unrelated binding.
                 bind_pattern(pat, false, roots);
             }
+            sink.bind(pat, value.as_ref());
             false
         }
         Stmt::Assign { target, value, .. } => {

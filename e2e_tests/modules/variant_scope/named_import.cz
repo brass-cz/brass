@@ -1,0 +1,21 @@
+// @backends: all
+// Importing a sum by name brings its variants into scope: bare `fast` and
+// `slow` are variant tests here, in `match` and `if let` alike.
+import speed.{ Mode, pick, pick_slow }
+
+fun label(m: Mode) -> string {
+    return match m {
+        fast => "fast",
+        slow => "slow",
+    }
+}
+
+fun main() {
+    println(label(pick()))
+    println(label(pick_slow()))
+    if let slow = pick() {
+        println("unexpected")
+    } else {
+        println("not slow")
+    }
+}

@@ -1,9 +1,7 @@
-// Pins two free-variable analysis rules for closures:
-// - a name used only inside a range expression (`[0..n]`) is still captured
-//   (the sub-expression walk must descend into ranges);
-// - a read *before* a same-named later `let` refers to the outer binding and
-//   is captured (binding collection must be ordered, not body-flat).
-// Both used to fail with "outside the typed subset" (missing capture).
+// Two capture rules for closures: a name used only inside a range expression
+// (`[0..n]`) is still captured, and a read before a same-named later `let`
+// in the closure body refers to the outer binding and captures it (the inner
+// `let` shadows only from its declaration on).
 fun main() {
     let n = 5
     let f = () -> {

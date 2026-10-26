@@ -1,0 +1,4 @@
+15:15: error: cannot use `string` where `int32` is required
+21:22: error: cannot use `string` where `int32` is required
+24:17: error: cannot use `string` where `int32` is required
+28:15: error: cannot use `string` where `int32` is required

@@ -5,8 +5,7 @@ import charset.{ hex_value, is_unreserved }
 const _HEX_UPPER = "0123456789ABCDEF".chars()
 
 fun _hex_byte(b: uint8) -> string {
-    let v: int32 = b
-    return "%{_HEX_UPPER[v >> 4]}{_HEX_UPPER[v & 15]}"
+    return "%{_HEX_UPPER[b >> 4]}{_HEX_UPPER[b & 15]}"
 }
 
 /** The byte the hex digits `hi` and `lo` spell. */

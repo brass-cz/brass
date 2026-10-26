@@ -293,6 +293,88 @@ fn same_function_name_in_two_modules_coexists_and_dispatches() {
 }
 
 #[test]
+fn same_type_name_in_two_modules_keeps_its_own_layout() {
+    // Both modules declare `P` and `S` with the same field set but a different
+    // declaration order, so the two types render alike yet lay out
+    // differently. Every per-type helper the JIT generates (deep copy for the
+    // mutating `bump`, equality, rendering, release at scope exit) must be the
+    // one built for that module's declaration.
+    let lib = |order: [&str; 2], variants: [&str; 2], suffix: &str, a: i64, b: &str| {
+        format!(
+            "type P = {{\n    {}\n    {}\n}}\n\ntype S = | {} | {}\n\n\
+             fun make{suffix}() {{\n    return P {{ a: {a}, b: \"{b}\" }}\n}}\n\n\
+             fun sum{suffix}() {{\n    return S.B {{ s: \"{b}\" }}\n}}\n",
+            order[0], order[1], variants[0], variants[1]
+        )
+    };
+    let m1 = lib(
+        ["a: int64", "b: string"],
+        ["A { n: int64 }", "B { s: string }"],
+        "1",
+        7,
+        "one",
+    );
+    let m2 = lib(
+        ["b: string", "a: int64"],
+        ["B { s: string }", "A { n: int64 }"],
+        "2",
+        9,
+        "two",
+    );
+    let main = setup(
+        "same_type_name_layouts",
+        &[
+            ("m1.cz", m1.as_str()),
+            ("m2.cz", m2.as_str()),
+            (
+                "main.cz",
+                "import m1.{ make1, sum1 }\nimport m2.{ make2, sum2 }\n\n\
+                 fun bump(p) {\n    p.a += 1\n    return p.a\n}\n\n\
+                 fun main() {\n    let x = make1()\n    let y = make2()\n    \
+                 println(\"{bump(x)} {bump(y)}\")\n    println(x == make1())\n    \
+                 println(y == make2())\n    println(\"{x.a} {x.b} {y.a} {y.b}\")\n    \
+                 println(\"{sum1()}|{sum2()}\")\n}\n",
+            ),
+        ],
+    );
+    let (ok, out) = run(&main);
+    assert!(ok, "expected success, got: {out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[..4], ["8 10", "true", "true", "7 one 9 two"], "{out}");
+    assert!(
+        out.contains("s: \"one\",\n}|S.B {\n    s: \"two\""),
+        "{out}"
+    );
+}
+
+#[test]
+fn imported_module_init_outside_the_typed_subset_fails_the_run() {
+    // `m`'s top-level code prints a `void` value, which has no rendering (the
+    // checker rejects it). The program must fail as a whole -- never run with
+    // `m`'s init skipped, which would leave `X` and `NAMES` unset for main's
+    // reads.
+    let main = setup(
+        "imported_init_untypeable",
+        &[
+            (
+                "m.cz",
+                "fun f() {\n    let z = 1\n}\nlet X = 5\nlet NAMES = [\"a\", \"b\"]\n\
+                 println(\"m init running\")\nprintln(f())\n",
+            ),
+            (
+                "main.cz",
+                "import m\nfun main() {\n    println(m.X)\n    println(m.NAMES)\n}\n",
+            ),
+        ],
+    );
+    let (ok, out) = run(&main);
+    assert!(!ok, "expected failure, got: {out}");
+    assert!(out.contains("error"), "{out}");
+    assert!(!out.contains("panicked"), "{out}");
+    assert!(!out.lines().any(|l| l == "0" || l == "[]"), "{out}");
+}
+
+#[test]
 fn same_global_name_in_two_modules_gets_its_own_slot() {
     // Both modules define a top-level `let tag`; global storage is keyed per
     // defining module, so `m`'s function must read `m`'s value while main reads
@@ -335,9 +417,8 @@ fn same_global_name_in_two_modules_gets_its_own_slot() {
 
 #[test]
 fn typed_int_functions_compile_and_run_correctly() {
-    // Leaf integer-arithmetic functions compile to typed unboxed
-    // bodies behind uniform-ABI adapters; results must match the uniform path,
-    // including truncation and sign extension across the boundary.
+    // Leaf integer-arithmetic functions compile to typed unboxed bodies;
+    // results must keep truncation and sign extension right across calls.
     let main = setup(
         "typed_int_codegen",
         &[(
@@ -357,8 +438,8 @@ fn typed_int_functions_compile_and_run_correctly() {
 
 #[test]
 fn typed_integer_control_flow_runs_correctly() {
-    // Typed codegen now handles integer functions with control flow
-    // (if/else, locals, multiple returns), not just single-return leaf bodies.
+    // Typed codegen handles integer functions with control flow (if/else,
+    // locals, multiple returns), not just single-return leaf bodies.
     let main = setup(
         "typed_int_control_flow",
         &[(
@@ -510,8 +591,8 @@ fn same_type_name_in_two_modules_constructs_and_dispatches() {
 
 #[test]
 fn importing_same_name_from_two_modules_is_ambiguous() {
-    // The same function name defined in two modules now coexists; the
-    // error is the ambiguous import into the module that pulls in both.
+    // The same function name defined in two modules coexists; the error is
+    // the ambiguous import into the module that pulls in both.
     let main = setup(
         "cross_module_collision",
         &[
@@ -549,11 +630,11 @@ fn stdlib_string_function_rejects_wrong_argument_type() {
 
 #[test]
 fn phantom_core_import_is_rejected() {
-    // An import from a module that was never loaded (`core.phantom`) used to
+    // An import from a module that was never loaded (`core.phantom`) must not
     // fall back to accepting any name defined anywhere in the program, which
-    // made every module's definitions reachable without importing the module.
-    // Only genuine core exports resolve for unloaded paths; anything else is an
-    // unknown module.
+    // would make every module's definitions reachable without importing the
+    // module. Only genuine core exports resolve for unloaded paths; anything
+    // else is an unknown module.
     let main = setup(
         "phantom_core_import",
         &[
@@ -1218,7 +1299,7 @@ fn empty_include_entries_are_skipped() {
     assert!(ok, "expected success, got: {out}");
 }
 
-/// `import c.{ X }` + `import a.b` + both `X` and `b.X` used — green, each
+/// `import c.{ X }` + `import a.b` + both `X` and `b.X` used -- green, each
 /// resolving to its own definition (bare `X` is c's, `b.X` is a.b's).
 #[test]
 fn qualified_use_disambiguates_from_braced_import() {
@@ -1425,8 +1506,6 @@ fn distributed_binary_binds_its_sibling_std_dir() {
 
 /// A module's top-level bindings are exported like its functions and types, in
 /// every form an import takes: by name, renamed, and through a module qualifier.
-/// Only functions and types used to be collected as exports, so importing a
-/// `const` was rejected as a name the module did not have.
 #[test]
 fn top_level_bindings_are_importable() {
     let main = setup(
@@ -1554,10 +1633,10 @@ fn keyed_specialization_distinguishes_same_named_receivers() {
 
 /// A static call on a type whose NAME another module also declares (here: an
 /// alias of that very type, `serv`'s `type HttpServer = Server` next to
-/// `serve`'s nominal). The duplicate name qualifies both symbols, and every
-/// bare-keyed lookup missed: the light pass typed `T.new(..)!` as unknown, the
-/// caller lost its inferred fallibility, and importing the ALIAS anywhere in the
-/// program broke a module that never referenced it.
+/// `serve`'s nominal). The duplicate name qualifies both symbols, so every
+/// lookup must use the qualified one: `T.new(..)!` must resolve and keep the
+/// caller's inferred fallibility, and importing the ALIAS anywhere in the
+/// program must not break a module that never references it.
 #[test]
 fn static_call_resolves_when_an_alias_shares_the_type_name() {
     let main = setup(

@@ -2,17 +2,19 @@
 //!
 //! The lazy profile types some calls from their signatures without
 //! re-elaborating the callee body (see `Checker::lazy_profile`). A keyed
-//! call, however, must be SEEN by the checker's first pass: discovering one
-//! later restarts the whole analysis, which is recoverable before execution
-//! but fatal mid-run. Skipping is therefore forbidden for any callable that
-//! can transitively reach a keyed call, and this module computes that set.
+//! call, however, must be SEEN while its caller is checked: the lazy driver
+//! specializes keyed calls before execution starts, and one first reported by
+//! a body checked after the run began cannot be specialized any more -- the
+//! run stops, since its side effects so far cannot be replayed. Skipping is
+//! therefore forbidden for any callable that can transitively reach a keyed
+//! call, and this module computes that set.
 //!
 //! The reachability is deliberately name-based and conservative: a method
 //! call is `Expr::Call` on an `Expr::Field` callee, which is syntactically
 //! identical to a qualified free-function call, so both feed the same
-//! name-level call graph. Over-tainting merely keeps the eager elaboration
-//! for a call that did not need it; under-tainting would surface as a
-//! mid-run restart, so precision loses to safety here.
+//! name-level call graph. Over-tainting merely keeps the call-site
+//! elaboration for a call that did not need it; under-tainting would stop a
+//! running program, so precision loses to safety here.
 
 use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -22,7 +24,10 @@ use brass_parser::ast::Expr;
 use crate::walk::{self, ExprVisitor};
 
 /// One callable's call-graph contribution: whether its body contains a
-/// keyed-named method call directly, and every callee NAME it mentions.
+/// keyed-named method call directly, and every callee NAME it mentions --
+/// a called method's or function's, and every other name it refers to: a
+/// function referenced as a value (`apply(helper, k)`) is called by whatever
+/// receives it.
 struct Calls<'k> {
     keyed: &'k HashSet<String>,
     direct: bool,
@@ -31,19 +36,19 @@ struct Calls<'k> {
 
 impl ExprVisitor for Calls<'_> {
     fn visit(&mut self, e: &Expr) {
-        if let Expr::Call(callee, _, _) = e {
-            match &**callee {
-                Expr::Field(_, name, _) => {
+        match e {
+            Expr::Call(callee, _, _) => {
+                if let Expr::Field(_, name, _) = &**callee {
                     if self.keyed.contains(name) {
                         self.direct = true;
                     }
                     self.names.insert(name.clone());
                 }
-                Expr::Ident(name, _) => {
-                    self.names.insert(name.clone());
-                }
-                _ => {}
             }
+            Expr::Ident(name, _) => {
+                self.names.insert(name.clone());
+            }
+            _ => {}
         }
     }
 }

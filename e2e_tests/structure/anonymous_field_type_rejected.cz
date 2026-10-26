@@ -1,5 +1,5 @@
-// Right field name, wrong field type: the field's type must be checked, otherwise
-// a string is read as an int32 in the unboxed back end.
+// Right field name, wrong field type: an anonymous argument's field is checked
+// against the parameter's field type, so `{ v: string }` is no `{ v: int32 }`.
 fun use_int(p: anonymous { v: int32 }) -> int32 {
     return p.v + 1
 }

@@ -1,7 +1,9 @@
 // Pins: a handle to the cown's interior taken BEFORE the spawn (`let h =
 // o.inner`) reaches the same object graph the task mutates. The alias-root map
 // must guard h's accesses under o's lock (the root cown), not h's own header,
-// or the spawner mutates off-lock.
+// or the spawner mutates off-lock; and h is promoted with the capture, so the
+// object's reference count -- updated by the spawner outside the lock and by
+// the task inside it -- is atomic.
 type Inner = {
     value: int64
 }

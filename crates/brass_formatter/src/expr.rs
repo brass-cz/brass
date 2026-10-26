@@ -41,6 +41,13 @@ fn prec(e: &Expr) -> u8 {
     }
 }
 
+/// Whether `e` is an anonymous record literal (`{ id: 1 }`), which must be
+/// parenthesized as a closure body or a match arm body: a closure's `-> {`
+/// and an arm's `=> {` always open a block.
+fn is_anonymous_record(e: &Expr) -> bool {
+    matches!(e, Expr::TypeLit(name, ..) if name.is_empty())
+}
+
 const PREC_UNARY: u8 = 10;
 const PREC_POSTFIX: u8 = 11;
 const PREC_PRIMARY: u8 = 12;
@@ -155,9 +162,17 @@ impl<'a> Printer<'a> {
             Expr::ErrorProp(b, _) => format!("{}!", self.flat_prec(b, PREC_POSTFIX, ns)?),
             Expr::Closure(params, body, _) => {
                 let params: Vec<String> = params.iter().map(|p| self.param_flat(p)).collect();
-                // The parser's `no_struct` head flag stays active inside a
-                // closure body written in a statement head, so `ns` carries on.
-                format!("({}) -> {}", params.join(", "), self.flat_expr(body, ns)?)
+                // A `{` right after `->` always opens a block body, so an
+                // anonymous record literal body keeps its parentheses.
+                // Otherwise the parser's `no_struct` head flag stays active
+                // inside a closure body written in a statement head, so `ns`
+                // carries on.
+                let body = if is_anonymous_record(body) {
+                    format!("({})", self.flat_expr(body, false)?)
+                } else {
+                    self.flat_expr(body, ns)?
+                };
+                format!("({}) -> {body}", params.join(", "))
             }
             Expr::Array(elems, _) => {
                 let mut parts = Vec::with_capacity(elems.len());
@@ -225,7 +240,7 @@ impl<'a> Printer<'a> {
 
     /// The literal's original spelling (radix prefixes, `_` separators,
     /// exponents survive), validated by re-lexing; falls back to the value.
-    fn int_text(&self, v: i64, span: Span) -> String {
+    fn int_text(&self, v: i128, span: Span) -> String {
         let slice = self.slice(span);
         if let Ok(tokens) = brass_parser::lex(slice)
             && let [tok, _eof] = &tokens[..]
@@ -270,6 +285,16 @@ impl<'a> Printer<'a> {
                         self.line(&format!("{head}{params} -> {{"));
                         self.block_body(b);
                         self.line(&format!("}}{tail}"));
+                    }
+                    body if is_anonymous_record(body) => {
+                        // See `flat_expr`: the parentheses keep the literal
+                        // from being read as a block body.
+                        self.expr_lines(
+                            format!("{head}{params} -> ("),
+                            body,
+                            &format!("){tail}"),
+                            false,
+                        );
                     }
                     body => {
                         // The parser skips newlines after a closure's `->`.
@@ -390,6 +415,17 @@ impl<'a> Printer<'a> {
 
     fn break_postfix(&mut self, head: String, e: &Expr, tail: &str, ns: bool) {
         let (base, links) = split_chain(e);
+        if self.flat_expr(base, false).is_none() {
+            // A base that only renders on several lines (an immediately
+            // applied closure with a block body, a parenthesized `if` or
+            // `match`) keeps its own layout inside parentheses, and the
+            // postfix links follow its closing line. Rendering it from the
+            // source text instead would repeat the source's own parentheses
+            // inside the ones added here, one more level per run.
+            let links = self.flat_links(&links);
+            self.expr_lines(format!("{head}("), base, &format!("){links}{tail}"), false);
+            return;
+        }
         let methods = links
             .windows(2)
             .filter(|w| matches!(w, [Link::Field(_), Link::Call(..)]))
@@ -686,6 +722,11 @@ impl<'a> Printer<'a> {
                     self.block_body(b);
                     self.line("},");
                 }
+            }
+            // `=> {` opens a block arm body, so an anonymous record literal
+            // keeps its parentheses (see `is_anonymous_record`).
+            body if is_anonymous_record(body) => {
+                self.expr_lines(format!("{pat} => ("), body, "),", false)
             }
             body => self.expr_lines(format!("{pat} => "), body, ",", false),
         }

@@ -1,0 +1,30 @@
+// @backends: all
+// `!` on an operand whose kind the source does not spell out (a builtin
+// container's `get`, an unannotated parameter) takes the operand's checked
+// kind instead of assuming a `Result`: here both are nullables, so the `!`
+// returns null on the null path and the values stay usable as `int32?`.
+fun maybe(b: bool) -> int32? {
+    if b {
+        return 7
+    }
+    return null
+}
+
+fun g(p) {
+    let a = p!
+    let b: int32? = p
+    println(b)
+    return a + 1
+}
+
+fun main() {
+    let m = HashMap.new()
+    m.set("a", 1)
+    let f = (k: string) -> m.get(k)!
+    let v: int32? = f("a")
+    let w: int32? = f("b")
+    println(v)
+    println(w)
+    println(g(maybe(true)))
+    println(g(maybe(false)))
+}

@@ -1,0 +1,30 @@
+// @backends: all
+// A call that only returns errors may still be propagated: `!` as a
+// statement and a returned call only forward its error, and a `match` may
+// name the Ok arm without reading the payload.
+fun fail(message) {
+    return error(message)
+}
+
+fun check(n) {
+    if n < 0 {
+        fail("negative")!
+    }
+    return n * 2
+}
+
+fun relay(m) {
+    return fail(m)
+}
+
+fun main() {
+    println(check(4)!)
+    match check(-1) {
+        Ok { value } => println(value),
+        Err { error } => println("err {error.value}"),
+    }
+    match relay("x") {
+        Ok { value } => println("never"),
+        Err { error } => println("relayed {error.value}"),
+    }
+}

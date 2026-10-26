@@ -1,0 +1,23 @@
+// @backends: all
+// Closed element requirements shape named and nested constructions in slice
+// operations and fixed arrays, while open arrays infer their element type.
+type Box = { item }
+type Box64 = Box { item: int64 }
+type Nest = { inner: Box64 }
+fun main() {
+    let xs: Box64[] = []
+    xs.push(Box { item: 3 })
+    xs.insert(0, Box { item: 4 })
+    xs.push(if true { Box { item: 5 } } else { Box { item: 6 } })
+    xs.insert(0, if false { Box { item: 7 } } else { Box { item: 8 } })
+    for x in xs { println("{x.item}: {typeof(x.item)}") }
+    let fixed: Box64[1] = [Box { item: 9 }]
+    println("{fixed[0].item}: {typeof(fixed[0].item)}")
+    let nested: Nest[] = []
+    nested.push(Nest { inner: Box { item: 10 } })
+    println(typeof(nested[0].inner.item))
+    let open = []
+    open.push(Box { item: 11 })
+    open.insert(0, Box { item: 12 })
+    println("{open.len()}: {typeof(open[0].item)}")
+}

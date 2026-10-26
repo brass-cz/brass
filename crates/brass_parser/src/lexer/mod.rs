@@ -58,6 +58,19 @@ mod tests {
         assert_eq!(kinds("1_000_000")[0], TokenKind::Int(1_000_000));
     }
 
+    /// The literal range covers `uint64` (values above `INT64_MAX` are
+    /// writable in every radix); one past `u64::MAX` is a lexical error.
+    #[test]
+    fn integer_literals_cover_the_unsigned_range() {
+        let max = i128::from(u64::MAX);
+        assert_eq!(kinds("18446744073709551615")[0], TokenKind::Int(max));
+        assert_eq!(kinds("0xFFFF_FFFF_FFFF_FFFF")[0], TokenKind::Int(max));
+        for src in ["18446744073709551616", "0x1_0000_0000_0000_0000"] {
+            let err = lex(src).unwrap_err();
+            assert_eq!(err.message, "integer literal out of range");
+        }
+    }
+
     #[test]
     #[allow(clippy::approx_constant)] // `3.14` is lexer test input, not an approximation of PI
     fn floats_with_exponent() {

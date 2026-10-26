@@ -1,0 +1,1 @@
+monomorphic_closure_result_at_join_rejected.cz:9:20: error: cannot implicitly convert `int64` to `int32`

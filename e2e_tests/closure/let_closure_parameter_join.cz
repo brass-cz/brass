@@ -1,0 +1,237 @@
+// @backends: all
+// Open monomorphic closure parameters take the numeric join of direct calls in
+// either order, across binding forms and both function and module scopes.
+fun make_list() {
+    return (x) -> {
+        println(typeof(x))
+        return [x]
+    }
+}
+fun make_identity() { return (x) -> x }
+
+fun local_joins() {
+    let big: int64 = 20
+    println("local literal: small first")
+    let literal_small = (n) -> {
+        println(typeof(n))
+        return n
+    }
+    println(literal_small(5))
+    println(literal_small(big))
+    literal_small = (n) -> n
+
+    println("local literal: large first")
+    let literal_large = (n) -> {
+        println(typeof(n))
+        return n
+    }
+    println(literal_large(big))
+    println(literal_large(5))
+    literal_large = (n) -> n
+
+    println("local reassigned: small first")
+    let reassigned_small = (n) -> n
+    reassigned_small = (n) -> {
+        println(typeof(n))
+        return n * 2
+    }
+    println(reassigned_small(5))
+    println(reassigned_small(big))
+
+    println("local reassigned: large first")
+    let reassigned_large = (n) -> n
+    reassigned_large = (n) -> {
+        println(typeof(n))
+        return n * 2
+    }
+    println(reassigned_large(big))
+    println(reassigned_large(5))
+
+    println("local recursive: small first")
+    let recursive_small = (n) -> n
+    recursive_small = (n) -> {
+        if n == 0 {
+            println(typeof(n))
+            return 1
+        }
+        return n * recursive_small(n - 1)
+    }
+    println(recursive_small(5))
+    println(recursive_small(big))
+
+    println("local recursive: large first")
+    let recursive_large = (n) -> n
+    recursive_large = (n) -> {
+        if n == 0 {
+            println(typeof(n))
+            return 1
+        }
+        return n * recursive_large(n - 1)
+    }
+    println(recursive_large(big))
+    println(recursive_large(5))
+
+    println("local factory: small first")
+    let factory_small = make_list()
+    println(factory_small(5))
+    println(factory_small(big))
+
+    println("local factory: large first")
+    let factory_large = make_list()
+    println(factory_large(big))
+    println(factory_large(5))
+
+    println("local indexed: small first")
+    let fs_indexed_small = [(x) -> {
+        println(typeof(x))
+        return x
+    }]
+    let indexed_small = fs_indexed_small[0]
+    println(indexed_small(5))
+    println(indexed_small(big))
+
+    println("local indexed: large first")
+    let fs_indexed_large = [(x) -> {
+        println(typeof(x))
+        return x
+    }]
+    let indexed_large = fs_indexed_large[0]
+    println(indexed_large(big))
+    println(indexed_large(5))
+
+    println("local conditional: small first")
+    let conditional_small = if true { make_identity() } else { make_identity() }
+    println(typeof(conditional_small(5)))
+    println(conditional_small(5))
+    println(typeof(conditional_small(big)))
+    println(conditional_small(big))
+    println("local conditional: large first")
+    let conditional_large = if true { make_identity() } else { make_identity() }
+    println(typeof(conditional_large(big)))
+    println(conditional_large(big))
+    println(typeof(conditional_large(5)))
+    println(conditional_large(5))
+    println("local block: small first")
+    let block_small = { make_identity() }
+    println(typeof(block_small(5)))
+    println(block_small(5))
+    println(typeof(block_small(big)))
+    println(block_small(big))
+    println("local block: large first")
+    let block_large = { make_identity() }
+    println(typeof(block_large(big)))
+    println(block_large(big))
+    println(typeof(block_large(5)))
+    println(block_large(5))
+    println("local field: small first")
+    let record = { f: make_identity() }
+    let field_small = record.f
+    println(typeof(field_small(5)))
+    println(field_small(5))
+    println(typeof(field_small(big)))
+    println(field_small(big))
+    println("local field: large first")
+    let record = { f: make_identity() }
+    let field_large = record.f
+    println(typeof(field_large(big)))
+    println(field_large(big))
+    println(typeof(field_large(5)))
+    println(field_large(5))
+    println("local destructured: both orders")
+    let [first, second] = [make_identity(), make_identity()]
+    println(typeof(first(5)))
+    println(first(big))
+    println(typeof(second(big)))
+    println(second(5))
+}
+
+local_joins()
+let big: int64 = 20
+println("global literal: small first")
+let literal_small = (n) -> {
+    println(typeof(n))
+    return n
+}
+println(literal_small(5))
+println(literal_small(big))
+literal_small = (n) -> n
+
+println("global literal: large first")
+let literal_large = (n) -> {
+    println(typeof(n))
+    return n
+}
+println(literal_large(big))
+println(literal_large(5))
+literal_large = (n) -> n
+
+println("global reassigned: small first")
+let reassigned_small = (n) -> n
+reassigned_small = (n) -> {
+    println(typeof(n))
+    return n * 2
+}
+println(reassigned_small(5))
+println(reassigned_small(big))
+
+println("global reassigned: large first")
+let reassigned_large = (n) -> n
+reassigned_large = (n) -> {
+    println(typeof(n))
+    return n * 2
+}
+println(reassigned_large(big))
+println(reassigned_large(5))
+
+println("global recursive: small first")
+let recursive_small = (n) -> n
+recursive_small = (n) -> {
+    if n == 0 {
+        println(typeof(n))
+        return 1
+    }
+    return n * recursive_small(n - 1)
+}
+println(recursive_small(5))
+println(recursive_small(big))
+
+println("global recursive: large first")
+let recursive_large = (n) -> n
+recursive_large = (n) -> {
+    if n == 0 {
+        println(typeof(n))
+        return 1
+    }
+    return n * recursive_large(n - 1)
+}
+println(recursive_large(big))
+println(recursive_large(5))
+
+println("global factory: small first")
+let factory_small = make_list()
+println(factory_small(5))
+println(factory_small(big))
+
+println("global factory: large first")
+let factory_large = make_list()
+println(factory_large(big))
+println(factory_large(5))
+
+println("global indexed: small first")
+let fs_indexed_small = [(x) -> {
+    println(typeof(x))
+    return x
+}]
+let indexed_small = fs_indexed_small[0]
+println(indexed_small(5))
+println(indexed_small(big))
+
+println("global indexed: large first")
+let fs_indexed_large = [(x) -> {
+    println(typeof(x))
+    return x
+}]
+let indexed_large = fs_indexed_large[0]
+println(indexed_large(big))
+println(indexed_large(5))
+

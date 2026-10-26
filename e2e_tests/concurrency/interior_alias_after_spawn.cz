@@ -1,0 +1,32 @@
+// Pins: a handle to the cown's interior taken AFTER the spawn (`let h =
+// o.inner`) is read out under o's lock, and the object it names leaves the
+// lock with an atomic reference count: the spawner keeps counting it outside
+// the lock (capturing it into each guarded call) while the task counts the
+// same object under the lock.
+type Inner = {
+    value: int64
+}
+type Outer = {
+    inner: Inner
+}
+
+fun Inner.add(self, n: int64) { self.value = self.value + n }
+
+fun main() {
+    let o = Outer { inner: Inner { value: 0 } }
+    spawn(() -> {
+        let i = 0
+        while i < 100000 {
+            o.inner.add(1)
+            i = i + 1
+        }
+    })
+    let h = o.inner
+    let j = 0
+    while j < 100000 {
+        h.add(1)
+        j = j + 1
+    }
+    sync()
+    println("value = {o.inner.value}")
+}

@@ -1,8 +1,18 @@
 //! Const checking: a value bound with `const` cannot be
 //! reassigned, nor can its fields/elements be mutated. Assignments whose root
-//! place is a const binding are rejected. Calls to methods inferred to mutate
-//! `self` are also rejected when their receiver is a const binding with a known
-//! record type.
+//! place is a const binding are rejected, and so is passing a const into a
+//! write-through (`ref(mut(T))`) parameter of a free function or closure this
+//! pass can see. Mutating a read-only `infer` parameter is rejected here too.
+//!
+//! Which places are const is decided here, lexically. Whether a METHOD call
+//! mutates a const place depends on the method the call dispatches to, which
+//! only inference knows (the receiver's type may come from an inferred return,
+//! an alias, a generic instantiation): this pass records every method call
+//! whose receiver or arguments are const-rooted (`ConstCalls`), and the
+//! inference checker rejects the ones whose resolved method writes through
+//! that receiver or argument. A call through a function value whose parameter
+//! modes this pass cannot see is recorded and judged the same way, on the
+//! callee's type.
 
 use fxhash::FxHashMap as HashMap;
 
@@ -10,55 +20,148 @@ use brass_hir::{
     MutationInfo, NominalInfo, ParamInfo, Program, Type, TypeInfo, TypeKind, mutates_root,
     param_is_immutable_ref, param_is_infer, root_ident,
 };
+use brass_parser::Span;
 use brass_parser::ast::*;
 
 use crate::TypeError;
 
-/// A binding tracked for const checking. `Const` carries the binding's type
-/// when it is statically derivable (from the annotation, the constructed
-/// value, or a called function's return type), which is used to detect
-/// mutating-method calls through field/element projections. `Fn` records a
-/// local bound to a named free function (`let f = mutate`), so calls through
-/// the alias resolve to the aliased function's write-through facts. `Mutable`
-/// records a non-const `let` so that it shadows an outer const of the same
-/// name, suppressing false positives on assignment to the inner binding.
+/// The calls touching a const value whose verdict depends on what the call
+/// resolves to, recorded by const checking for inference to judge: method
+/// calls against the resolved receiver type
+/// (`Checker::check_const_method_call`), calls through a function value
+/// against its resolved parameter types
+/// (`Checker::check_read_only_value_args`).
+#[derive(Default)]
+pub(crate) struct ConstCalls {
+    /// Call span -> the const binding its receiver is rooted in.
+    pub(crate) receivers: HashMap<Span, String>,
+    /// Call span -> each const-rooted argument: its call-site index (the
+    /// receiver excluded), its const root, and its span.
+    pub(crate) args: HashMap<Span, Vec<(usize, String, Span)>>,
+    /// The same for a call through a function value this pass cannot see
+    /// into (a function-valued parameter, any value not bound to a closure
+    /// literal or a named function): whether it takes an argument by
+    /// `ref(mut(T))` is decided by the callee's type in each elaboration.
+    pub(crate) value_args: HashMap<Span, Vec<(usize, String, Span)>>,
+    /// The program's write-through facts the verdicts are read from.
+    pub(crate) mutation: MutationInfo,
+}
+
+/// A binding tracked for const checking.
 #[derive(Clone)]
 enum Binding {
+    /// A const binding, with its type when it is statically derivable (from
+    /// the annotation, the constructed value, or a called function's declared
+    /// return type), which decides whether binding it to another name aliases
+    /// the same heap value.
     Const(Option<Type>),
+    /// A `let` bound to a const-rooted place of a derivable shared-heap type:
+    /// it shares the const's value, so mutating through it is rejected exactly
+    /// as through the const, but -- unlike the const itself -- a bare
+    /// reassignment only rebinds the local handle (a `let` is a mutable
+    /// binding; rebinding a name is not a mutation of its value).
+    Alias(Type),
+    /// A `let` bound to a const-rooted place whose type is not derivable
+    /// here: it shares the const's value whenever that value is a heap
+    /// aggregate, so mutating through it (a projection store, a mutating
+    /// method, a write-through argument -- all of which imply an aggregate) is
+    /// rejected, while a bare reassignment only rebinds the local.
+    ConstAlias,
+    /// A local bound to a named free function (`let f = mutate`): calls
+    /// through it resolve to the aliased function's write-through facts.
     Fn(String),
+    /// A binding initialized with a closure literal: calls through it resolve
+    /// the closure's own write-through (`ref(mut(T))`) parameter positions,
+    /// and `constant` keeps a `const` closure binding unassignable.
+    Closure {
+        write_through: Vec<usize>,
+        constant: bool,
+    },
+    /// A non-const `let`, recorded so that it shadows an outer const of the
+    /// same name: assigning to the inner binding is allowed.
     Mutable,
+}
+
+/// The bindings a destructuring `let`/`const` pattern introduces: every
+/// bound name is const under `const` (the binding is immutable at any depth),
+/// and a mutable shadow of any outer const of the same name under `let`.
+fn destructured_bindings(pat: &Pattern, is_const: bool) -> Vec<(String, Binding)> {
+    pat.bound_names()
+        .into_iter()
+        .map(|name| {
+            let binding = if is_const {
+                Binding::Const(None)
+            } else {
+                Binding::Mutable
+            };
+            (name.to_string(), binding)
+        })
+        .collect()
+}
+
+/// The parameter positions of a closure literal that write through to the
+/// caller's value: exactly the `ref(mut(T))` parameters. Every other closure
+/// parameter is a borrow the body cannot mutate, or a private copy (see the
+/// parameter-passing table), so a `const` argument there is safe.
+fn closure_write_through(params: &[Param]) -> Vec<usize> {
+    params
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| {
+            matches!(&p.ty, Some(TypeExpr::Ref(inner, _)) if matches!(**inner, TypeExpr::Mut(..)))
+        })
+        .map(|(i, _)| i)
+        .collect()
 }
 
 type ConstScopes = Vec<HashMap<String, Binding>>;
 
 struct ConstChecker<'a> {
     program: &'a Program,
-    /// Shared parameter-mutation facts: which free-function parameters and which
-    /// methods' `self` the bodies mutate. Const checking uses this to reject
-    /// passing a const value into a position the callee mutates through its
-    /// reference (a `ref(mut(..))` parameter, an unannotated mutated parameter,
-    /// or a mutating method on a const receiver).
+    /// The program's write-through facts (`brass_hir::MutationInfo`): which
+    /// free-function and method parameters, and which methods' `self`, a
+    /// callee mutates through the caller's reference. Only a `ref(mut(T))`
+    /// position (or one forwarded into such a position) writes through; an
+    /// unannotated parameter the body mutates is a private copy. This pass
+    /// rejects a const argument to such a free-function parameter itself and
+    /// hands the facts on (`ConstCalls::mutation`) for the method calls
+    /// inference judges.
     mutation: MutationInfo,
     /// The module whose body is currently being checked, so a bare callee name at
     /// a call site resolves to the same symbol the fixpoint keyed on.
     current_module: Vec<String>,
     errors: Vec<TypeError>,
+    /// Method calls touching a const, for inference to judge.
+    calls: ConstCalls,
 }
 
+/// The diagnostics this pass decides on its own: const reassignment, stores
+/// through const places, const arguments to write-through parameters of free
+/// functions and closures, and mutation of read-only parameters. Method calls
+/// on const values, and calls through function values this pass cannot see
+/// into, are judged by the full analysis (`crate::analyze`), which resolves
+/// what each call reaches.
 pub fn check(program: &Program) -> Vec<TypeError> {
-    check_in(program, crate::AnalysisModules::all())
+    check_in(program, crate::AnalysisModules::all()).0
 }
 
-pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -> Vec<TypeError> {
+/// [`check`] over the analyzed modules, also returning the calls touching a
+/// const value that inference judges (`ConstCalls`).
+pub(crate) fn check_in(
+    program: &Program,
+    modules: crate::AnalysisModules<'_>,
+) -> (Vec<TypeError>, ConstCalls) {
     let mut checker = ConstChecker {
         program,
         // Entry diagnostics still need mutation facts for seeded callees.
         mutation: MutationInfo::analyze(program),
         current_module: Vec::new(),
         errors: Vec::new(),
+        calls: ConstCalls::default(),
     };
     checker.check_program(modules);
-    checker.errors
+    checker.calls.mutation = checker.mutation;
+    (checker.errors, checker.calls)
 }
 
 /// Peel the wrappers that do not change which value a place denotes
@@ -71,14 +174,6 @@ fn peel(ty: &Type) -> &Type {
             peel(inner)
         }
         _ => ty,
-    }
-}
-
-/// The nominal storage symbol used by the mutation facts for this receiver.
-fn nominal_symbol<'a>(program: &'a Program, ty: &Type) -> Option<&'a str> {
-    match peel(ty) {
-        Type::Record(n) | Type::Sum(n) => Some(program.type_by_id(n.id)?.symbol.as_str()),
-        _ => None,
     }
 }
 
@@ -108,10 +203,10 @@ impl ConstChecker<'_> {
             if !modules.checks(&f.module) {
                 continue;
             }
-            // Parameters are mutable handles within their own body (mutating one is
-            // the very thing that makes the parameter mutable to callers), and they
-            // shadow any like-named global const. A `ref(T)` parameter is an
-            // immutable reference, so it binds as const instead.
+            // Parameters shadow any like-named global const. Each binds
+            // mutable within its body (a private copy, or a `ref(mut(T))`
+            // reference), except an immutable `ref(T)` reference, which
+            // binds as const (see `param_scope`).
             let params = param_scope(&f.signature.params, false);
             self.current_module = f.module.clone();
             self.check_param_mutability(&f.signature.params, &f.decl.body);
@@ -167,6 +262,17 @@ impl ConstChecker<'_> {
         for init in &self.program.inits {
             let bindings = modules.entry(init.path.clone()).or_default();
             for stmt in &init.stmts {
+                if let Stmt::Let {
+                    pat,
+                    is_const,
+                    value: Some(_),
+                    ..
+                } = stmt
+                    && !matches!(pat, Pattern::Binding(..))
+                {
+                    bindings.extend(destructured_bindings(pat, *is_const));
+                    continue;
+                }
                 let Stmt::Let {
                     pat: Pattern::Binding(name, None, _),
                     ty,
@@ -177,7 +283,15 @@ impl ConstChecker<'_> {
                 else {
                     continue;
                 };
-                if *is_const && let Some(value) = value {
+                if let Some(Expr::Closure(params, _, _)) = value {
+                    bindings.insert(
+                        name.clone(),
+                        Binding::Closure {
+                            write_through: closure_write_through(params),
+                            constant: *is_const,
+                        },
+                    );
+                } else if *is_const && let Some(value) = value {
                     bindings.insert(
                         name.clone(),
                         Binding::Const(self.binding_const_type(&init.path, ty, value)),
@@ -263,19 +377,29 @@ impl ConstChecker<'_> {
                     return;
                 };
                 self.check_expr(value, scopes);
+                if !matches!(pat, Pattern::Binding(..))
+                    && let Some(top) = scopes.last_mut()
+                {
+                    top.extend(destructured_bindings(pat, *is_const));
+                }
                 if let Pattern::Binding(name, None, _) = pat {
-                    let alias = self.const_alias_type(value, scopes);
+                    let alias = self.const_alias(value, scopes);
                     let fn_alias = self.fn_value_symbol(value, scopes);
                     let module = self.current_module.clone();
                     if let Some(top) = scopes.last_mut() {
-                        let binding = if *is_const {
+                        let binding = if let Expr::Closure(params, _, _) = value {
+                            Binding::Closure {
+                                write_through: closure_write_through(params),
+                                constant: *is_const,
+                            }
+                        } else if *is_const {
                             Binding::Const(self.binding_const_type(&module, ty, value))
-                        } else if let Some(ty) = alias {
+                        } else if let Some(alias) = alias {
                             // Aliasing a const heap value binds another handle to
-                            // the same shared value, so constness propagates. The
-                            // runtime shares heap objects by reference, hence the
-                            // alias is also immutable.
-                            Binding::Const(ty)
+                            // the same shared value (the runtime shares heap
+                            // objects by reference), so mutating through the
+                            // alias is rejected as through the const.
+                            alias
                         } else if let Some(symbol) = fn_alias {
                             Binding::Fn(symbol)
                         } else {
@@ -294,8 +418,18 @@ impl ConstChecker<'_> {
             } => {
                 self.check_expr(value, scopes);
                 self.check_expr(target, scopes);
+                // A store through a const place is rejected; so is rebinding a
+                // const name, except a `ConstAlias`, whose bare reassignment
+                // only rebinds the local handle.
+                let rejected = |binding: Option<&Binding>| match binding {
+                    Some(Binding::Const(_) | Binding::Closure { constant: true, .. }) => true,
+                    Some(Binding::ConstAlias | Binding::Alias(_)) => {
+                        !matches!(target, Expr::Ident(..))
+                    }
+                    _ => false,
+                };
                 if let Some(root) = root_ident(target)
-                    && matches!(self.const_binding(scopes, root), Some(Binding::Const(_)))
+                    && rejected(self.const_binding(scopes, root))
                 {
                     self.errors.push(TypeError {
                         message: format!("cannot assign to const value `{root}`"),
@@ -349,9 +483,8 @@ impl ConstChecker<'_> {
                 self.check_expr(right, scopes);
             }
             Expr::Call(callee, args, span) => {
-                self.check_mutating_const_call(callee, *span, scopes);
-                self.check_const_args_to_mutating_fn(callee, args, scopes);
-                self.check_const_args_to_mutating_method(callee, args, scopes);
+                self.record_const_method_call(callee, args, *span, scopes);
+                self.check_const_args_to_mutating_fn(callee, args, *span, scopes);
                 self.check_expr(callee, scopes);
                 for arg in args {
                     self.check_expr(&arg.expr, scopes);
@@ -363,9 +496,14 @@ impl ConstChecker<'_> {
                 self.check_expr(idx, scopes);
             }
             Expr::Closure(params, body, _) => {
+                // Closure parameters follow the function parameter-passing
+                // table: a `ref(T)` parameter is an immutable reference (bound
+                // const, so mutating through it is rejected) and an `infer`
+                // parameter is a read-only copy.
+                self.check_closure_param_mutability(params, body);
                 let frame = params
                     .iter()
-                    .map(|param| (param.name.clone(), Binding::Mutable))
+                    .map(|param| (param.name.clone(), self.closure_param_binding(param)))
                     .collect();
                 scopes.push(frame);
                 self.check_expr(body, scopes);
@@ -447,49 +585,55 @@ impl ConstChecker<'_> {
             .collect()
     }
 
-    fn check_mutating_const_call(
+    /// Record a method call whose receiver, or some argument, is rooted in a
+    /// const binding. Whether it mutates that const depends on the method the
+    /// call dispatches to, which inference decides from the resolved receiver
+    /// type (a parenthesized callee is a call through a function-typed value,
+    /// not a method call).
+    fn record_const_method_call(
         &mut self,
         callee: &Expr,
+        args: &[Arg],
         span: brass_parser::Span,
         scopes: &ConstScopes,
     ) {
         if callee.span().is_parenthesized() {
             return;
         }
-        let Expr::Field(receiver, method, _) = callee else {
+        let Expr::Field(receiver, _, _) = callee else {
             return;
         };
-        let place_ty = self.const_place_type(receiver, scopes);
-        let nominal = place_ty
-            .as_ref()
-            .and_then(|t| nominal_symbol(self.program, t));
-        // A built-in growable-array mutator (`push`/`insert`/`remove`/`pop`) on a
-        // const array -- or an array reachable from a const struct/sum/tuple root --
-        // modifies a value declared immutable, so it is rejected. The receiver is a
-        // const place that is not a user nominal type (records/sums whose own
-        // methods are checked via the mutation facts below have a type name).
-        if matches!(method.as_str(), "push" | "insert" | "remove" | "pop")
-            && nominal.is_none()
-            && let Some(root) = self.const_root(receiver, scopes)
-        {
-            self.errors.push(TypeError {
-                message: format!("cannot call mutating method `{method}` on const value `{root}`"),
-                span,
-            });
-            return;
+        if let Some(root) = self.const_root(receiver, scopes) {
+            self.calls.receivers.insert(span, root.to_string());
         }
-        // The receiver may be a nested projection of a const value
-        // (e.g. `o.inner.bump()` or `arr[0].bump()`); a mutating method on any
-        // place reachable from a const root is rejected (propagation).
-        let Some(type_name) = nominal else {
-            return;
-        };
-        if self.mutation.method_writes_through_self(type_name, method) {
-            let root = root_ident(receiver).unwrap_or("");
-            self.errors.push(TypeError {
-                message: format!("cannot call mutating method `{method}` on const value `{root}`"),
-                span,
-            });
+        let const_args: Vec<(usize, String, Span)> = args
+            .iter()
+            .enumerate()
+            .filter_map(|(i, arg)| {
+                let root = self.const_root(&arg.expr, scopes)?;
+                Some((i, root.to_string(), arg.expr.span()))
+            })
+            .collect();
+        if !const_args.is_empty() {
+            self.calls.args.insert(span, const_args);
+        }
+    }
+
+    /// Record a call through a function value whose parameter modes this pass
+    /// cannot see, with its const-rooted (read-only) arguments: inference
+    /// rejects the ones the callee's resolved type takes by `ref(mut(T))`
+    /// (see `Checker::check_read_only_value_args`).
+    fn record_const_value_call(&mut self, args: &[Arg], span: Span, scopes: &ConstScopes) {
+        let const_args: Vec<(usize, String, Span)> = args
+            .iter()
+            .enumerate()
+            .filter_map(|(i, arg)| {
+                let root = self.const_root(&arg.expr, scopes)?;
+                Some((i, root.to_string(), arg.expr.span()))
+            })
+            .collect();
+        if !const_args.is_empty() {
+            self.calls.value_args.insert(span, const_args);
         }
     }
 
@@ -500,14 +644,14 @@ impl ConstChecker<'_> {
     fn const_root<'a>(&self, place: &'a Expr, scopes: &ConstScopes) -> Option<&'a str> {
         let root = root_ident(place)?;
         match self.const_binding(scopes, root) {
-            Some(Binding::Const(_)) => Some(root),
+            Some(Binding::Const(_) | Binding::Alias(_) | Binding::ConstAlias) => Some(root),
             _ => None,
         }
     }
 
     /// Reject mutating a parameter whose type forbids it. An `a: infer` parameter
-    /// receives a read-only deep copy, so mutating it through its reference is
-    /// rejected here. The other read-only case -- an immutable `ref(T)` parameter
+    /// receives a read-only deep copy, so mutating or rebinding it is rejected
+    /// here. The other read-only case -- an immutable `ref(T)` parameter
     /// (or `self: ref(Self)`) -- binds as const in [`param_scope`], so it is
     /// reported by the const path and skipped here to avoid a duplicate error.
     /// Everything else (an unannotated parameter, a `mut(T)`/`ref(mut(T))`, a bare
@@ -538,24 +682,51 @@ impl ConstChecker<'_> {
     /// Reject passing an immutable (`const`-rooted) value into a parameter the
     /// callee requires to be mutable: it mutates that parameter through the shared
     /// reference, which would modify a value declared immutable at the call site.
-    /// Any const-rooted place qualifies (records, sums, arrays, tuples) -- a
-    /// primitive parameter is never marked mutable (it cannot be mutated through a
-    /// reference), so this does not reject a copied `const` primitive argument.
+    /// Any const-rooted place qualifies, a primitive included: only a
+    /// `ref(mut(T))` position (directly or by forwarding) writes through, and a
+    /// parameter that receives a copy never does.
     ///
-    /// Covers three shapes: a direct call to a write-through function (by name or
-    /// through a `let f = mutate` fn alias), and a higher-order call that passes a
-    /// write-through function alongside the const it will be applied to
-    /// (`apply(mutate, o)` with `fun apply(f, v) { f(v) }`).
+    /// Covers a direct call to a write-through function (by name or through a
+    /// `let f = mutate` fn alias) or to a closure literal or closure binding
+    /// with `ref(mut(T))` parameters, and a higher-order call that passes a
+    /// write-through function or closure alongside the const it will be applied
+    /// to (`apply(mutate, o)` with `fun apply(f, v) { f(v) }`). A call through
+    /// any other function value is recorded for inference instead
+    /// (`ConstCalls::value_args`).
     fn check_const_args_to_mutating_fn(
         &mut self,
         callee: &Expr,
         args: &[Arg],
+        span: Span,
         scopes: &ConstScopes,
     ) {
+        if let Some(write_through) = self.closure_value_write_through(callee, scopes) {
+            let shown = match callee {
+                Expr::Ident(name, _) => format!("`{name}`"),
+                _ => "this closure".to_string(),
+            };
+            for (i, arg) in args.iter().enumerate() {
+                if write_through.contains(&i)
+                    && let Some(root) = self.const_root(&arg.expr, scopes)
+                {
+                    self.errors.push(TypeError {
+                        message: format!(
+                            "cannot pass const value `{root}` to {shown}, which requires a mutable parameter"
+                        ),
+                        span: arg.expr.span(),
+                    });
+                }
+            }
+            return;
+        }
         let Expr::Ident(fname, _) = callee else {
+            if callee.span().is_parenthesized() || !matches!(callee, Expr::Field(..)) {
+                self.record_const_value_call(args, span, scopes);
+            }
             return;
         };
         let Some(symbol) = self.callee_fn_symbol(fname, scopes) else {
+            self.record_const_value_call(args, span, scopes);
             return;
         };
         if let Some(indices) = self.mutation.write_through_params(&symbol).cloned() {
@@ -575,34 +746,69 @@ impl ConstChecker<'_> {
         // Higher-order laundering: the callee calls one of its fn-valued
         // parameters with (some of) its other parameters. Resolve the function
         // value actually passed here and check its write-through positions
-        // against the arguments it will receive.
+        // against the arguments it will receive. A parameter the callee
+        // receives as a private copy (an unannotated one it hands to a function
+        // value, which may take it by `ref(mut)`) keeps the argument out of
+        // reach, so only a reference parameter can launder a const.
         let Some(calls) = self.mutation.param_calls(&symbol) else {
             return;
         };
+        let copied: Vec<bool> = self
+            .program
+            .functions
+            .get(&symbol)
+            .map(|f| {
+                f.signature
+                    .params
+                    .iter()
+                    .map(|p| {
+                        brass_hir::param_receives_copy(
+                            self.program,
+                            &f.module,
+                            &f.signature.params,
+                            p,
+                            &f.decl.body,
+                            &self.mutation,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut hof_errors = Vec::new();
         for pc in calls {
             let Some(fn_arg) = args.get(pc.fn_param) else {
                 continue;
             };
-            let Expr::Ident(gname, _) = &fn_arg.expr else {
-                continue;
+            let (gname, g_indices): (String, Vec<usize>) = match (
+                &fn_arg.expr,
+                self.closure_value_write_through(&fn_arg.expr, scopes),
+            ) {
+                (Expr::Ident(gname, _), Some(indices)) => (format!("`{gname}`"), indices),
+                (_, Some(indices)) => ("a closure".to_string(), indices),
+                (Expr::Ident(gname, _), None) => {
+                    let Some(gsym) = self.callee_fn_symbol(gname, scopes) else {
+                        continue;
+                    };
+                    let Some(indices) = self.mutation.write_through_params(&gsym) else {
+                        continue;
+                    };
+                    (format!("`{gname}`"), indices.iter().copied().collect())
+                }
+                _ => continue,
             };
-            let Some(gsym) = self.callee_fn_symbol(gname, scopes) else {
-                continue;
-            };
-            let Some(g_indices) = self.mutation.write_through_params(&gsym) else {
-                continue;
-            };
-            for k in g_indices {
+            for k in &g_indices {
                 let Some(j) = pc.args.get(*k).copied().flatten() else {
                     continue;
                 };
+                if copied.get(j).copied().unwrap_or(false) {
+                    continue;
+                }
                 if let Some(arg) = args.get(j)
                     && let Some(root) = self.const_root(&arg.expr, scopes)
                 {
                     hof_errors.push(TypeError {
                         message: format!(
-                            "cannot pass const value `{root}` to `{fname}`, which passes it to `{gname}` requiring a mutable parameter"
+                            "cannot pass const value `{root}` to `{fname}`, which passes it to {gname} requiring a mutable parameter"
                         ),
                         span: arg.expr.span(),
                     });
@@ -612,37 +818,68 @@ impl ConstChecker<'_> {
         self.errors.extend(hof_errors);
     }
 
-    /// Reject passing a const-rooted value into a method argument position that
-    /// writes through. The receiver's type is generally unknown here (it may be
-    /// any expression), so positions are matched by method name across all types
-    /// -- conservative in the same way as the fixpoint's forwarding step.
-    fn check_const_args_to_mutating_method(
-        &mut self,
-        callee: &Expr,
-        args: &[Arg],
+    /// The write-through parameter positions of a closure value: a closure
+    /// literal written in place (an immediately called or directly passed
+    /// closure), or a binding initialized with one. `None` for any other
+    /// expression.
+    fn closure_value_write_through(
+        &self,
+        value: &Expr,
         scopes: &ConstScopes,
-    ) {
-        if callee.span().is_parenthesized() {
-            return;
+    ) -> Option<Vec<usize>> {
+        match value {
+            Expr::Closure(params, _, _) => Some(closure_write_through(params)),
+            Expr::Ident(name, _) => match self.const_binding(scopes, name) {
+                Some(Binding::Closure { write_through, .. }) => Some(write_through.clone()),
+                _ => None,
+            },
+            _ => None,
         }
-        let Expr::Field(_, method, _) = callee else {
-            return;
-        };
-        let indices = self.mutation.method_write_through_args_by_name(method);
-        if indices.is_empty() {
-            return;
-        }
-        for (i, arg) in args.iter().enumerate() {
-            if indices.contains(&i)
-                && let Some(root) = self.const_root(&arg.expr, scopes)
-            {
-                self.errors.push(TypeError {
-                    message: format!(
-                        "cannot pass const value `{root}` to method `{method}`, which requires a mutable parameter"
-                    ),
-                    span: arg.expr.span(),
-                });
+    }
+
+    /// The binding a closure parameter introduces: an immutable `ref(T)`
+    /// reference binds const (with its type when it resolves), every other
+    /// parameter binds mutable (a private copy or a `ref(mut(T))`).
+    fn closure_param_binding(&self, param: &Param) -> Binding {
+        match &param.ty {
+            Some(TypeExpr::Ref(inner, _)) if !matches!(**inner, TypeExpr::Mut(..)) => {
+                let module = self.current_module.clone();
+                Binding::Const(
+                    brass_hir::resolve(inner, |n| self.nominal_info(&module, n))
+                        .ok()
+                        .filter(|t| !t.is_unknown()),
+                )
             }
+            _ => Binding::Mutable,
+        }
+    }
+
+    /// The closure counterpart of [`Self::check_param_mutability`]: an
+    /// `infer` closure parameter is a read-only deep copy, so mutating or
+    /// rebinding it is rejected exactly like a function's.
+    fn check_closure_param_mutability(&mut self, params: &[Param], body: &Expr) {
+        let block = match body {
+            Expr::Block(b, _) => b.clone(),
+            other => Block {
+                stmts: vec![Stmt::Expr(other.clone())],
+                span: other.span(),
+            },
+        };
+        for p in params {
+            if !matches!(&p.ty, Some(TypeExpr::Named(n, _)) if n == "infer") {
+                continue;
+            }
+            if !mutates_root(&block, &p.name) && !rebinds(&block, &p.name) {
+                continue;
+            }
+            self.errors.push(TypeError {
+                message: format!(
+                    "cannot mutate parameter `{}`: an `infer` parameter is a read-only deep copy \
+                     (use `mut(T)` for a mutable copy, or `ref(mut(T))` for a mutable reference)",
+                    p.name
+                ),
+                span: p.span,
+            });
         }
     }
 
@@ -674,6 +911,7 @@ impl ConstChecker<'_> {
         match place {
             Expr::Ident(name, _) => match self.const_binding(scopes, name) {
                 Some(Binding::Const(ty)) => ty.clone(),
+                Some(Binding::Alias(ty)) => Some(ty.clone()),
                 _ => None,
             },
             Expr::SelfExpr(_) => match self.const_binding(scopes, "self") {
@@ -713,23 +951,23 @@ impl ConstChecker<'_> {
         scopes.iter().rev().find_map(|scope| scope.get(name))
     }
 
-    /// The type under which `value` aliases const heap data, if it does: a
-    /// place (identifier, `self`, or a field/index projection) rooted in a
-    /// const binding whose derived type is a shared heap aggregate. Primitives
-    /// are copied on binding, and a place whose type could not be derived stays
-    /// conservative (no alias), matching the previous behavior for untyped
-    /// consts.
-    fn const_alias_type(&self, value: &Expr, scopes: &ConstScopes) -> Option<Option<Type>> {
+    /// The binding a `let` of `value` takes when `value` is a place
+    /// (identifier, `self`, or a field/index projection) rooted in a const
+    /// binding: `Alias` at a derived shared-heap type, nothing (an ordinary
+    /// mutable copy) at a derived primitive type -- primitives are copied on
+    /// binding -- and `ConstAlias` when the type is not derivable here.
+    fn const_alias(&self, value: &Expr, scopes: &ConstScopes) -> Option<Binding> {
         self.const_root(value, scopes)?;
-        let ty = self.const_place_type(value, scopes)?;
-        is_shared_heap(&ty).then_some(Some(ty))
+        match self.const_place_type(value, scopes) {
+            Some(ty) => is_shared_heap(&ty).then_some(Binding::Alias(ty)),
+            None => Some(Binding::ConstAlias),
+        }
     }
 
     /// The statically derivable type of a const binding: the annotation when it
     /// resolves, else a type derived from the initializer -- a record/variant
     /// literal, an array literal (a slice of its first derivable element type),
-    /// a free-function call's declared/inferred return type, or a static method
-    /// call's return type.
+    /// or a free-function or static method call's declared return type.
     fn binding_const_type(
         &self,
         module: &[String],
@@ -826,8 +1064,8 @@ fn param_scope(params: &[brass_hir::ParamInfo], is_method: bool) -> HashMap<Stri
     scope
 }
 
-/// Whether a parameter may be mutated through its reference in the body. Two
-/// annotations forbid it: `a: infer` receives a read-only deep copy, and
+/// Whether a parameter may be mutated in the body. Two annotations forbid it:
+/// `a: infer` receives a read-only deep copy, and
 /// `a: ref(T)`/`self: ref(Self)` is an immutable reference. Everything else -- an
 /// unannotated parameter (a private `mut` copy, or an inferred `ref(mut(Self))`
 /// for `self`), a `mut(T)`/`ref(mut(T))`, `self: Self`/`mut(Self)`, or a bare

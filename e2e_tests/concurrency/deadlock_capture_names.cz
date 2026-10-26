@@ -1,8 +1,8 @@
 // Pins: two spawns capturing the SAME two objects under names that sort in
-// opposite orders (a/b vs b/z where z aliases a). The old auto-wrap acquired
-// nested `with` locks in capture-NAME order, so the two bodies deadlocked
-// against each other. The group wrap (_with_all) acquires by runtime ADDRESS
-// order, so all 100 tasks complete and the totals are exact.
+// opposite orders (a/b vs b/z where z aliases a). The automatic guard takes
+// the captured objects' locks as one group in runtime ADDRESS order, never in
+// capture-name order, so the two bodies cannot deadlock: all 100 tasks
+// complete and the totals are exact.
 type Counter = {
     value: int64
 }

@@ -1,0 +1,6 @@
+// @backends: all
+// An out-of-range negative array store reports the shared bounds diagnostic.
+fun main() {
+    let a = [1]
+    a[-1] = 2
+}

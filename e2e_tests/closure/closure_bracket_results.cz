@@ -1,0 +1,92 @@
+// @backends: all
+// Closure brackets take their concrete elements' numeric join or unifiable array
+// shape, retain heterogeneous tuples, and honor explicit contracts across instances.
+fun named_pair(a, b) { return [a, b] }
+fun make_pair() { return (a, b) -> [a, b] }
+fun apply(f, a, b) { return f(a, b) }
+fun use_tuple(f: (int32, int32) -> [int32, int32]) { return f(1, 2) }
+fun declared_tuple() -> (int32, int32) -> [int32, int32] {
+    return (a, b) -> [a, b]
+}
+
+const pair = (a, b) -> [a, b]
+let big: int64 = 5000000000
+let signed: int64 = 1
+let unsigned: uint64 = 2
+println("element joins and shapes")
+println(typeof(pair(1, 2)))
+println(typeof(named_pair(1, 2)))
+println(typeof(pair(1, big)))
+println(typeof(named_pair(1, big)))
+println(typeof(pair(1, 2.5)))
+println(typeof(pair(signed, unsigned)))
+println(typeof(named_pair(signed, unsigned)))
+println(typeof(pair("a", "b")))
+println(typeof(pair(1, "b")))
+println(typeof(((a, b) -> [a, b])(1, 2)))
+println(typeof(((a: int32, b: int64) -> [a, b])(1, 2)))
+
+println("nested and block bodies")
+const nested = (a, b) -> [[a, b]]
+println(typeof(nested(1, 2)))
+const block = (a, b) -> { return [a, b] }
+println(typeof(block(1, 2)))
+println(typeof(block(1, big)))
+
+println("array and tuple bindings")
+let array: int32[] = pair(1, 2)
+println(typeof(array))
+println(array)
+let tuple: (int32, int32) -> [int32, int32] = (a, b) -> [a, b]
+println(typeof(tuple(1, 2)))
+
+fun contracts_and_annotations() {
+    println("contextual tuple contracts and independent uses")
+    println(typeof(use_tuple((a, b) -> [a, b])))
+    let declared = declared_tuple()
+    println(typeof(declared(1, 2)))
+    const local = (a, b) -> {
+        let value: [int32, int32] = [a, b]
+        return value
+    }
+    println(typeof(local(1, 2)))
+    const polymorphic = (a, b) -> [a, b]
+    println(typeof(use_tuple(polymorphic)))
+    println(typeof(polymorphic(1, 2)))
+
+    println("partial annotations and literal elements")
+    const partial = (a, b: int32) -> [a, b]
+    println(typeof(partial(big, 1)))
+    const literal = (a) -> [a, 1]
+    println(typeof(literal(big)))
+    println(typeof(literal("x")))
+    println(typeof(apply((a, b) -> [a, b], 1, 2)))
+}
+contracts_and_annotations()
+
+fun producer_results() {
+    println("returned closure")
+    let returned = make_pair()
+    println(typeof(returned(1, 2)))
+    println(returned(1, 2))
+    println(returned(big, big))
+
+    println("indexed closure")
+    let calls = [(a, b) -> [a, b]]
+    let indexed = calls[0]
+    println(typeof(indexed(1, 2)))
+    println(typeof(indexed(big, big)))
+}
+producer_results()
+
+println("captured elements")
+let xs = []
+let ys = []
+let numbers = () -> [xs[0], ys[0]]
+let mixed = () -> [xs[0], "x"]
+xs.push(1)
+ys.push(2)
+println(typeof(numbers()))
+println(numbers())
+println(typeof(mixed()))
+println(mixed())

@@ -1,5 +1,7 @@
-// Mutual recursion without a return annotation has no sound provisional type
-// to assume, so the typed backend rejects it with a hint naming the fix.
+// @backends: all
+// Mutual recursion without a return annotation compiles at the return type
+// the checker settled for each instantiation in the cycle (`int32`, from the
+// literal returns), so the typed back ends run it.
 fun flip(n: int64) {
     if n == 0 {
         return 0

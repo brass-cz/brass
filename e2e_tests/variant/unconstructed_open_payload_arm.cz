@@ -1,0 +1,52 @@
+// @backends: all
+// A sum whose variant has an unannotated payload, handed to a function as a
+// value that never holds that variant (`Opt.Nothing` alone): the instance's
+// type leaves the payload unpinned, so no value of it can be that variant and
+// its arm is dead for the instance instead of failing to compile.
+
+type Opt =
+    | Some { v }
+    | Nothing
+
+fun show(o: Opt) {
+    match o {
+        Some { v } => println("some {v}"),
+        Nothing => println("nothing"),
+    }
+}
+
+fun peek(o: Opt) -> string {
+    if let Opt.Some { v } = o {
+        return "has {v}"
+    }
+    return "empty"
+}
+
+fun maybe(o: Opt?) -> string {
+    if let x = o {
+        match x {
+            Some { v } => { return "some {v}" }
+            Nothing => { return "nothing" }
+        }
+    }
+    return "null"
+}
+
+fun main() {
+    let a = Opt.Some { v: 1 }
+    let b = Opt.Nothing
+    show(a)
+    show(b)
+    for x in [a, b] {
+        match x {
+            Some { v } => println(v + 1),
+            Nothing => println("-"),
+        }
+    }
+    let c = if true { a } else { b }
+    show(c)
+    println(peek(b))
+    println(peek(Opt.Some { v: "s" }))
+    println(maybe(b))
+    println(maybe(null))
+}

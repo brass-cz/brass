@@ -1,0 +1,89 @@
+// @backends: all
+// `Self` names the enclosing type: in a method's return and parameter
+// annotations (static and instance methods, `-> Self!`, sum methods), in a
+// method body's annotations, and as a data field's type (`next: Self?` is a
+// recursive `Node?`, `left: Self` in a variant is the sum itself). Each
+// spelling must mean exactly what writing the type's name means.
+type B = {
+    v: int32
+}
+
+fun B.make(x: int32) -> Self {
+    return Self { v: x }
+}
+
+fun B.inc(self) -> Self {
+    return Self { v: self.v + 1 }
+}
+
+fun B.twice(self) -> Self {
+    return self.inc().inc()
+}
+
+fun B.plus(self, other: Self) -> Self {
+    let sum: Self = B { v: self.v + other.v }
+    return sum
+}
+
+fun B.checked(x: int32) -> Self! {
+    if x < 0 {
+        return error("negative")
+    }
+    return B { v: x }
+}
+
+type Node = {
+    v: int32
+    next: Self?
+}
+
+fun Node.push(self, v: int32) -> Self {
+    return Node { v, next: self }
+}
+
+fun Node.sum(self) -> int32 {
+    let total = self.v
+    if let n = self.next {
+        total += n.sum()
+    }
+    return total
+}
+
+type Tree =
+    | Leaf
+    | Branch { v: int32, left: Self, right: Self }
+
+fun Tree.total(self) -> int32 {
+    return match self {
+        Leaf => 0,
+        Branch { v, left, right } => v + left.total() + right.total(),
+    }
+}
+
+fun Tree.single(v: int32) -> Self {
+    return Tree.Branch { v, left: Tree.Leaf, right: Tree.Leaf }
+}
+
+fun main() {
+    let b = B.make(1)
+    println(b.v)
+    println(b.inc().v)
+    println(b.twice().v)
+    println(b.plus(B.make(40)).v)
+    match B.checked(5) {
+        Ok { value } => println(value.v),
+        Err { error } => println(error),
+    }
+    match B.checked(-1) {
+        Ok { value } => println(value.v),
+        Err { error } => println(error.value),
+    }
+    let n = Node { v: 1, next: null }.push(2).push(3)
+    println(n.sum())
+    let tail: Node? = n.next
+    if let t = tail {
+        println(t.v)
+    }
+    let t = Tree.Branch { v: 1, left: Tree.single(2), right: Tree.single(3) }
+    println(t.total())
+}

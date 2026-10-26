@@ -1,10 +1,10 @@
 // An unannotated fallible function that returns an already-fallible value
 // forwards the Result whole -- its type is Result<T, E>, never a nested
-// Result<Result<T, E>, E>. The back ends Ok-wrap only bare return values, so
-// the checker nesting this used to describe a value the program never built;
-// a compensating double-`!` then reinterpreted the payload record as a
-// Result and crashed (found via an HTTP fetch whose status field 200 was
-// retained as a pointer).
+// Result<Result<T, E>, E>, because the back ends Ok-wrap only bare return
+// values. A single `!` therefore unwraps the forwarded Result completely,
+// the forwarded Err arrives single-layer, and scalar payloads forward the
+// same way; a second `!` on the unwrapped record is rejected (see
+// double_unwrap_rejected).
 type Point = {
     x: int32
     y: int32

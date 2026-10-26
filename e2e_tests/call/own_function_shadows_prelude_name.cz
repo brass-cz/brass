@@ -1,0 +1,16 @@
+// @backends: all
+// A module's own declaration of a prelude function name (`println`, `print`)
+// is what a bare call there invokes, for the checker and the back ends alike:
+// the call is typed by that declaration, not as the prelude's `void` printer.
+// A local binding of a prelude name shadows it the same way.
+fun println(text: string) -> int32 {
+    print("[own] {text}\n")
+    return 7
+}
+
+fun main() {
+    let n = println("a") + 1
+    print("{n}\n")
+    let assert = (ok: bool) -> if ok { "fine" } else { "broken" }
+    print(assert(true) + "\n")
+}

@@ -1,0 +1,4 @@
+30:18: error: cannot use a `() -> Dog` where `() -> Animal` is required: a function value is compiled for its own signature
+31:17: error: cannot use a `(Animal) -> string` where `(Dog) -> string` is required
+33:26: error: cannot use a `() -> Tagged` where `() -> Shape` is required
+34:25: error: cannot use a `(Animal) -> string` where `(Dog) -> string` is required

@@ -1,0 +1,11 @@
+// A generic body is checked per instantiation: printing its parameter is
+// fine for a number and rejected for the instance that receives a function
+// value, at the `println` inside the generic body.
+fun show(v) {
+    println(v)
+}
+
+fun main() {
+    show(1)
+    show((x: int32) -> x + 1)
+}

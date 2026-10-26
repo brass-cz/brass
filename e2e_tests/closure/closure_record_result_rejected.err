@@ -1,0 +1,1 @@
+10:20: error: cannot store a `Dog` in a slot of type `Animal`

@@ -1,8 +1,8 @@
 // Pins shift semantics for amounts at/over the operand width: both back ends
 // follow Rust's wrapping shifts computed at 64 bits (amount masked to 0..63)
-// with the result truncated to the operand width. A raw LLVM shift would be
-// poison for these amounts. Note `1i32 << 40` is 0 (not 256): the 64-bit
-// masked shift pushes the bit past the low 32 bits before truncation.
+// with the result truncated to the operand width, so every amount has a
+// defined result. Note `1i32 << 40` is 0 (not 256): the 64-bit masked shift
+// pushes the bit past the low 32 bits before truncation.
 fun main() {
     let x: int64 = 1
     let n: int64 = 64

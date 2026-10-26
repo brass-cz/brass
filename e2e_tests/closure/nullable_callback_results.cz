@@ -1,0 +1,55 @@
+// @backends: all
+// A closure literal passed where a nullable-returning callback is required:
+// its `return null` (or a nullable `!` that returns null on the null path)
+// makes its own result nullable, and an integer literal returned into an
+// `int32?` slot is a present `int32`. The checker must accept these rather
+// than demand the closure's result be exactly the non-null type.
+fun run(f: (bool) -> int32?) {
+    println(f(true))
+    println(f(false))
+}
+
+fun maybe(b: bool) -> int32? {
+    if b {
+        return 7
+    }
+    return null
+}
+
+fun call(pred: (int32) -> string?) -> string? {
+    return pred(3)
+}
+
+fun pair() -> [int32?, string] {
+    return [5, "x"]
+}
+
+fun main() {
+    run((x) -> {
+        if x {
+            return 1
+        }
+        return null
+    })
+    run((x) -> {
+        let v = maybe(x)!
+        return v + 1
+    })
+    println(call((u) -> {
+        if u == 3 {
+            return "three"
+        }
+        return null
+    }))
+    println(call((u: int32) -> {
+        if u == 4 {
+            return "four"
+        }
+        return null
+    }))
+    let t: [int32?, string] = [1, "s"]
+    println(t[0])
+    println(t[1])
+    let p = pair()
+    println(p[0])
+}

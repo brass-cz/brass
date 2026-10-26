@@ -1,0 +1,18 @@
+// @backends: all
+// A global container built without element types (`HashMap.new()`) takes
+// them from how the functions use it: the initializer and `main` share one
+// map type, so the value `main` stores is the one it reads back.
+let m = HashMap.new()
+
+fun put(k, v) {
+    m.set(k, v)
+}
+
+fun main() {
+    m.set("a", 1)
+    put("b", 2)
+    println(m.get("a"))
+    println(m.get("b"))
+    println(m.size())
+    println(typeof(m))
+}

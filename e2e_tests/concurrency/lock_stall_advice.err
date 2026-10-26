@@ -1,0 +1,4 @@
+suspected deadlock
+acquire shared objects in a consistent order across tasks
+do not wait for tasks (`sync`) while holding a lock they need
+increase BRASS_LOCK_STALL_SECS to raise the budget, or set it to 0 to disable this check

@@ -1,0 +1,14 @@
+// @backends: all
+// Percent-encoding splits each byte into its two hex digits with `b >> 4` and
+// `b & 15` directly on the `uint8` byte (the literal adapts to the byte's
+// type), including bytes at and above 0x80 from a multi-byte character, and
+// decoding restores the text.
+import std.url.percent
+
+fun main() {
+    const text = "a b/~é?"
+    const encoded = percent.encode_component(text)
+    println(encoded)
+    println(percent.encode("x=1&y", "=&"))
+    println(percent.decode(encoded)!)
+}

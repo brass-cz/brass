@@ -1,0 +1,43 @@
+// A module initializer may not read a global defined later in the module,
+// directly or through what it calls: a function chain, a static method, a
+// method on a value, or a function handed over as a value. Every path is
+// reported at the call that leads to the uninitialized global.
+type Reg = { n: int32 }
+
+fun Reg.make() {
+    return Reg { n: limit }
+}
+
+fun Reg.size(self) {
+    return self.n + offset
+}
+
+fun get() {
+    return later.len()
+}
+
+fun inner() {
+    return late_a
+}
+
+fun outer() {
+    return inner() + 1
+}
+
+fun apply(f) {
+    return f()
+}
+
+let early = get()
+let a = outer()
+let r = Reg.make()
+let s = r.size()
+let v = apply(inner)
+let later = "hello"
+let late_a = 2
+let limit = 3
+let offset = 4
+
+fun main() {
+    println(early)
+}

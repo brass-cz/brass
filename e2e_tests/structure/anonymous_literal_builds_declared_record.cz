@@ -1,0 +1,66 @@
+// @backends: all
+// An anonymous record literal stored in a slot of a declared record type is
+// built AS that record when its fields are exactly the record's: in an
+// annotated binding, a return (also as the `Ok` payload of a `T!` return and
+// into a `T?` return), a field initializer and store, a sum payload, an array
+// element and `push`, a nullable slot, an argument, a closure's result, and
+// a record with an open field (instantiated by the literal's values).
+type Named = { name: string, id: int32 }
+type Box = { n: Named }
+type Cell = { item }
+type Holder = | Full { a: Named } | Empty
+
+fun mk() -> Named {
+    return { id: 7, name: "made" }
+}
+
+fun mk_ok(fail: bool) -> Named! {
+    if fail {
+        return error("no")
+    }
+    return { id: 9, name: "fallible" }
+}
+
+fun mk_opt() -> Named? {
+    return { id: 10, name: "nullable" }
+}
+
+fun show(n: Named) {
+    println(n.name)
+}
+
+fun main() {
+    let p: Named = { id: 3, name: "lit" }
+    println(p.name)
+    println(mk().name)
+    let b = Box { n: { id: 1, name: "boxed" } }
+    println(b.n.name)
+    b.n = { id: 2, name: "stored" }
+    println(b.n.name)
+    let arr: Named[] = [{ id: 4, name: "elem" }]
+    arr.push({ id: 5, name: "pushed" })
+    println(arr[0].name)
+    println(arr[1].name)
+    show({ id: 6, name: "arg" })
+    let o: Named? = { id: 8, name: "opt" }
+    if let x = o {
+        println(x.name)
+    }
+    let c: Cell = { item: 41 }
+    println(c.item + 1)
+    println(mk_ok(false)!.name)
+    if let m = mk_opt() {
+        println(m.name)
+    }
+    let h = Holder.Full { a: { id: 11, name: "payload" } }
+    match h {
+        Full { a } => println(a.name)
+        Empty => println("empty")
+    }
+    let f: () -> Named = () -> {
+        return { id: 12, name: "closure" }
+    }
+    println(f().name)
+    println(typeof(p))
+    println(p)
+}

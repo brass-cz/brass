@@ -1,0 +1,14 @@
+// @backends: all
+// A `let` bound to a const record shares the const's value, so mutating
+// through it is rejected (see const_projection_mutation_rejected) -- but the
+// `let` itself is a mutable binding: reassigning it rebinds the local handle
+// and leaves the const untouched.
+type Node = { v: int32, next: Node? }
+
+fun main() {
+    const n = Node { v: 1, next: null }
+    let cur = n
+    cur = Node { v: 5, next: null }
+    println(cur.v)
+    println(n.v)
+}

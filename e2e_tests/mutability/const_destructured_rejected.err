@@ -1,0 +1,5 @@
+cannot call mutating method `push` on const value `ga`
+cannot call mutating method `push` on const value `gi`
+cannot call mutating method `push` on const value `a`
+cannot assign to const value `inner`
+cannot assign to const value `b`

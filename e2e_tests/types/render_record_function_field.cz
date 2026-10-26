@@ -1,0 +1,21 @@
+// @backends: all
+// A record or variant holding a function value still renders: the
+// function-valued field shows as `<opaque>`, identically on the JIT and the
+// REPL interpreter.
+type Ops = {
+    step: (int32) -> int32,
+    count: int32
+}
+type Action =
+    | Run {
+        go: () -> int32
+    }
+    | Idle
+
+fun main() {
+    let ops = Ops { step: (x: int32) -> x + 1, count: 2 }
+    println(ops)
+    println("{ops}")
+    println(Action.Run { go: () -> 3 })
+    println(ops.step(ops.count))
+}

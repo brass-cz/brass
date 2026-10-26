@@ -1,11 +1,9 @@
 //! The execution engine: drive a [`Codegen`] back end over a monomorphized
 //! program to compile and run it.
 //!
-//! This is the backend-agnostic counterpart of the old `brass_jit::engine::run`
-//! loop. It performs no target-specific work itself; it only sequences the
-//! trait's phases -- declare, emit, finalize, execute -- so any [`Codegen`]
-//! implementation (the LLVM JIT, a test backend, a future target) runs MIR the
-//! same way.
+//! It performs no target-specific work itself; it only sequences the trait's
+//! phases -- declare, emit, finalize, execute -- so every [`Codegen`]
+//! implementation (the LLVM JIT, a test back end) runs MIR the same way.
 
 use crate::codegen::Codegen;
 use crate::mono::MonoProgram;

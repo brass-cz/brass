@@ -1,12 +1,11 @@
-//! End-to-end test: examples within the typed (Value-free) subset must run to
-//! completion; every example must still type-check. The typed back end is the
-//! only execution path (the boxed-Value back end has been removed), so examples
-//! that still exercise runtime features outside that subset type-check but do not
-//! run in this test.
+//! End-to-end test: every example must type-check, and every example the
+//! default runtime of every build can execute must run to completion. The
+//! concurrency example needs the JIT back end, which interpreter-only builds
+//! lack, so this test only type-checks it.
 
 mod support;
 
-/// Examples the typed back end runs end to end.
+/// Examples every build's default runtime runs end to end.
 const RUNNABLE: &[&str] = &[
     "examples/01_records.cz",
     "examples/02_sum_types.cz",
@@ -28,8 +27,8 @@ const RUNNABLE: &[&str] = &[
     "examples/modules/main.cz",
 ];
 
-/// Valid examples outside the typed runtime subset: they type-check but use
-/// constructs the typed back end does not yet lower, so they do not run.
+/// Valid examples this test only type-checks: they use concurrency, which only
+/// the JIT back end executes.
 const TYPECHECK_ONLY: &[&str] = &["examples/12_concurrency.cz"];
 
 fn all_examples() -> Vec<&'static str> {

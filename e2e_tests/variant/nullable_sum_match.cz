@@ -1,7 +1,6 @@
 // Matching a narrowed nullable SUM dispatches on the actual variant: the
-// scrutinee local still carries `S?`, so the tag test must unwrap the
-// nullable before comparing (previously the `B` value below matched the `A`
-// arm on the typed back end and read a garbage field).
+// scrutinee local is declared `S?`, and the match tests the present value's
+// tag, so the `B` value takes the `B` arm and the `A` value binds its `x`.
 type S = | A { x: int32 } | B
 
 fun m(c: int32) -> S? {

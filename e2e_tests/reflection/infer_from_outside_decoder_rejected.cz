@@ -1,0 +1,10 @@
+// `infer` names the target type only inside a reflective decoder method
+// (`fun T.m(self) -> infer!`); `infer.from(x)` anywhere else is rejected with
+// a diagnostic saying where it is valid, not as an unknown name.
+fun widen(x: int32) -> int64! {
+    return infer.from(x)
+}
+
+fun main() {
+    println(widen(3)!)
+}

@@ -1,0 +1,3 @@
+11:12: error: cannot store a `Dog` in a slot of type `Animal`
+15:13: error: cannot store a `Dog` in a slot of type `Animal`
+19:9: error: cannot use `Animal` where `ref(mut(Dog

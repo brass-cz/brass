@@ -1,0 +1,65 @@
+// @backends: all
+// `T.from(v)` succeeds when every field of `T` is present in `v` and its value
+// flows into `T`'s field type by the flow conversions: a value-preserving
+// numeric widening (int32 into int64 / float64), a value or null into a
+// nullable field. A field that would need a lossy conversion (int64 into
+// int32, float into int), or a missing field, makes the result null.
+
+type Wide = {
+    x: int64
+}
+
+type Mixed = {
+    x: float64
+    label: string?
+}
+
+type Optional = {
+    tag: string?
+    n: int64?
+}
+
+type Narrow = {
+    x: int32
+}
+
+fun main() {
+    const small: int32 = 5
+    if let w = Wide.from({ x: small }) {
+        println(w.x + 1)
+    } else {
+        println("Wide: null")
+    }
+    if let m = Mixed.from({ x: small, label: "s" }) {
+        println(m)
+    } else {
+        println("Mixed: null")
+    }
+    if let o = Optional.from({ tag: "t", n: small }) {
+        println(o)
+    } else {
+        println("Optional: null")
+    }
+    if let o = Optional.from({ tag: null, n: null }) {
+        println(o)
+    } else {
+        println("Optional with nulls: null")
+    }
+    const big: int64 = 7
+    if let n = Narrow.from({ x: big }) {
+        println(n)
+    } else {
+        println("int64 into int32: null")
+    }
+    const fraction = 1.5
+    if let w = Wide.from({ x: fraction }) {
+        println(w)
+    } else {
+        println("float into int64: null")
+    }
+    if let w = Wide.from({ y: small }) {
+        println(w)
+    } else {
+        println("missing field: null")
+    }
+}

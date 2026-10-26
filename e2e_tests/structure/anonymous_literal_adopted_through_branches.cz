@@ -1,0 +1,68 @@
+// @backends: all
+// An anonymous record literal that is a branch value of an `if`, `if let`,
+// `else if` chain, `match` or block flowing into a slot of a declared record
+// is built as that record, exactly like a direct initializer: in an annotated
+// binding, a return, a nullable return, a field initializer and an array
+// element, also mixed with a branch that already holds the record. Two
+// anonymous literals with the same fields also join without a slot.
+type Named = { name: string, id: int32 }
+type Box = { n: Named }
+
+fun pick(k: int32) -> Named {
+    return if k == 0 {
+        { id: 0, name: "zero" }
+    } else if k == 1 {
+        { id: 1, name: "one" }
+    } else {
+        { id: k, name: "many" }
+    }
+}
+
+fun opt(k: int32) -> Named? {
+    if k < 0 {
+        return null
+    }
+    return match k {
+        0 => {
+            { id: 0, name: "m0" }
+        },
+        _ => {
+            let n = k * 2
+            { id: n, name: "m{n}" }
+        },
+    }
+}
+
+fun main() {
+    let c = true
+    let p: Named = if c { { id: 3, name: "x" } } else { { id: 4, name: "y" } }
+    println(p.name)
+    let q: Named = match 2 {
+        1 => {
+            { id: 5, name: "one" }
+        },
+        _ => {
+            { id: 6, name: "other" }
+        },
+    }
+    println(q.name)
+    println(pick(0).name)
+    println(pick(1).name)
+    println(pick(7).id)
+    if let o = opt(3) {
+        println(o.name)
+    }
+    let n = Named { id: 9, name: "n" }
+    let r: Named = if c { n } else { { id: 7, name: "lit" } }
+    println(r.name)
+    let maybe: Named? = null
+    let s: Named = if let m = maybe { m } else { { id: 10, name: "fallback" } }
+    println(s.name)
+    let b = Box { n: if c { { id: 2, name: "boxed" } } else { { id: 3, name: "other" } } }
+    println(b.n.name)
+    let arr: Named[] = [if c { { id: 4, name: "elem" } } else { { id: 5, name: "b" } }]
+    println(arr[0].name)
+    println(typeof(p))
+    let plain = if c { { id: 1, name: "anon" } } else { { id: 2, name: "other" } }
+    println(plain.name)
+}

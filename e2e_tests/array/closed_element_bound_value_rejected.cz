@@ -1,0 +1,19 @@
+// Bound records keep their inferred field types when pushed, inserted, or
+// stored in a fixed array whose element requires a wider field type.
+type PushedBox = { item }
+type PushedBox64 = PushedBox { item: int64 }
+type InsertedBox = { item }
+type InsertedBox64 = InsertedBox { item: int64 }
+type FixedBox = { item }
+type FixedBox64 = FixedBox { item: int64 }
+
+fun main() {
+    let pushed = PushedBox { item: 3 }
+    let inserted = InsertedBox { item: 3 }
+    let fixed = FixedBox { item: 3 }
+    let push_target: PushedBox64[] = []
+    let insert_target: InsertedBox64[] = []
+    push_target.push(pushed)
+    insert_target.insert(0, inserted)
+    let fixed_target: FixedBox64[1] = [fixed]
+}

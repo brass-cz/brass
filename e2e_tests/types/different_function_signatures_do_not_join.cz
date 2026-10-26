@@ -1,0 +1,15 @@
+// Distinct value types have no inferred return join through structural subtyping.
+type Animal = { name: string }
+type Dog = { age: int32, name: string }
+
+fun pick(c: bool) {
+    if c {
+        return (a: Animal) -> a.name
+    }
+    return (d: Dog) -> "{d.age} {d.name}"
+}
+
+const f = pick(true)
+println(f(Dog { age: 7, name: "Rex" }))
+const g = pick(false)
+println(g(Dog { age: 7, name: "Rex" }))

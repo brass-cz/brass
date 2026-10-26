@@ -1,0 +1,18 @@
+// The prelude `Error` renders one way in every diagnostic: the short form
+// naming only its payload's `value` type, whether the payload was raised by
+// `error(..)` or lifted from a propagated failure (`int32.parse(s)!`).
+type Bad = {
+    code: int32
+}
+
+fun run(s: string) {
+    if s == "" {
+        return error(Bad { code: 1 })
+    }
+    let n = int32.parse(s)!
+    return n
+}
+
+fun main() {
+    println(run("1"))
+}

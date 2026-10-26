@@ -338,7 +338,10 @@ pub struct Arg {
 
 #[derive(Clone, Debug)]
 pub enum Expr {
-    Int(i64, Span),
+    /// An integer literal. The parser produces non-negative magnitudes (up to
+    /// `u64::MAX`), except that a negated literal PATTERN (`-1 =>`) is folded
+    /// into one negative value.
+    Int(i128, Span),
     Float(f64, Span),
     Str(Vec<StrSeg>, Span),
     Bool(bool, Span),
@@ -433,6 +436,23 @@ impl Expr {
             | Expr::TypeTest(_, _, _, s)
             | Expr::Match(_, _, s)
             | Expr::Block(_, s) => s,
+        }
+    }
+
+    /// The value of an integer literal expression, sign included: a literal
+    /// (`200`) or a negated literal (`-1`, which parses as a unary minus
+    /// applied to `1`). Every pass that types or lowers a literal treats
+    /// these two shapes as one literal, so the value -- not the magnitude --
+    /// decides its default type and the types it adapts to. `None` for any
+    /// other expression.
+    pub fn int_literal_value(&self) -> Option<i128> {
+        match self {
+            Expr::Int(v, _) => Some(*v),
+            Expr::Unary(UnaryOp::Neg, inner, _) => match &**inner {
+                Expr::Int(v, _) => Some(-*v),
+                _ => None,
+            },
+            _ => None,
         }
     }
 }

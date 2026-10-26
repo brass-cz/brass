@@ -666,4 +666,20 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn pattern_qualifier_shadowing_is_lexical() {
+        // Parameters and match bindings shadow inside their scope; leaving a
+        // nested block restores the imported qualifier.
+        for body in [
+            "let f = (shapes) -> { match x { shapes.Shape.Y => 0, _ => 1 } }",
+            "match x { shapes => match x { shapes.Shape.Y => 0, _ => 1 } }",
+        ] {
+            let errors = pattern_errors(body);
+            assert_eq!(errors.len(), 1, "{body}: {errors:?}");
+            assert_eq!(errors[0].message, "unknown type `shapes.Shape`");
+        }
+        let errors =
+            pattern_errors("if true { let shapes = 0 }\nmatch x { shapes.Shape.Y => 0, _ => 1 }");
+        assert!(errors.is_empty(), "{errors:?}");
+    }
 }

@@ -1,0 +1,28 @@
+// @lazy: fail
+// @eager: fail
+// A parameter takes a wider record at the argument's own type, so a `Dog`
+// passed as an `Animal` stays a `Dog` in the callee: returning it as an
+// `Animal`, storing it in an `Animal` field or assigning it one is rejected.
+type Animal = { name: string }
+type Dog = { age: int32, name: string }
+type Kennel = { pet: Animal }
+
+fun keep(a: Animal) -> Animal {
+    return a
+}
+
+fun house(k: Kennel, a: Animal) {
+    k.pet = a
+}
+
+fun replace(a: ref(mut(Animal))) {
+    a = Animal { name: "cat" }
+}
+
+fun main() {
+    let d = Dog { age: 3, name: "rex" }
+    println(keep(d).name)
+    let k = Kennel { pet: Animal { name: "cat" } }
+    house(k, d)
+    replace(d)
+}

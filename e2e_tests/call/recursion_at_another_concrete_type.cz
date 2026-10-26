@@ -1,0 +1,18 @@
+// @backends: all
+// A recursive call at a different but fixed type is ordinary recursion: the
+// `int32` instance calls the `int32[]` instance once, which then recurses at
+// its own type. Only a call that keeps growing the type is rejected.
+
+fun show(x, depth: int32) {
+    if depth == 0 {
+        println(x)
+        return
+    }
+    show([1, 2], depth - 1)
+}
+
+fun main() {
+    show(5, 1)
+    show([7], 3)
+    show("a", 0)
+}

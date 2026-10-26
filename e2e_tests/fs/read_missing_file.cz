@@ -1,5 +1,5 @@
-// `read_file` of a nonexistent path returns a Result.Err that can be matched
-// instead of crashing the program.
+// `read_file` of a nonexistent path returns a `Result.Err` that the program
+// can match and carry on from.
 import std.fs.{ read_file }
 
 fun main() {

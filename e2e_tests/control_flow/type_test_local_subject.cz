@@ -1,0 +1,44 @@
+// @backends: all
+// A type test decides per instantiation for any subject whose type the
+// instance knows -- a local copied from a parameter, an element read -- not
+// only for a parameter itself. The unselected arm contributes nothing: its
+// `return` does not join the instance's return type and its `error(..)` does
+// not make the instance fallible.
+fun checked(x) {
+    let y = x
+    if y: string {
+        return error("bad")
+    }
+    return 7
+}
+
+fun first(xs) {
+    if xs[0]: string {
+        return "str"
+    }
+    return xs[0] * 2
+}
+
+fun describe(x) {
+    let y = x
+    if y: string {
+        return "s:" + y
+    }
+    return 5
+}
+
+fun main() {
+    let v: int32 = checked(3)
+    println(v)
+    println([checked(3), checked(4)])
+    println(typeof(checked(3)))
+    match checked("s") {
+        Ok { value } => println("ok"),
+        Err { error } => println("err {error.value}"),
+    }
+    let n: int32 = first([5, 6])
+    println(n)
+    println(first(["a"]))
+    println(describe(3))
+    println(describe("a"))
+}

@@ -1,0 +1,34 @@
+// @backends: all
+// An instance's types depend on its argument types only. `scale(x)` with an
+// int16 `x` computes in int16 (the literals adapt, so `20000 * 2` wraps
+// there) whether or not the call site expects an int16, and the lazy JIT's
+// deferred instance agrees with its call site. The same holds for a
+// parameter annotated uint8 (`v + 200` is uint8 arithmetic) and a uint16
+// counter returned from a generic increment.
+fun scale(a) {
+    return a * 2 / 4
+}
+
+fun add200(v: uint8) {
+    return v + 200
+}
+
+fun inc(x) {
+    return x + 1
+}
+
+fun main() {
+    let x: int16 = 20000
+    let b: int16 = scale(x)
+    println(b)
+    println(scale(x))
+    println(typeof(scale(x)))
+    let r: uint8 = add200(100) / 2
+    println(r)
+    println(add200(100))
+    let w: uint16 = 65535
+    const n = inc(w)
+    let c: uint16 = n
+    println(c)
+    println(typeof(n))
+}

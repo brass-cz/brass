@@ -86,7 +86,14 @@ pub fn function_markdown(full: &FullAnalysis, f: &FunInfo, call_args: Option<&[T
         .params
         .iter()
         .map(|p| {
-            brass_hir::mutates_value(&full.program, &f.module, &f.decl.body, &p.name, &mutation)
+            brass_hir::mutates_value(
+                &full.program,
+                &f.module,
+                &f.signature.params,
+                &f.decl.body,
+                &p.name,
+                &mutation,
+            )
         })
         .collect();
 

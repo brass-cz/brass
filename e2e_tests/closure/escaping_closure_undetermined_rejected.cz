@@ -1,0 +1,11 @@
+// A returned closure whose parameter nothing determines -- not its body, not
+// an expected type, not any application -- cannot be compiled: `check`
+// asks for a parameter annotation instead of the back end refusing it.
+fun mk() {
+    return (x) -> x
+}
+
+fun main() {
+    let f = mk()
+    println("made")
+}

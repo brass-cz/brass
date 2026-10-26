@@ -1,0 +1,4 @@
+13:14: error: cannot use `Animal` where `Dog` is required
+14:23: error: cannot use `Animal` where `Dog` is required
+15:15: error: cannot use `Animal` where `Dog` is required
+17:22: error: cannot use `Animal` where `Dog` is required

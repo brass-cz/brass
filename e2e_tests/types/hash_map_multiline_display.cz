@@ -1,0 +1,17 @@
+// @backends: all
+// HashMap display indents continuation lines of debug-rendered keys and values.
+type R = { n: int32 }
+type Nested = { inner: R }
+fun main() {
+    let values = HashMap.new()
+    values.set("key", R { n: 1 })
+    println(values)
+    let nested = HashMap.new()
+    nested.set(R { n: 2 }, Nested { inner: R { n: 3 } })
+    println(nested)
+    let strings = HashMap.new()
+    strings.set("line", "a\nb")
+    println(strings)
+    values.delete("key")
+    println(values)
+}

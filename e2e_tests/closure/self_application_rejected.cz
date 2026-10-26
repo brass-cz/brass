@@ -1,0 +1,8 @@
+// A value applied to itself would need a type that contains itself; the
+// checker reports it instead of leaving the callee an untypeable unknown for
+// the back ends to refuse.
+fun main() {
+    let f = (x) -> x(x)
+    let id = (y) -> y
+    println(typeof(f(id)))
+}

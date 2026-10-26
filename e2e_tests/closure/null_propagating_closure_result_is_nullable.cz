@@ -1,0 +1,9 @@
+// A closure whose `!` propagates the null of a builtin container's `get`
+// returns a nullable: reading its result as a plain `int32` is rejected.
+fun main() {
+    let m = HashMap.new()
+    m.set("a", 1)
+    let f = (k: string) -> m.get(k)!
+    let s: int32 = f("a")
+    println(s)
+}

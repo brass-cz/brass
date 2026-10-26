@@ -154,3 +154,49 @@ fn passing_modes_are_whole_parameter_annotations() {
         );
     }
 }
+
+/// The arms of the single `match` returned by the body of `fun f`.
+fn match_arms(src: &str) -> Vec<brass_parser::ast::MatchArm> {
+    let module = parse(src).unwrap();
+    let TopLevel::Fun(f) = &module.items[0] else {
+        panic!("expected a function")
+    };
+    let Some(Stmt::Return(Some(Expr::Match(_, arms, _)), _)) = f.body.stmts.first() else {
+        panic!("expected `return match`")
+    };
+    arms.clone()
+}
+
+#[test]
+fn a_line_parsing_as_an_arm_ends_the_previous_arm() {
+    // `-1 =>` and `[x, y] =>` on a new line start arms instead of continuing
+    // the previous arm's expression as a subtraction or an index.
+    let arms = match_arms(
+        "fun f(n) {\nreturn match n {\n1 => \"one\"\n-1 => \"minus\"\n[x, y] => x\n_ => 0\n}\n}",
+    );
+    assert_eq!(arms.len(), 4);
+    assert!(matches!(arms[0].body, Expr::Str(..)));
+    assert!(matches!(
+        arms[1].pattern,
+        brass_parser::ast::Pattern::Literal(..)
+    ));
+    assert!(matches!(arms[1].body, Expr::Str(..)));
+    assert!(matches!(
+        arms[2].pattern,
+        brass_parser::ast::Pattern::Array(..)
+    ));
+    assert!(matches!(arms[2].body, Expr::Ident(..)));
+}
+
+#[test]
+fn a_line_that_is_no_arm_still_continues_the_expression() {
+    // Without a following `=>` (or nested in parentheses) the same tokens keep
+    // continuing the arm's expression.
+    let arms = match_arms(
+        "fun f(n, xs) {\nreturn match n {\n1 => n\n- 1\n2 => xs\n[0]\n_ => (n\n-1)\n}\n}",
+    );
+    assert_eq!(arms.len(), 3, "{arms:#?}");
+    assert!(matches!(arms[0].body, Expr::Binary(..)));
+    assert!(matches!(arms[1].body, Expr::Index(..)));
+    assert!(matches!(arms[2].body, Expr::Binary(..)));
+}

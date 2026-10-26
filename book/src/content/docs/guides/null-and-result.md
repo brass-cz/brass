@@ -37,7 +37,14 @@ if !none {
 Using a nullable value without a check (say `found + 1` before the `if`) is
 a compile error. An early-return guard also narrows: after
 `if !x { return ... }`, the value `x` is a plain `T` for the rest of the
-function.
+block the guard is in. Assigning a possibly-null value to `x` (for example
+`x = x.next` while walking a linked list) is allowed and makes it nullable
+again until the next check.
+
+Only a variable narrows. Testing a field (`if node.next`) leaves the field
+nullable, since any alias of the record could reassign it; bind it first with
+`if let next = node.next { ... }`. The full narrowing rules are in the
+[type system reference](/references/types/#nullable).
 
 ## Result and `error`
 
@@ -304,9 +311,12 @@ failure.
 
 ## Absent fields become `null` in conditions
 
-Inside a conditional, an inference failure (such as accessing a field the
-value does not have) becomes `null` instead of a compile error. This lets a
-structurally typed function probe for optional fields:
+A member the value's type does not have reads as `null`, so a condition over
+it is false and its arm is dropped (see
+[Dispatching on a value's type](/guides/reflection/#dispatching-on-a-values-type)).
+A field an unannotated parameter's body uses only behind such a test is
+therefore not required of the argument, which lets a structurally typed
+function probe for optional fields:
 
 ```brass
 fun get_name(person) {

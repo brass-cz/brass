@@ -25,433 +25,28 @@ use brass_mir::{
 use brass_parser::ast::{BinOp, UnaryOp};
 
 use crate::mono::{
-    MonoFunction, MonoProgram, binary_operand_type, float_kind_name, instance_symbol,
-    int_kind_name, is_comparison, method_symbol, numeric_conv_ret, operand_type_of,
-    prim_method_instance, static_symbol, unwrap_nullable,
+    MonoFunction, MonoProgram, binary_operand_type, display_instance, float_kind_name,
+    instance_symbol, int_kind_name, is_comparison, method_symbol, nullable_display_instance,
+    numeric_conv_ret, operand_type_of, prim_method_instance, static_symbol, unwrap_nullable,
 };
 
-/// Whether a type is a reference-counted heap object the back end tracks with
-/// retain/release: strings, records, sums, arrays/slices, tuples, closures, and
-/// nullable cells. Aggregates release the heap contents they own recursively
-/// through per-type destructors ([`Codegen::release_obj`]: record/variant
-/// fields, array elements and the element buffer); a closure releases its
-/// captures through the destructor stored in its object
-/// ([`Codegen::release_closure`], since the `Fun` type hides the capture
-/// types); a string is a leaf, freed directly.
-pub fn rc_managed(ty: &Type) -> bool {
-    matches!(
-        ty,
-        Type::Str
-            | Type::Record(..)
-            | Type::Sum(..)
-            | Type::Slice(..)
-            | Type::Array(..)
-            | Type::Fun(..)
-            // A tuple is a fixed heterogeneous heap aggregate (a pointer), tracked
-            // and reclaimed like a record.
-            | Type::Tuple(..)
-            // A nullable is a heap cell (a pointer, null = null), so it is
-            // reference-counted: retained when aliased, released when dropped. A cell
-            // of a managed value also owns that value (its destructor releases it).
-            | Type::Nullable(..)
-    )
-}
+mod concurrency;
+mod dispatch;
+mod ownership;
+mod types;
 
-/// Whether storing a `value_ty` value into a `dest_ty` slot is a nullable wrap: a
-/// non-nullable value flowing into a nullable cell. `nullable_wrap` builds a fresh
-/// cell that already owns its content, so the storing slot takes that ownership
-/// without an extra retain (retaining the fresh cell would over-count it -- it is an
-/// intermediate, never separately dropped).
-fn is_nullable_wrap(dest_ty: &Type, value_ty: &Type) -> bool {
-    matches!(dest_ty, Type::Nullable(_)) && !matches!(value_ty, Type::Nullable(_))
-}
+pub use concurrency::{batch_spawns, program_uses_with, spawn_precompile};
+pub use ownership::rc_managed;
+pub use types::{
+    ViewFieldPlan, aggregate_field_type, element_type, record_field_names, record_field_type,
+    record_from_field_flows, record_from_succeeds, result_ok_type, str_const, strip_wrappers,
+    view_field_plans,
+};
 
-/// The locals moved out by a `spawn` (their reference is transferred to the new
-/// thread, which releases the closure when it finishes). R6's capture analysis
-/// guarantees such a value is not live after the spawn, so excluding it from the
-/// spawner's end-of-scope releases is the move -- not a leak or a use-after-free.
-/// Whether any instance in `program` spawns a task. The lazy JIT compiles
-/// and primes every recorded deferred target before code from such a batch
-/// runs: spawned code executes on worker threads, which can only READ the
-/// resolved-address cache -- the compiler lives on the main thread.
-pub fn batch_spawns(program: &MonoProgram) -> bool {
-    let spawns =
-        |rv: &Rvalue| matches!(rv, Rvalue::Call(Callee::Builtin(name), _) if name == "spawn");
-    program.functions.iter().any(|f| {
-        f.body.blocks.iter().any(|b| {
-            b.stmts.iter().any(|s| match s {
-                MirStmt::Assign(_, rv) | MirStmt::Eval(rv) => spawns(rv),
-                _ => false,
-            })
-        })
-    })
-}
-
-fn spawn_moved_locals(f: &MonoFunction) -> fxhash::FxHashSet<LocalId> {
-    let mut moved = fxhash::FxHashSet::default();
-    let mut scan = |rv: &Rvalue| {
-        if let Rvalue::Call(Callee::Builtin(name), args) = rv
-            && name == "spawn"
-            && let Some(Operand::Local(id)) = args.first()
-        {
-            moved.insert(*id);
-        }
-    };
-    for block in &f.body.blocks {
-        for s in &block.stmts {
-            match s {
-                MirStmt::Assign(_, rv) | MirStmt::Eval(rv) => scan(rv),
-                _ => {}
-            }
-        }
-    }
-    moved
-}
-
-/// The monomorphized instance symbols a spawned worker thread may execute, or
-/// `None` when the program never spawns. For each `spawn` site the operand is
-/// traced to the closure instances it can hold; those roots plus everything
-/// statically reachable from their bodies -- direct calls, and closures
-/// created inside reachable bodies (the only way a function value originates
-/// on the worker) -- form the set.
-///
-/// The walk gives up and returns EVERY instance, the sound fallback, when a
-/// function value can cross onto the worker unseen: a spawn operand or a
-/// `Fun`-typed capture that cannot be traced to its creations, a capture or a
-/// read global whose type carries a function anywhere inside it, or a program
-/// with runtime-deferred call sites. Precision only trims the set; soundness
-/// never depends on it.
-pub fn spawn_precompile(program: &MonoProgram) -> Option<Vec<String>> {
-    if !batch_spawns(program) {
-        return None;
-    }
-    spawn_reachable_instances(program)
-        .or_else(|| Some(program.functions.iter().map(|f| f.symbol.clone()).collect()))
-}
-
-/// The precise half of [`spawn_precompile`]; `None` means the walk gave up.
-fn spawn_reachable_instances(program: &MonoProgram) -> Option<Vec<String>> {
-    // Deferred sites resolve through the runtime service; their targets are
-    // invisible to a static walk.
-    if !program.deferred.is_empty() {
-        return None;
-    }
-
-    // Roots: every closure instance a spawn operand can hold. Closure bodies
-    // are instances themselves, so a nested spawn's operand resolves inside
-    // its enclosing closure body here as well.
-    let mut roots: Vec<String> = Vec::new();
-    for f in &program.functions {
-        for (_, rv) in body_rvalues(f) {
-            let Rvalue::Call(Callee::Builtin(name), args) = rv else {
-                continue;
-            };
-            if name != "spawn" {
-                continue;
-            }
-            let local = args.first().and_then(Operand::as_local)?;
-            let mut visiting = fxhash::FxHashSet::default();
-            trace_closure_local(program, f, local, &mut roots, &mut visiting)?;
-        }
-    }
-
-    // Everything statically reachable from the roots. A closure created inside
-    // a reachable body is callable there (indirectly), so it joins the walk;
-    // any other function value a worker can call was either created in such a
-    // body or rejected while resolving the roots' captures.
-    let mut seen = std::collections::BTreeSet::new();
-    let mut queue = roots;
-    while let Some(symbol) = queue.pop() {
-        if !seen.insert(symbol.clone()) {
-            continue;
-        }
-        // An uninstantiated closure has no body: its value slot stays null and
-        // calling it traps, so there is nothing to compile or walk.
-        let Some(f) = program.lookup(&symbol) else {
-            continue;
-        };
-        for (dest, rv) in body_rvalues(f) {
-            match rv {
-                Rvalue::Call(callee, args) => {
-                    let arg_types: Vec<Type> = args
-                        .iter()
-                        .map(|a| operand_type_of(a, &f.local_types))
-                        .collect();
-                    let dest_ty = dest
-                        .map(|d| f.local_types[d.index()].clone())
-                        .unwrap_or(Type::Void);
-                    if let CallKind::Instance(target) =
-                        classify_call(program, callee, &arg_types, &dest_ty)
-                    {
-                        // The eager path panics when a validated call has no
-                        // instance; this walk cannot prove more than it does.
-                        program.lookup(&target)?;
-                        queue.push(target);
-                    }
-                }
-                Rvalue::Closure { id, captures } => {
-                    if let Some(sym) = created_closure_symbol(f, dest, *id, captures) {
-                        queue.push(sym);
-                    }
-                }
-                Rvalue::Global(name) => {
-                    // A function value read out of module state is invisible
-                    // to this walk.
-                    let known_fun_free = program
-                        .global_type(name)
-                        .is_some_and(|t| !type_contains_fun(program.hir, t));
-                    if !known_fun_free {
-                        return None;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    // Only symbols with an instance have a module to materialize.
-    Some(
-        seen.into_iter()
-            .filter(|s| program.lookup(s).is_some())
-            .collect(),
-    )
-}
-
-/// Add every closure instance `local` can hold in `f`'s body to `out`,
-/// following local-to-local copies, and trace `Fun`-typed captures to their
-/// own creations (they become roots too: the worker can call them). `None`
-/// when a producer other than a closure creation or a copy feeds the local,
-/// or when a capture's type could smuggle a function value the trace cannot
-/// see.
-fn trace_closure_local(
-    program: &MonoProgram,
-    f: &MonoFunction,
-    local: LocalId,
-    out: &mut Vec<String>,
-    visiting: &mut fxhash::FxHashSet<LocalId>,
-) -> Option<()> {
-    if !visiting.insert(local) {
-        return Some(());
-    }
-    let mut found = false;
-    for (dest, rv) in body_rvalues(f) {
-        if dest != Some(local) {
-            continue;
-        }
-        match rv {
-            Rvalue::Closure { id, captures } => {
-                for op in captures {
-                    let cty = operand_type_of(op, &f.local_types);
-                    if matches!(cty, Type::Fun(..)) {
-                        trace_closure_local(program, f, op.as_local()?, out, visiting)?;
-                    } else if type_contains_fun(program.hir, &cty) {
-                        return None;
-                    }
-                }
-                out.push(created_closure_symbol(f, dest, *id, captures)?);
-                found = true;
-            }
-            // A plain copy: the source's closures are this local's closures.
-            Rvalue::Use(op) => {
-                trace_closure_local(program, f, op.as_local()?, out, visiting)?;
-                found = true;
-            }
-            // Any other producer (a call result, a load, a global) hides the
-            // creation site.
-            _ => return None,
-        }
-    }
-    found.then_some(())
-}
-
-/// The instance symbol of a closure created by [`Rvalue::Closure`], keyed the
-/// way [`Codegen::codegen_rvalue`] keys `make_closure`: capture types from the
-/// capture operands, parameter types from the destination local's `Fun` type.
-/// `None` when the destination is discarded or not function-typed -- the
-/// shared driver never materializes the value then either.
-fn created_closure_symbol(
-    f: &MonoFunction,
-    dest: Option<LocalId>,
-    id: ClosureId,
-    captures: &[Operand],
-) -> Option<String> {
-    let Type::Fun(params, _) = &f.local_types[dest?.index()] else {
-        return None;
-    };
-    let capture_types: Vec<Type> = captures
-        .iter()
-        .map(|op| operand_type_of(op, &f.local_types))
-        .collect();
-    Some(crate::mono::closure_symbol(id, &capture_types, params))
-}
-
-/// Every rvalue in `f`'s body with its destination local (`None` for an
-/// evaluated-and-discarded statement).
-fn body_rvalues<'a>(
-    f: &'a MonoFunction<'_>,
-) -> impl Iterator<Item = (Option<LocalId>, &'a Rvalue)> {
-    f.body.blocks.iter().flat_map(|b| {
-        b.stmts.iter().filter_map(|s| match s {
-            MirStmt::Assign(dest, rv) => Some((Some(*dest), rv)),
-            MirStmt::Eval(rv) => Some((None, rv)),
-            _ => None,
-        })
-    })
-}
-
-/// Whether a value of `ty` can contain a function value anywhere inside it:
-/// directly, or through an element, a record field, or a variant payload.
-/// Conservative: an unresolvable layout counts as containing one.
-fn type_contains_fun(hir: &brass_hir::Program, ty: &Type) -> bool {
-    fn walk(hir: &brass_hir::Program, ty: &Type, visiting: &mut Vec<String>) -> bool {
-        match ty {
-            Type::Fun(..) => true,
-            Type::Bool | Type::Int(_) | Type::Float(_) | Type::Str | Type::Void | Type::Never => {
-                false
-            }
-            Type::Array(elem, _) | Type::Slice(elem) => walk(hir, elem, visiting),
-            Type::Nullable(inner) | Type::ConstOf(inner) | Type::Mut(inner) | Type::Ref(inner) => {
-                walk(hir, inner, visiting)
-            }
-            Type::Tuple(elems) => elems.iter().any(|e| walk(hir, e, visiting)),
-            // A revisited nominal is already being examined higher in the
-            // walk; the cycle adds no new field types.
-            Type::Record(n) => {
-                let key = ty.display_full();
-                if visiting.contains(&key) {
-                    return false;
-                }
-                visiting.push(key);
-                let contains = match crate::render::render_record_fields(hir, n) {
-                    Some(fields) => fields.iter().any(|(_, t)| walk(hir, t, visiting)),
-                    None => true,
-                };
-                visiting.pop();
-                contains
-            }
-            Type::Sum(n) => {
-                let key = ty.display_full();
-                if visiting.contains(&key) {
-                    return false;
-                }
-                visiting.push(key);
-                let contains =
-                    match sum_variant_names(hir, n) {
-                        Some(names) => names.iter().any(|v| {
-                            match crate::render::render_variant_fields(hir, n, v) {
-                                Some((_, fields)) => {
-                                    fields.iter().any(|(_, t)| walk(hir, t, visiting))
-                                }
-                                None => true,
-                            }
-                        }),
-                        None => true,
-                    };
-                visiting.pop();
-                contains
-            }
-            // Neither survives monomorphization; assume the worst.
-            Type::Unknown(_) | Type::SelfType => true,
-        }
-    }
-    walk(hir, ty, &mut Vec::new())
-}
-
-/// The declared variant names of sum type `n`, or `None` for an unknown
-/// nominal.
-fn sum_variant_names(hir: &brass_hir::Program, n: &brass_hir::NominalType) -> Option<Vec<String>> {
-    let info = hir.type_by_id(n.id)?;
-    let brass_hir::TypeKind::Sum { variants } = &info.kind else {
-        return None;
-    };
-    Some(variants.iter().map(|v| v.name.clone()).collect())
-}
-
-/// Whether an rvalue yields a *second reference to an existing object* (an alias)
-/// rather than a freshly-owned value. Aliases must be retained when bound; fresh
-/// values (call results, constructions, literals) already own their single
-/// reference.
-fn is_alias_rvalue(rv: &Rvalue) -> bool {
-    matches!(
-        rv,
-        Rvalue::Use(Operand::Local(_)) | Rvalue::Load(_) | Rvalue::Global(_)
-    )
-}
-
-/// Whether an operand is an alias of an existing object (a local read), as opposed to
-/// a fresh value (a literal constant). Storing an alias into an aggregate must retain
-/// it (a second reference); a fresh constant is already owned at count 1 and the
-/// aggregate takes that ownership -- retaining it would leak, since a constant has no
-/// local binding whose drop would balance the retain.
-fn operand_is_alias(op: &Operand) -> bool {
-    matches!(op, Operand::Local(_))
-}
-
-/// Whether an rvalue *bound to a local* yields an alias of an existing managed
-/// object and so must be retained: a plain alias rvalue, or `to_string`/`string.from`
-/// of a string (its identity result is a second reference to the argument). The
-/// conversion is recognized here rather than in the back end's leaf so that an
-/// unbound, transient conversion (e.g. inside `print`) is not retained and leaked.
-fn binds_alias(rv: &Rvalue, local_types: &[Type]) -> bool {
-    if is_alias_rvalue(rv) {
-        return true;
-    }
-    // Rendering a string is the identity, so the result aliases the argument. Both
-    // the implicit interpolation builtin (`to_string`) and the explicit `string.from`
-    // static call lower to that same identity leaf, so a bound result of either must
-    // be retained -- otherwise its later drop over-releases the borrowed argument
-    // (e.g. `let a = string.from(key)` used twice double-frees `key`). For a
-    // non-string argument the conversion allocates a fresh owned string, not an alias.
-    let str_identity_arg = match rv {
-        Rvalue::Call(Callee::Builtin(name), args) if name == "to_string" => args.first(),
-        Rvalue::Call(Callee::Static { ty, method }, args) if ty == "string" && method == "from" => {
-            args.first()
-        }
-        _ => None,
-    };
-    if let Some(arg) = str_identity_arg {
-        return matches!(operand_type_of(arg, local_types), Type::Str);
-    }
-    if let Rvalue::Call(Callee::Builtin(name), args) = rv
-        && name == "__nonnull"
-        && let Some(arg) = args.first()
-    {
-        return rc_managed(unwrap_nullable(&operand_type_of(arg, local_types)));
-    }
-    false
-}
-
-/// Whether a discarded call result borrows a managed value already owned by a
-/// local. Identity conversions and nullable narrowing return their argument;
-/// releasing that borrowed result would consume the local's reference. A
-/// constant argument has no other owner, so its identity result remains an
-/// owned temporary and is released normally.
-fn discarded_call_borrows_alias(rv: &Rvalue, local_types: &[Type]) -> bool {
-    binds_alias(rv, local_types)
-        && matches!(
-            rv,
-            Rvalue::Call(_, args) if matches!(args.first(), Some(Operand::Local(_)))
-        )
-}
-
-/// Whether the program uses `with` -- and so opens regions and needs the write
-/// barrier on heap stores. A back end consults this so a sequential (region-free)
-/// program emits no barriers and pays no barrier cost.
-pub fn program_uses_with(program: &MonoProgram) -> bool {
-    fn rv_with(rv: &Rvalue) -> bool {
-        // `_with_all` is the auto-acquire pass's group form of `with`; a program
-        // whose only guards are group wraps still shares cowns across threads, so
-        // it needs the same barriers.
-        matches!(rv, Rvalue::Call(Callee::Builtin(n), _) if n == "with" || n == "_with_all")
-    }
-    program.functions.iter().any(|f| {
-        f.body.blocks.iter().any(|b| {
-            b.stmts.iter().any(|s| match s {
-                MirStmt::Assign(_, rv) | MirStmt::Eval(rv) => rv_with(rv),
-                _ => false,
-            })
-        })
-    })
-}
+use concurrency::spawn_moved_locals;
+use dispatch::{CallKind, classify_call};
+use ownership::{binds_alias, discarded_call_borrows_alias, is_nullable_wrap, operand_is_alias};
+use types::{builtin_result_type, index_type, strip_ret_nullable};
 
 /// A typed code-generation back end for monomorphized MIR.
 pub trait Codegen {
@@ -490,6 +85,9 @@ pub trait Codegen {
 
     // ===== typed constants (leaf) =====
 
+    /// An integer constant of type `ty`. `v` carries the value's low 64 bits
+    /// in two's complement, so a `uint64` above `INT64_MAX` arrives as its
+    /// bit pattern (a negative `i64`).
     fn const_int(&mut self, v: i64, ty: &Type) -> Self::Value;
     fn const_float(&mut self, v: f64, ty: &Type) -> Self::Value;
     fn const_bool(&mut self, v: bool) -> Self::Value;
@@ -513,6 +111,18 @@ pub trait Codegen {
     fn string_len(&mut self, s: Self::Value) -> Self::Value;
     /// Render value `v` of type `ty` as a string (string interpolation).
     fn to_string(&mut self, v: Self::Value, ty: &Type) -> Self::Value;
+    /// Render the nullable value `v` (a `T?` with inner type `inner`) through
+    /// `T`'s USER `display` instance `symbol` (returning `ret`, a string): the
+    /// string `null` when `v` is absent, else the instance's result on the
+    /// unwrapped value. The result is an owned string either way, like
+    /// [`Codegen::to_string`] of a nullable.
+    fn display_nullable(
+        &mut self,
+        v: Self::Value,
+        inner: &Type,
+        symbol: &str,
+        ret: &Type,
+    ) -> Self::Value;
     /// The substring `[start, end)` of `s` (`_string_slice`).
     fn string_slice(&mut self, s: Self::Value, start: Self::Value, end: Self::Value)
     -> Self::Value;
@@ -598,18 +208,6 @@ pub trait Codegen {
     /// back end returns [`Codegen::unit`] for a `void` callee).
     fn call(&mut self, symbol: &str, args: &[Self::Value], ret: &Type) -> Self::Value;
 
-    /// Deferred dispatch: resolve-or-compile the consumer named
-    /// `consumer` for the runtime type named `type_name`, then call it on `value`,
-    /// returning its `int32` result. The back end emits a call to the runtime
-    /// dispatch trampoline for the resolution and an indirect call for the
-    /// dispatch.
-    fn deferred_dispatch(
-        &mut self,
-        consumer: &str,
-        type_name: &str,
-        value: Self::Value,
-    ) -> Self::Value;
-
     // ===== records (leaf) =====
 
     /// Construct a record of type `record_ty` (a `Type::Record` whose
@@ -670,6 +268,19 @@ pub trait Codegen {
     /// makes a mutated capture a cown (still mutated under its `with` lock).
     fn freeze(&mut self, value: Self::Value);
     fn make_cown(&mut self, value: Self::Value);
+    /// Give a heap value of type `ty` that leaves a `with` callback an atomic
+    /// reference count before the lock is released. Such a value was read out
+    /// of (or built from) the locked object graph and is now held by code
+    /// running outside the lock (`let h = o.inner` becomes
+    /// `let h = with(o, (o) -> o.inner)` under the spawn auto-guard), while a
+    /// spawned task may reach the same object under the lock: both sides then
+    /// update its count, which must therefore be atomic. A nullable is promoted
+    /// together with its present content. The default promotes the value
+    /// itself.
+    fn share_escaping(&mut self, value: Self::Value, ty: &Type) {
+        let _ = ty;
+        self.make_cown(value);
+    }
     /// Join every thread spawned so far (`sync`), so their effects are observable
     /// before execution continues.
     fn thread_join_all(&mut self);
@@ -678,7 +289,7 @@ pub trait Codegen {
     /// reference-counted (heap) values; scalars never reach it.
     fn retain(&mut self, value: Self::Value);
     /// Decrement a heap value's reference count, freeing the (leaf) object at zero.
-    /// Used for strings; records go through [`Codegen::release_record`].
+    /// Used for strings; aggregates go through [`Codegen::release_obj`].
     fn release(&mut self, value: Self::Value);
     /// Decrement an aggregate's reference count and, at zero, release the heap
     /// contents it owns before freeing it (a per-type destructor): a record's
@@ -779,6 +390,7 @@ pub trait Codegen {
         &mut self,
         fun_ty: &Type,
         id: ClosureId,
+        target: Option<&str>,
         captures: &[(Type, Self::Value)],
     ) -> Self::Value;
     /// Call a closure value `callee` (of `Fun` type `callee_ty`) with `args`.
@@ -799,6 +411,17 @@ pub trait Codegen {
     fn emit_unreachable(&mut self);
 
     // ===== default dispatch (provided) =====
+
+    /// [`Codegen::share_escaping`] for `result`, the value a lock-holding
+    /// `with` callback of closure type `closure_ty` returned, when it is a heap
+    /// value. Called before the lock is released.
+    fn share_with_result(&mut self, result: Self::Value, closure_ty: &Type) {
+        if let Type::Fun(_, ret) = closure_ty
+            && rc_managed(unwrap_nullable(ret))
+        {
+            self.share_escaping(result, ret);
+        }
+    }
 
     fn codegen_program(&mut self, program: &MonoProgram) {
         let mut perf = brass_utils::PerfLog::start("back/codegen-fn");
@@ -914,7 +537,7 @@ pub trait Codegen {
                     let raw_ty = f.local_type(place.local).clone();
                     let base = self.load_local(place.local);
                     let (base, base_ty) = self.unwrap_narrowed(base, &raw_ty);
-                    let fty = record_field_type(&base_ty, field);
+                    let fty = aggregate_field_type(program.hir, &base_ty, field);
                     // Snapshot the slot's previous value before overwriting: the
                     // slot owned it, and the barrier must read its header before
                     // the release below can free it.
@@ -976,7 +599,7 @@ pub trait Codegen {
     ///    separately tracked object reachable through the slot -- is accounted
     ///    (and un-accounted) together with the cell itself.
     /// 3. Release the old value: the slot owned it and it is no longer reachable
-    ///    through the slot, so without this every overwrite leaked it.
+    ///    through the slot.
     fn overwrite_epilogue(
         &mut self,
         f: &MonoFunction,
@@ -1232,10 +855,11 @@ pub trait Codegen {
             }
             // `T.from(v)`: a fallible structural conversion. `dest_ty` is `T?`; per
             // instance the source's concrete type is known, so the branch is decided
-            // here. When the source record has every field `T` declares (with a
-            // matching type) the record is built by reading those fields and wrapped
-            // nullable; otherwise the conversion fails and yields null. This is the
-            // "branch by the actual argument type" resolved at monomorphization time.
+            // here. When the source record has every field `T` declares, each
+            // flowing into its target field (`record_from_succeeds`), the record is
+            // built by reading and converting those fields and wrapped nullable;
+            // otherwise the conversion fails and yields null. This is the "branch
+            // by the actual argument type" resolved at monomorphization time.
             Rvalue::RecordFrom { source, .. } => {
                 let target = match dest_ty {
                     Type::Nullable(inner) => inner.as_ref().clone(),
@@ -1251,10 +875,14 @@ pub trait Codegen {
                 let mut managed: Vec<Self::Value> = Vec::new();
                 for name in &field_names {
                     let fty = record_field_type(&target, name);
+                    let sty = record_field_type(strip_wrappers(&src_ty), name);
                     // The field is read out of `src` (an alias into the source
-                    // record), so the new record must retain a managed one.
+                    // record) and converted to the target field's type.
                     let v = self.load_field(src, &src_ty, name);
-                    if rc_managed(&fty) {
+                    let v = self.coerce(v, &sty, &fty);
+                    // The new record must retain a managed alias; a nullable
+                    // wrap is a fresh cell that already owns its content.
+                    if rc_managed(&fty) && !is_nullable_wrap(&fty, &sty) {
                         managed.push(v);
                     }
                     named.push((name.as_str(), v));
@@ -1267,11 +895,12 @@ pub trait Codegen {
                 self.coerce(rec, &target, dest_ty)
             }
             // The view of a callee parameter's row: a fresh structural record
-            // holding exactly the row's fields. `dest_ty` is the view type the
-            // monomorphizer fixed from the row and this instance's concrete
-            // source; per field the shared plan decides copy vs null, so a
-            // guarded field the source lacks (or carries at a non-flowing type)
-            // materializes as null rather than failing the call. A destination
+            // holding exactly the row's fields, each at the source's own field
+            // type. `dest_ty` is the view type the monomorphizer fixed from the
+            // row and this instance's concrete source; per field the shared
+            // plan decides copy vs null, so a guarded field the source lacks
+            // (or cannot supply) materializes as null rather than failing the
+            // call. A destination
             // that is not a structural record is mono's defensive identity
             // pass-through; mirror it.
             Rvalue::RecordView { source, .. } => {
@@ -1301,8 +930,8 @@ pub trait Codegen {
                             let v = self.coerce(v, &ft, fty);
                             // The loaded field is an alias into the source, so
                             // the fresh record must retain a managed one. A
-                            // guarded wrap is exempt: the wrap cell is fresh and
-                            // already retains its content itself.
+                            // nullable wrap is exempt: the wrap cell is fresh
+                            // and already retains its content itself.
                             if rc_managed(fty) && !is_nullable_wrap(fty, &ft) {
                                 managed.push(v);
                             }
@@ -1367,7 +996,12 @@ pub trait Codegen {
                     }
                     caps.push((cty, v));
                 }
-                let clo = self.make_closure(dest_ty, *id, &caps);
+                let clo = self.make_closure(
+                    dest_ty,
+                    *id,
+                    f.closure_targets.get(id).map(String::as_str),
+                    &caps,
+                );
                 // The closure environment now references each managed capture.
                 for v in managed {
                     self.retain(v);
@@ -1404,8 +1038,8 @@ pub trait Codegen {
                     }
                     let arr = self.make_array(&elem_ty, &vals);
                     // Same ownership rule as `MirStmt::Store` (see the tuple arm
-                    // above): retaining a fresh constant or wrap cell leaked one
-                    // reference per element.
+                    // above): retaining a fresh constant or wrap cell would leak
+                    // one reference per element.
                     if rc_managed(&elem_ty) {
                         for (op, v) in es.iter().zip(&vals) {
                             let op_ty = operand_type_of(op, &f.local_types);
@@ -1478,7 +1112,7 @@ pub trait Codegen {
         }
     }
 
-    /// Generate a call, branching on the shared [`classify_call`] dispatch (the
+    /// Generate a call, branching on the shared `classify_call` dispatch (the
     /// same classification [`Codegen::call_result_type`] types results with) and
     /// routing free / instance-method / static calls to the matching
     /// monomorphized instance.
@@ -1494,7 +1128,7 @@ pub trait Codegen {
             .iter()
             .map(|a| operand_type_of(a, &f.local_types))
             .collect();
-        let target = match classify_call(program, callee, &arg_types, dest_ty) {
+        let target = match classify_call(program, f, callee, &arg_types, dest_ty) {
             // The receiver type is stripped of a top-level nullable (a narrowed
             // `T[]?`), and the operand is loaded at that stripped type so the
             // cell is unwrapped.
@@ -1553,6 +1187,11 @@ pub trait Codegen {
             CallKind::Io(name) => return self.codegen_io(program, f, name, args),
             CallKind::Builtin(name) => return self.codegen_builtin(program, f, name, args),
             CallKind::Indirect(callee) => return self.codegen_indirect(program, f, callee, args),
+            CallKind::NullableDisplay(symbol) => {
+                let ty = &arg_types[0];
+                let v = self.codegen_operand(program, f, &args[0], ty);
+                return self.render_nullable_display(program, v, ty, &symbol);
+            }
             CallKind::Instance(target) => target,
         };
         let Some(inst) = program.lookup(&target) else {
@@ -1583,30 +1222,9 @@ pub trait Codegen {
         self.call(&symbol, &vals, &ret)
     }
 
-    /// Deferred dispatch: `__rt_dispatch("consumer", type_id,
-    /// value)`. Evaluates the runtime type id and the value, then hands them with
-    /// the consumer's source name to the back end's [`Codegen::deferred_dispatch`]
-    /// leaf, which (via the runtime dispatch service) JIT-compiles the consumer
-    /// specialized for that type on first use and calls it. The consumer name is a
-    /// string literal; the result is `int32`.
-    fn codegen_deferred_dispatch(
-        &mut self,
-        program: &MonoProgram,
-        f: &MonoFunction,
-        args: &[Operand],
-    ) -> Self::Value {
-        // `__rt_dispatch("consumer", "TypeName", value)`: the consumer and the
-        // runtime type are string literals; the value is evaluated.
-        let consumer = str_const(&args[0]).unwrap_or_default();
-        let type_name = str_const(&args[1]).unwrap_or_default();
-        let val_ty = operand_type_of(&args[2], &f.local_types);
-        let value = self.codegen_operand(program, f, &args[2], &val_ty);
-        self.deferred_dispatch(consumer, type_name, value)
-    }
-
     /// MIR-internal builtins: the `match`-lowering tests (`value_matches`,
     /// `panic`), the runtime string/array/conversion primitives, and the
-    /// concurrency operations. Paired with [`builtin_result_type`], which types
+    /// concurrency operations. Paired with `builtin_result_type`, which types
     /// the result of every builtin whose shape differs from its destination --
     /// when adding a builtin here, add its result shape there unless the
     /// destination type already matches.
@@ -1704,9 +1322,6 @@ pub trait Codegen {
                 self.runtime_panic(m);
                 self.unit()
             }
-            // Deferred dispatch: `__rt_dispatch("consumer",
-            // "TypeName", value)`.
-            "__rt_dispatch" => self.codegen_deferred_dispatch(program, f, args),
             "len" => {
                 // Strip a top-level nullable (a narrowed `T[]?`/`string?`) so the
                 // operand is loaded at its inner type and the cell is unwrapped.
@@ -1725,9 +1340,8 @@ pub trait Codegen {
                 // A tuple's arity is fixed by its type, and it carries no length
                 // field to read: answer from the type. `[k, v]` destructuring
                 // lowers to an array pattern, whose match test is a length check,
-                // so without this a `match`/`for` over tuples never matched (the
-                // interpreter, which reads the value's own length, always did --
-                // the two back ends disagreed).
+                // so a `match`/`for` over tuples matches here exactly as it does
+                // on the interpreter, which reads the value's own length.
                 if let Type::Tuple(elems) = &ty {
                     let n = elems.len() as i64;
                     return self.const_int(n, &Type::Int(brass_hir::IntKind::I64));
@@ -1749,7 +1363,7 @@ pub trait Codegen {
                 self.unit()
             }
             // `sync()` joins every spawned thread so their effects are observable
-            // before the program continues (R6 value-observability).
+            // before the program continues.
             "sync" => {
                 self.thread_join_all();
                 self.unit()
@@ -1763,9 +1377,9 @@ pub trait Codegen {
                 // Only a heap-managed capture has an object header to retag and an
                 // atomic reference count to promote. A primitive capture (int,
                 // float, bool) is copied by value across the spawn boundary, so it
-                // needs neither -- and feeding its scalar value to the runtime's
-                // `void(ptr)` promotion would be a type mismatch (and a wild header
-                // write). Skip promotion for such captures.
+                // needs neither -- and its scalar value does not match the
+                // runtime's `void(ptr)` promotion. Skip promotion for such
+                // captures.
                 if rc_managed(unwrap_nullable(&ty)) {
                     let v = self.codegen_operand(program, f, &args[0], &ty);
                     if name == "_freeze" {
@@ -1796,10 +1410,9 @@ pub trait Codegen {
                 // The multi form applies ONLY to arrays of records -- the shape
                 // the explicit group syntax produces. Any other array shared
                 // with a task (an `int32[]` or `string[]` capture the
-                // auto-acquire pass wrapped) is itself the single cown:
-                // element-locking would chase raw scalars as object pointers
-                // (a crash), and a push's realloc would change the element set
-                // between lock and unlock.
+                // auto-acquire pass wrapped) is itself the single cown: its
+                // elements are not cowns, and a push's realloc would change the
+                // element set between lock and unlock.
                 let multi = match unwrap_nullable(&obj_ty) {
                     Type::Slice(e) | Type::Array(e, _) => matches!(**e, Type::Record(_)),
                     _ => false,
@@ -1808,9 +1421,9 @@ pub trait Codegen {
                 // its bridge; closedness is verified on release.
                 // The lock (data-race-freedom) is kept around the region: acquire it
                 // first, so the region open/close and the body all run under it.
-                // Otherwise concurrent `with`s on the same cown race on the region
-                // setup -- `region_open` writes the bridge's header, and the body's
-                // write barrier mutates region metadata -- which corrupts the heap.
+                // Otherwise concurrent `with`s on the same cown would race on the
+                // region setup -- `region_open` writes the bridge's header, and the
+                // body's write barrier mutates region metadata.
                 if multi {
                     self.cown_lock_all(obj);
                 } else {
@@ -1818,6 +1431,7 @@ pub trait Codegen {
                 }
                 let region = (!multi).then(|| self.region_open(obj));
                 let result = self.call_indirect(clo, &cty, &[obj]);
+                self.share_with_result(result, &cty);
                 if let Some(region_id) = region {
                     self.region_close(region_id);
                 }
@@ -1853,6 +1467,7 @@ pub trait Codegen {
                 }
                 self.cown_lock_many(&cowns);
                 let result = self.call_indirect(clo, &cty, &[]);
+                self.share_with_result(result, &cty);
                 self.cown_unlock_many(&cowns);
                 result
             }
@@ -1983,7 +1598,7 @@ pub trait Codegen {
     /// call result must then be unwrapped explicitly (`T? -> T`) instead of storing
     /// the nullable cell pointer where the inner value pointer is expected.
     ///
-    /// Branches on the same [`classify_call`] dispatch as
+    /// Branches on the same `classify_call` dispatch as
     /// [`Codegen::codegen_call`], so the emitted call and its assumed result type
     /// cannot disagree. A `None` means the shape is unknown here and the
     /// destination type is assumed to match.
@@ -1999,7 +1614,7 @@ pub trait Codegen {
             .iter()
             .map(|a| operand_type_of(a, &f.local_types))
             .collect();
-        match classify_call(program, callee, &arg_types, dest_ty) {
+        match classify_call(program, f, callee, &arg_types, dest_ty) {
             CallKind::ArrayPush | CallKind::ArrayInsert => Some(Type::Void),
             CallKind::ArrayRemove => Some(element_type(&arg_types[0])),
             CallKind::ArrayPop => Some(Type::Nullable(Box::new(element_type(&arg_types[0])))),
@@ -2015,7 +1630,27 @@ pub trait Codegen {
                 .lookup(&target)
                 .map(|inst| inst.ret.clone())
                 .or_else(|| program.deferred.get(&target).map(|sig| sig.ret.clone())),
+            CallKind::NullableDisplay(_) => Some(Type::Str),
         }
+    }
+
+    /// Render a nullable value `v` of type `ty` whose inner type renders
+    /// through the USER `display` instance `symbol`: the string `null` when
+    /// absent, else the instance called on the unwrapped value -- the text the
+    /// non-null value renders as. Shared by `"{v}"` and `print`/`println`.
+    fn render_nullable_display(
+        &mut self,
+        program: &MonoProgram,
+        v: Self::Value,
+        ty: &Type,
+        symbol: &str,
+    ) -> Self::Value {
+        let inner = unwrap_nullable(ty).clone();
+        let ret = program
+            .lookup(symbol)
+            .map(|inst| inst.ret.clone())
+            .unwrap_or(Type::Str);
+        self.display_nullable(v, &inner, symbol, &ret)
     }
 
     /// Generate a `print`/`println`: a string argument is written directly, a
@@ -2035,15 +1670,16 @@ pub trait Codegen {
                 let v = self.codegen_operand(program, f, op, &ty);
                 if matches!(ty, Type::Str) {
                     v
-                } else if let Some(inst) =
-                    program.lookup(&method_symbol("display", std::slice::from_ref(&ty)))
-                {
+                } else if let Some(inst) = display_instance(program, &ty) {
                     // Like a `"{v}"` segment, `print`/`println` prefer the USER
                     // `display` method when the value's type declares one (the
                     // monomorphizer created the instance).
                     let symbol = inst.symbol.clone();
                     let ret = inst.ret.clone();
                     self.call(&symbol, &[v], &ret)
+                } else if let Some(inst) = nullable_display_instance(program, &ty) {
+                    let symbol = inst.symbol.clone();
+                    self.render_nullable_display(program, v, &ty, &symbol)
                 } else {
                     self.to_string(v, &ty)
                 }
@@ -2105,7 +1741,8 @@ pub trait Codegen {
         } else if let Some(k) = float_kind_name(ty) {
             Type::Float(k)
         } else {
-            return self.unit();
+            // `classify_call` routes only `numeric_conv_ret` names here.
+            panic!("internal error: `{ty}.{method}` is not a numeric conversion");
         };
         self.convert(&target, method, arg_ty, v)
     }
@@ -2154,7 +1791,7 @@ pub trait Codegen {
             // fresh managed constant's own reference has no other owner: unlike a
             // local, no binding ever drops it. Release it here so the cell holds
             // the constant's only reference -- otherwise every `"x"` wrapped into
-            // a `string?` slot leaked the string.
+            // a `string?` slot would leak the string.
             if rc_managed(inner) {
                 self.emit_release(v, inner);
             }
@@ -2166,7 +1803,9 @@ pub trait Codegen {
             Literal::Int(v) if matches!(expected_ty, Type::Float(_)) => {
                 self.const_float(*v as f64, expected_ty)
             }
-            Literal::Int(v) => self.const_int(*v, expected_ty),
+            // The checker only lets a literal reach a type that holds its
+            // value, so the low 64 bits are the whole value at that width.
+            Literal::Int(v) => self.const_int(*v as i64, expected_ty),
             Literal::Float(v) => self.const_float(*v, expected_ty),
             Literal::Bool(b) => self.const_bool(*b),
             Literal::Str(s) => self.const_str(s),
@@ -2174,289 +1813,4 @@ pub trait Codegen {
             Literal::Null => self.const_null(),
         }
     }
-}
-
-/// How a call site dispatches, derived from the callee and the concrete
-/// argument types. [`Codegen::codegen_call`] (emission) and
-/// [`Codegen::call_result_type`] (result typing) both branch on this one
-/// classification, so the two can never disagree about which primitive or
-/// instance a call resolves to.
-enum CallKind<'c> {
-    /// `arr.push(v)`: a growable-array append, not a user method.
-    ArrayPush,
-    /// `arr.insert(i, v)`: a growable-array insertion (`_array_insert`).
-    ArrayInsert,
-    /// `arr.remove(i)`: a growable-array removal (`_array_remove`) returning
-    /// the removed element.
-    ArrayRemove,
-    /// `arr.pop()`: removal of the last element (`_array_pop`), returned as a
-    /// nullable.
-    ArrayPop,
-    /// `arr.len()` / `s.len()`: the length builtin in method form.
-    Len,
-    /// A runtime-recognized numeric/string conversion `ty.method(arg)` (not a
-    /// user static).
-    NumericConv { ty: &'c str, method: &'c str },
-    /// Typed I/O: `print`/`println` write to stdout directly.
-    Io(&'c str),
-    /// A MIR-internal builtin (`match` lowering, runtime primitives).
-    Builtin(&'c str),
-    /// An indirect (closure) call through a runtime function value.
-    Indirect(&'c Operand),
-    /// A monomorphized instance, called by its resolved symbol.
-    Instance(String),
-}
-
-/// Classify how `callee` dispatches for these concrete argument types. The
-/// receiver checks strip a top-level nullable (a narrowed `T[]?` receiver still
-/// carries its declared nullable type in MIR).
-fn classify_call<'c>(
-    program: &MonoProgram,
-    callee: &'c Callee,
-    arg_types: &[Type],
-    dest_ty: &Type,
-) -> CallKind<'c> {
-    let slice_receiver = || matches!(arg_types.first().map(unwrap_nullable), Some(Type::Slice(_)));
-    match callee {
-        Callee::Method(name) if name == "push" && slice_receiver() => CallKind::ArrayPush,
-        Callee::Method(name) if name == "insert" && slice_receiver() => CallKind::ArrayInsert,
-        Callee::Method(name) if name == "remove" && slice_receiver() => CallKind::ArrayRemove,
-        Callee::Method(name) if name == "pop" && slice_receiver() => CallKind::ArrayPop,
-        Callee::Method(name)
-            if name == "len"
-                && matches!(
-                    arg_types.first().map(unwrap_nullable),
-                    Some(Type::Slice(_) | Type::Array(..) | Type::Str)
-                ) =>
-        {
-            CallKind::Len
-        }
-        // Instance method (`arg_types[0]` is the receiver). A nominal method
-        // instance is keyed by `method_symbol`; a stdlib primitive/array method
-        // (`fun string.split`) by its class-qualified symbol. The type checker
-        // has already rejected any other `recv.m()`.
-        Callee::Method(name) => {
-            let msym = method_symbol(name, arg_types);
-            let target = if program.lookup(&msym).is_some() {
-                msym
-            } else if let Some(psym) = prim_method_instance(program, name, arg_types) {
-                psym
-            } else if name == "debug" {
-                // The built-in `debug`: a receiver with neither a user nor a
-                // core primitive `debug` renders through the runtime's
-                // traditional formatter, exactly like a `"{v}"` segment.
-                return CallKind::Builtin("to_string");
-            } else {
-                instance_symbol(name, arg_types)
-            };
-            CallKind::Instance(target)
-        }
-        Callee::Static { ty, method } if numeric_conv_ret(ty, method).is_some() => {
-            CallKind::NumericConv { ty, method }
-        }
-        // The destination type keys a return-polymorphic, no-argument
-        // constructor (a witness-free `new()`) to the same instance the
-        // monomorphizer created for this result type.
-        Callee::Static { ty, method } => {
-            CallKind::Instance(static_symbol(ty, method, arg_types, Some(dest_ty)))
-        }
-        Callee::Free(base) if base == "print" || base == "println" => CallKind::Io(base),
-        Callee::Free(base) => CallKind::Instance(instance_symbol(base, arg_types)),
-        // A `to_string` segment (`"{v}"`) routes to the USER `display`
-        // instance the monomorphizer created when the value's type declares
-        // one; everything else keeps the built-in renderer.
-        Callee::Builtin(name) if name == "to_string" => {
-            let dsym = method_symbol("display", arg_types);
-            if program.lookup(&dsym).is_some() {
-                CallKind::Instance(dsym)
-            } else {
-                CallKind::Builtin(name)
-            }
-        }
-        Callee::Builtin(name) => CallKind::Builtin(name),
-        Callee::Indirect(op) => CallKind::Indirect(op),
-    }
-}
-
-/// The `Ok` payload type of a `Result` return type (`void` if not a `Result`).
-/// A `Result<..>?` return (a body that also propagates a null) reads as its
-/// inner `Result`.
-pub fn result_ok_type(ret: &Type) -> Type {
-    match strip_ret_nullable(ret) {
-        Type::Sum(n) => n
-            .result_payloads()
-            .map(|(ok, _)| ok.clone())
-            .unwrap_or(Type::Void),
-        _ => Type::Void,
-    }
-}
-
-/// A fallible return type with its outer nullability stripped: `Result<..>?`
-/// (a body that also propagates a null) reads as its `Result`.
-fn strip_ret_nullable(ret: &Type) -> &Type {
-    match ret {
-        Type::Nullable(inner) if inner.is_result_type() => inner,
-        other => other,
-    }
-}
-
-/// The concrete type of field `name` in a record type, or `void` if absent.
-pub fn record_field_type(record_ty: &Type, name: &str) -> Type {
-    match unwrap_nullable(record_ty) {
-        Type::Record(n) => n.substitution.get(name).cloned().unwrap_or(Type::Void),
-        _ => Type::Void,
-    }
-}
-
-/// The field names of a record type, in its substitution's (sorted) order.
-pub fn record_field_names(record_ty: &Type) -> Vec<String> {
-    match record_ty {
-        Type::Record(n) => n
-            .substitution
-            .iter()
-            .map(|(name, _)| name.to_string())
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// See through reference/mutability/const wrappers (erased before the back ends,
-/// but peeled defensively) to the underlying type.
-pub fn strip_wrappers(ty: &Type) -> &Type {
-    match ty {
-        Type::Ref(inner) | Type::Mut(inner) | Type::ConstOf(inner) => strip_wrappers(inner),
-        other => other,
-    }
-}
-
-/// How one field of a [`brass_mir::Rvalue::RecordView`] is materialized for a
-/// concrete (per-instance) source type.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ViewFieldPlan {
-    /// Copy the source's field into the slot (identity, a value-preserving
-    /// numeric widening, or the guarded nullable wrap).
-    Copy,
-    /// The source lacks the (guarded) field, or carries it at a type that does
-    /// not flow into the slot's element: the view stores null.
-    Null,
-}
-
-/// The per-field construction plan of a view: each field of `view_ty` (the
-/// structural record the monomorphizer derived from the callee's row) with its
-/// slot type and how the concrete `src_ty` fills it. Derived purely from the
-/// two types, so the compiling back ends and the interpreter make the identical
-/// decision the type derivation made:
-///
-/// - a non-nullable slot is a Required row field -- presence and type were
-///   established by the checker (or the deferred boundary rejected the type);
-/// - a nullable slot is Guarded: it copies when the source field has the
-///   identical nullable type (a chained view passes its slot through) or a bare
-///   type flowing into the element, and is null otherwise.
-pub fn view_field_plans(view_ty: &Type, src_ty: &Type) -> Vec<(String, Type, ViewFieldPlan)> {
-    let Type::Record(view) = view_ty else {
-        return Vec::new();
-    };
-    let src = match strip_wrappers(src_ty) {
-        Type::Record(n) => Some(n),
-        _ => None,
-    };
-    view.substitution
-        .iter()
-        .map(|(name, fty)| {
-            let have = src.and_then(|s| s.substitution.get(name));
-            let plan = match fty {
-                Type::Nullable(inner) => match have {
-                    Some(ft) if ft == fty => ViewFieldPlan::Copy,
-                    Some(ft)
-                        if !matches!(ft, Type::Nullable(_))
-                            && !matches!(**inner, Type::Never)
-                            && brass_typesys::field_satisfies(ft, inner) =>
-                    {
-                        ViewFieldPlan::Copy
-                    }
-                    _ => ViewFieldPlan::Null,
-                },
-                _ => ViewFieldPlan::Copy,
-            };
-            (name.to_string(), fty.clone(), plan)
-        })
-        .collect()
-}
-
-/// Whether `T.from(source)` succeeds for a concrete (per-instance) `src_ty` and
-/// target record `target`: the source must be a record carrying every field
-/// `target` declares, each with a matching type. A mismatch (a missing field or a
-/// differently-typed one) means the conversion yields null rather than reading a
-/// field that is absent or laid out differently.
-pub fn record_from_succeeds(src_ty: &Type, target: &Type) -> bool {
-    let (Type::Record(s), Type::Record(t)) = (strip_wrappers(src_ty), target) else {
-        return false;
-    };
-    t.substitution
-        .iter()
-        .all(|(name, tty)| s.substitution.get(name).is_some_and(|sty| sty == tty))
-}
-
-/// The string payload of a constant string operand (the variant/panic argument
-/// of a MIR-internal builtin call), if it is one.
-pub fn str_const(op: &Operand) -> Option<&str> {
-    match op {
-        Operand::Const(Literal::Str(s)) => Some(s),
-        _ => None,
-    }
-}
-
-/// Typed return shapes for compiler/runtime builtins that are not backed by a
-/// monomorphized function instance. Unknown shapes are left as `None`; callers
-/// then assume the destination type already matches. Paired with
-/// [`Codegen::codegen_builtin`], which emits these builtins: a builtin emitted
-/// there needs an entry here exactly when its result shape can differ from its
-/// destination (e.g. a nullable-returning primitive flowing into a narrowed
-/// slot).
-fn builtin_result_type(name: &str, args: &[Operand], local_types: &[Type]) -> Option<Type> {
-    match name {
-        "value_matches" | "result_is_ok" | "__nullable_context_present" => Some(Type::Bool),
-        "__deep_copy" => args.first().map(|op| operand_type_of(op, local_types)),
-        "__nonnull" => args
-            .first()
-            .map(|op| unwrap_nullable(&operand_type_of(op, local_types)).clone()),
-        "panic" | "_panic" | "print" | "println" | "spawn" | "sync" | "_freeze" | "_cown" => {
-            Some(Type::Void)
-        }
-        // The group-acquire wrap yields its closure's result, like `with`.
-        "_with_all" => match args.first().map(|op| operand_type_of(op, local_types)) {
-            Some(Type::Fun(_, ret)) => Some(*ret),
-            _ => None,
-        },
-        "len" | "array_len" => Some(Type::Int(brass_hir::IntKind::I64)),
-        "to_string" => Some(Type::Str),
-        "_float_sqrt" | "_float_floor" | "_float_ceil" | "_float_pow" => {
-            Some(Type::Float(brass_hir::FloatKind::F64))
-        }
-        "_string_slice" | "_string_concat" => Some(Type::Str),
-        "_string_bytes" => Some(Type::Slice(Box::new(Type::Int(brass_hir::IntKind::U8)))),
-        "_string_find" => Some(Type::Nullable(Box::new(Type::Int(brass_hir::IntKind::I64)))),
-        "_string_char_at" => Some(Type::Nullable(Box::new(Type::Str))),
-        "_string_cmp" => Some(Type::Int(brass_hir::IntKind::I32)),
-        "_int_to_string" | "_float_to_string" => Some(Type::Str),
-        "_int_to_float" => Some(Type::Float(brass_hir::FloatKind::F64)),
-        // Native-plugin dispatch: the result shape is in the name's suffix.
-        // Every other name has an arm above, so this decodes once and yields
-        // `None` for a non-plugin builtin.
-        n => brass_hir::plugin_builtin_return(n),
-    }
-}
-
-/// The element type of an array/slice type, or `void` if not a sequence. A
-/// narrowed nullable array (`int32[]?` proven non-null) is unwrapped first.
-pub fn element_type(ty: &Type) -> Type {
-    match unwrap_nullable(ty) {
-        Type::Slice(e) | Type::Array(e, _) => (**e).clone(),
-        _ => Type::Void,
-    }
-}
-
-/// The concrete type of an index operand (the loop counter / index expression).
-fn index_type(idx: &Operand, f: &MonoFunction) -> Type {
-    operand_type_of(idx, &f.local_types)
 }

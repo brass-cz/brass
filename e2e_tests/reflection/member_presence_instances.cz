@@ -1,8 +1,8 @@
 // A generic body reached at several types must not let one instantiation's
 // types leak into another's code. `s.join(SEP)` is a `string` where `s` is an
 // array and a `Wrap` where `s` is a `Wrap` (it recurses); the two share one MIR
-// body, so seeding either result type onto the shared local would reinterpret
-// the other value's representation. Both arms must run, and agree.
+// body, so the call's result is typed per instance, never by the other
+// instance's type. Both arms must run, and agree.
 type Wrap = { _parts: string[] }
 
 const SEP = "/"

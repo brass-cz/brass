@@ -1,0 +1,2 @@
+reference_nullable_rewidened_after_call.cz:8:12: error: nullable value must be checked for null before use
+reference_nullable_rewidened_after_call.cz:14:12: error: nullable value must be checked for null before use

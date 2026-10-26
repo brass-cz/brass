@@ -1,0 +1,22 @@
+// A narrower record passed through an unannotated forwarder reaches the
+// annotated parameter at the forwarder's instance, where it is rejected.
+type Big = {
+    a: int32
+    b: string
+}
+
+type Small = {
+    a: int32
+}
+
+fun use_big(x: Big) {
+    println(x.b)
+}
+
+fun forward(y) {
+    use_big(y)
+}
+
+fun main() {
+    forward(Small { a: 1 })
+}

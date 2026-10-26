@@ -1,5 +1,5 @@
-// Integer division by zero is a runtime error, not undefined behavior: the
-// program aborts with a diagnostic instead of producing a garbage value.
+// Integer division by zero is a runtime error: the program aborts with a
+// `division by zero` diagnostic.
 fun main() {
     let a = 10
     let b = 0

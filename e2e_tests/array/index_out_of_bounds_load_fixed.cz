@@ -1,0 +1,6 @@
+// @backends: all
+// An out-of-range fixed array load reports the shared bounds diagnostic.
+fun main() {
+    let a: int32[1] = [1]
+    println(a[1])
+}

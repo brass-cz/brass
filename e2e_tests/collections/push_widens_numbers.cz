@@ -1,0 +1,28 @@
+// @backends: all
+// Pushing or inserting a number into an array converts it into the element
+// type with the value-preserving flow conversions, like an assignment: an
+// int32 into an int64[] (sign kept), a uint8 into a uint64[], an int16 or a
+// literal into a float32[]. A nullable element accepts its plain value.
+fun main() {
+    let ys: int64[] = [5000000000]
+    let x: int32 = -2147483648
+    ys.push(x)
+    ys.insert(0, x)
+    ys.push(7)
+    println(ys)
+    println(ys[1] - 1)
+    let us: uint64[] = []
+    let b: uint8 = 255
+    us.push(b)
+    println(us)
+    let fs: float32[] = []
+    let h: int16 = -300
+    fs.push(h)
+    fs.push(1)
+    println(fs)
+    let ns: int32?[] = []
+    let small: int16 = 3
+    ns.push(small)
+    ns.push(null)
+    println(ns)
+}

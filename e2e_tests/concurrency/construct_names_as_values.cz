@@ -1,0 +1,12 @@
+// Non-function spawn and with bindings are values while their calls launch
+// tasks and acquire shared objects.
+fun main() {
+    let spawn = 1
+    let with = 2
+    println(spawn)
+    println(with)
+    let item = { n: 0 }
+    spawn(() -> { item.n = 3 })
+    sync()
+    with(item, (x) -> println(x.n))
+}

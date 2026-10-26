@@ -1,0 +1,18 @@
+// @backends: all
+// A field annotated `infer[]` (an array whose element type is inferred) gets
+// its element type from the array literal it is constructed with, and every
+// construction carries that type into the value's own type, so the back ends
+// read `b.items[2]` as an `int32` although `a`'s literal has already fixed
+// the declaration's element.
+type Bag = {
+    items: infer[]
+}
+
+fun main() {
+    let a = Bag { items: [1, 2] }
+    let b = Bag { items: [3, 4] }
+    b.items.push(5)
+    println(a.items[1])
+    println(b.items[2])
+    println(typeof(a.items))
+}

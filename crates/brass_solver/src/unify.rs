@@ -1,18 +1,27 @@
-//! Unification over `Type` with a substitution for `Unknown` variables
-//! Records use structural compatibility; sum types are
-//! nominal.
+//! Unification over `Type` with a substitution for `Unknown` variables.
+//! Declared records and sums are nominal: two instances of one declaration
+//! unify through the substitution entries both carry (see
+//! `Subst::unify_shared_keys`); structural records are compared elsewhere.
+
+mod changes;
+mod reference;
+
+pub use changes::PublicationChanges;
 
 use fxhash::FxHashMap as HashMap;
 
 use brass_hir::{NominalType, Substitution, Type, passing_modes_match, split_passing_mode};
 
-#[derive(Default)]
+/// A substitution: the binding of every solved inference variable, plus the
+/// trail of bindings a [`Snapshot`] rolls back to.
+#[derive(Clone, Default)]
 pub struct Subst {
     table: HashMap<u32, Type>,
     /// Keys inserted in order, so a snapshot can be rolled back. Every variable
     /// is bound at most once (unify resolves before binding), so undoing a
     /// binding is just removing the key.
     trail: Vec<u32>,
+    publication: changes::PublicationFeed,
 }
 
 /// An opaque marker for the substitution state, used to roll back speculative
@@ -35,8 +44,27 @@ impl Subst {
         while self.trail.len() > snapshot.0 {
             if let Some(id) = self.trail.pop() {
                 self.table.remove(&id);
+                self.publication.record(id);
             }
         }
+    }
+
+    /// Restore checkpoint bindings while retaining the committed mutation feed.
+    pub(crate) fn restore_checkpoint(&mut self, checkpoint: Self) {
+        for (id, ty) in &self.table {
+            if checkpoint.table.get(id) != Some(ty) {
+                self.publication.record(*id);
+            }
+        }
+        for id in checkpoint
+            .table
+            .keys()
+            .filter(|id| !self.table.contains_key(id))
+        {
+            self.publication.record(*id);
+        }
+        self.table = checkpoint.table;
+        self.trail = checkpoint.trail;
     }
 
     /// Follow substitutions to a representative type.
@@ -61,6 +89,19 @@ impl Subst {
         }
     }
 
+    /// [`Self::resolve_head`] without copying: the representative of the
+    /// top-level inference-variable chain of `t`, borrowed from `t` or from
+    /// the substitution, for callers that only inspect its constructor.
+    pub fn resolve_head_ref<'a>(&'a self, t: &'a Type) -> &'a Type {
+        match t {
+            Type::Unknown(id) => match self.table.get(id) {
+                Some(bound) => self.resolve_head_ref(bound),
+                None => t,
+            },
+            _ => t,
+        }
+    }
+
     /// Follow only a top-level inference-variable chain to its representative.
     /// Nested components stay untouched for callers that only inspect the outer
     /// constructor and do not need a fully materialized type.
@@ -75,45 +116,72 @@ impl Subst {
     }
 
     /// Resolve a type and recurse into its components so that nested inference
-    /// variables are substituted too. Used when instantiating a polymorphic
-    /// closure call: the argument types are unified into the parameter
-    /// variables, then the closure's return type is resolved through this
-    /// substitution to recover the concrete result type (e.g. `(x) -> x`
-    /// applied to an `int32` yields `int32`, not an unconstrained unknown).
+    /// variables are substituted too: the fully solved form of a type (e.g.
+    /// the result of `(x) -> x` applied to an `int32` is `int32` once the
+    /// argument has unified into the parameter variable, not an unconstrained
+    /// unknown).
     pub fn resolve_deep(&self, t: &Type) -> Type {
-        match self.resolve(t) {
-            Type::Array(inner, n) => Type::Array(Box::new(self.resolve_deep(&inner)), n),
-            Type::Slice(inner) => Type::Slice(Box::new(self.resolve_deep(&inner))),
-            // The shallow `resolve` above already collapsed a variable that
-            // pinned to a nullable; deep-resolving the payload can expose one
-            // more level (a variable bound to `T?` reached only now).
-            Type::Nullable(inner) => match self.resolve_deep(&inner) {
+        self.resolve_read(t, &mut |_| {})
+    }
+
+    /// Resolve a type while collecting bound aliases and unresolved variables.
+    /// Both are dependencies because rollback can remove an alias's binding.
+    pub fn resolve_with_dependencies(&self, t: &Type) -> (Type, Vec<u32>) {
+        let mut variables = Vec::new();
+        let ty = self.resolve_read(t, &mut |id| variables.push(id));
+        variables.sort_unstable();
+        variables.dedup();
+        (ty, variables)
+    }
+
+    /// Consume coalesced mutations for the single channel publication consumer.
+    /// The first read enables tracking; subsequent reads reclaim the window.
+    pub fn take_publication_changes(&self) -> PublicationChanges {
+        self.publication.take()
+    }
+
+    fn resolve_read(&self, t: &Type, read: &mut impl FnMut(u32)) -> Type {
+        match t {
+            Type::Unknown(id) => {
+                read(*id);
+                match self.table.get(id) {
+                    Some(bound) => self.resolve_read(bound, read),
+                    None => t.clone(),
+                }
+            }
+            Type::Array(inner, n) => Type::Array(Box::new(self.resolve_read(inner, read)), *n),
+            Type::Slice(inner) => Type::Slice(Box::new(self.resolve_read(inner, read))),
+            // Resolving the payload can expose another nullable layer.
+            // Collapse it without constructing an intermediate owned subtree.
+            Type::Nullable(inner) => match self.resolve_read(inner, read) {
                 nested @ Type::Nullable(_) => nested,
                 other => Type::Nullable(Box::new(other)),
             },
-            Type::ConstOf(inner) => Type::ConstOf(Box::new(self.resolve_deep(&inner))),
-            Type::Mut(inner) => Type::Mut(Box::new(self.resolve_deep(&inner))),
-            Type::Ref(inner) => Type::Ref(Box::new(self.resolve_deep(&inner))),
+            Type::ConstOf(inner) => Type::ConstOf(Box::new(self.resolve_read(inner, read))),
+            Type::Mut(inner) => Type::Mut(Box::new(self.resolve_read(inner, read))),
+            Type::Ref(inner) => Type::Ref(Box::new(self.resolve_read(inner, read))),
             Type::Fun(params, ret) => Type::Fun(
-                params.iter().map(|p| self.resolve_deep(p)).collect(),
-                Box::new(self.resolve_deep(&ret)),
+                params.iter().map(|p| self.resolve_read(p, read)).collect(),
+                Box::new(self.resolve_read(ret, read)),
             ),
-            Type::Tuple(elems) => Type::Tuple(elems.iter().map(|t| self.resolve_deep(t)).collect()),
+            Type::Tuple(elems) => {
+                Type::Tuple(elems.iter().map(|t| self.resolve_read(t, read)).collect())
+            }
             // A nominal type carries the concrete types of its unannotated fields
             // (and a Result's payloads) in its substitution; resolve those too, so
             // e.g. `HashMap<entries=?[]>` whose element was pinned by a `push`
             // becomes `HashMap<entries=_Entry<...>[]>`.
-            Type::Record(n) => Type::Record(self.resolve_nominal_deep(&n)),
-            Type::Sum(n) => Type::Sum(self.resolve_nominal_deep(&n)),
-            other => other,
+            Type::Record(n) => Type::Record(self.resolve_nominal_read(n, read)),
+            Type::Sum(n) => Type::Sum(self.resolve_nominal_read(n, read)),
+            other => other.clone(),
         }
     }
 
     /// Deep-resolve every type in a nominal's substitution.
-    fn resolve_nominal_deep(&self, n: &NominalType) -> NominalType {
+    fn resolve_nominal_read(&self, n: &NominalType, read: &mut impl FnMut(u32)) -> NominalType {
         let mut substitution = Substitution::empty();
         for (key, ty) in n.substitution.iter() {
-            substitution.insert(key, self.resolve_deep(ty));
+            substitution.insert(key, self.resolve_read(ty, read));
         }
         NominalType::with_substitution(n.id, n.name.clone(), substitution)
     }
@@ -144,7 +212,9 @@ impl Subst {
     }
 
     /// Unify two types, extending the substitution. Returns an error message on
-    /// a concrete-vs-concrete conflict.
+    /// a concrete-vs-concrete conflict or an infinite type (occurs check). A
+    /// failed unification may leave the bindings it made before the conflict;
+    /// callers that probe take a [`Snapshot`] and roll back.
     pub fn unify(&mut self, a: &Type, b: &Type) -> Result<(), String> {
         let a = self.resolve(a);
         let b = self.resolve(b);
@@ -186,6 +256,7 @@ impl Subst {
                 }
                 tracing::debug!(var = *i, bound_to = %other.display(), "binding inference variable");
                 self.table.insert(*i, other.clone());
+                self.publication.record(*i);
                 self.trail.push(*i);
                 Ok(())
             }
@@ -223,13 +294,22 @@ impl Subst {
                 }
                 Ok(())
             }
+            // Two instances of the same sum declaration unify like same-id
+            // records: a refinement (the concrete type of an unannotated
+            // variant field, recorded at construction) is extra information,
+            // not a different type. Only the keys both sides carry are unified;
+            // a key present on one side only belongs to a sparser instance
+            // (`Opt.Nothing` knows nothing about `Some.v`) and constrains
+            // nothing, so `[Opt.Nothing, Opt.Some { v: 1 }]` has one element
+            // type. Synthetic negative ids identify by name as well.
+            (Type::Sum(n1), Type::Sum(n2))
+                if n1.id == n2.id && (n1.id >= 0 || n1.name == n2.name) =>
+            {
+                self.unify_shared_keys(n1, n2)
+            }
             (Type::Sum(n1), Type::Sum(n2)) => {
-                if n1.same_nominal(n2) {
-                    Ok(())
-                } else {
-                    tracing::debug!(left = %n1, right = %n2, "sum type mismatch");
-                    Err(format!("cannot unify sum types `{n1}` and `{n2}`"))
-                }
+                tracing::debug!(left = %n1, right = %n2, "sum type mismatch");
+                Err(format!("cannot unify sum types `{n1}` and `{n2}`"))
             }
             // Two records of the same *declared* nominal (id >= 0) unify by
             // unifying the shared entries of their generic substitutions, so a
@@ -249,15 +329,7 @@ impl Subst {
                     tracing::debug!(left = %n1, right = %n2, "record type mismatch");
                     return Err(format!("cannot unify record types `{n1}` and `{n2}`"));
                 }
-                let pairs: Vec<(Type, Type)> = n1
-                    .substitution
-                    .iter()
-                    .filter_map(|(k, v1)| n2.substitution.get(k).map(|v2| (v1.clone(), v2.clone())))
-                    .collect();
-                for (v1, v2) in pairs {
-                    self.unify(&v1, &v2)?;
-                }
-                Ok(())
+                self.unify_shared_keys(n1, n2)
             }
             _ if a == b => Ok(()),
             _ => {
@@ -271,10 +343,25 @@ impl Subst {
         }
     }
 
+    /// Unify the substitution entries two instances of one nominal declaration
+    /// both carry. A key present on only one side is left unconstrained: that
+    /// side is a sparser instance of the same declaration.
+    fn unify_shared_keys(&mut self, n1: &NominalType, n2: &NominalType) -> Result<(), String> {
+        let pairs: Vec<(Type, Type)> = n1
+            .substitution
+            .iter()
+            .filter_map(|(k, v1)| n2.substitution.get(k).map(|v2| (v1.clone(), v2.clone())))
+            .collect();
+        for (v1, v2) in pairs {
+            self.unify(&v1, &v2)?;
+        }
+        Ok(())
+    }
+
     /// Whether inference variable `id` occurs inside `ty`. Variables already
     /// bound in the substitution are followed so the check reflects the current
     /// solution, not just the syntactic shape of `ty`.
-    fn occurs(&self, id: u32, ty: &Type) -> bool {
+    pub fn occurs(&self, id: u32, ty: &Type) -> bool {
         match self.resolve(ty) {
             Type::Unknown(j) => j == id,
             Type::Array(inner, _)
@@ -290,9 +377,9 @@ impl Subst {
             // Nominal records and sums (including `Result`) carry their component
             // types in the substitution, and a variable can occur there -- e.g.
             // `o = Result<o, e>` arising from `[x, x!]`. Descend so the occurs
-            // check matches `Solver::collect_free`, which traverses these: without
-            // it a cyclic binding is committed and the later generalization that
-            // walks the substitution recurses until the stack overflows.
+            // check matches `Solver::free_vars` and `resolve_deep`, which
+            // traverse these: a cyclic binding there would make every later
+            // walk of the substitution recurse until the stack overflows.
             Type::Record(n) | Type::Sum(n) => {
                 n.substitution.iter().any(|(_, t)| self.occurs(id, t))
             }
@@ -359,6 +446,37 @@ mod tests {
         assert_eq!(s.resolve(&nullable(var.clone())), nullable(var.clone()));
         s.unify(&var, &Type::Int(IntKind::I32)).unwrap();
         assert_eq!(s.resolve(&nullable(var)), nullable(Type::Int(IntKind::I32)));
+    }
+
+    /// Same-declaration sums unify through the substitution keys both carry,
+    /// like records: a sparser instance constrains nothing, a shared open slot
+    /// is bound, and a shared slot pinned two ways is still a conflict.
+    #[test]
+    fn same_sum_instances_unify_by_shared_refinements() {
+        use brass_hir::{NominalType, Substitution};
+        let sum = |entries: &[(&str, Type)]| {
+            let mut substitution = Substitution::empty();
+            for (key, ty) in entries {
+                substitution.insert(*key, ty.clone());
+            }
+            Type::Sum(NominalType::with_substitution(3, "Opt", substitution))
+        };
+        let int = Type::Int(IntKind::I32);
+        let mut s = Subst::new();
+        assert!(s.unify(&sum(&[]), &sum(&[("Some.v", int.clone())])).is_ok());
+        let open = Type::Unknown(0);
+        s.unify(
+            &sum(&[("Some.v", open.clone())]),
+            &sum(&[("Some.v", int.clone())]),
+        )
+        .unwrap();
+        assert_eq!(s.resolve(&open), int);
+        assert!(
+            s.unify(&sum(&[("Some.v", int)]), &sum(&[("Some.v", Type::Str)]))
+                .is_err()
+        );
+        let other = Type::Sum(NominalType::new(4, "Other"));
+        assert!(s.unify(&sum(&[]), &other).is_err());
     }
 
     #[test]

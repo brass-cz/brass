@@ -1,0 +1,7 @@
+// @backends: all
+// Function annotations bind nested typeof operands to the enclosing value scope.
+let v: int64 = 5
+let f: (typeof(v)) -> typeof(v) = (x) -> x
+println(typeof(f))
+println(typeof(f(v)))
+println(f(v))

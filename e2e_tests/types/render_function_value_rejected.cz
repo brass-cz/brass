@@ -1,0 +1,11 @@
+// A function value has no text rendering, on its own or inside an array:
+// `print`, interpolation, `string.from` and the built-in `debug` reject it at
+// check time instead of a back end refusing it at run time.
+fun main() {
+    let f = (x: int32) -> x + 1
+    println(f)
+    let s = "f={f}"
+    let t = string.from(f)
+    let d = f.debug()
+    println([f, f])
+}

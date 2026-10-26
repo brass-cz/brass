@@ -1,0 +1,21 @@
+// @backends: all
+// A call through a parameter (or local) named like a top-level function calls
+// the parameter: a fallible body returning `helper()` returns what the
+// closure passed as `helper` returns, not what `fun helper` returns.
+fun helper() {
+    return 1
+}
+
+fun f(fail: bool, helper) {
+    if fail {
+        error("boom")!
+    }
+    return helper()
+}
+
+fun main() {
+    println(helper())
+    let v = f(false, () -> "a string")!
+    println(typeof(v))
+    println(v)
+}

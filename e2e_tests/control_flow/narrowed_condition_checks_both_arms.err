@@ -1,0 +1,1 @@
+narrowed_condition_checks_both_arms.cz:17:17: error: nullable value must be checked for null before use

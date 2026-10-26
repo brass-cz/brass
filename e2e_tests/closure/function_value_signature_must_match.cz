@@ -1,0 +1,35 @@
+// A function value (a closure or a named function) is compiled once, for its
+// own signature, and nothing converts the arguments it receives or the
+// result it returns. It therefore only flows where the parameter and result
+// types name the same records and sums as the required function type: no
+// structural or declared-sum subtyping inside a function type, in either
+// direction, at a binding, a parameter, or a record field.
+type Animal = { name: string }
+type Dog = { age: int32, name: string }
+type Shape = | Circle { r: float64 } | Sq { s: float64 }
+type Tagged: Shape = | Circle { tag: string, r: float64 } | Sq { tag: string, s: float64 }
+type Holder = { f: (Dog) -> string }
+
+fun make() -> Dog {
+    return Dog { age: 7, name: "rex" }
+}
+
+fun animal_name(a: Animal) -> string {
+    return a.name
+}
+
+fun call(f: () -> Animal) -> string {
+    return f().name
+}
+
+fun run(f: (Dog) -> string) -> string {
+    return f(Dog { age: 3, name: "rex" })
+}
+
+fun main() {
+    println(call(make))
+    println(run(animal_name))
+    let g = () -> Tagged.Sq { tag: "x", s: 3.0 }
+    let f: () -> Shape = g
+    let h = Holder { f: (a: Animal) -> a.name }
+}

@@ -1,0 +1,1 @@
+5:12: error: `infer.from(x)` is valid only inside a reflective decoder method (`fun T.m(self) -> infer!`), where `infer` is the target type

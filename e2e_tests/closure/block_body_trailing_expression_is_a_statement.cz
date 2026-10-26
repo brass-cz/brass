@@ -1,0 +1,25 @@
+// @backends: all
+// A block-bodied closure yields only what it `return`s: a trailing call whose
+// value is discarded (`c.bump()` returns `int32`) does not make the closure
+// an `() -> int32`, so it fits a `() -> void` parameter.
+type Counter = {
+    n: int32
+}
+
+fun Counter.bump(self) -> int32 {
+    self.n += 1
+    return self.n
+}
+
+fun run(f: () -> void) {
+    f()
+    f()
+}
+
+fun main() {
+    let c = Counter { n: 0 }
+    run(() -> {
+        c.bump()
+    })
+    println(c.n)
+}

@@ -1,0 +1,8 @@
+// @backends: all
+fun main() {
+    let f = (x) -> x + 1
+    f = (x) -> x + 1
+    let small: int8 = 1
+    println(f(127))
+    println(f(small))
+}

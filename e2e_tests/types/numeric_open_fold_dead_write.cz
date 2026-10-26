@@ -1,0 +1,9 @@
+// @backends: all
+fun main() {
+    let x = 0
+    if x: int64 {
+        let wide: int64 = 2
+        x = wide
+    }
+    println(x)
+}

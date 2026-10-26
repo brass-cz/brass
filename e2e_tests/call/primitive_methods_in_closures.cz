@@ -1,0 +1,9 @@
+// @backends: all
+// Closures and generic functions accept the stdlib methods of each concrete receiver.
+let split = (x) -> x.split(",")
+println(split("a,b").len())
+let trim = (x) -> x.trim()
+println(trim("  hi  "))
+fun size(x) { return x.len() }
+println(size([1, 2]))
+println(size("abc"))

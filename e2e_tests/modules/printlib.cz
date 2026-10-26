@@ -1,0 +1,10 @@
+// Library declaring its own `println`: a bare call here reaches it, while a
+// bare `println` in any other module stays the prelude's (see
+// view_print_with_custom_println.cz).
+fun println(value) {
+    print("[printlib] {value}\n")
+}
+
+fun shout(text: string) {
+    println(text)
+}

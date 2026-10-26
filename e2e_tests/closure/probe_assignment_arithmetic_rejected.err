@@ -1,0 +1,9 @@
+probe_assignment_arithmetic_rejected.cz:4:24: error: operator `+` is not defined for `int64` and `string` (no applicable conversion)
+probe_assignment_arithmetic_rejected.cz:10:24: error: operator `+` is not defined for `int64` and `string` (no applicable conversion)
+probe_assignment_arithmetic_rejected.cz:16:24: error: operator `+` is not defined for `int64` and `string` (no applicable conversion)
+probe_assignment_arithmetic_rejected.cz:18:20: error: cannot use `never?` where `_` is required
+probe_assignment_arithmetic_rejected.cz:22:24: error: operator `+` is not defined for `int64` and `string` (no applicable conversion)
+probe_assignment_arithmetic_rejected.cz:24:20: error: operator `+` is not defined for `int64` and `string` (no applicable conversion)
+probe_assignment_arithmetic_rejected.cz:28:24: error: operator `+` is not defined for `int64` and `string` (no applicable conversion)
+probe_assignment_arithmetic_rejected.cz:34:24: error: operator `+` is not defined for `int64` and `string` (no applicable conversion)
+probe_assignment_arithmetic_rejected.cz:40:24: error: operator `+` is not defined for `int64` and `string` (no applicable conversion)

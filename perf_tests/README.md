@@ -2,8 +2,9 @@
 
 Benchmarks comparing the driver's two JIT pipelines: **lazy** (the default:
 type inference on a checker thread, per-function ORC materialization on
-demand) and **eager** (`brass --eager`: whole-program check, then a full
-module compile before execution).
+demand) and **eager** (`brass --eager`: whole-program check and IR for every
+instance before execution; optimization and instruction selection still run
+on first use).
 
 ## Run
 
@@ -46,14 +47,13 @@ groups:
 cases plus the real czpm closure, isolating the front end from back-end
 changes.
 
+`czpm_bench.sh` measures `czpm run` on a small project with a path
+dependency, from launch to the program's first output line, for each
+combination of cold/warm JIT cache and default/`BRASS_OPT=2` compilation. Each
+cell has its own launcher, project, `HOME`, and cache. The minimum over `REPS`
+runs must stay under the ceilings in `thresholds.env` (overridable from the
+environment); the script exits non-zero otherwise.
+
 Files marked `GENERATED` are produced by `gen_cases.py`; edit the size
 constants there and rerun it to re-scale the corpus (the generated files are
 checked in).
-
-## Known pipeline divergence
-
-An unannotated-return call chain of int64 functions deeper than 64 aborts
-under the lazy pipeline (`deferred instance ... resolved with return type
-int64 but its call site was compiled for int32`) while eager runs it fine;
-`06_infer_chain` therefore uses an int32 chain. Reproduce with
-`gen_cases.py`'s chain generator switched back to int64 at depth >= 65.

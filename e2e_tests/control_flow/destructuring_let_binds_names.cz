@@ -1,0 +1,33 @@
+// @backends: all
+// A destructuring `let` binds every name it introduces, shadowing an outer
+// local or a global function of the same name -- for array and record
+// patterns alike.
+type P = {
+    x: int32
+    y: int32
+}
+
+fun first(n: int32) -> int32 {
+    return n
+}
+
+fun main() {
+    let a = "outer"
+    if true {
+        let [a, b] = [1, 2]
+        let c: int32 = a + b
+        println(c)
+    }
+    println(a)
+    let [first, second] = [10, 20]
+    let d: int32 = first
+    println(d + second)
+    let x = "outer x"
+    let p = P { x: 1, y: 2 }
+    if true {
+        let P { x, y } = p
+        let s: int32 = x + y
+        println(s)
+    }
+    println(x)
+}

@@ -1,0 +1,45 @@
+// @backends: all
+// HashMap keys compare with structural `==` on every back end: a record key
+// with a nullable field, tuple keys, sum keys and array keys are all found
+// again by an equal value built separately, and storing an equal key replaces
+// the entry instead of adding a duplicate.
+
+type K = {
+    name: string
+    tag: string?
+}
+
+type Shape =
+    | Circle { r: int64 }
+    | Empty
+
+fun main() {
+    let m = HashMap.new()
+    m.set(K { name: "a", tag: "x" }, 1)
+    m.set(K { name: "a", tag: null }, 2)
+    m.set(K { name: "a", tag: "x" }, 3)
+    println(m.size())
+    println(m.get(K { name: "a", tag: "x" }))
+    println(m.get(K { name: "a", tag: null }))
+    println(m.get(K { name: "b", tag: null }))
+
+    let pairs = HashMap.new()
+    pairs.set([1, "a"], 10)
+    pairs.set([2, "b"], 20)
+    pairs.set([1, "a"], 11)
+    println(pairs.size())
+    println(pairs.get([1, "a"]))
+    println(pairs.get([2, "a"]))
+
+    let shapes = HashMap.new()
+    shapes.set(Shape.Circle { r: 3 }, "c3")
+    shapes.set(Shape.Empty, "empty")
+    println(shapes.get(Shape.Circle { r: 3 }))
+    println(shapes.get(Shape.Empty))
+    println(shapes.get(Shape.Circle { r: 4 }))
+
+    let arrays = HashMap.new()
+    arrays.set([1, 2], "12")
+    println(arrays.get([1, 2]))
+    println(arrays.get([2, 1]))
+}

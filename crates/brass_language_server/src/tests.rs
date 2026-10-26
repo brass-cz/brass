@@ -3,6 +3,8 @@
 
 use std::path::PathBuf;
 
+mod source_locations;
+
 use crate::analysis::items::Diag;
 use crate::analysis::{DocAnalyzer, FullAnalysis};
 use crate::document::Document;
@@ -231,7 +233,8 @@ fn hover_shows_type_and_method_doc_comments() {
 /// Calling an unannotated parameter (`fun apply(f, x) { f(x) }`) constrains it to
 /// a function type, so hover shows `apply` as a higher-order function -- `f` as
 /// `(U) -> V` (a function value, shown without a `ref`/`mut` wrapper) rather than
-/// a bare `unknown`.
+/// a bare `unknown`. `x` is handed to that function value, which may take it by
+/// `ref(mut)`, so it is a private `mut` copy.
 #[test]
 fn hover_infers_called_parameter_as_a_function() {
     let src = "fun apply(f, x) {\n    return f(x)\n}\n";
@@ -239,7 +242,7 @@ fn hover_infers_called_parameter_as_a_function() {
     let (doc, pos) = position(src, "apply(f, x)", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover over apply"));
     assert!(
-        text.contains("fun apply(f: (unknown_0) -> unknown_1, x: ref(unknown_0)) -> unknown_1"),
+        text.contains("fun apply(f: (unknown_0) -> unknown_1, x: mut(unknown_0)) -> unknown_1"),
         "apply must be a higher-order function: {text}"
     );
 }
@@ -493,10 +496,9 @@ fn hover_shows_inferred_return_type() {
 /// with nothing in the file calling it.
 ///
 /// This is `http`'s `fetch` (`let client = HttpClient.http(..)` then
-/// `return client.fetch(path)`), which used to render as
-/// `Result<unknown_0, unknown_1>`: the light pass refused to type a local bound
-/// from an unannotated static, so every method called on it was unknown too, and
-/// hover could only recover a return from call sites in the file being edited.
+/// `return client.fetch(path)`): the local bound from an unannotated static is
+/// typed, so the methods called on it are too, and the return does not depend
+/// on call sites in the file being edited.
 #[test]
 fn hover_shows_inferred_return_through_a_constructor_and_method_chain() {
     let src = concat!(
@@ -535,8 +537,8 @@ fn hover_shows_inferred_return_through_a_constructor_and_method_chain() {
 
 /// Hovering the name in a method DECLARATION shows THAT method -- not a free
 /// function that happens to share the name. `http` declares both
-/// `fun HttpClient.request` and a free `request`, and the declaration used to
-/// render the free one's signature and doc comment.
+/// `fun HttpClient.request` and a free `request`; the method declaration must
+/// not render the free one's signature and doc comment.
 #[test]
 fn hover_method_declaration_does_not_resolve_to_a_same_named_function() {
     let src = concat!(
@@ -602,9 +604,8 @@ fn hover_shows_a_sum_types_method() {
 
 /// An unannotated parameter that is FORWARDED into an annotated function
 /// position takes that annotation: it is the parameter's whole call contract,
-/// so `g`'s signature is determined, not generic. It used to hover as
-/// `handler: unknown_0` -- the assignability check only probed the annotation
-/// without committing it.
+/// so `g`'s signature is determined, not generic: `handler` hovers as
+/// `(int32) -> void`, not `unknown_0`.
 #[test]
 fn hover_resolves_a_forwarded_function_parameter() {
     let src = concat!(
@@ -1443,8 +1444,8 @@ fn completion_import_names_carry_signature_and_doc() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// After `arr.` on an array value, offer the built-in array methods and the std
-/// array functions reachable through UFCS -- even though `arr.` does not parse.
+/// After `arr.` on an array value, offer the built-in array methods and the core
+/// array methods (`fun infer[].map`, ...) -- even though `arr.` does not parse.
 #[test]
 fn completion_offers_array_members() {
     let src = "fun main() {\n    let a = [1]\n    a.\n}\n";

@@ -1,0 +1,10 @@
+// An integer literal whose value the target cannot hold is a compile error
+// naming the literal: out of an integer type's range, or not exactly
+// representable in a float (16777217 needs 25 mantissa bits; float32 has 24).
+fun main() {
+    let z: float32 = 16777217
+    let b: int8 = 300
+    let xs: uint8[] = []
+    xs.push(256)
+    println("{z} {b} {xs}")
+}

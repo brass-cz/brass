@@ -1,0 +1,36 @@
+// Fixed parameters reject wider arguments, joined results reject narrowing,
+// and nonnumeric calls and captured bracket results retain their type checks.
+fun make_fixed() {
+    let n: int32 = 2
+    return (x) -> x + n
+}
+fun make_list() { return (x) -> [x] }
+
+let xs = []
+let ys = []
+let captured_pair = () -> [xs[0], ys[0]]
+xs.push(1)
+ys.push(2)
+let wrong: string = captured_pair()
+
+fun main() {
+    let big: int64 = 7
+    let prior_fs = [(x) -> x]
+    println(prior_fs[0](1))
+    let prior = prior_fs[0]
+    println(prior(1))
+    println(prior(big))
+
+    let result_fs = [(x) -> x]
+    let joined = result_fs[0]
+    let narrow: int32 = joined(1)
+    println(joined(big))
+
+    let fixed = make_fixed()
+    println(fixed(1))
+    println(fixed(big))
+
+    let nonnumeric = make_list()
+    println(nonnumeric(1))
+    println(nonnumeric("x"))
+}

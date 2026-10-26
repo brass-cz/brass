@@ -1,0 +1,2 @@
+16:7: error: cannot pass the read-only `v` where a write-through `ref(mut(P))` is required
+21:7: error: cannot pass the read-only `c` where a write-through `ref(mut(P))` is required

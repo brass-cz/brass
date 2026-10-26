@@ -1,0 +1,1 @@
+value_if_without_else_rejected.cz:9:13: error: `if` branches have incompatible types `int32` and `void`

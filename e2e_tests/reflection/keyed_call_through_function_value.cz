@@ -1,0 +1,44 @@
+// @backends: all
+// A function that reaches a reflective `-> infer!` call may be handed over as
+// a value instead of being called by name: the lazy run still discovers the
+// keyed call before execution starts, so it runs like `--eager` does.
+type Json =
+    | JNum { value: int64 }
+    | JStr { value: string }
+
+fun Json.into(self) -> infer! {
+    match self {
+        Json.JNum { value } => {
+            return infer.from(value)
+        }
+        Json.JStr { value } => {
+            return infer.from(value)
+        }
+    }
+}
+
+fun decode(k: int64) -> int64 {
+    let j = Json.JNum { value: k }
+    let r: int64! = j.into()
+    match r {
+        Ok { value } => {
+            return value
+        }
+        Err { error } => {
+            return -1
+        }
+    }
+}
+
+fun apply(f: (int64) -> int64, k: int64) -> int64 {
+    return f(k)
+}
+
+fun go(k: int64) -> int64 {
+    return apply(decode, k)
+}
+
+fun main() {
+    println("start")
+    println(go(7))
+}

@@ -1,91 +1,44 @@
-//! Pattern typing and nullable flow analysis: binding match/if-let
-//! patterns against a scrutinee type, validating pattern shapes, and
-//! the null-narrowing that tracks when a nullable binding is known
-//! non-null (and when calls invalidate that knowledge).
+//! Pattern typing: binding `match`, `if let`, `let` and `for` patterns against
+//! a scrutinee type, validating their shapes, coverage and refutability, and
+//! the nullable-use diagnostic (null narrowing itself lives in `narrowing`).
+//!
+//! A record or variant pattern on a nullable subject tests the present value
+//! (see `pattern_subject`): it is refutable, and `null` takes the `else` or
+//! `_` arm. A written qualifier (`Alias.Variant { .. }`) resolves through a
+//! type alias like any type name.
 
 use super::*;
+use brass_hir::PatternTypeHead;
 
 impl<'a> Checker<'a> {
+    /// Report a nullable value used where a non-null one is required. When the
+    /// use is (or contains) a read of a field an enclosing condition tested,
+    /// say why the test did not help: only bindings narrow (a field can be
+    /// reassigned through any alias of its record), so the field must be
+    /// bound first.
     pub(super) fn report_nullable_use(&mut self, span: brass_parser::Span) {
-        self.errors.push(TypeError {
-            message: "nullable value must be checked for null before use".to_string(),
-            span,
-        });
-    }
-
-    pub(super) fn apply_truthy_narrowing(&mut self, cond: &Expr, scopes: &mut ScopeStack) {
-        if let Some(name) = narrow::truthy_narrows(cond) {
-            self.narrow_non_null(name, scopes);
-        }
-    }
-
-    pub(super) fn apply_guard_narrowing(&mut self, stmt: &Stmt, scopes: &mut ScopeStack) {
-        let Stmt::Expr(Expr::If(cond, then, None, _)) = stmt else {
-            return;
+        let tested = self
+            .tested_field_reads
+            .iter()
+            .filter(|(read, _)| span.lo <= read.lo && read.hi <= span.hi)
+            .min_by_key(|(read, _)| (read.lo, read.hi))
+            .map(|(_, path)| path);
+        let message = match tested {
+            Some(path) => {
+                let name = path.rsplit('.').next().unwrap_or(path);
+                format!(
+                    "nullable value must be checked for null before use: a field is not \
+                     narrowed by testing it; bind it first: `if let {name} = {path} {{ ... }}`"
+                )
+            }
+            None => "nullable value must be checked for null before use".to_string(),
         };
-        if !block_always_returns(then) {
-            return;
-        }
-        if let Some(name) = narrow::falsy_narrows(cond) {
-            self.narrow_non_null(name, scopes);
-        }
+        self.errors.push(TypeError { message, span });
     }
 
-    fn narrow_non_null(&mut self, name: &str, scopes: &mut ScopeStack) {
-        for (frame, scope) in scopes.iter_mut().enumerate().rev() {
-            if let Some(original) = scope.get(name).cloned() {
-                let Type::Nullable(inner) = self.resolve(&original) else {
-                    return;
-                };
-                tracing::debug!(name, to = %inner.display(), "narrowing nullable to non-null");
-                scope.insert(name.to_string(), (*inner).clone());
-                // Remember the pre-narrowing type so a later call can undo the
-                // narrowing when the binding is reachable by the callee (a
-                // global or a closure-assigned local).
-                self.narrowed_bindings.push(NarrowedBinding {
-                    name: name.to_string(),
-                    frame,
-                    original: Type::Nullable(inner),
-                });
-                break;
-            }
-        }
-    }
-
-    /// Undo narrowings a call may have invalidated: a narrowed GLOBAL (frame 0
-    /// of the scope stack; any callee can assign it) and a narrowed local that
-    /// some closure in this body assigns (the closure may run during the call).
-    /// The nullable type is restored in the current (branch-local) scope clone,
-    /// so uses after the call must re-check for null. Plain locals stay
-    /// narrowed: no callee can rebind them.
-    pub(super) fn invalidate_narrowed_after_call(&mut self, scopes: &mut ScopeStack) {
-        if self.narrowed_bindings.is_empty() {
-            return;
-        }
-        let narrowed = self.narrowed_bindings.clone();
-        for NarrowedBinding {
-            name,
-            frame,
-            original,
-        } in narrowed
-        {
-            let Some(scope) = scopes.get_mut(frame) else {
-                continue;
-            };
-            let global = frame == 0;
-            if !global && !self.closure_write_targets.contains(&name) {
-                continue;
-            }
-            let still_narrowed = scope
-                .get(&name)
-                .is_some_and(|t| !matches!(self.resolve(t), Type::Nullable(_)));
-            if still_narrowed {
-                tracing::debug!(name, "re-widening narrowed binding after call");
-                scope.insert(name, original);
-            }
-        }
-    }
-
+    /// Bind the names `pat` introduces in the innermost frame of `scopes`,
+    /// each at the type of its position in `ty`. A qualified name or a unit
+    /// variant tests rather than binds.
     pub(super) fn bind_pattern(&mut self, pat: &Pattern, ty: &Type, scopes: &mut ScopeStack) {
         match pat {
             Pattern::Binding(name, qualifier, span) => {
@@ -149,7 +102,7 @@ impl<'a> Checker<'a> {
     /// parent's definition. A written qualifier must therefore have the same
     /// nominal ID as the resolved scrutinee, even for related sums.
     fn scrutinee_accepts_variant(&mut self, scrutinee: &Type, variant: &str) -> bool {
-        let resolved = self.resolve_head(scrutinee);
+        let resolved = self.pattern_subject(scrutinee);
         if resolved.is_result_type() {
             return matches!(variant, "Ok" | "Err");
         }
@@ -157,14 +110,23 @@ impl<'a> Checker<'a> {
             Type::Sum(sum) => match self.program.type_by_id(sum.id) {
                 Some(info) => info.variant(variant).is_some(),
                 // A synthesized sum must still share its owner's nominal identity.
-                None => self
-                    .program
-                    .sums_containing_variant(variant)
-                    .iter()
-                    .any(|info| sum.id == info.id),
+                None => self.program.variant_owner_ids(variant).contains(&sum.id),
             },
             Type::Unknown(_) => true,
             _ => false,
+        }
+    }
+
+    /// The value a refutable pattern tests: the scrutinee with its mode
+    /// wrappers and one nullable layer peeled. A record or variant pattern on
+    /// a nullable subject (`if let A { x } = f()` with `f -> S?`) tests the
+    /// present value; `null` matches no such pattern and takes the `else` or
+    /// `_` arm.
+    fn pattern_subject(&self, scrutinee: &Type) -> Type {
+        let resolved = self.resolve_head(scrutinee);
+        match peel_modes(&resolved) {
+            Type::Nullable(inner) => peel_modes(&self.resolve_head(inner)).clone(),
+            other => other.clone(),
         }
     }
 
@@ -174,7 +136,8 @@ impl<'a> Checker<'a> {
         self.check_pattern_shape(scrutinee, pat);
     }
 
-    /// Each pattern creates one binding scope, including all nested fields.
+    /// Report a name `pat` binds more than once: a pattern, nested fields
+    /// included, is one binding scope.
     pub(super) fn check_pattern_bindings(&mut self, pat: &Pattern, names: &mut HashSet<String>) {
         match pat {
             Pattern::Binding(name, None, span) if !self.is_unit_variant_name(name) => {
@@ -220,8 +183,15 @@ impl<'a> Checker<'a> {
             return;
         }
         match pat {
-            Pattern::Binding(name, _, span) => {
-                if let Some(owner) = self.variant_owner(name)
+            Pattern::Binding(name, qualifier, span) => {
+                // An unqualified name is a variant only when a sum in scope
+                // declares it; otherwise it binds and has no owner to check.
+                let owner = if qualifier.is_some() {
+                    self.variant_owner(name)
+                } else {
+                    self.scoped_variant_owner(name)
+                };
+                if let Some(owner) = owner
                     && !self.scrutinee_accepts_variant(scrutinee, name)
                 {
                     let other = self.resolve(scrutinee);
@@ -234,8 +204,12 @@ impl<'a> Checker<'a> {
                     });
                 }
             }
-            Pattern::Record(name, _, fields, span) => {
-                let owner = self.variant_owner(name);
+            Pattern::Record(name, qualifier, fields, span) => {
+                let owner = if qualifier.is_some() || self.braced_head_is_variant(name, scrutinee) {
+                    self.variant_owner(name)
+                } else {
+                    None
+                };
                 if let Some(owner) = &owner
                     && !self.scrutinee_accepts_variant(scrutinee, name)
                 {
@@ -324,14 +298,49 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Reject a bare name in a refutable pattern position (a `match` arm or
+    /// `if let`) that binds a new variable although the matched value's own
+    /// sum declares a unit variant of that name: the sum is not in scope here,
+    /// so the name is no variant test, and silently binding would turn the
+    /// arm into a catch-all.
+    pub(super) fn check_out_of_scope_variant_binding(&mut self, scrutinee: &Type, pat: &Pattern) {
+        let Pattern::Binding(name, None, span) = pat else {
+            return;
+        };
+        if self.is_unit_variant_name(name) {
+            return;
+        }
+        let Type::Sum(sum) = self.pattern_subject(scrutinee) else {
+            return;
+        };
+        let Some(info) = self.program.type_by_id(sum.id) else {
+            return;
+        };
+        if info.variant(name).is_some_and(|v| v.fields.is_empty()) {
+            self.errors.push(TypeError {
+                message: format!(
+                    "`{name}` binds a new name, but the matched `{}` has a variant `{name}` \
+                     that is not in scope here; import `{}` to match the variant, or rename the binding",
+                    info.name, info.name
+                ),
+                span: *span,
+            });
+        }
+    }
+
     /// Resolve a pattern's written type through module imports and aliases.
     /// Light inference uses this without emitting diagnostics; the full pass
     /// validates the variant and its agreement with the scrutinee separately.
     pub(super) fn pattern_qualifier_type(&self, q: &PatternQualifier) -> Option<Type> {
         let name = self.resolve_self_name(&q.ty);
-        self.program
-            .resolve_type_or_alias(&self.current_module, &name)
-            .map(|info| info.type_ref())
+        match self
+            .program
+            .pattern_scope(&self.current_module)
+            .type_head(&name)
+        {
+            PatternTypeHead::Nominal(info) => Some(info.type_ref()),
+            _ => None,
+        }
     }
 
     /// An open scrutinee takes its field types from the written nominal head:
@@ -351,8 +360,7 @@ impl<'a> Checker<'a> {
         if resolved.is_unknown() && name.contains('.') {
             return self
                 .program
-                .resolve_type_or_alias(&self.current_module, name)
-                .filter(|info| !info.is_sum())
+                .record_pattern_head(&self.current_module, name)
                 .map(|info| info.type_ref())
                 .unwrap_or(resolved);
         }
@@ -367,9 +375,10 @@ impl<'a> Checker<'a> {
         name: &str,
         span: brass_parser::Span,
     ) -> bool {
-        let Some(info) = self
+        let PatternTypeHead::Nominal(info) = self
             .program
-            .resolve_type_or_alias(&self.current_module, name)
+            .pattern_scope(&self.current_module)
+            .type_head(name)
         else {
             self.errors.push(TypeError {
                 message: format!("unknown type `{name}`"),
@@ -397,14 +406,12 @@ impl<'a> Checker<'a> {
         pat: &Pattern,
     ) -> bool {
         let name = self.resolve_self_name(&q.ty);
-        let Some(info) = self
+        let head = self
             .program
-            .resolve_type_or_alias(&self.current_module, &name)
-        else {
-            let known_alias = self
-                .program
-                .resolve_type_alias(&self.current_module, &name)
-                .is_some();
+            .pattern_scope(&self.current_module)
+            .type_head(&name);
+        let PatternTypeHead::Nominal(info) = head else {
+            let known_alias = matches!(head, PatternTypeHead::NonNominalAlias);
             self.errors.push(TypeError {
                 message: if known_alias
                     || IntKind::from_name(&name).is_some()
@@ -444,9 +451,10 @@ impl<'a> Checker<'a> {
         )
     }
 
-    /// A written nominal pattern must select the scrutinee's declaration.
-    /// An open scrutinee is pinned to it; known payload substitutions remain
-    /// those of the scrutinee, since a pattern head selects a type, not a value.
+    /// A written nominal pattern must select the declaration of the scrutinee
+    /// (of its present value, when nullable). An open scrutinee is pinned to
+    /// it; known payload substitutions remain those of the scrutinee, since a
+    /// pattern head selects a type, not the types of its per-value fields.
     fn check_pattern_type_agreement(
         &mut self,
         scrutinee: &Type,
@@ -455,11 +463,8 @@ impl<'a> Checker<'a> {
         type_name: &str,
         span: brass_parser::Span,
     ) -> bool {
-        let resolved = self.resolve_head(scrutinee);
+        let resolved = self.pattern_subject(scrutinee);
         if resolved.is_unknown() {
-            // Only an open variable is pinned here. Known instances retain
-            // their payload substitutions; a qualifier selects a declaration,
-            // not the types of its per-value fields.
             let _ = self.solver.unify(scrutinee, selected);
             return true;
         }
@@ -479,12 +484,9 @@ impl<'a> Checker<'a> {
         true
     }
 
-    /// Check a `let` pattern, whose bindings must always be initialized. Array
-    /// patterns are refutable on a growable slice because its runtime length is
-    /// not part of the type; those patterns belong in `if let` or `match`.
-    /// Fixed arrays and tuples carry an exact arity and remain valid total
-    /// destructures. Recurse so a slice nested in a tuple/record cannot bypass
-    /// the same requirement.
+    /// Check a `let`/`const` pattern: its shape, and that it always matches,
+    /// since every binding it introduces must be initialized (see
+    /// `check_irrefutable_pattern`).
     pub(super) fn check_let_pattern_against(
         &mut self,
         scrutinee: &Type,
@@ -496,8 +498,15 @@ impl<'a> Checker<'a> {
         self.check_irrefutable_pattern(scrutinee, pat, Some(value), context);
     }
 
-    /// Require total initialization, preserving the literal-array length proof
-    /// allowed for declarations and reporting refutable nested constructs.
+    /// Report each part of `pat` that may fail to match a `scrutinee` value
+    /// where every binding must be initialized (`context`: `let`, `const` or
+    /// `for`). A literal, a qualified name, a unit variant, a variant of a sum
+    /// with others, and any record or array pattern on a nullable subject are
+    /// refutable. An array pattern is refutable on a growable slice, whose
+    /// runtime length is not part of its type, unless `value` is an array
+    /// literal of the pattern's length; fixed arrays and tuples carry an exact
+    /// arity and destructure totally. Nested positions are checked too, so a
+    /// slice inside a tuple or record cannot bypass the requirement.
     pub(super) fn check_irrefutable_pattern(
         &mut self,
         scrutinee: &Type,
@@ -506,6 +515,13 @@ impl<'a> Checker<'a> {
         context: &str,
     ) {
         match pat {
+            // A nullable subject may be absent, which no array or tuple
+            // pattern matches.
+            Pattern::Array(..)
+                if matches!(peel_modes(&self.resolve(scrutinee)), Type::Nullable(_)) =>
+            {
+                self.report_refutable_pattern(pat, context)
+            }
             Pattern::Array(patterns, span) => match self.resolve(scrutinee) {
                 Type::Tuple(elements) => {
                     for (index, (pattern, element)) in patterns.iter().zip(&elements).enumerate() {
@@ -754,36 +770,46 @@ impl<'a> Checker<'a> {
             .any(|path| binding_in(path, name) == Some(true))
     }
 
-    // An open scrutinee can share a variant spelling across unrelated sums.
-    // Defer an ambiguous verdict until its concrete instance is checked.
+    /// Whether the record or variant pattern `name { .. }` (fields aside)
+    /// covers every value of `ty`: a plain record or the variant of a
+    /// single-variant sum does; a variant of a wider sum or any pattern on a
+    /// nullable subject does not. An open subject can share a variant spelling
+    /// across unrelated sums: `None` when those disagree, deferring the
+    /// verdict to the check of the concrete instance.
     fn record_pattern_totality(&self, ty: &Type, name: &str) -> Option<bool> {
         let resolved = self.resolve(ty);
         let total = |info: &TypeInfo| matches!(&info.kind, TypeKind::Sum { variants } if variants.len() == 1);
         match peel_modes(&resolved) {
             Type::Sum(sum) => self.program.type_by_id(sum.id).map(total),
             Type::Nullable(_) => Some(false),
+            // A head that is no variant here destructures a plain record.
+            Type::Unknown(_) if !self.braced_head_is_variant(name, &resolved) => Some(true),
             Type::Unknown(_) => {
-                let owners = self.program.sums_containing_variant(name);
-                let Some(first) = owners.first() else {
+                let mut owners = self
+                    .program
+                    .variant_owner_ids(name)
+                    .iter()
+                    .filter_map(|id| self.program.type_by_id(*id));
+                let Some(first) = owners.next() else {
                     return Some(true);
                 };
                 let first = total(first);
-                owners
-                    .iter()
-                    .all(|info| total(info) == first)
-                    .then_some(first)
+                owners.all(|info| total(info) == first).then_some(first)
             }
             _ => Some(true),
         }
     }
 
-    /// Resolve field payloads using the scrutinee's nominal substitutions.
+    /// The field types a record or variant pattern named `variant` binds over
+    /// `ty` (its present value, when nullable): the scrutinee's nominal
+    /// substitution, else the declared field type. An open subject takes them
+    /// from the declaration of the sum that declares `variant`.
     pub(super) fn pattern_field_types(
         &mut self,
         ty: &Type,
         variant: &str,
     ) -> HashMap<String, Type> {
-        let resolved = self.resolve(ty);
+        let resolved = self.resolve(&self.pattern_subject(ty));
         if let Type::Record(record) = peel_modes(&resolved) {
             let Some(info) = self.program.type_by_id(record.id) else {
                 return HashMap::default();

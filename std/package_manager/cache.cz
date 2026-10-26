@@ -1,0 +1,130 @@
+// Package-store paths and publication names shared by fetching and management.
+// This module has no manifest or network imports, so both fetch entry points
+// can use the layout without loading each other's dependency graph.
+
+import std.path.Path
+import std.hash.{ sha256, hex }
+import std.process.{ Command, Stdio }
+
+/** The package store under the user's home directory; does not create it. */
+fun packages_dir() -> Path! {
+    return Path.home()!.join(".brass").join("packages")
+}
+
+/** The shared checkout path for the exact repository and revision strings. */
+fun git_entry(repo: string, rev: string) -> Path! {
+    const key = hex(sha256(to_bytes("{repo}\n{rev}")))
+    return packages_dir()!.join("git").join(key)
+}
+
+/** The extraction path for a lowercase SHA-256 digest, rejecting other names. */
+fun tarball_entry(hash: string) -> Path! {
+    if !valid_digest(hash) {
+        return error(
+            "tarball hash must be exactly 64 lowercase hexadecimal characters",
+        )
+    }
+    return packages_dir()!.join("tarball").join(hash)
+}
+
+/** Whether a name is a digest emitted by the package store. */
+fun valid_digest(key: string) -> bool {
+    if len(key) != 64 {
+        return false
+    }
+    for b in to_bytes(key) {
+        if !((b >= 48 && b <= 57) || (b >= 97 && b <= 102)) {
+            return false
+        }
+    }
+    return true
+}
+
+/** Format a digest and PID as a staging name; an empty PID gives the shell prefix. */
+fun staging_name(key: string, pid: string) -> string {
+    return ".{key}.{pid}"
+}
+
+/** Recognize only the digest and canonical positive PID form used by staging_dir. */
+fun is_staging_name(name: string) -> bool {
+    const parts = name.split(".")
+    if parts.len() != 3 || parts[0] != "" || !valid_digest(parts[1]) {
+        return false
+    }
+    const pid = to_bytes(parts[2])
+    if pid.len() == 0 || pid[0] == 48 {
+        return false
+    }
+    for b in pid {
+        if b < 48 || b > 57 {
+            return false
+        }
+    }
+    return staging_name(parts[1], parts[2]) == name
+}
+
+/**
+ * Reserve a staging sibling using a short-lived shell's PID. Exclusive mkdir
+ * separates concurrent fetches. `kind` names the source in failure diagnostics.
+ */
+fun staging_dir(parent: Path, key: string, kind: string) -> Path! {
+    let cmd = Command.new("sh")
+    // The shell substitutes only its PID; the complete name comes from the
+    // same rule the cleaner recognizes. Positional arguments preserve paths.
+    cmd.args(
+        [
+            "-c",
+            "umask 077; stage=\"$1$2$$\"; mkdir \"$stage\" && printf '%s' \"$stage\"",
+            "czpm-stage",
+            parent.to_string() + "/",
+            staging_name(key, ""),
+        ],
+    )
+    cmd.stdout(Stdio.Pipe)
+    const child = cmd.spawn()!
+    const out = child.output()!
+    if out.code != 0 {
+        return error("failed to create a {kind} staging directory")
+    }
+    return Path.parse(to_text(out.stdout)!)
+}
+
+/**
+ * Whether management may inspect a store directory. Missing directories are
+ * empty; symbolic links in the store's structural components are never followed.
+ */
+fun store_directory(path: Path) -> bool! {
+    if path.is_sym_link() {
+        return false
+    }
+    if !path.exists() {
+        return false
+    }
+    if !path.is_dir() {
+        return error(
+            "package cache path is not a directory: {path.to_string()}",
+        )
+    }
+    return true
+}
+
+/** Whether the store root and its private parent are ordinary directories. */
+fun store_available() -> bool! {
+    const root = packages_dir()!
+    return store_directory(root.parent())! && store_directory(root)!
+}
+
+/** Whether a published entry is an ordinary directory in the managed layout. */
+fun entry_available(path: Path) -> bool! {
+    const root = packages_dir()!
+    const kind = path.parent().basename().to_string()
+    if path.parent().parent().to_string() != root.to_string() ||
+        (kind != "git" && kind != "tarball") ||
+        !valid_digest(path.basename().to_string()) {
+        return false
+    }
+    if !store_available()! || !store_directory(path.parent())! {
+        return false
+    }
+    return !path.is_sym_link() && path.is_dir()
+}

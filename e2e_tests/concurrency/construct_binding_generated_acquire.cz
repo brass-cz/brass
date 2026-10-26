@@ -1,0 +1,11 @@
+// A function binding named with remains usable through another name while
+// compiler-generated acquisitions keep their construct meaning.
+fun main() {
+    let with = (x: int32) -> x + 1
+    let apply = with
+    let item = { n: 0 }
+    spawn(() -> { item.n = 3 })
+    sync()
+    println(item.n)
+    println(apply(4))
+}

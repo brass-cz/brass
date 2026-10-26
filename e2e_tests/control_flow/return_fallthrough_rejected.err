@@ -1,0 +1,4 @@
+incompatible return types: `int32` and `void`
+incompatible return types: `bool` and `void`
+incompatible return types: `string` and `void`
+incompatible return types: `float64` and `void`

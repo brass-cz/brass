@@ -1,7 +1,8 @@
 # Brass language server in Neovim
 
-Diagnostics, hover types, go-to-definition, and semantic-token highlighting for
-`.cz` files, backed by `czls` (the `brass_language_server` crate).
+Diagnostics, hover types, go-to-definition, completion, formatting, and
+semantic-token highlighting for `.cz` files, backed by `czls` (the
+`brass_language_server` crate).
 
 Uses the native Neovim 0.11+ LSP workflow: a server definition in `lsp/`, the
 filetype mapping in `ftdetect/`, and `vim.lsp.enable("brass")` to start it.
@@ -17,6 +18,13 @@ cargo build -p brass_language_server                # -> target/debug/czls
 ```
 
 `czls` has no LLVM dependency, so it builds without the JIT toolchain.
+
+The server config launches `czpm lsp`, which resolves a project's
+`package.toml` dependencies and then starts `czls` from `PATH` (outside a
+project it starts the plain server). The complete toolchain (see
+[Installing Brass](../../book/src/content/docs/installation/interpreter.md))
+puts both on `PATH`; with only `czls` installed,
+[override `cmd`](#overriding-the-server-command).
 
 ## 2. Put this directory on the runtimepath and enable the server
 
@@ -42,9 +50,11 @@ vim.opt.runtimepath:append("/path/to/brass/editors/nvim")
 vim.lsp.enable("brass")
 ```
 
-### Using a locally built binary instead of one on PATH
+### Overriding the server command
 
-Override `cmd` before enabling; the override merges over `lsp/brass.lua`:
+Override `cmd` before enabling; the override merges over `lsp/brass.lua`.
+Use `{ "czls" }` to run the server from `PATH` without `czpm`, or point at a
+locally built binary:
 
 ```lua
 vim.lsp.config("brass", {
@@ -109,7 +119,7 @@ vim.api.nvim_create_autocmd("LspAttach", {
 
 - `ftdetect/brass.lua` maps the `.cz` extension to the `brass` filetype.
 - Imports are resolved from each file's directory on disk, so unsaved edits in
-  *other* open files are not yet reflected across files; the active file is
-  always analyzed from its live buffer contents.
+  *other* open files are not seen across files; the active file is always
+  analyzed from its live buffer contents.
 - Set `BRASS_LOG=debug` in the environment for server-side trace logs on
   stderr (visible via `:LspLog`).

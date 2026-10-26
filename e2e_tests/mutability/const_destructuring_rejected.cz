@@ -1,0 +1,19 @@
+// @backends: all
+// Every name a `const` destructuring pattern binds is const, at top level
+// and in a function body alike: reassigning it or mutating the value it
+// names is rejected.
+
+type P = { x: int32, ys: int32[] }
+
+const P { x, ys } = P { x: 1, ys: [1] }
+const [first, rest] = [[1], [2]]
+
+fun main() {
+    x = 5
+    first.push(2)
+    const P { x: lx, ys: lys } = P { x: 1, ys: [1] }
+    lys.push(3)
+    const [a, b] = [1, 2]
+    a = 3
+    println(b + lx)
+}

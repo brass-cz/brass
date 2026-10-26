@@ -1,0 +1,8 @@
+5.0
+7
+N {
+    n: -3,
+}
+300 does not fit uint8
+16777217 is not exact in float32
+2.5

@@ -1,0 +1,61 @@
+// @backends: all
+// The value of an `if`/`match` is the join of its branch values: numbers
+// meet at their common type, and a literal branch adapts to the typed
+// branches when it fits -- whichever branch comes first. So a literal `0`
+// arm next to an int64 is an int64 (no truncation of 5000000000), a 200 arm
+// next to a uint8 is a uint8, a 300 arm widens the join to int32, and a
+// float32 branch keeps an integer literal branch at float32.
+fun f(x: int64) -> int64 {
+    return if x > 1 { x } else { 0 }
+}
+
+fun g(x: int64) -> int64 {
+    return match x {
+        1 => 0,
+        _ => x,
+    }
+}
+
+fun h(c: bool, x: int64) {
+    return if c { 0 } else { x }
+}
+
+fun k(c: bool, a: int32, b: int64) {
+    let r = if c { a } else { b }
+    return r
+}
+
+fun m(c: bool, b: uint8) {
+    return if c { 200 } else { b }
+}
+
+fun n(c: bool, b: uint8) {
+    let v = if c { 300 } else { b }
+    return v
+}
+
+fun p(c: int32, b: uint8, w: int16) {
+    return match c {
+        0 => -1,
+        1 => b,
+        _ => w,
+    }
+}
+
+fun main() {
+    println(f(5000000000))
+    println(g(5000000000))
+    println(g(1))
+    println(h(false, 5000000000))
+    println(typeof(h(true, 5)))
+    println(k(false, 1, 5000000000))
+    println(typeof(k(true, 1, 5)))
+    println("{m(true, 7)} {typeof(m(true, 7))}")
+    println("{n(true, 7)} {typeof(n(false, 7))}")
+    println("{p(0, 7, 9)} {typeof(p(0, 7, 9))}")
+    let fl: float32 = 1.5
+    let q = if fl > 1.0 { fl } else { 2 }
+    println("{q} {typeof(q)}")
+    let opt = if fl > 2.0 { 1 } else { null }
+    println(opt)
+}

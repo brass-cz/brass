@@ -1,7 +1,7 @@
 // Pins deterministic owning-sum resolution when two sums share variant names:
-// a fully-exhaustive match on Big must be accepted on EVERY run. The owner
-// used to be picked from HashMap iteration order, flipping between Small and
-// Big and rejecting this program nondeterministically.
+// the bare variant patterns of each match resolve to the matched value's sum,
+// so the exhaustive match on `Big` (with `Z`) and the one on `Small` are both
+// accepted on every run.
 type Small =
     | X { a: int32 }
     | Y { a: int32 }

@@ -5,7 +5,7 @@
 // error -- the plugin gives each descriptor up exactly once.
 import std.process.{ Command, Stdio }
 
-const child = Command.new("echo")
+let child = Command.new("echo")
     .args(["buffered"])
     .stdout(Stdio.Pipe)
     .spawn()!

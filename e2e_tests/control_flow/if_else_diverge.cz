@@ -1,5 +1,6 @@
-// An `if/else` used as a statement where both arms return: the (unreachable)
-// merge produces no value, so the lowering must not leave a dangling result.
+// An `if`/`else` statement whose arms both return ends a non-void function:
+// the unreachable merge after it needs no value, and each call returns its
+// arm's value.
 fun classify(x: int32) -> int32 {
     if x == 0 {
         return 100

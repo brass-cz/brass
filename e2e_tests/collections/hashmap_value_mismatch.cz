@@ -1,7 +1,6 @@
 // A HashMap's value type is fixed by use: `set("a", "b")` makes this a
-// `string -> string` map. Setting a later value of a different type (`int32`) is a
-// type error, caught at the call site rather than silently miscompiling the
-// unboxed slot and crashing at runtime.
+// `string -> string` map, and a later `set` of an `int32` value is a type
+// error at the call site.
 fun main() {
     let map = HashMap.new()
     map.set("a", "b")

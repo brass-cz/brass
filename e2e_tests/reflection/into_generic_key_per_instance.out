@@ -1,0 +1,7 @@
+Result.Ok {
+    value: 42,
+}
+Result.Ok {
+    value: "hi",
+}
+err cannot decode this value as `int32` at line 24

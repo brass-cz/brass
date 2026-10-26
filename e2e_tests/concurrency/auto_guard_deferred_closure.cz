@@ -1,0 +1,10 @@
+// Wrapping a deferred closure does not report an access in its enclosing scope.
+type Counter = { count: int32 }
+fun main() {
+    let counter = Counter { count: 0 }
+    spawn(() -> { with(counter, (c) -> { c.count += 1 }) })
+    spawn(() -> { with(counter, (c) -> { c.count += 2 }) })
+    sync()
+    let read = () -> counter.count
+    println(read())
+}

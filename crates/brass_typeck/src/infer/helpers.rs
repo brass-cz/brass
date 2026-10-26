@@ -1,14 +1,17 @@
 //! Stateless helper functions shared across the checker: syntactic
-//! predicates over the AST, type-shape predicates and wrapper peeling,
-//! unknown-id scanning, and substitution plumbing.
+//! predicates over the AST, the default types of numeric and pattern
+//! literals, type-shape predicates and wrapper peeling, unknown-id scanning,
+//! and substitution plumbing.
 
 use super::*;
 
-/// Free-function names the runtime resolves without a user or stdlib
-/// definition (mirrors `brass_runtime::builtins::builtin_function`). They are
-/// always legitimate value/callee names even when the standard library is not
-/// loaded (for example in typeck unit tests), so name resolution must not
-/// reject them. Keep this list in sync with the runtime dispatcher.
+/// Free-function names the back ends implement without a user or prelude
+/// definition (the engine's `Codegen::codegen_builtin` walk and the REPL's
+/// `eval_builtin`). They are always legitimate value/callee names even when
+/// the prelude is not loaded (for example in typeck unit tests), so
+/// name resolution must not reject them. Keep this list in sync with both back
+/// ends: a name listed here but implemented by neither passes the check and
+/// then fails at run time.
 pub(super) fn is_runtime_builtin_value(name: &str) -> bool {
     // The native-plugin dispatch family (`_plugin_call_i` etc., emitted by
     // the loader's synthesized plugin modules) is decoded by suffix.
@@ -53,16 +56,9 @@ pub(super) fn is_runtime_builtin_value(name: &str) -> bool {
             | "_float_floor"
             | "_float_ceil"
             | "_float_pow"
-            | "_array_push"
-            | "_array_pop"
-            | "_array_insert"
-            | "_array_remove"
     )
 }
 
-/// Whether `ty` is a fully known primitive with no user fields or methods.
-/// Field/method access on such a receiver cannot be deferred to runtime shape
-/// dispatch and is therefore a static error.
 /// Whether a type annotation contains a `typeof(v)` node (so its resolved type
 /// must be recorded for the back end rather than re-derived scope-free).
 pub(super) fn contains_typeof(te: &TypeExpr) -> bool {
@@ -83,6 +79,8 @@ pub(super) fn contains_typeof(te: &TypeExpr) -> bool {
     }
 }
 
+/// Whether `ty` is a fully known primitive with no user fields or methods, so
+/// a field or method access on it is a static error.
 pub(super) fn is_concrete_primitive(ty: &Type) -> bool {
     matches!(
         ty,
@@ -102,28 +100,58 @@ pub(super) fn same_nominal_instance(a: &Type, b: &Type) -> bool {
     }
 }
 
-/// Whether a (resolved) type is fully concrete: it contains no inference
-/// variable, `Never`, or `Self` placeholder, so it can name a monomorphized
-/// instance.
 /// The value of a constant non-negative integer index (a tuple position), or
 /// `None` if the index is not a literal.
-pub(crate) fn const_index(expr: &Expr) -> Option<i64> {
+pub(super) fn const_index(expr: &Expr) -> Option<i64> {
     match expr {
-        Expr::Int(n, _) if *n >= 0 => Some(*n),
+        Expr::Int(n, _) if *n >= 0 => i64::try_from(*n).ok(),
         _ => None,
     }
 }
 
-/// The default concrete type of a numeric literal element, for classifying a
-/// bracket literal as array vs tuple (an int literal is `int32`, a float `float64`).
-pub(crate) fn numeric_literal_repr(e: &Expr) -> Option<Type> {
+/// The numeric literal an expression's value is written as: the literal
+/// itself (`0`, `-1`, `0.5`), or the trailing expression of a block
+/// (`{ 0 }`), the way a branch of an `if`/`match` yields it. Branch joins let
+/// such a value adapt like a literal operand.
+pub(super) fn value_literal(expr: &Expr) -> Option<brass_typesys::NumericLiteral> {
+    match expr {
+        Expr::Block(block, _) => block_literal(block),
+        other => brass_typesys::NumericLiteral::of_expr(other),
+    }
+}
+
+/// The numeric literal a block's trailing expression is written as.
+pub(super) fn block_literal(block: &Block) -> Option<brass_typesys::NumericLiteral> {
+    match block.stmts.last() {
+        Some(Stmt::Expr(expr)) => value_literal(expr),
+        _ => None,
+    }
+}
+
+/// The type an integer literal with this value takes on its own: its default
+/// ([`brass_typesys::int_literal_kind`]). A value no integer type holds falls
+/// back to `int64` so typing can continue; the full check reports it at the
+/// literal.
+pub(super) fn int_literal_type(value: i128) -> Type {
+    Type::Int(brass_typesys::int_literal_kind(value).unwrap_or(IntKind::I64))
+}
+
+/// The default type of a numeric literal element, for classifying a bracket
+/// literal as array vs tuple: an integer literal's default by value (see
+/// [`int_literal_type`]), `float64` for a float literal.
+pub(super) fn numeric_literal_repr(e: &Expr) -> Option<Type> {
+    if let Some(value) = e.int_literal_value() {
+        return Some(int_literal_type(value));
+    }
     match e {
-        Expr::Int(v, _) => Some(Type::Int(int_literal_kind(*v))),
         Expr::Float(_, _) => Some(Type::Float(FloatKind::F64)),
         _ => None,
     }
 }
 
+/// Whether a (resolved) type is fully concrete: it contains no inference
+/// variable, `Never`, or `Self` placeholder, so it can name a monomorphized
+/// instance.
 pub(super) fn is_concrete_type(ty: &Type) -> bool {
     match ty {
         Type::Unknown(_) | Type::Never | Type::SelfType => false,
@@ -135,6 +163,7 @@ pub(super) fn is_concrete_type(ty: &Type) -> bool {
         | Type::Ref(inner) => is_concrete_type(inner),
         Type::Fun(params, ret) => params.iter().all(is_concrete_type) && is_concrete_type(ret),
         Type::Tuple(elems) => elems.iter().all(is_concrete_type),
+        Type::Record(n) | Type::Sum(n) => n.substitution.iter().all(|(_, ty)| is_concrete_type(ty)),
         _ => true,
     }
 }
@@ -156,9 +185,13 @@ pub(super) fn peel_value_wrappers(ty: &Type) -> &Type {
     }
 }
 
+/// The type a literal pattern is written at on its own (an integer by its
+/// value's default, a float as `float64`, `null` as `never?`); whether it can
+/// match a scrutinee is [`literal_pattern_matches`]'s question. `None` for an
+/// expression that is no literal.
 pub(super) fn literal_pattern_type(expr: &Expr) -> Option<Type> {
     match expr {
-        Expr::Int(v, _) => Some(Type::Int(int_literal_kind(*v))),
+        Expr::Int(v, _) => Some(int_literal_type(*v)),
         Expr::Float(..) => Some(Type::Float(FloatKind::F64)),
         Expr::Bool(..) => Some(Type::Bool),
         Expr::Str(..) => Some(Type::Str),
@@ -167,18 +200,28 @@ pub(super) fn literal_pattern_type(expr: &Expr) -> Option<Type> {
     }
 }
 
+/// Whether a literal pattern can match a value of type `scrutinee`. An
+/// integer literal follows the flow rule (its value must fit the scrutinee's
+/// integer type, so `-1` matches an `int64`); a float literal adapts to either
+/// float width, as it does in an expression; a value literal against a
+/// nullable scrutinee tests for a present value equal to it, so it is checked
+/// against the element type.
 pub(super) fn literal_pattern_matches(expr: &Expr, lit_ty: &Type, scrutinee: &Type) -> bool {
     match (expr, scrutinee) {
         (_, Type::Unknown(_)) => true,
-        (Expr::Int(..), Type::Int(_)) => integer_literal_fits(expr, scrutinee),
         (Expr::Null(_), Type::Nullable(_) | Type::Never) => true,
+        (Expr::Null(_), _) => false,
+        (_, Type::Nullable(inner)) => literal_pattern_matches(expr, lit_ty, inner),
+        (Expr::Int(..), Type::Int(_)) => integer_literal_fits(expr, scrutinee),
+        (Expr::Float(v, _), Type::Float(FloatKind::F32)) => (*v as f32).is_finite(),
         _ => Subst::new().unify(lit_ty, scrutinee).is_ok(),
     }
 }
 
+/// Whether a callable whose return type is `ty` receives a propagated error:
+/// a `Result`, a `Result?` (a body that also propagates a null), or a
+/// still-open return.
 pub(super) fn is_result_return_type(ty: &Type) -> bool {
-    // A `Result<..>?` return (a body that also propagates a null) still
-    // receives propagated errors.
     let ty = match ty {
         Type::Nullable(inner) => inner,
         other => other,
@@ -186,6 +229,9 @@ pub(super) fn is_result_return_type(ty: &Type) -> bool {
     ty.is_unknown() || ty.is_result_type()
 }
 
+/// The first inference-variable id above every one the program's type and
+/// function declarations already carry, so the checker's fresh variables
+/// never alias a declaration's.
 pub(super) fn next_unknown_after_program(program: &Program) -> u32 {
     let mut max_id = None;
     let mut record = |id| {
@@ -265,6 +311,8 @@ fn visit_unknowns(ty: &Type, record: &mut impl FnMut(u32)) {
     }
 }
 
+/// `ty` (a record or sum) with `substitution` as its substitution; any other
+/// type, or an empty `substitution`, is returned unchanged.
 pub(super) fn apply_nominal_substitution(ty: Type, substitution: Substitution) -> Type {
     if substitution.is_empty() {
         return ty;
@@ -284,6 +332,24 @@ pub(super) fn apply_nominal_substitution(ty: Type, substitution: Substitution) -
     }
 }
 
+/// `ty` (a nominal instance) with `entries` added to its substitution,
+/// replacing the ones it already has: a literal's field types written over the
+/// instance a refinement alias pins (whose slot entries the literal's own
+/// substitution does not carry).
+pub(super) fn overlay_nominal_substitution(ty: Type, entries: &Substitution) -> Type {
+    match ty {
+        Type::Record(mut n) => {
+            for (key, t) in entries.iter() {
+                n.substitution.insert(key, t.clone());
+            }
+            Type::Record(n)
+        }
+        other => other,
+    }
+}
+
+/// The key of a field's entry in a nominal substitution: the field name, or
+/// `Variant.field` for a sum variant's payload field.
 pub(super) fn field_substitution_key(variant: Option<&str>, field: &str) -> String {
     variant
         .map(|variant| format!("{variant}.{field}"))
@@ -318,6 +384,9 @@ pub(super) fn method_return_substitution_key(method: &str) -> String {
     format!("{method}.return")
 }
 
+/// `resolved` with each non-`self` parameter type and the return type taken
+/// from the receiver instance's `substitution` where it has an entry for them
+/// (`method.param` / `method.return` keys).
 pub(super) fn apply_method_substitution(
     mut resolved: ResolvedMethod,
     substitution: &Substitution,
@@ -342,12 +411,15 @@ pub(super) fn apply_method_substitution(
     resolved
 }
 
+/// A parameter's resolved declared type, unless it is a bare inference
+/// variable (an unannotated parameter).
 pub(super) fn param_expected_type(param: &ParamInfo) -> Option<&Type> {
     param.resolved_ty.as_ref().filter(|ty| !ty.is_unknown())
 }
 
 /// Whether a parameter is nullable. A trailing run of nullable parameters is
-/// optional at call sites: each omitted argument defaults to `null`. This is how `assert(cond, msg: string?)` accepts both `assert(cond)` and
+/// optional at call sites: each omitted argument defaults to `null`. This is
+/// how `assert(cond, msg: string?)` accepts both `assert(cond)` and
 /// `assert(cond, "..")` without function overloading.
 fn param_is_nullable(param: &ParamInfo) -> bool {
     matches!(param.resolved_ty, Some(Type::Nullable(_)))
@@ -373,26 +445,13 @@ pub(super) fn required_arg_count(program: &Program, params: &[ParamInfo]) -> usi
     params.len() - optional
 }
 
+/// Whether a value of this type may have a length and be indexed: an array,
+/// a string, or a still-open type.
 pub(super) fn is_maybe_indexable(ty: &Type) -> bool {
     matches!(
         ty,
         Type::Array(..) | Type::Slice(..) | Type::Str | Type::Unknown(_)
     )
-}
-
-pub(super) fn int_fits_kind(value: i64, kind: IntKind) -> bool {
-    let value = value as i128;
-    let (min, max) = match kind {
-        IntKind::I8 => (i8::MIN as i128, i8::MAX as i128),
-        IntKind::I16 => (i16::MIN as i128, i16::MAX as i128),
-        IntKind::I32 => (i32::MIN as i128, i32::MAX as i128),
-        IntKind::I64 => (i64::MIN as i128, i64::MAX as i128),
-        IntKind::U8 => (0, u8::MAX as i128),
-        IntKind::U16 => (0, u16::MAX as i128),
-        IntKind::U32 => (0, u32::MAX as i128),
-        IntKind::U64 => (0, u64::MAX as i128),
-    };
-    (min..=max).contains(&value)
 }
 
 pub(super) fn assign_binop(op: AssignOp) -> BinOp {
@@ -418,6 +477,22 @@ pub(super) fn is_self_expr(expr: &Expr) -> bool {
     }
 }
 
+/// The compile-time truth of the presence test `if let <binding> = v` over a
+/// value of type `ty`: false for the always-null `never?` (an absent member),
+/// true for a fully known non-nullable value (the binding is irrefutable),
+/// undecided for a nullable or still-open one. A reference or `mut`
+/// parameter is tested through its value. The back end folds the same test
+/// (its `__present` builtin) the same way.
+pub(super) fn presence_binding_truth(ty: &Type) -> Option<bool> {
+    match peel_ref_mut(ty) {
+        Type::Nullable(inner) => matches!(**inner, Type::Never).then_some(false),
+        Type::Unknown(_) | Type::Never => None,
+        other => brass_hir::is_fully_known(other).then_some(true),
+    }
+}
+
+/// Whether the block always returns: one of its own statements is a
+/// `return` (a `return` nested in a branch does not count).
 pub(super) fn block_always_returns(block: &Block) -> bool {
     block.stmts.iter().any(|s| matches!(s, Stmt::Return(..)))
 }
@@ -435,140 +510,12 @@ pub(super) fn expr_always_returns(e: &Expr) -> bool {
     }
 }
 
-/// Names assigned (rebound) anywhere inside a closure literal of `b`. A closure
-/// captures such a binding by reference, so any call made while the binding is
-/// narrowed non-null can run the closure and re-null it; the narrowing pass
-/// treats these names like globals and re-widens them after calls. Shadowing is
-/// not tracked (a closure-local `let` of the same name over-approximates),
-/// which only re-widens more than strictly needed -- never less.
-pub(super) fn closure_write_targets_block(b: &Block) -> HashSet<String> {
-    let mut acc = HashSet::default();
-    for s in &b.stmts {
-        collect_closure_writes_stmt(s, false, &mut acc);
-    }
-    acc
-}
-
-pub(super) fn collect_closure_writes_stmt(
-    stmt: &Stmt,
-    in_closure: bool,
-    acc: &mut HashSet<String>,
-) {
-    match stmt {
-        Stmt::Let {
-            value: Some(value), ..
-        } => collect_closure_writes_expr(value, in_closure, acc),
-        Stmt::Let { value: None, .. } => {}
-        Stmt::Assign { target, value, .. } => {
-            if in_closure && let Expr::Ident(name, _) = target {
-                acc.insert(name.clone());
-            }
-            collect_closure_writes_expr(target, in_closure, acc);
-            collect_closure_writes_expr(value, in_closure, acc);
-        }
-        Stmt::Expr(e) => collect_closure_writes_expr(e, in_closure, acc),
-        Stmt::While { cond, body, .. } => {
-            collect_closure_writes_expr(cond, in_closure, acc);
-            for s in &body.stmts {
-                collect_closure_writes_stmt(s, in_closure, acc);
-            }
-        }
-        Stmt::For { iter, body, .. } => {
-            collect_closure_writes_expr(iter, in_closure, acc);
-            for s in &body.stmts {
-                collect_closure_writes_stmt(s, in_closure, acc);
-            }
-        }
-        Stmt::Return(value, _) => {
-            if let Some(e) = value {
-                collect_closure_writes_expr(e, in_closure, acc);
-            }
-        }
-        Stmt::Break(_) | Stmt::Continue(_) => {}
-    }
-}
-
-fn collect_closure_writes_expr(expr: &Expr, in_closure: bool, acc: &mut HashSet<String>) {
-    match expr {
-        Expr::Closure(_, body, _) => collect_closure_writes_expr(body, true, acc),
-        Expr::Block(b, _) => {
-            for s in &b.stmts {
-                collect_closure_writes_stmt(s, in_closure, acc);
-            }
-        }
-        Expr::Unary(_, inner, _) | Expr::ErrorProp(inner, _) | Expr::TypeTest(inner, _, _, _) => {
-            collect_closure_writes_expr(inner, in_closure, acc)
-        }
-        Expr::Binary(_, a, b, _) | Expr::Range(a, b, _) => {
-            collect_closure_writes_expr(a, in_closure, acc);
-            collect_closure_writes_expr(b, in_closure, acc);
-        }
-        Expr::Call(callee, args, _) => {
-            collect_closure_writes_expr(callee, in_closure, acc);
-            for a in args {
-                collect_closure_writes_expr(&a.expr, in_closure, acc);
-            }
-        }
-        Expr::Field(base, _, _) => collect_closure_writes_expr(base, in_closure, acc),
-        Expr::Index(base, idx, _) => {
-            collect_closure_writes_expr(base, in_closure, acc);
-            collect_closure_writes_expr(idx, in_closure, acc);
-        }
-        Expr::Array(items, _) => {
-            for e in items {
-                collect_closure_writes_expr(e, in_closure, acc);
-            }
-        }
-        Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => {
-            for (_, e) in fields {
-                collect_closure_writes_expr(e, in_closure, acc);
-            }
-        }
-        Expr::Str(segs, _) => {
-            for seg in segs {
-                if let StrSeg::Expr(e) = seg {
-                    collect_closure_writes_expr(e, in_closure, acc);
-                }
-            }
-        }
-        Expr::If(cond, then, els, _) => {
-            collect_closure_writes_expr(cond, in_closure, acc);
-            for s in &then.stmts {
-                collect_closure_writes_stmt(s, in_closure, acc);
-            }
-            if let Some(e) = els {
-                collect_closure_writes_expr(e, in_closure, acc);
-            }
-        }
-        Expr::IfLet(_, scrut, then, els, _) => {
-            collect_closure_writes_expr(scrut, in_closure, acc);
-            for s in &then.stmts {
-                collect_closure_writes_stmt(s, in_closure, acc);
-            }
-            if let Some(e) = els {
-                collect_closure_writes_expr(e, in_closure, acc);
-            }
-        }
-        Expr::Match(scrut, arms, _) => {
-            collect_closure_writes_expr(scrut, in_closure, acc);
-            for arm in arms {
-                collect_closure_writes_expr(&arm.body, in_closure, acc);
-            }
-        }
-        Expr::Int(..)
-        | Expr::Float(..)
-        | Expr::Bool(..)
-        | Expr::Null(_)
-        | Expr::Ident(..)
-        | Expr::SelfExpr(_) => {}
-    }
-}
-
 /// Whether lowering this statement can produce a MIR branch (a `CondBranch`
 /// terminator) before control reaches the next statement. Used by the
-/// structural if-probe: the back end's fold follows only straight-line
-/// `Goto`/`Return` chains, so any branching statement before the arm's
-/// `return` makes the arm non-foldable. Conservative: `true` when unsure.
+/// structural if-probe (`Checker::then_branch_return_conflicts`), which
+/// judges an arm only by a `return` reached through straight-line
+/// statements: any branching statement before it leaves the arm live.
+/// Conservative: `true` when unsure.
 pub(super) fn stmt_may_branch(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Let { value, .. } => value.as_ref().is_some_and(expr_may_branch),
@@ -615,9 +562,20 @@ pub(super) fn expr_may_branch(e: &Expr) -> bool {
     }
 }
 
+/// `x.pipe(f)` is `f(x)`: applies a function at the end of a method chain.
 pub(super) trait Pipe: Sized {
     fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
         f(self)
     }
 }
 impl<T> Pipe for T {}
+
+/// The diagnostic for a callable value applied to itself (`x(x)`), whose type
+/// would have to contain itself: named after the callee when it is a plain
+/// name, generic otherwise.
+pub(super) fn infinite_application_message(callee: Option<&str>) -> String {
+    match callee {
+        Some(name) => format!("infinite type: `{name}` is applied to itself"),
+        None => "infinite type: the callee is applied to itself".to_string(),
+    }
+}

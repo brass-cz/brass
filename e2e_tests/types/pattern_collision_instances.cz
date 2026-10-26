@@ -1,0 +1,29 @@
+// @backends: all
+// One generic pattern body serves a record, unrelated sums, and nullable values.
+type P = { x: int32 }
+type S = | P { x: int32 } | Empty
+type T = | P { x: int32 } | Other
+type Alias = S
+
+fun first(v) -> int32 {
+    if let P { x } = v { return x }
+            return -1
+}
+fun qualified(v: Alias?) -> int32 {
+    return match v { Alias.P { x } => x, Alias.Empty => 0, null => -1 }
+}
+fun optional(v: S?) -> int32 {
+    if let P { x } = v { return x }
+    return -1
+}
+fun main() {
+    println(first(P { x: 1 }))
+    println(first(S.P { x: 2 }))
+    println(first(T.P { x: 3 }))
+    println(first(S.Empty))
+    println(qualified(S.P { x: 4 }))
+    println(qualified(S.Empty))
+    println(qualified(null))
+    println(optional(S.P { x: 5 }))
+    println(optional(null))
+}

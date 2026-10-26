@@ -27,7 +27,7 @@ fun from_map(source: HashMap) -> Config! {
 }
 
 fun main() {
-    const source = HashMap.new()
+    let source = HashMap.new()
     source.set("width", 1920)
     source.set("height", 1080)
     source.set("depth", 24)
@@ -43,7 +43,7 @@ fun main() {
     }
 
     // A missing key is reported by name.
-    const partial = HashMap.new()
+    let partial = HashMap.new()
     partial.set("width", 800)
     partial.set("height", 600)
     match from_map(partial) {

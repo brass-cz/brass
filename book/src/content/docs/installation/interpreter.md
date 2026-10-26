@@ -66,10 +66,19 @@ brass repl program.cz    # run with the interpreter
 brass                    # start an interactive REPL
 ```
 
-An interactive session retains definitions and bindings between turns. Before
-executing the new input, it validates that input together with the accumulated
-session, but it does not execute earlier effectful statements again: prior
-prints and `input()` calls are not repeated.
+Native JIT builds also support `brass --no-jit-cache program.cz`,
+`brass cache info`, and `brass cache clean`; see
+[JIT object cache](/references/execution/#jit-object-cache). Interpreter-only
+builds accept the flag and report that no JIT cache is available for either
+cache command.
+
+An interactive session retains definitions between turns. Before executing
+the new input, it validates that input together with the accumulated session,
+but it executes each input only once: prior prints and `input()` calls are
+not repeated. A binding stays available to later inputs when its initializer
+has no side effects; one initialized by a call is usable only in the input
+that binds it. See [Execution model](/references/execution/) for the exact
+rule.
 
 Diagnostics are printed to stderr and produce a non-zero exit status. A normal
 run checks functions as it needs them; use `brass check` for a complete

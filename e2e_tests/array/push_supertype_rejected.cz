@@ -1,6 +1,5 @@
-// A structural SUPERtype element must not be accepted by `push`: storing an
-// `Animal` (fewer fields) into a `Dog[]` and reading it back as a `Dog` would
-// read past the `Animal` layout in the unboxed back end. Must be rejected.
+// An array element is a storage site: a `Dog[]` takes only a `Dog`, so
+// pushing an `Animal`, which lacks `breed`, is rejected.
 type Animal = {
     name: string
 }

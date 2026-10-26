@@ -1,0 +1,12 @@
+// A sum whose unit variants (`fast`, `slow`) are in scope only where `Mode`
+// is: in this module, in modules importing `Mode` by name, and in modules
+// importing this module whole.
+type Mode = fast | slow
+
+fun pick() -> Mode {
+    return Mode.fast
+}
+
+fun pick_slow() -> Mode {
+    return Mode.slow
+}

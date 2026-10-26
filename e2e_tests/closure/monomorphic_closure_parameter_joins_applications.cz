@@ -1,0 +1,35 @@
+// @backends: all
+// A closure binding that is not let-polymorphic (here: it is reassigned)
+// has one type, and its unannotated parameter is the value join of the
+// arguments of all of its applications, whatever their order: `f(a32)`
+// before `f(b64)` makes `x` an `int64` exactly as the reverse order does,
+// instead of committing `int32` at the first call and rejecting the second.
+// Applications in loops, branches and nested closures count too.
+fun main() {
+    let a: int32 = 7
+    let b: int64 = 5000000000
+    let f = (x) -> x + 1
+    println(f(a))
+    println(f(b))
+    f = (y) -> y * 2
+    println(f(a))
+    let small: uint8 = 3
+    let total: int64 = 0
+    let add = (x) -> {
+        total = total + x
+    }
+    let i = 0
+    while i < 2 {
+        add(a)
+        i = i + 1
+    }
+    if total > 0 {
+        let later = () -> add(b)
+        later()
+    }
+    add(small)
+    println(total)
+    add = (y) -> {
+        total = total - y
+    }
+}

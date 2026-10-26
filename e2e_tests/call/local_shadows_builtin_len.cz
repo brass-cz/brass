@@ -1,0 +1,22 @@
+// @backends: all
+// A local binding named like the builtin `len` shadows it in call position,
+// exactly as a local shadows a function of the same name: the call applies
+// the binding (a local closure, a parameter) in the checker and every back
+// end alike. Where no binding shadows it, `len` is still the builtin, and
+// the `.len()` method is unaffected.
+fun apply_len(len, xs) {
+    return len(xs)
+}
+
+fun main() {
+    let len = (x) -> "item {x}"
+    println(len(3))
+    println(apply_len((xs) -> 7, [1, 2, 3]))
+    const xs = [1, 2]
+    println(xs.len())
+    println(later())
+}
+
+fun later() -> int64 {
+    return len("abc")
+}

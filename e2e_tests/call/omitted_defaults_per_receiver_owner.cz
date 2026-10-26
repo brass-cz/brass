@@ -1,0 +1,72 @@
+// @backends: all
+// A generic body's method call can reach a different owner's method in each
+// instantiation. The omitted trailing arguments are completed from the
+// signature of the method each instance actually calls: `Dog.describe`
+// takes an optional `prefix` (filled with null), `Cat.describe` takes none,
+// and `Bird.describe` takes the caller's `Location` (the call in `show`), so
+// the one call site serves all three receivers. A declared sum subtype
+// (`Fancy: Shape`) with its own method selects its own signature, not its
+// parent's.
+type Dog = {
+    name: string
+}
+
+type Cat = {
+    lives: int32
+}
+
+type Bird = {
+    wings: int32
+}
+
+fun Dog.describe(self, prefix: string?) -> string {
+    if prefix {
+        return "{prefix} dog {self.name}"
+    }
+    return "dog {self.name}"
+}
+
+fun Cat.describe(self) -> string {
+    return "cat {self.lives}"
+}
+
+fun Bird.describe(self, loc: Location) -> string {
+    return "bird {self.wings} at line {loc.line}"
+}
+
+type Shape =
+    | Circle {
+        r: int32
+    }
+    | Square {
+        s: int32
+    }
+
+type Fancy: Shape =
+    | Circle {
+        r: int32
+    }
+    | Square {
+        s: int32
+    }
+
+fun Shape.describe(self, prefix: string?) -> string {
+    return "shape"
+}
+
+fun Fancy.describe(self) -> string {
+    return "fancy"
+}
+
+fun show(x) {
+    return x.describe()
+}
+
+fun main() {
+    println(show(Dog { name: "rex" }))
+    println(show(Cat { lives: 9 }))
+    println(show(Bird { wings: 2 }))
+    println(Dog { name: "fido" }.describe("good"))
+    println(show(Shape.Circle { r: 1 }))
+    println(show(Fancy.Square { s: 2 }))
+}

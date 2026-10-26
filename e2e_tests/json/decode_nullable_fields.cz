@@ -1,0 +1,42 @@
+// @backends: all
+// Nullable target fields decode through the reflective decoder: a JSON value
+// decodes as the field's payload (an object as the nested record, a number
+// through the range-checked integer conversion), while JSON `null` and an
+// absent member both decode as `null`. A non-nullable field still requires its
+// member, and a decode failure is located at the decoder call that could not
+// produce its target.
+import std.data.json.{ JsonValue }
+
+type Address = { city: string }
+type User = { name: string, address: Address?, age: int64? }
+
+fun show(src: string) {
+    const u: User! = JsonValue.parse(src)!.into()
+    match u {
+        Ok { value } => {
+            if let a = value.address {
+                println("{value.name} lives in {a.city}")
+            } else {
+                println("{value.name}: no address")
+            }
+            if let g = value.age {
+                println("  age {g}")
+            } else {
+                println("  no age")
+            }
+        }
+        Err { error } => println("err: {error}")
+    }
+}
+
+fun main() {
+    show("\{\"name\": \"Aki\", \"address\": \{\"city\": \"Tokyo\"\}, \"age\": 30\}")
+    show("\{\"name\": \"Bo\", \"address\": null, \"age\": null\}")
+    show("\{\"name\": \"Cy\"\}")
+    show("\{\"age\": 3\}")
+    const n: int64! = JsonValue.parse("\"x\"")!.into()
+    match n {
+        Ok { value } => println(value)
+        Err { error } => println("err: {error}")
+    }
+}

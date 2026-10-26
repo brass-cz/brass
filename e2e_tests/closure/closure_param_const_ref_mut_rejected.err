@@ -1,0 +1,2 @@
+cannot pass const value `b` to `set`, which requires a mutable parameter
+cannot pass const value `b` to `apply`, which passes it to a closure requiring a mutable parameter

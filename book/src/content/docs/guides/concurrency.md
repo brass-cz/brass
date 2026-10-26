@@ -59,15 +59,19 @@ count = 6, total = 21
 ```
 
 Both tasks mutate the same `counter`; the compiler notices the shared capture
-and guards it, so the updates do not race. It also prints warnings that
-accesses to `counter` are auto-guarded; acquiring the object explicitly with
-`with(cown, f)` gives finer-grained control and silences them.
+and guards it, so the updates are serialized. The final read explicitly uses
+`with`, so this example emits no auto-guard warning. If the spawning function
+accesses the promoted object outside `with`, the compiler guards that access
+and warns once per object in that execution scope, suggesting explicit
+`with(cown, f)` for finer-grained control.
 `sync()` is the barrier that makes the spawned work's effects observable:
 without it, the final read could run ahead of the tasks. Spawned work is
 otherwise joined at the end of `main`.
 
 Current restrictions (enforced as compile errors): `spawn` takes a closure
 literal (or a local bound to one) with zero parameters and a return type that
-is `void` or still open to inference; a spawned task may not write module
-globals; and spawning at the top level (outside a function) is unsupported.
-See the [concurrency reference](/references/concurrency/) for details.
+is `void` or still open to inference; a spawned task may not access a module
+global that any code writes, nor reassign a captured variable (mutate a
+shared object instead); and spawning at the top level (outside a function) is
+unsupported. See the [concurrency reference](/references/concurrency/) for
+details.

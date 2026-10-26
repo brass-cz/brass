@@ -1,8 +1,7 @@
-// A nullable array narrowed by an `if a` guard must support every array
-// operation on its inner `int32[]`. The guard proves non-null but does not
-// retype the MIR local, so the value still carries the declared `int32[]?`;
-// each op below previously failed to monomorphize, which silently dropped the
-// whole module init and produced no output at all.
+// A nullable array narrowed by an `if a` guard supports every array
+// operation on its inner `int32[]`: `len`, iteration, indexing, an element
+// store, `push` and `pop` all act on the present array, and a `null`
+// argument takes no branch.
 fun describe(a: int32[]?) {
     if a {
         println(a.len())

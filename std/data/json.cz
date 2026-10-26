@@ -111,8 +111,10 @@ fun JsonValue.at(self, index: int64) -> JsonValue! {
  * Decode `self` into the type the call site expects, driven entirely by that
  * target type: `const u: User = j.into()!`. A scalar target reads the
  * matching JSON scalar; a record target walks its own fields (each decoded
- * recursively); a nullable target accepts JSON null. A JSON value of the
- * wrong kind for the target is a runtime decode error.
+ * recursively); a nullable target accepts JSON null, and a nullable field
+ * also accepts an absent member. A JSON value of the wrong kind for the
+ * target, or an absent member for a non-nullable field, is a runtime decode
+ * error.
  */
 fun JsonValue.into(self) -> infer! {
     match self {
@@ -131,7 +133,21 @@ fun JsonValue.into(self) -> infer! {
         JsonValue.Object { values } => {
             let ret: infer
             for field in fields(ret) {
-                ret[field] = self.get(field)!.into()!
+                if let member = values.get(field) {
+                    ret[field] = member.into()!
+                } else {
+                    // An absent member reads as JSON null: a nullable field
+                    // decodes it as null, any other field reports the miss.
+                    const absent = JsonValue.Null
+                    match absent.into() {
+                        Ok { value } => {
+                            ret[field] = value
+                        },
+                        Err { error } => {
+                            return error("missing field '{field}'")
+                        },
+                    }
+                }
             }
             return ret
         },

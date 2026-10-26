@@ -3,10 +3,15 @@
 //! Newlines: the lexer emits `Newline` tokens. Inside brackets (`()`, `[]`,
 //! and type-literal / match braces) newlines are insignificant and skipped
 //! automatically (`depth > 0`). At statement level a newline terminates a
-//! statement, with two continuation allowances:
+//! statement, with three continuation allowances (see the `newline` module):
 //!   - a binary/assign operator at end of line continues onto the next line
 //!     (operators call `eat_newlines` before parsing their right operand);
-//!   - a `.` at the start of the next line continues a method chain.
+//!   - a `.` at the start of the next line continues a method chain;
+//!   - an `else` at the start of the next line continues the `if`.
+//!
+//! Inside a `match` arm body, a line that parses as `pattern =>` starts the
+//! next arm even when its first token (`-`, `[`) could continue the arm's
+//! expression (see `Parser::at_arm_boundary`).
 //!
 //! Statement blocks reset to `depth == 0` so newlines separate their
 //! statements even when the block is nested inside brackets (closure bodies).
@@ -31,9 +36,9 @@ pub fn parse(src: &str) -> Result<Module, ParseError> {
 /// each source a disjoint `base`, so a span's byte offset uniquely identifies the
 /// file it came from -- which lets a diagnostic be attributed to the right file
 /// and line even though each file is lexed from offset zero. Spans are
-/// token-derived (the lexer shift carries through the parser's `merge`s); only an
-/// interpolation sub-expression, re-lexed from its fragment, stays
-/// fragment-relative, which is a pre-existing limitation unaffected here.
+/// token-derived (the lexer shift carries through the parser's `merge`s); an
+/// interpolation sub-expression, re-lexed from its fragment, is shifted by the
+/// fragment's in-file offset as well.
 pub fn parse_with_base(src: &str, base: usize) -> Result<Module, ParseError> {
     let (module, mut errors) = parse_recovering(src, base);
     match errors.is_empty() {
@@ -102,6 +107,12 @@ struct Parser {
     /// Syntax errors recovered from so far, in source order; bounded by
     /// [`MAX_PARSE_ERRORS`].
     errors: Vec<ParseError>,
+    /// While a `match` arm body is parsed: the bracket depth of that match's
+    /// braces. At exactly this depth (not nested in brackets or a block) a
+    /// newline followed by a line that parses as `pattern =>` ends the arm,
+    /// even when the line begins with a token that could otherwise continue
+    /// the expression (`-1 =>`, `[x, y] =>`). `None` outside arm bodies.
+    arm_depth: Option<usize>,
 }
 
 type PResult<T> = Result<T, ParseError>;
@@ -132,6 +143,7 @@ impl Parser {
             no_struct: false,
             ns_save: Vec::new(),
             errors: Vec::new(),
+            arm_depth: None,
         }
     }
 
@@ -833,6 +845,13 @@ impl Parser {
     // ----- statements -----
 
     fn parse_block(&mut self) -> PResult<Block> {
+        let saved_arm = self.arm_depth.take();
+        let block = self.parse_block_inner();
+        self.arm_depth = saved_arm;
+        block
+    }
+
+    fn parse_block_inner(&mut self) -> PResult<Block> {
         let saved_depth = self.depth;
         let saved_ns = self.no_struct;
         let saved_ns_len = self.ns_save.len();
@@ -1138,6 +1157,9 @@ impl Parser {
     fn parse_add(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_mul()?;
         loop {
+            if self.at_p(TokenKind::Minus) && self.at_arm_boundary() {
+                break;
+            }
             let op = match self.peek() {
                 TokenKind::Plus => BinOp::Add,
                 TokenKind::Minus => BinOp::Sub,
@@ -1203,6 +1225,9 @@ impl Parser {
             // Continue a method chain that breaks across a line: `expr \n .m()`.
             if self.depth == 0 && self.newline_then(TokenKind::Dot) {
                 self.eat_newlines();
+            }
+            if self.at_p(TokenKind::LBracket) && self.at_arm_boundary() {
+                break;
             }
             match self.peek() {
                 TokenKind::Dot => {
@@ -1605,7 +1630,10 @@ impl Parser {
             let pat = self.parse_pattern()?;
             self.expect(TokenKind::FatArrow, "'=>'")?;
             self.eat_newlines();
-            let body = self.parse_arm_body()?;
+            let saved_arm = self.arm_depth.replace(self.depth);
+            let body = self.parse_arm_body();
+            self.arm_depth = saved_arm;
+            let body = body?;
             arms.push(MatchArm {
                 span: pat.span().merge(body.span()),
                 pattern: pat,
@@ -1615,6 +1643,37 @@ impl Parser {
         }
         let hi = self.close(TokenKind::RBrace, "'}'")?;
         Ok(Expr::Match(Box::new(scrut), arms, lo.merge(hi)))
+    }
+
+    /// Whether the cursor starts the next arm of the match whose arm body is
+    /// being parsed: it sits at that match's own bracket depth, the token
+    /// before it was a newline, and the line parses as `pattern =>`. The
+    /// tokens that both start a pattern and continue an expression (`-`,
+    /// `[`) consult this before continuing; the lookahead is speculative and
+    /// leaves the parser untouched.
+    fn at_arm_boundary(&mut self) -> bool {
+        if self.arm_depth != Some(self.depth)
+            || !self
+                .pos
+                .checked_sub(1)
+                .is_some_and(|i| matches!(self.tokens[i].kind, TokenKind::Newline))
+        {
+            return false;
+        }
+        let pos = self.pos;
+        let depth = self.depth;
+        let syntax_depth = self.syntax_depth;
+        let no_struct = self.no_struct;
+        let ns_len = self.ns_save.len();
+        let errors = self.errors.len();
+        let arm = self.parse_pattern().is_ok() && self.at_p(TokenKind::FatArrow);
+        self.pos = pos;
+        self.depth = depth;
+        self.syntax_depth = syntax_depth;
+        self.no_struct = no_struct;
+        self.ns_save.truncate(ns_len);
+        self.errors.truncate(errors);
+        arm
     }
 
     /// A match arm body is a block, an expression, or an assignment (the

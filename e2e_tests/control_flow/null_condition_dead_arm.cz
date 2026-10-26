@@ -1,8 +1,10 @@
-// A bare `null` flowing into an unannotated `if` condition. The parameter is
-// monomorphized to `never?` (a value that can only be null), so the truthy arm
-// -- which narrows it to `never` and would multiply -- is statically dead: the
-// checker tolerates it and the back end skips emitting it. A passed value takes
-// the opposite, always-true arm. Both backends must run this identically.
+// @backends: all
+// A bare `null` passed to an unannotated parameter tested by an `if`: that
+// instance's parameter is `never?` (only null), so the truthy arm, which
+// would multiply a `never`, is statically dead (accepted by the checker, not
+// compiled) and the instance returns the `else` arm's error. For a number the
+// test is always true, so the dead `error(..)` arm contributes nothing: that
+// instance is not fallible and returns the bare value.
 fun double(a) {
     if a {
         return a * 2

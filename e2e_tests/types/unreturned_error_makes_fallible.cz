@@ -1,0 +1,23 @@
+// @backends: all
+// A function is fallible when its body evaluates `error(..)`, wherever the
+// call sits -- returned, propagated, bound, or as a statement -- so this
+// unannotated function returns a Result whose error payload is the call's
+// (in the checker and every back end alike), although the discarded
+// `error(..)` never makes it fail.
+fun inferred(n: int32) {
+    error("ignored")
+    return n * 2
+}
+
+fun main() {
+    match inferred(4) {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.value}"),
+    }
+    let r = inferred(1)
+    if let Err { error } = r {
+        println(typeof(error.value))
+    } else {
+        println("no error")
+    }
+}

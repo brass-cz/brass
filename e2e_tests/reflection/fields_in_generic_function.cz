@@ -1,0 +1,17 @@
+// @backends: all
+// `fields(v)` on an unannotated parameter is checked per instantiation: the
+// definitional pass leaves it to the calls, each of which unrolls the loop at
+// its own record type (a const argument included).
+type P = { x: int32, name: string }
+
+fun dump(v) {
+    for f in fields(v) {
+        println("{f} = {v[f]}")
+    }
+}
+
+fun main() {
+    dump(P { x: 1, name: "n" })
+    const p = P { x: 2, name: "m" }
+    dump(p)
+}

@@ -1,0 +1,33 @@
+// Inside a spawned task, mutating a captured OBJECT (a field store, a
+// mutating method, an array push) stays allowed and is visible after `sync`,
+// and so is assigning a variable the task declares itself -- including one
+// that shadows a captured name. Only reassigning the captured variable itself
+// is rejected (see spawn_rebinding_capture_rejected).
+type Box = {
+    value: int64
+}
+
+fun Box.bump(self) {
+    self.value += 1
+}
+
+fun main() {
+    let b = Box { value: 1 }
+    let log: string[] = []
+    let n = 10
+    spawn(() -> {
+        b.value = 40
+        b.bump()
+        let total = 0
+        for i in [0..3] {
+            total += i
+        }
+        let n = total
+        n += 100
+        log.push("task saw {n}")
+    })
+    sync()
+    println(b.value)
+    println(log[0])
+    println(n)
+}

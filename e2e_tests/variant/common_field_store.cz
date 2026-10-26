@@ -1,0 +1,40 @@
+// @backends: all
+// Assigning to a field shared by every variant of a sum writes the active
+// variant's slot, on every back end: directly when the field sits at the same
+// offset in all variants, and through the runtime tag when the variants place
+// it at different offsets (here `C` puts `label` after an int64 and an int8).
+
+type S =
+    | A { n: int8, label: string }
+    | B { label: string }
+    | C { a: int64, b: int8, label: string }
+
+type T =
+    | P { name: string }
+    | Q { name: string }
+
+fun S.relabel(self, l: string) {
+    self.label = l
+}
+
+fun main() {
+    let s = S.B { label: "x" }
+    s.label = "y"
+    println(s.label)
+
+    let t = T.Q { name: "q" }
+    t.name = "renamed"
+    println(t)
+
+    let c = S.C { a: 1, b: 2, label: "r" }
+    c.relabel("z")
+    println(c)
+
+    let xs = [S.B { label: "b" }, S.A { n: 2, label: "a" }, S.C { a: 3, b: 4, label: "c" }]
+    for v in xs {
+        v.label = v.label + "!"
+    }
+    for v in xs {
+        println(v.label)
+    }
+}

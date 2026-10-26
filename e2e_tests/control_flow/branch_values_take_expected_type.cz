@@ -1,0 +1,18 @@
+// @backends: all
+// The value of an `if`/`match` in a position whose required type shapes a
+// construction passes the requirement to each branch value, so a construction
+// there adapts to the slot as it would directly: a bracket literal takes a
+// tuple shape and a closure the slot's parameter types. (Numeric branches
+// keep their own join rule.)
+fun main() {
+    let c = true
+    let t: [int64, int64] = if c { [1, 2] } else { [3, 4] }
+    println(t[1] + 5000000000)
+    let m: [string, int32] = match 1 {
+        1 => ["one", 1],
+        _ => ["other", 0],
+    }
+    println(m[0])
+    let f: (int32) -> int32 = if c { (x) -> x + 1 } else { (x) -> x - 1 }
+    println(f(1))
+}

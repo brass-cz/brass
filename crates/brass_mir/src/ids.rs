@@ -10,7 +10,7 @@ use std::fmt;
 /// Index of a local slot inside one [`crate::MirBody`]. Locals are mutable
 /// storage cells, not SSA values: the same id may be assigned in several blocks
 /// and read after a control-flow merge (this is what lets `if`/`match`/`&&`
-/// lower without phi nodes; see [`crate::lower`]).
+/// lower without phi nodes; see the `lower` module).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct LocalId(pub u32);
 

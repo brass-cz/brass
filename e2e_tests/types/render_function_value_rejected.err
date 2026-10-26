@@ -1,0 +1,5 @@
+render_function_value_rejected.cz:6:13: error: cannot print `(int32) -> int32`: a function value has no text rendering
+render_function_value_rejected.cz:7:17: error: cannot interpolate `(int32) -> int32`: a function value has no text rendering
+render_function_value_rejected.cz:8:25: error: `string.from` cannot render `(int32) -> int32`: a function value has no text rendering
+render_function_value_rejected.cz:9:13: error: `debug` cannot render `(int32) -> int32`: a function value has no text rendering
+render_function_value_rejected.cz:10:13: error: cannot print `((int32) -> int32)[]`: a function value has no text rendering

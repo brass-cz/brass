@@ -1,8 +1,7 @@
-// Pins that monomorphized instance symbols are collision-resistant: type names
-// containing `_` must not let (A_B, C) and (A, B_C) share one instance. A
-// display-joined symbol keyed both calls as `get__A_B_C`, so the second call
-// reused a body typed int32 for a string field (garbage int on the JIT, 0 on
-// the interpreter).
+// Pins that monomorphized instances of distinct argument types stay distinct
+// even when the type names contain `_`: (A_B, C) and (A, B_C) must not share
+// one instance although joining the names with `_` would key both as
+// `get__A_B_C`, so the second call reads its string field as a string.
 type A_B =
     | P { v: int32 }
 

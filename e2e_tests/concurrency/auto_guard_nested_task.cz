@@ -1,0 +1,10 @@
+// Nested spawning scopes report their own accesses without task-entry warnings.
+type Counter = { count: int32 }
+fun main() {
+    spawn(() -> {
+        let counter = Counter { count: 0 }
+        spawn(() -> { counter.count += 1 })
+        println(counter.count >= 0)
+    })
+    sync()
+}

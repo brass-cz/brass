@@ -1,0 +1,15 @@
+// @backends: all
+// Testing a narrowed variable is always allowed (types.md, Narrowing): `!x`,
+// `if x` and `x == null` on a binding a guard already proved non-null test
+// its declared nullable instead of being rejected as an operator on `T`.
+fun f(x: int32?) {
+    if !x { return }
+    if !x { println("again") }
+    if x { println("truthy {x}") }
+    if x == null { println("null") } else { println("present") }
+    println(!x)
+    println(x)
+}
+
+f(1)
+f(null)

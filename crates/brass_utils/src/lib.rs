@@ -1,8 +1,12 @@
 //! Cross-crate utilities: the tracing initialization every Brass binary
-//! (driver, language server) uses, and the program argument vector shared
-//! between the driver and both back ends' `_argv` builtin.
+//! (driver, language server) uses, the program argument vector shared
+//! between the driver and both back ends' `_argv` builtin, and the
+//! observable texts (float rendering, string debug quoting, builtin failure
+//! payloads) both back ends must produce identically.
 
 use std::sync::OnceLock;
+
+pub mod builtin_errors;
 
 /// The running program's argument vector: the program file as it was written
 /// on the driver's command line, then everything after it. Set once by the
@@ -124,7 +128,8 @@ impl PerfLog {
             total.as_secs_f64() * 1000.0,
             self.items.len()
         );
-        self.items.sort_by(|a, b| b.1.cmp(&a.1));
+        self.items
+            .sort_by_key(|(_, elapsed)| std::cmp::Reverse(*elapsed));
         for (label, d) in self.items.iter().take(15) {
             tracing::debug!(
                 target: "brass::perf",
@@ -158,4 +163,30 @@ pub fn float_str(v: f64) -> String {
     } else {
         format!("{v}")
     }
+}
+
+/// The quoted debug form of a string, exactly as `string.debug` (core/show.cz)
+/// writes it: wrapped in `"`, with `"` and `\` backslash-escaped, backspace,
+/// form feed, newline, carriage return and tab as `\b` `\f` `\n` `\r` `\t`,
+/// and any other ASCII control character as `\u00XX`. The built-in rendering
+/// of a record or variant quotes its string fields with it, so a field reads
+/// like the string's own debug form.
+pub fn debug_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_ascii_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

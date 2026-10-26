@@ -1,0 +1,27 @@
+// @backends: all
+// Calling a record field that holds a function calls the field, even when
+// some other type in the program declares a method of the same name (`map`
+// on arrays, `run` on `Job`). A generic body whose instantiations call a
+// field for one receiver and a method for another selects per instance.
+
+type Ops = { map: (int32) -> int32, name: string }
+
+type Runner = { run: () -> string }
+
+type Job = { id: int32 }
+
+fun Job.run(self) -> string {
+    return "job {self.id}"
+}
+
+fun go(r) {
+    return r.run()
+}
+
+fun main() {
+    let o = Ops { map: (x: int32) -> x + 1, name: "inc" }
+    println(o.map(41))
+    println([1, 2].map((x) -> x * 2))
+    println(go(Runner { run: () -> "runner" }))
+    println(go(Job { id: 3 }))
+}

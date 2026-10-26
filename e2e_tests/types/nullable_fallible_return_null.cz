@@ -1,0 +1,37 @@
+// @backends: all
+// Under a `T!?` annotation a bare `return null` is the declared outer null,
+// not an Ok payload: the instance returns `Result<T, E>?` whether or not the
+// body also propagates a null through `!`.
+fun pick(c: int32) -> int32!? {
+    if c == 0 {
+        return 1
+    } else if c == 1 {
+        return error("one")
+    }
+    return null
+}
+
+fun bang(c: int32) -> int32!? {
+    if c == 0 {
+        return 2
+    } else if c == 1 {
+        error("bang")!
+    }
+    return null
+}
+
+fun show(r: int32!?) {
+    if r {
+        match r {
+            Ok { value } => println("ok {value}"),
+            Err { error } => println("err {error.value}"),
+        }
+    } else {
+        println("null")
+    }
+}
+
+for c in [0, 1, 2] {
+    show(pick(c))
+    show(bang(c))
+}

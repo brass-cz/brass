@@ -1,14 +1,12 @@
 // @lazy: fail
 // @eager: fail
 //
-// Both modes reject this program, but lazily only the diagnostics on the
-// execution path surface (`f` is the first call): the whole-program check
-// pins all three messages, the lazy leg just the first (.lazy.err).
-// Pins that `break` is found wherever it hides:
-//  - a break in a call argument or a let value makes a `while true` breakable,
-//    so a `-> int32` function ending in that loop can fall through and must be
-//    rejected (previously judged infinite -> garbage return value);
-//  - a break outside any loop hidden in a call argument is rejected.
+// A `break` is found wherever it hides: one in a call argument or a `let`
+// value makes a `while true` loop breakable, so a `-> int32` function ending
+// in that loop may finish without a value and is rejected, and one outside
+// any loop is rejected even inside a call argument. Both modes report all
+// three errors: a failed lazy run (`f` is the first call) reports the
+// checker's complete verdict, including the bodies execution never reaches.
 fun f(c: bool) -> int32 {
     while true {
         println(if c { break } else { 1 })

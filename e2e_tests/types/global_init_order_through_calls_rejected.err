@@ -1,0 +1,5 @@
+global `later` is used before it is initialized (through `get`)
+global `late_a` is used before it is initialized (through `outer`)
+global `limit` is used before it is initialized (through `Reg.make`)
+global `offset` is used before it is initialized (through `size`)
+global `late_a` is used before it is initialized (through `inner`)

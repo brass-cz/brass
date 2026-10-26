@@ -1,0 +1,25 @@
+int32?
+3
+int32?
+3
+int32?
+3
+(int32?) -> int32?
+3
+int32?
+3
+(int32?) -> int32?
+3
+int32?
+null
+3
+int32?[]
+[3, null]
+[int32?, string]
+[3, a]
+P?
+P {
+    v: 3,
+}
+int32?
+3

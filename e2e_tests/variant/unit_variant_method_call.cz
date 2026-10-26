@@ -1,0 +1,41 @@
+// @backends: all
+// `Sum.Variant.method(..)` on a UNIT variant calling an instance method is an
+// instance call on the variant value, exactly like binding the variant first;
+// a static method reached through a variant qualifier stays a static call.
+
+type L = Nil | Cons { head: int32, tail: L }
+
+fun L.size(self) -> int32 {
+    return match self {
+        Nil => 0,
+        Cons { tail, .. } => 1 + tail.size(),
+    }
+}
+
+fun L.empty() -> L {
+    return L.Nil
+}
+
+type Dir = North | South
+
+fun Dir.flip(self) -> Dir {
+    return match self {
+        North => Dir.South,
+        South => Dir.North,
+    }
+}
+
+fun Dir.label(self, prefix: string) -> string {
+    return match self {
+        North => "{prefix}N",
+        South => "{prefix}S",
+    }
+}
+
+fun main() {
+    println(L.Nil.size())
+    println(L.Cons { head: 1, tail: L.Nil }.size())
+    println(L.Nil.empty().size())
+    println(Dir.North.flip().label(">"))
+    println(Dir.South.label("<"))
+}

@@ -2,9 +2,9 @@
 //! references, and `Base { .. }` refinements.
 //!
 //! A record may declare type parameters as `type slot` members (see
-//! [`TypeInfo::slots`]). Each slot is given an inference variable; another
-//! field expresses its type over the slots with `Self.slot`
-//! (`entries: _Entry { key: Self.key }?[]`). A refinement -- an inline
+//! [`TypeInfo::slots`](crate::hir::TypeInfo::slots)). Each slot is given an
+//! inference variable; another field expresses its type over the slots with
+//! `Self.slot` (`entries: _Entry { key: Self.key }?[]`). A refinement -- an inline
 //! `Base { field: T }` or the right-hand side of a `type Alias = Base { .. }`
 //! -- fills those variables, yielding a concrete instance.
 //!
@@ -61,6 +61,17 @@ impl TypeMeta {
             .find(|(n, _, _)| n == name)
             .map(|(_, te, v)| (te, *v))
     }
+}
+
+/// The diagnostic for a refinement `Base { .. }` whose base is a sum type.
+/// Refinements pin a record's slots and fields; a sum has no slots, and the
+/// types of its open payload fields are inferred per construction instead.
+pub fn sum_refinement_error(base: &str) -> String {
+    format!(
+        "`{base}` is a sum type and cannot be refined: a refinement `Base {{ .. }}` pins the \
+         slots and fields of a record type, while a sum's open payload types are inferred \
+         from each construction"
+    )
 }
 
 /// Resolve every record type's field annotations (honoring slots, `Self.field`,
@@ -144,6 +155,8 @@ pub(crate) fn resolve_type_decls(
         import_origins: &program.import_origins,
         import_renames: &program.import_renames,
         prelude_modules: &program.prelude_modules,
+        module_aliases: &program.module_aliases,
+        symbol_aliases: &program.symbol_aliases,
         next_unknown,
         resolved: HashMap::default(),
         alias_resolved: HashMap::default(),
@@ -211,6 +224,8 @@ struct Resolver<'a> {
     import_origins: &'a HashMap<Vec<String>, HashMap<String, Vec<String>>>,
     import_renames: &'a HashMap<Vec<String>, HashMap<String, String>>,
     prelude_modules: &'a HashSet<Vec<String>>,
+    module_aliases: &'a HashMap<Vec<String>, HashMap<String, Vec<String>>>,
+    symbol_aliases: &'a HashMap<String, String>,
     next_unknown: &'a mut u32,
     /// Memoized resolved field types, keyed by (owner symbol, field name).
     resolved: HashMap<(String, String), Type>,
@@ -272,6 +287,15 @@ impl Resolver<'_> {
                 )
             })
         };
+        if let Some(key) = crate::hir::resolve_marker_key(
+            self.module_aliases,
+            self.symbol_aliases,
+            module,
+            name,
+            &in_table,
+        ) {
+            return Some(key);
+        }
         // Rename first, as in `resolve_qualified`: a renamed local must not be
         // captured by an unrelated module's unique definition of that name.
         if let Some(remote) = self.import_renames.get(module).and_then(|m| m.get(name)) {
@@ -366,7 +390,10 @@ impl Resolver<'_> {
         }
         let module = m.module.clone();
         let owner = sym.to_string();
+        let owner_type = Type::Record(NominalType::new(m.id, &m.name));
         let mut t = self.resolve_texpr(Some(&owner), &module, &texpr);
+        // `next: Self?` is the record itself (see `bind_data_self`).
+        t = crate::types::bind_data_self(&t, &owner_type);
         // Freshen each `infer` placeholder into its own variable, matching the
         // plain field resolver.
         t = freshen_infer(t, &mut || {
@@ -391,7 +418,7 @@ impl Resolver<'_> {
                 Type::Slice(Box::new(self.resolve_texpr(owner, module, inner)))
             }
             TypeExpr::Nullable(inner, _) => {
-                Type::Nullable(Box::new(self.resolve_texpr(owner, module, inner)))
+                Type::nullable(self.resolve_texpr(owner, module, inner))
             }
             // `T!` builds over the `Result` in scope, like the pure resolver's
             // Fallible arm. Only a sum declared with the name `Result` can
@@ -474,6 +501,15 @@ impl Resolver<'_> {
     }
 
     fn nominal_lookup(&self, module: &[String], name: &str) -> Option<NominalInfo> {
+        if let Some(key) = crate::hir::resolve_marker_key(
+            self.module_aliases,
+            self.symbol_aliases,
+            module,
+            name,
+            |k| self.nominal_by_symbol.contains_key(k),
+        ) {
+            return self.nominal_by_symbol.get(&key).copied();
+        }
         crate::hir::resolve_qualified(
             self.nominal_by_symbol,
             self.import_origins,
@@ -549,7 +585,7 @@ impl Resolver<'_> {
         };
         if !self.meta[&bsym].is_record {
             self.errors.push(crate::lower::LowerError {
-                message: format!("`{bname}` is not a record type and cannot be refined"),
+                message: sum_refinement_error(bname),
                 span,
             });
             return Type::Unknown(self.fresh());

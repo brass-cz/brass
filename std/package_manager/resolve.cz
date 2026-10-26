@@ -1,7 +1,7 @@
 import std.process.{ Command, Stdio }
 import std.path.Path
 import std.fs.{ read_file, create_dir, move_dir, remove_dir }
-import std.hash.{ sha256, hex }
+import cache.{ git_entry, staging_dir }
 
 import manifest.{ Manifest, Dependency, Dependencies }
 
@@ -63,17 +63,11 @@ fun _resolve_deps(
     return
 }
 
-fun packages_dir() {
-    return Path.home()!.join(".brass").join("packages")
-}
-
 /** Clone `repo` at `rev` into the package cache and return its directory. */
 fun git_clone(repo: string, rev: string) {
-    const pkgs = packages_dir()!.join("git")
-    // A digest keeps arbitrary repository URLs and revision names out of path
-    // components, while making the same source/revision reuse one checkout.
-    const key = hex(sha256(to_bytes("{repo}\n{rev}")))
-    const path = pkgs.join(key)
+    const path = git_entry(repo, rev)!
+    const pkgs = path.parent()
+    const key = path.basename().to_string()
     if path.is_dir() {
         if path.join(".git").is_dir() && _revision_matches(path, rev)! {
             return path
@@ -84,7 +78,7 @@ fun git_clone(repo: string, rev: string) {
         create_dir(pkgs)!
     }
 
-    const staging = _staging_dir(pkgs, key)!
+    const staging = staging_dir(pkgs, key, "git")!
     const populated = _clone_checkout(staging, repo, rev)
     match populated {
         Err { error } => {
@@ -168,26 +162,6 @@ fun _try_resolved_commit(path: Path, rev: string) -> string?! {
         return null
     }
     return to_text(out.stdout)!.trim()
-}
-
-fun _staging_dir(parent: Path, key: string) -> Path! {
-    let cmd = Command.new("sh")
-    cmd.args(
-        [
-            "-c",
-            "umask 077; stage=\"$1/.$2.$$\"; mkdir \"$stage\" && printf '%s' \"$stage\"",
-            "czpm-stage",
-            parent.to_string(),
-            key,
-        ],
-    )
-    cmd.stdout(Stdio.Pipe)
-    const child = cmd.spawn()!
-    const out = child.output()!
-    if out.code != 0 {
-        return error("failed to create a git staging directory")
-    }
-    return Path.parse(to_text(out.stdout)!)
 }
 
 /**

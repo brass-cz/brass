@@ -1,6 +1,6 @@
 // Pins comparison-operand typing when an int literal is wider than the
-// variable's kind: `b < 300` must compare at the common (wider) type, not
-// truncate 300 into uint8 (which made 200 < 44 false). A literal that fits
+// variable's kind: `b < 300` compares at the common (wider) type -- truncated
+// into uint8, 300 would be 44 and `200 < 300` false. A literal that fits
 // still adapts to the variable's kind (`b < 250` compares as uint8).
 fun main() {
     let b: uint8 = 200

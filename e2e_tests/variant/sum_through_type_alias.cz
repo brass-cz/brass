@@ -1,0 +1,30 @@
+// @backends: all
+// A `type A = S` alias of a sum names the sum wherever a construction or a
+// pattern names it: unit-variant values, braced variant literals, qualified
+// patterns, a static call, and an alias of an alias.
+type L = Nil | Cons { head: int32, tail: L }
+type List = L
+type Seq = List
+
+fun L.size(self) -> int32 {
+    return match self {
+        List.Nil => 0,
+        Seq.Cons { tail, .. } => 1 + tail.size(),
+    }
+}
+
+fun L.empty() -> L {
+    return L.Nil
+}
+
+fun main() {
+    let x = List.Nil
+    let y = Seq.Cons { head: 1, tail: List.Cons { head: 2, tail: x } }
+    println(y.size())
+    println(List.empty().size())
+    let z: List = Seq.Nil
+    println(z)
+    if let List.Cons { head, .. } = y {
+        println(head)
+    }
+}

@@ -835,13 +835,13 @@ impl OrcJit {
     }
 
     /// Register a GROUP of lazily materialized functions: every symbol keeps
-    /// its own call-through stub (callers defer per function exactly as
-    /// before), but all of the group's implementations are claimed by one
-    /// materialization unit, satisfied by one emitted module that defines
-    /// them all. Entering any member's stub therefore compiles the whole
-    /// group at once, amortizing the per-module fixed cost (pass-pipeline
-    /// setup, instruction selection, linking) that dominates when many small
-    /// functions materialize individually.
+    /// its own call-through stub (callers still defer per function), but all
+    /// of the group's implementations are claimed by one materialization
+    /// unit, satisfied by one emitted module that defines them all. Entering
+    /// any member's stub therefore compiles the whole group at once,
+    /// amortizing the per-module fixed cost (pass-pipeline setup, instruction
+    /// selection, linking) that dominates when many small functions
+    /// materialize individually.
     pub(crate) fn register_lazy_group(&self, symbols: &[String]) -> Result<(), String> {
         if symbols.is_empty() {
             return Ok(());
@@ -1126,7 +1126,7 @@ mod tests {
 
     use super::*;
 
-    fn constant_module<'ctx>(context: &'ctx Context, name: &str, value: u64) -> OrcModule {
+    fn constant_module(context: &Context, name: &str, value: u64) -> OrcModule {
         let module = context.create_module(name);
         let ty = context.i32_type().fn_type(&[], false);
         let function = module.add_function(name, ty, None);

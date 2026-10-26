@@ -1,9 +1,9 @@
 //! End-to-end: a Brass program is parsed, lowered to HIR then MIR,
 //! monomorphized into concrete-typed instances, and compiled + run by
 //! `brass_engine::Engine` driving the `LlvmCodegen` backend over the *typed*
-//! `Codegen` trait. This path emits fully unboxed code -- no `Value` boxing, no
-//! `pp_*` runtime calls -- so a result returned through `extern "C" fn() -> iN`
-//! is correct only if the function really has an unboxed `iN` ABI.
+//! `Codegen` trait. This path emits fully unboxed code, so a result returned
+//! through `extern "C" fn() -> iN` is correct only if the function really has
+//! an unboxed `iN` ABI.
 //!
 //! Tests serialize through a lock (the JIT/LLVM globals are process-wide).
 
@@ -83,7 +83,7 @@ fn engine_jits_unboxed_typed_instances() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -139,7 +139,7 @@ fun use_flt() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -168,9 +168,9 @@ fun use_flt() {
 fn typed_records_construct_and_read_fields_unboxed() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    // A record laid out as a typed heap object (no boxed Value fields); the
-    // field reads sum to 7. A second instance with float fields monomorphizes
-    // `Point` to a distinct layout.
+    // A record laid out as a typed heap object; the field reads sum to 7. A
+    // second instance with float fields monomorphizes `Point` to a distinct
+    // layout.
     let src = "\
 type Point = {
     x
@@ -199,7 +199,7 @@ fun fdemo() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -263,7 +263,7 @@ fun demo_mutate() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -312,7 +312,7 @@ fun rect_area() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -361,7 +361,7 @@ fun nested_field() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -404,7 +404,7 @@ fun text_len() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -417,8 +417,8 @@ fun text_len() {
 fn typed_strings_concat_interpolate_and_compare() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Strings as typed heap handles (no boxed Value): literals, `+` concat,
-    // interpolation (to_string), `==`, and `len`.
+    // Strings as typed heap handles: literals, `+` concat, interpolation
+    // (to_string), `==`, and `len`.
     let src = "\
 fun greet() {
     let s = \"hello\" + \" world\"
@@ -452,7 +452,7 @@ fun eq_len() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -466,8 +466,8 @@ fun eq_len() {
 fn typed_arrays_literal_index_and_length() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Fixed arrays laid out inline as typed elements (no boxed Value): literal
-    // construction, indexed read/write, and length.
+    // Array literals with typed (unboxed) elements: literal construction,
+    // indexed read/write, and length.
     let src = "\
 fun sum_ends() {
     let a = [10, 20, 30]
@@ -506,7 +506,7 @@ fun sum_loop() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -514,7 +514,7 @@ fun sum_loop() {
     assert_eq!(backend.run_entry_i32("sum_ends"), Some(40)); // 10 + 30
     assert_eq!(backend.run_entry_i64("count"), Some(4));
     assert_eq!(backend.run_entry_i32("mutate"), Some(9));
-    // A `for` loop iterates the array (int32 counter coerced against int64 len).
+    // A `for` loop iterates the array.
     assert_eq!(backend.run_entry_i32("sum_loop"), Some(10)); // 1+2+3+4
 }
 
@@ -561,7 +561,7 @@ fun count_built() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -574,7 +574,8 @@ fun count_built() {
 fn typed_growable_arrays_pop() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    // `arr.pop()` removes and returns the last element as a nullable (`_array_pop`): a value when present, null when the array is empty.
+    // `arr.pop()` removes and returns the last element as a nullable
+    // (`_array_pop`): a value when present, null when the array is empty.
     let src = "\
 fun pop_last() -> int32 {
     let r = []
@@ -615,7 +616,7 @@ fun pop_empty_is_null() -> int32 {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -672,7 +673,7 @@ fun rendered_len() -> int64 {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -690,8 +691,8 @@ fn typed_closures_capture_and_call() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     // Direct-call closures: the closure value is a typed environment object
-    // (captured values + function pointer), called through that pointer -- no
-    // boxed Value. The closure's parameter types come from its call site.
+    // (captured values + function pointer), called through that pointer. The
+    // closure's parameter types come from its call site.
     let src = "\
 fun apply() {
     let n = 10
@@ -717,7 +718,7 @@ fun adder() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -730,9 +731,9 @@ fun adder() {
 fn typed_higher_order_closures() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    // A closure passed to a higher-order function and called there: the closure's
-    // parameter types are inferred from the callee's use of the parameter (probe),
-    // so it is monomorphized and called through its function pointer -- unboxed.
+    // A closure passed to a higher-order function and called there: the callee
+    // is instantiated at the closure's function type, and the call goes through
+    // the closure's function pointer with unboxed arguments.
     let src = "\
 fun apply_twice(f, x) {
     return f(f(x))
@@ -763,7 +764,7 @@ fun via_run() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -777,8 +778,7 @@ fn typed_print_program_runs_on_typed_path() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     // A `main` that does typed computation and `println` (string literal +
-    // interpolated scalar) monomorphizes -- so the driver runs it on the typed
-    // unboxed path -- and executes without falling back to the Value path.
+    // interpolated scalar) monomorphizes and runs on the typed, unboxed path.
     let src = "\
 fun double(n: int32) -> int32 {
     return n * 2
@@ -804,7 +804,7 @@ fun main() {
     // `main` is in the typed subset (print is typed I/O), so it is compiled.
     assert!(mono.lookup("main").is_some(), "main should monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     // Runs main (writing to stdout) entirely unboxed.
@@ -815,9 +815,9 @@ fun main() {
 fn typed_nullable_wrap_check_and_narrow() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Nullable `T?` as a heap cell (null = null pointer, no boxed Value): a value
-    // is wrapped on return, `null` is the null pointer, `if x` is a non-null test,
-    // and narrowing reads the value back out.
+    // Nullable `T?` as a heap cell (null = null pointer): a value is wrapped on
+    // return, `null` is the null pointer, `if x` is a non-null test, and
+    // narrowing reads the value back out.
     let src = "\
 fun first_even(nums: int32[]) -> int32? {
     for n in nums {
@@ -864,7 +864,7 @@ fun unwrap_or_zero() -> int32 {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -878,9 +878,9 @@ fun unwrap_or_zero() -> int32 {
 fn typed_result_ok_err_and_match() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    // The built-in generic `Result<T, E>` as a tagged sum (no boxed Value): a
-    // fallible function implicitly wraps a bare return as Ok, `error(...)` builds
-    // Err, and `match` reads the payloads. Payload types (int32, string) are
+    // The prelude's generic `Result<T, E>` as a tagged sum: a fallible function
+    // implicitly wraps a bare return as Ok, `error(...)` builds Err, and
+    // `match` reads the payloads. Payload types (int32, string) are
     // inferred and laid out via the nominal substitution.
     let src = "\
 fun checked(x: int32) {
@@ -918,7 +918,7 @@ fun err_val() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -977,7 +977,7 @@ fun err_case() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -990,8 +990,8 @@ fun err_case() {
 fn typed_numeric_conversions() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    // `Type.from` / `Type.parse` as typed conversions returning a typed Result
-    // (no boxed Value): range checks and parsing match the runtime exactly.
+    // `Type.from` / `Type.parse` as typed conversions returning a typed Result:
+    // range checks and parsing match the runtime exactly.
     let src = "\
 fun from_ok() {
     let r = int32.from(1000)
@@ -1029,7 +1029,7 @@ fun byte_overflow() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1095,7 +1095,7 @@ fun result() -> int32 {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     // Runs the init (total = 0) and `main` (spawns both threads), then joins them.
@@ -1109,8 +1109,8 @@ fun result() -> int32 {
 fn typed_globals_initialized_and_read() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Module-level globals are typed LLVM globals (no boxed Value): the init body
-    // runs (via Engine::run) before reads, and functions load the typed global.
+    // Module-level globals are typed LLVM globals: the init body runs (via
+    // Engine::run) before reads, and functions load the typed global.
     let src = "\
 let base = 7
 let scale = 3
@@ -1135,7 +1135,7 @@ fun scaled() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     // Engine::run executes the init body, initializing the globals.
@@ -1145,10 +1145,10 @@ fun scaled() {
     assert_eq!(backend.run_entry_i32("scaled"), Some(21)); // 7 * 3
 }
 
-/// R6 value-observability: `sync()` joins spawned threads so their effects are
-/// observable. Three threads each increment a shared counter under `with` (so the
-/// increments are race-free), then `sync()` joins them; reading the counter after
-/// `sync()` deterministically sees all three.
+/// `sync()` joins spawned threads so their effects are observable. Three threads
+/// each increment a shared counter under `with` (so the increments are
+/// race-free), then `sync()` joins them; reading the counter after `sync()`
+/// deterministically sees all three.
 #[test]
 fn sync_makes_spawned_results_observable() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1173,7 +1173,7 @@ fn sync_makes_spawned_results_observable() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1182,10 +1182,10 @@ fn sync_makes_spawned_results_observable() {
     assert_eq!(backend.run_entry_i32("counted"), Some(3));
 }
 
-/// R6 reference counting: straight-line string temporaries are reclaimed at
+/// Reference counting: straight-line string temporaries are reclaimed at
 /// return -- the live-block count returns to its pre-call baseline (no leak), and
-/// it never goes below (no double free). Validates retain-on-alias + release of
-/// dead managed locals at return.
+/// it never goes below (every release matches a retain). Validates
+/// retain-on-alias + release of dead managed locals at return.
 #[test]
 fn rc_reclaims_string_temporaries() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1206,7 +1206,7 @@ fn rc_reclaims_string_temporaries() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1216,11 +1216,11 @@ fn rc_reclaims_string_temporaries() {
     let after = brass_runtime::mem::pp_live_blocks();
     assert_eq!(
         after, before,
-        "string temporaries reclaimed (no leak, no double free): {before} -> {after}"
+        "string temporary count returns to baseline: {before} -> {after}"
     );
 }
 
-/// R6 reference counting with reassignment: a loop that rebinds a string each
+/// Reference counting with reassignment: a loop that rebinds a string each
 /// iteration reclaims the previous value (release-on-reassign), so live blocks
 /// return to baseline rather than growing with the iteration count.
 #[test]
@@ -1245,7 +1245,7 @@ fn rc_reclaims_loop_string_temporaries() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1259,19 +1259,17 @@ fn rc_reclaims_loop_string_temporaries() {
     );
 }
 
-/// Regression (R6 RC): string interpolation calls `to_string`, which for a string
-/// argument is the identity -- its result aliases the argument, so binding it must
-/// retain or releasing both the source and the bound copy double-frees (which
-/// previously crashed example 02). This asserts soundness: the program runs and the
-/// live-block count never drops below baseline (no double free). A small bounded
-/// residue remains -- interpolation builds a couple of inline transient string
-/// literals not bound to a local, which the current local-scoped reclamation does
-/// not reach (sound: they leak, never use-after-free).
+/// String interpolation calls `to_string`, which for a string argument is the
+/// identity -- its result aliases the argument, so binding it retains it and
+/// releasing both the source and the bound copy stays balanced: the program runs
+/// and the live-block count never drops below baseline. The only residue is the
+/// string literals the first evaluation interns, and a repeat evaluation adds
+/// nothing.
 #[test]
 fn rc_balances_string_interpolation() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let src = "fun name() -> string {\n  return \"green\"\n}\n\
-               fun greet() -> int32 {\n\
+               fun greet() -> int64 {\n\
                \x20 let msg = \"color = {name()}\"\n\
                \x20 return len(msg)\n\
                }\n\
@@ -1286,24 +1284,23 @@ fn rc_balances_string_interpolation() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
 
     let before = brass_runtime::mem::pp_live_blocks();
-    assert_eq!(backend.run_entry_i32("greet"), Some(13)); // "color = green"
+    assert_eq!(backend.run_entry_i64("greet"), Some(13)); // "color = green"
     let after = brass_runtime::mem::pp_live_blocks();
-    // No double free: the count never drops below baseline (the bug it guards
-    // manifested as a double free / crash). The first evaluation may intern
+    // The count never drops below baseline. The first evaluation may intern
     // each string literal once (a process-lifetime materialization, not a
     // per-evaluation leak) -- which the repeat run below pins down.
     assert!(
         after >= before && after - before <= 3,
-        "interpolation runs soundly, bounded interned literals: {before} -> {after}"
+        "interpolation retains only bounded interned literals: {before} -> {after}"
     );
     // Re-running must add NOTHING: literals are interned, transients released.
-    assert_eq!(backend.run_entry_i32("greet"), Some(13));
+    assert_eq!(backend.run_entry_i64("greet"), Some(13));
     let after_second = brass_runtime::mem::pp_live_blocks();
     assert_eq!(
         after_second, after,
@@ -1311,7 +1308,7 @@ fn rc_balances_string_interpolation() {
     );
 }
 
-/// R6 RC: a scalar-field record built and dropped within a function is reclaimed
+/// A scalar-field record built and dropped within a function is reclaimed
 /// at return (its block is freed), so the live-block count returns to baseline.
 #[test]
 fn rc_reclaims_record_temporaries() {
@@ -1333,7 +1330,7 @@ fn rc_reclaims_record_temporaries() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1347,9 +1344,9 @@ fn rc_reclaims_record_temporaries() {
     );
 }
 
-/// R6 RC recursive destructor: a record owning a string field is reclaimed with
-/// its field -- freeing the record releases the string, so live blocks return to
-/// baseline (no leak of the field, no double free).
+/// Recursive destructor: a record owning a string field is reclaimed with its
+/// field -- freeing the record releases the string once, so live blocks return
+/// to baseline.
 #[test]
 fn rc_recursive_destructor_releases_record_fields() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1369,7 +1366,7 @@ fn rc_recursive_destructor_releases_record_fields() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1383,9 +1380,9 @@ fn rc_recursive_destructor_releases_record_fields() {
     );
 }
 
-/// R6 RC for arrays + sums: a scalar-element array and a sum value built and
-/// dropped within a function reclaim to baseline (the array frees its element
-/// buffer and header; the sum frees its block).
+/// Arrays + sums: a scalar-element array and a sum value built and dropped
+/// within a function reclaim to baseline (the array frees its element buffer
+/// and header; the sum frees its block).
 #[test]
 fn rc_reclaims_array_and_sum() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1409,7 +1406,7 @@ fn rc_reclaims_array_and_sum() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1421,12 +1418,11 @@ fn rc_reclaims_array_and_sum() {
     assert_eq!(after, before, "array + sum reclaimed: {before} -> {after}");
 }
 
-/// R6 RC overwrite: storing into a managed record field, array element,
-/// nullable field, or global releases the value being overwritten -- the slot
-/// owned it and it is no longer reachable through the slot. Before the
-/// release-on-overwrite each loop iteration leaked the previous value (and a
-/// nullable slot leaked its cell too), so live blocks grew with the iteration
-/// count; now they return to baseline.
+/// Overwrite: storing into a managed record field, array element, nullable
+/// field, or global releases the value being overwritten (and a nullable
+/// slot's cell) -- the slot owned it and it is no longer reachable through the
+/// slot -- so live blocks return to baseline instead of growing with the
+/// iteration count.
 #[test]
 fn rc_releases_overwritten_field_element_and_global() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1458,7 +1454,7 @@ fn rc_releases_overwritten_field_element_and_global() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1475,12 +1471,12 @@ fn rc_releases_overwritten_field_element_and_global() {
     );
 }
 
-/// R6 RC recursive array content: an array of strings reclaims its elements (the
+/// Recursive array content: an array of strings reclaims its elements (the
 /// element loop in the destructor releases each), so live blocks return to baseline.
 #[test]
 fn rc_recursive_array_releases_string_elements() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let src = "fun build() -> int32 {\n\
+    let src = "fun build() -> int64 {\n\
                \x20 let xs = [string.from(1), string.from(2), string.from(3)]\n\
                \x20 return len(xs)\n\
                }\n\
@@ -1495,13 +1491,13 @@ fn rc_recursive_array_releases_string_elements() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
 
     let before = brass_runtime::mem::pp_live_blocks();
-    assert_eq!(backend.run_entry_i32("build"), Some(3));
+    assert_eq!(backend.run_entry_i64("build"), Some(3));
     let after = brass_runtime::mem::pp_live_blocks();
     assert_eq!(
         after, before,
@@ -1509,14 +1505,14 @@ fn rc_recursive_array_releases_string_elements() {
     );
 }
 
-/// R6 RC recursive sum content: a sum variant owning a string field reclaims it
+/// Recursive sum content: a sum variant owning a string field reclaims it
 /// (the tag-dispatched destructor releases the active variant's heap fields), so
 /// live blocks return to baseline.
 #[test]
 fn rc_recursive_sum_releases_variant_fields() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let src = "type Box =\n  | S { name: string }\n  | E\n\
-               fun build() -> int32 {\n\
+               fun build() -> int64 {\n\
                \x20 let b = Box.S { name: string.from(7) }\n\
                \x20 return match b {\n    S { name } => len(name),\n    E => 0,\n  }\n\
                }\n\
@@ -1531,13 +1527,13 @@ fn rc_recursive_sum_releases_variant_fields() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
 
     let before = brass_runtime::mem::pp_live_blocks();
-    assert_eq!(backend.run_entry_i32("build"), Some(1)); // len("7")
+    assert_eq!(backend.run_entry_i64("build"), Some(1)); // len("7")
     let after = brass_runtime::mem::pp_live_blocks();
     assert_eq!(
         after, before,
@@ -1545,10 +1541,9 @@ fn rc_recursive_sum_releases_variant_fields() {
     );
 }
 
-/// R6 RC for closures: a spawned closure is moved to its thread, which releases it
-/// when it finishes; after `sync()` joins the threads the closure blocks are
-/// reclaimed, so live blocks return to baseline (no leak of the closure, no double
-/// free across spawner/thread).
+/// Closures: a spawned closure is moved to its thread, which releases it when it
+/// finishes; after `sync()` joins the threads the closure blocks are reclaimed
+/// exactly once across spawner and thread, so live blocks return to baseline.
 #[test]
 fn rc_reclaims_spawned_closures() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1569,7 +1564,7 @@ fn rc_reclaims_spawned_closures() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1583,7 +1578,7 @@ fn rc_reclaims_spawned_closures() {
     );
 }
 
-/// R6 RC: a spawned closure that captures a heap value (a string) releases the
+/// A spawned closure that captures a heap value (a string) releases the
 /// capture via its stored destructor when the thread finishes, so after `sync()`
 /// the live-block count returns to baseline (the capture is reclaimed, not leaked).
 #[test]
@@ -1606,7 +1601,7 @@ fn rc_spawned_closure_releases_heap_capture() {
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1625,7 +1620,7 @@ fn rc_spawned_closure_releases_heap_capture() {
 #[test]
 fn array_renders_as_bracketed_list() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let src = "fun show() -> int32 {\n\
+    let src = "fun show() -> int64 {\n\
                \x20 let xs = [1, 2, 3]\n\
                \x20 let s = \"{xs}\"\n\
                \x20 return len(s)\n\
@@ -1640,12 +1635,12 @@ fn array_renders_as_bracketed_list() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
     // "[1, 2, 3]" is 9 bytes.
-    assert_eq!(backend.run_entry_i32("show"), Some(9));
+    assert_eq!(backend.run_entry_i64("show"), Some(9));
 }
 
 /// A trailing nullable parameter is optional at call sites and keeps
@@ -1673,7 +1668,7 @@ fn trailing_nullable_param_is_optional() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1681,9 +1676,9 @@ fn trailing_nullable_param_is_optional() {
 }
 
 /// A captured-and-mutated local that is also used in its defining frame after
-/// capture is a shared heap cell (RcCell): the closure's mutations
-/// are seen through the shared capture, not made on a per-closure copy. `g` adds to
-/// `x` twice; `f` returns the shared `x` = 2 (by-value capture would give 0).
+/// capture is a shared heap cell: the closure's mutations are seen through the
+/// shared capture, not made on a per-closure copy. `g` adds to `x` twice; `f`
+/// returns the shared `x` = 2 (by-value capture would give 0).
 #[test]
 fn captured_mutated_local_is_a_shared_cell() {
     let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1707,7 +1702,7 @@ fn captured_mutated_local_is_a_shared_cell() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1739,7 +1734,7 @@ fn cycle_collector_reclaims_record_cycle() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     let before = brass_runtime::mem::pp_live_blocks();
@@ -1772,7 +1767,7 @@ fn cycle_collector_reclaims_two_node_cycle() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     let before = brass_runtime::mem::pp_live_blocks();
@@ -1805,7 +1800,7 @@ fn cycle_collector_reclaims_data_owned_by_cycle() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     let before = brass_runtime::mem::pp_live_blocks();
@@ -1841,7 +1836,7 @@ fn full_width_numbers_render() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1866,7 +1861,7 @@ fn rc_recursive_tuple_releases_managed_elements() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1898,7 +1893,7 @@ fn aggregate_rendering_releases_intermediate_strings() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     Engine::run(&mut backend, &mono).expect("engine run");
@@ -1933,7 +1928,7 @@ fn cycle_collector_reclaims_sum_cycle() {
     assert!(errors.is_empty(), "lower: {errors:?}");
     let mir = lower_program(&program);
     let mono = monomorphize(&mir, &program).expect("monomorphize");
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
     let mut backend = LlvmCodegen::new_backend(&ctx, &program);
     let before = brass_runtime::mem::pp_live_blocks();

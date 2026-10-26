@@ -1,0 +1,26 @@
+// @backends: all
+// The rejecting counterpart of `narrowing_generic_instances`: instantiated
+// with a type whose `display` nulls the global, and with `null`, the same
+// generic bodies read an unchecked nullable.
+let g: string? = "a"
+type T = { a: int32 }
+fun T.display(self) -> string {
+    g = null
+    return "T"
+}
+fun show(v) {
+    if g {
+        println(v)
+        println(g.len())
+    }
+}
+fun keep(v) {
+    let x: string? = "abc"
+    if !x { return }
+    x = v
+    println(x.len())
+}
+fun main() {
+    show(T { a: 1 })
+    keep(null)
+}

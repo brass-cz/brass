@@ -1,0 +1,58 @@
+// @backends: all
+// A method that does not write through its receiver or arguments is callable
+// on a const value, whatever its name: `push` on this sum builds a new list,
+// and `Reader.absorb` only reads its argument even though another type's
+// `absorb` writes through it. A bare reassignment of a `let` alias of a const
+// rebinds the alias and leaves the const untouched.
+type L =
+    | Cons { head: int32, tail: L }
+    | Nil
+
+fun L.push(self, v: int32) -> L {
+    return L.Cons { head: v, tail: self }
+}
+
+fun L.size(self) -> int32 {
+    return match self {
+        Cons { tail } => 1 + tail.size()
+        Nil => 0
+    }
+}
+
+type P = { x: int32 }
+
+type Sink = { total: int32 }
+
+fun Sink.absorb(self, p: ref(mut(P))) {
+    p.x = 0
+}
+
+type Reader = { n: int32 }
+
+fun Reader.absorb(self, p) -> int32 {
+    return self.n + p.x
+}
+
+fun count() {
+    return 41
+}
+
+fun main() {
+    const n = L.Nil
+    println(n.push(1).push(2).size())
+    println(n.size())
+
+    const o = P { x: 1 }
+    let r = Reader { n: 1 }
+    println(r.absorb(o))
+    let s = Sink { total: 0 }
+    let mine = P { x: 5 }
+    s.absorb(mine)
+    println(mine.x)
+
+    const total = count()
+    let next = total
+    next += 1
+    println(next)
+    println(total)
+}

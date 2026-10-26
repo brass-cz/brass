@@ -1,0 +1,18 @@
+[a, null]
+[a, null]
+[a, null]
+[a, b]
+[1, x]
+R {
+    s: "q",
+    xs: [z, null],
+}
+R {
+    s: null,
+    xs: [],
+}
+S.V {
+    s: "w",
+}
+[[m, null]]
+[plain]

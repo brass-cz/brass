@@ -4,18 +4,22 @@
 //! Every [`FnLower::lower_expr`] returns an [`Operand`] naming the result. Plain
 //! computations emit one assignment to a fresh temporary; branching constructs
 //! allocate a result local that each arm writes before jumping to the merge
-//! block. Call routing, field/element reads, literals, and constructors mirror
-//! the AST-walking codegen so the two stay behaviorally equivalent.
+//! block. Call routing, field/element reads, literals, and constructors are
+//! resolved by name and scope; the type-dependent choices come from the
+//! checker's channels (the span-keyed tables on `ProgramCtx`).
+
+mod call;
+mod names;
 
 use brass_hir::Type;
 use brass_parser::Span;
-use brass_parser::ast::{Arg, BinOp, Block, Expr, Param, Stmt, StrSeg};
+use brass_parser::ast::{Arg, BinOp, Block, Expr, StrSeg};
 
-use crate::analysis::free_vars_of;
 use crate::cfg::{MirStmt, Terminator};
 use crate::ids::{BlockId, LocalId};
-use crate::lower::{FnLower, ProgramCtx};
-use crate::program::MirClosure;
+use crate::lower::FnLower;
+use crate::lower::closure::ParamPassing;
+use crate::lower::order::{assigned_names, later_assigned};
 use crate::value::{Callee, Literal, Operand, Place, Projection, Rvalue};
 
 /// Whether a checker-resolved call result is worth seeding onto its result
@@ -27,29 +31,6 @@ use crate::value::{Callee, Literal, Operand, Place, Projection, Rvalue};
 fn is_seedable_result(ty: &Type) -> bool {
     matches!(ty, Type::Record(_) | Type::Sum(_))
         || matches!(ty, Type::Nullable(inner) if matches!(inner.as_ref(), Type::Record(_) | Type::Sum(_)))
-}
-
-/// Whether a checker-resolved array-literal type must be seeded onto its result
-/// local: a slice/array whose *element representation* the back end would
-/// re-derive differently from the element values alone. A nullable element is a
-/// heap cell, not the bare value; a non-default numeric element (`int64[]`,
-/// `uint8[]`, `float32[]`) has a different width than the literal's int32 /
-/// float64 default -- either way the buffer built at the re-derived type would
-/// be reinterpreted at the annotated one and corrupt every element. Literals
-/// whose element matches the derived representation keep an inferred `Var`
-/// (see [`is_seedable_result`] for why seeding is otherwise avoided).
-fn array_element_needs_seed(ty: &Type) -> bool {
-    use brass_hir::{FloatKind, IntKind};
-    let elem = match ty {
-        Type::Slice(e) | Type::Array(e, _) => e,
-        _ => return false,
-    };
-    match elem.as_ref() {
-        Type::Nullable(_) => true,
-        Type::Int(k) => *k != IntKind::I32,
-        Type::Float(f) => *f != FloatKind::F64,
-        _ => false,
-    }
 }
 
 /// The zero value `T.default()` folds to for a primitive type word.
@@ -78,6 +59,18 @@ impl<'a, 'p> FnLower<'a, 'p> {
             let target = target.clone();
             return self.apply_sum_view(&target, op);
         }
+        let numeric = |ty: &Type| matches!(ty, Type::Int(_) | Type::Float(_));
+        let shared = self.ctx.expr_type(e.span()).filter(|ty| numeric(ty));
+        let per_instance = self
+            .ctx
+            .instance_seeds
+            .get(&e.span())
+            .is_some_and(|seeds| seeds.values().any(numeric));
+        if shared.is_some() || per_instance {
+            return self
+                .b
+                .emit_seeded(Rvalue::Use(op), e.span(), shared.cloned());
+        }
         op
     }
 
@@ -88,8 +81,20 @@ impl<'a, 'p> FnLower<'a, 'p> {
             Expr::Bool(b, _) => Operand::Const(Literal::Bool(*b)),
             Expr::Null(_) => Operand::Const(Literal::Null),
             Expr::Str(segs, _) => self.lower_string(segs),
-            Expr::Ident(name, _) => self.lower_ident(name),
+            Expr::Ident(name, span) => self.lower_ident_at(name, Some(*span)),
             Expr::SelfExpr(_) => self.lower_ident("self"),
+            // A negated numeric literal is ONE constant (the checker types
+            // `-1` by its value, and lets `-0.5` adapt like `0.5`), so the
+            // operand rule sees a literal here too instead of a computed
+            // temporary.
+            Expr::Unary(..) if let Some(v) = e.int_literal_value() => {
+                Operand::Const(Literal::Int(v))
+            }
+            Expr::Unary(brass_parser::ast::UnaryOp::Neg, inner, _)
+                if let Expr::Float(v, _) = &**inner =>
+            {
+                Operand::Const(Literal::Float(-*v))
+            }
             Expr::Unary(op, a, _) => {
                 let v = self.lower_expr(a);
                 self.b.emit(Rvalue::Un(*op, v))
@@ -105,19 +110,22 @@ impl<'a, 'p> FnLower<'a, 'p> {
                 }
                 let rv = self.lower_call(callee, args, *span);
                 // A call whose checker-resolved result is a constructed aggregate
-                // (a record/sum/array) seeds its result local `Known`, so the back
-                // end follows the instance type the caller fixed -- the path a
-                // witness-free constructor (`HashMap.new()`) depends on. Other
-                // calls keep an inferred `Var` local.
-                match self.ctx.expr_type(*span) {
-                    Some(ty) if is_seedable_result(ty) => self.b.emit_known(rv, ty.clone()),
-                    _ => self.b.emit(rv),
-                }
+                // (a record/sum/array) seeds its result local, so the back end
+                // follows the instance type the caller fixed -- the path a
+                // witness-free constructor (`HashMap.new()`) depends on. The
+                // seed shared by every instance is carried here; per-instance
+                // seeds are looked up by the call's span.
+                let shared = self
+                    .ctx
+                    .expr_type(*span)
+                    .filter(|ty| is_seedable_result(ty))
+                    .cloned();
+                self.b.emit_seeded(rv, *span, shared)
             }
             Expr::Field(base, name, _) => self.lower_field(base, name),
             Expr::Index(base, idx, _) => self.lower_index(base, idx),
             Expr::ErrorProp(inner, span) => self.lower_error_prop(inner, *span),
-            Expr::Closure(params, body, _) => self.lower_closure(params, body),
+            Expr::Closure(params, body, span) => self.lower_closure(params, body, *span),
             Expr::Array(es, span) => self.lower_array(es, *span),
             Expr::Range(lo, hi, span) => self.lower_range(lo, hi, *span),
             Expr::TypeLit(name, fields, span) => self.lower_record(name, fields, *span),
@@ -125,12 +133,11 @@ impl<'a, 'p> FnLower<'a, 'p> {
             // A type test folds to a constant bool per monomorphized instance
             // (the back ends match the operand's type against the pattern);
             // the subject is still evaluated like any operand. `lower_if`
-            // handles negation by swapping successors, so MIR tests stay positive.
-            // The pattern is
-            // the checker-resolved channel entry; a body no instantiation
-            // ever decided falls back to the syntactic annotation with every
-            // hole a wildcard -- such a body is never monomorphized, the
-            // fallback only keeps the shared lowering total.
+            // handles negation by swapping successors, so MIR tests stay
+            // positive. The pattern is the checker-resolved channel entry; a
+            // body no instantiation ever decided falls back to the syntactic
+            // annotation with every hole a wildcard -- such a body is never
+            // monomorphized, the fallback only keeps the shared lowering total.
             Expr::TypeTest(subject, te, _, span) => {
                 let subj = self.lower_expr(subject);
                 let pattern = self.ctx.type_tests.get(span).cloned().unwrap_or_else(|| {
@@ -152,11 +159,13 @@ impl<'a, 'p> FnLower<'a, 'p> {
                 self.b
                     .emit_known(Rvalue::TypeTest(subj, pattern), Type::Bool)
             }
-            Expr::If(cond, then, els, _) => self.lower_if(cond, then, els.as_deref()),
-            Expr::IfLet(pat, scrut, then, els, _) => {
-                self.lower_iflet(pat, scrut, then, els.as_deref())
+            Expr::If(cond, then, els, span) => {
+                self.lower_if(cond, then, els.as_deref(), true, *span)
             }
-            Expr::Match(scrut, arms, _) => self.lower_match(scrut, arms),
+            Expr::IfLet(pat, scrut, then, els, span) => {
+                self.lower_iflet(pat, scrut, then, els.as_deref(), true, *span)
+            }
+            Expr::Match(scrut, arms, span) => self.lower_match(scrut, arms, true, *span),
             Expr::Block(b, _) => self.lower_block_value(b),
         }
     }
@@ -167,6 +176,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
     /// `Result.context`, preserving its frame-append policy.
     fn lower_nullable_context(&mut self, base: &Expr, args: &[Arg], span: Span) -> Operand {
         let base = self.lower_expr(base);
+        let base = self.hold(base, &assigned_names(args.iter().map(|a| &a.expr)));
         let receiver = self.b.make_local(base);
         let lowered_args = self.lower_args(args);
         let message = lowered_args.first().cloned().unwrap_or_else(Operand::void);
@@ -174,10 +184,12 @@ impl<'a, 'p> FnLower<'a, 'p> {
             .get(1)
             .cloned()
             .unwrap_or_else(|| self.location_operand(span));
-        let result = match self.ctx.expr_type(span) {
-            Some(ty) if is_seedable_result(ty) => self.b.fresh_local_typed(None, ty.clone()),
-            _ => self.b.fresh_local(None),
-        };
+        let shared = self
+            .ctx
+            .expr_type(span)
+            .filter(|ty| is_seedable_result(ty))
+            .cloned();
+        let result = self.b.fresh_seeded_local(span, shared);
         let present = self.b.emit(Rvalue::Call(
             Callee::Builtin("__nullable_context_present".into()),
             vec![Operand::Local(receiver)],
@@ -218,13 +230,19 @@ impl<'a, 'p> FnLower<'a, 'p> {
             .push(MirStmt::Assign(result, Rvalue::Use(contextualized)));
         self.b.terminate(Terminator::Goto(merge_bb));
 
+        // The Ok wrap is built straight into the result local, so it takes
+        // the whole expression's `Result` type: a separate temporary would be
+        // typed on its own and fall back to the enclosing function's return
+        // type, whose Ok payload is another type.
         self.b.switch_to(plain_bb);
-        let ok = self.b.emit(Rvalue::Variant {
-            ty: "Result".to_string(),
-            variant: "Ok".to_string(),
-            fields: vec![("value".to_string(), value)],
-        });
-        self.b.push(MirStmt::Assign(result, Rvalue::Use(ok)));
+        self.b.push(MirStmt::Assign(
+            result,
+            Rvalue::Variant {
+                ty: "Result".to_string(),
+                variant: "Ok".to_string(),
+                fields: vec![("value".to_string(), value)],
+            },
+        ));
         self.b.terminate(Terminator::Goto(merge_bb));
 
         self.b.switch_to(missing_bb);
@@ -347,67 +365,29 @@ impl<'a, 'p> FnLower<'a, 'p> {
         Operand::Local(res)
     }
 
-    /// A bare identifier: a bound local, otherwise a module global read.
-    pub(crate) fn lower_ident(&mut self, name: &str) -> Operand {
-        // A cell-promoted name reads element 0 of its one-element cell array.
-        if self.is_cell(name)
-            && let Some(local) = self.lookup(name)
-        {
-            let zero = Operand::Const(Literal::Int(0));
-            return self.b.emit(Rvalue::Load(Place::projected(
-                local,
-                vec![Projection::Index(zero)],
-            )));
-        }
-        match self.lookup(name) {
-            Some(local) => Operand::Local(local),
-            // A bare reference to a top-level function (not a local, not a global
-            // binding) is a first-class function value: eta-expand it into a
-            // forwarding closure so it lowers exactly like the closure a caller
-            // could write by hand, and the back ends need no dedicated fn-value.
-            None => match self.ctx.function_arity(&self.module, name) {
-                Some(arity) => self.lower_fn_value(name, arity),
-                // Global storage is keyed per defining module, so the read
-                // resolves the bare name to that module's key.
-                None => self
-                    .b
-                    .emit(Rvalue::Global(self.ctx.global_symbol(&self.module, name))),
-            },
-        }
-    }
-
-    /// Eta-expand a bare reference to top-level function `name` of `arity`
-    /// parameters into the forwarding closure `(a0, .., a{n-1}) -> name(a0, ..,
-    /// a{n-1})`. Reuses closure lowering, so the value is an ordinary closure the
-    /// monomorphizer and both back ends already handle.
-    fn lower_fn_value(&mut self, name: &str, arity: usize) -> Operand {
-        use brass_parser::ast::{Arg, Param};
-        let span = brass_parser::Span::new(0, 0);
-        let names: Vec<String> = (0..arity).map(|i| format!("__eta{i}")).collect();
-        let params: Vec<Param> = names
-            .iter()
-            .map(|n| Param {
-                name: n.clone(),
-                ty: None,
-                span,
-            })
-            .collect();
-        let args: Vec<Arg> = names
-            .iter()
-            .map(|n| Arg {
-                expr: Expr::Ident(n.clone(), span),
-            })
-            .collect();
-        let body = Expr::Call(Box::new(Expr::Ident(name.to_string(), span)), args, span);
-        self.lower_closure(&params, &body)
-    }
-
     fn lower_binary(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Operand {
         match op {
             // `&&`/`||` short-circuit and so become control flow.
             BinOp::And | BinOp::Or => self.lower_logical(op, a, b),
+            // Each use of a generalized closure binding builds its own
+            // closure value, and function values compare by identity, so
+            // such a use equals no other value -- itself included (types.md,
+            // Equality). The comparison is decided without building the
+            // closure, which nothing else would type; the other operand
+            // still runs for its effects.
+            BinOp::Eq | BinOp::Ne
+                if self.is_closure_template_use(a) || self.is_closure_template_use(b) =>
+            {
+                for operand in [a, b] {
+                    if !self.is_closure_template_use(operand) {
+                        self.lower_expr(operand);
+                    }
+                }
+                Operand::Const(Literal::Bool(op == BinOp::Ne))
+            }
             _ => {
                 let la = self.lower_expr(a);
+                let la = self.hold(la, &assigned_names([b]));
                 let lb = self.lower_expr(b);
                 self.b.emit(Rvalue::Bin(op, la, lb))
             }
@@ -451,9 +431,34 @@ impl<'a, 'p> FnLower<'a, 'p> {
         Operand::Local(res)
     }
 
-    /// `if cond { then } else { els }` as a value: each arm writes the result.
-    fn lower_if(&mut self, cond: &Expr, then: &Block, els: Option<&Expr>) -> Operand {
-        let res = self.b.fresh_local(None);
+    /// The local an `if`/`if let`/`match` value at `span` is written into:
+    /// a join of the branch values, or -- when the checker joined them at a
+    /// numeric type their literal branches adapted to (the `expr_types`
+    /// channel) -- a local of that type, so each literal branch is built at it.
+    fn branch_result_local(&mut self, span: Span) -> LocalId {
+        let adapted = self.ctx.expr_type(span).filter(|ty| {
+            matches!(ty, Type::Int(_) | Type::Float(_))
+                || matches!(ty, Type::Nullable(inner) if matches!(**inner, Type::Int(_) | Type::Float(_)))
+        });
+        match adapted {
+            Some(ty) => self.b.fresh_local_typed(None, ty.clone()),
+            None => self.b.fresh_join_local(),
+        }
+    }
+
+    /// `if cond { then } else { els }`. As a value (`value`) each arm writes
+    /// the result; as a statement the arms run for their effects only and
+    /// their trailing values are discarded, so arms of different types (or a
+    /// value-yielding arm without an `else`) never meet in one result.
+    pub(super) fn lower_if(
+        &mut self,
+        cond: &Expr,
+        then: &Block,
+        els: Option<&Expr>,
+        value: bool,
+        span: Span,
+    ) -> Operand {
+        let res = value.then(|| self.branch_result_local(span));
         let c = self.lower_expr(cond);
         let then_bb = self.b.new_block();
         let else_bb = self.b.new_block();
@@ -468,51 +473,85 @@ impl<'a, 'p> FnLower<'a, 'p> {
 
         let mut reached = false;
         self.b.switch_to(then_bb);
-        let tv = self.lower_block_value(then);
-        if !self.b.terminated() {
-            self.b.push(MirStmt::Assign(res, Rvalue::Use(tv)));
-            self.b.terminate(Terminator::Goto(merge_bb));
-            reached = true;
-        }
+        let tv = self.lower_arm_block(then, value);
+        reached |= self.close_arm(res, tv, merge_bb);
 
         self.b.switch_to(else_bb);
         let ev = match els {
-            Some(e) => self.lower_expr(e),
-            None => Operand::void(),
+            Some(e) => self.lower_arm_expr(e, value),
+            None => Some(Operand::void()),
         };
-        if !self.b.terminated() {
-            self.b.push(MirStmt::Assign(res, Rvalue::Use(ev)));
-            self.b.terminate(Terminator::Goto(merge_bb));
-            reached = true;
-        }
+        reached |= self.close_arm(res, ev, merge_bb);
 
         self.b.switch_to(merge_bb);
         self.seal_value_merge(res, reached)
     }
 
-    /// Finalize a value-producing construct (`if`/`if let`/`match`) at its merge
+    /// Lower an arm block of a branching expression: its value when the
+    /// expression yields one, else its statements alone (`None`).
+    fn lower_arm_block(&mut self, b: &Block, value: bool) -> Option<Operand> {
+        if value {
+            Some(self.lower_block_value(b))
+        } else {
+            self.lower_block_stmts(b);
+            None
+        }
+    }
+
+    /// As [`Self::lower_arm_block`], for an arm written as an expression (an
+    /// `else` chain, a `match` arm body).
+    fn lower_arm_expr(&mut self, e: &Expr, value: bool) -> Option<Operand> {
+        if value {
+            Some(self.lower_expr(e))
+        } else {
+            self.lower_expr_stmt(e);
+            None
+        }
+    }
+
+    /// End an arm that falls through: write its value `v` into the result
+    /// `res` (when the expression yields one) and jump to `merge`. Returns
+    /// whether the arm reached the merge (it did not when it diverged).
+    fn close_arm(&mut self, res: Option<LocalId>, v: Option<Operand>, merge: BlockId) -> bool {
+        if self.b.terminated() {
+            return false;
+        }
+        if let (Some(res), Some(v)) = (res, v) {
+            self.b.push(MirStmt::Assign(res, Rvalue::Use(v)));
+        }
+        self.b.terminate(Terminator::Goto(merge));
+        true
+    }
+
+    /// Finalize a branching construct (`if`/`if let`/`match`) at its merge
     /// block: when no arm reached the merge (all diverged), the merge is dead, so
-    /// give the result local a value -- keeping it typeable -- and terminate the
-    /// block, so a trailing implicit return never reads an unassigned local.
-    fn seal_value_merge(&mut self, res: LocalId, reached: bool) -> Operand {
+    /// give the result local (if the construct yields a value) a value --
+    /// keeping it typeable -- and terminate the block, so a trailing implicit
+    /// return never reads an unassigned local. A statement yields `void`.
+    fn seal_value_merge(&mut self, res: Option<LocalId>, reached: bool) -> Operand {
         if !reached {
-            self.b
-                .push(MirStmt::Assign(res, Rvalue::Use(Operand::void())));
+            if let Some(res) = res {
+                self.b
+                    .push(MirStmt::Assign(res, Rvalue::Use(Operand::void())));
+            }
             self.b.terminate(Terminator::Unreachable);
         }
-        Operand::Local(res)
+        res.map_or_else(Operand::void, Operand::Local)
     }
 
     /// `if let pat = scrut { then } else { els }`: test the pattern, bind on the
-    /// success arm, and merge like an ordinary `if`.
-    fn lower_iflet(
+    /// success arm, and merge like an ordinary `if` (as a value or, without
+    /// `value`, as a statement).
+    pub(super) fn lower_iflet(
         &mut self,
         pat: &brass_parser::ast::Pattern,
         scrut: &Expr,
         then: &Block,
         els: Option<&Expr>,
+        value: bool,
+        span: Span,
     ) -> Operand {
-        let res = self.b.fresh_local(None);
+        let res = value.then(|| self.branch_result_local(span));
         let subj = self.lower_expr(scrut);
         let subj = self.b.make_local(subj);
         // A plain (non-variant) binding in `if let` is a *presence* test, not the
@@ -524,7 +563,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
         // `if let p = T.from(v)` (whose result is `T?`) take the else arm when the
         // conversion yields null. Other patterns test as usual.
         let cond = match pat {
-            brass_parser::ast::Pattern::Binding(name, _, _) if !self.is_variant_name(name) => {
+            brass_parser::ast::Pattern::Binding(name, None, _) if !self.is_variant_name(name) => {
                 self.b.emit(Rvalue::Call(
                     Callee::Builtin("__present".into()),
                     vec![Operand::Local(subj)],
@@ -549,7 +588,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
         // the nullable -- `__nonnull` narrows it (and is the identity for a
         // non-nullable). Other patterns bind their parts as usual.
         match pat {
-            brass_parser::ast::Pattern::Binding(name, _, _) if !self.is_variant_name(name) => {
+            brass_parser::ast::Pattern::Binding(name, None, _) if !self.is_variant_name(name) => {
                 let nn = self.b.emit(Rvalue::Call(
                     Callee::Builtin("__nonnull".into()),
                     vec![Operand::Local(subj)],
@@ -558,34 +597,33 @@ impl<'a, 'p> FnLower<'a, 'p> {
             }
             _ => self.lower_pattern_bind(pat, subj),
         }
-        let tv = self.lower_block_value(then);
+        let tv = self.lower_arm_block(then, value);
         self.pop_scope();
-        if !self.b.terminated() {
-            self.b.push(MirStmt::Assign(res, Rvalue::Use(tv)));
-            self.b.terminate(Terminator::Goto(merge_bb));
-            reached = true;
-        }
+        reached |= self.close_arm(res, tv, merge_bb);
 
         self.b.switch_to(else_bb);
         let ev = match els {
-            Some(e) => self.lower_expr(e),
-            None => Operand::void(),
+            Some(e) => self.lower_arm_expr(e, value),
+            None => Some(Operand::void()),
         };
-        if !self.b.terminated() {
-            self.b.push(MirStmt::Assign(res, Rvalue::Use(ev)));
-            self.b.terminate(Terminator::Goto(merge_bb));
-            reached = true;
-        }
+        reached |= self.close_arm(res, ev, merge_bb);
 
         self.b.switch_to(merge_bb);
         self.seal_value_merge(res, reached)
     }
 
     /// `match scrut { pat => body, ... }`: a linear chain of pattern tests, each
-    /// arm binding then writing the result. Falling off the end panics, so the
+    /// arm binding then writing the result (when `value`; as a statement the
+    /// arms' values are discarded). Falling off the end panics, so the
     /// post-match merge is reached only by a matching arm.
-    fn lower_match(&mut self, scrut: &Expr, arms: &[brass_parser::ast::MatchArm]) -> Operand {
-        let res = self.b.fresh_local(None);
+    pub(super) fn lower_match(
+        &mut self,
+        scrut: &Expr,
+        arms: &[brass_parser::ast::MatchArm],
+        value: bool,
+        span: Span,
+    ) -> Operand {
+        let res = value.then(|| self.branch_result_local(span));
         let subj = self.lower_expr(scrut);
         let subj = self.b.make_local(subj);
         let merge_bb = self.b.new_block();
@@ -602,13 +640,9 @@ impl<'a, 'p> FnLower<'a, 'p> {
             self.b.switch_to(arm_bb);
             self.push_scope();
             self.lower_pattern_bind(&arm.pattern, subj);
-            let v = self.lower_expr(&arm.body);
+            let v = self.lower_arm_expr(&arm.body, value);
             self.pop_scope();
-            if !self.b.terminated() {
-                self.b.push(MirStmt::Assign(res, Rvalue::Use(v)));
-                self.b.terminate(Terminator::Goto(merge_bb));
-                reached = true;
-            }
+            reached |= self.close_arm(res, v, merge_bb);
             self.b.switch_to(next_bb);
         }
         // No arm matched: panic and diverge.
@@ -675,6 +709,11 @@ impl<'a, 'p> FnLower<'a, 'p> {
         self.b.terminate(Terminator::Goto(cont_bb));
 
         self.b.switch_to(err_bb);
+        // Propagating returns from the callable, ending every enclosing
+        // iteration (an aborting entry point has no caller to observe it).
+        if !self.abort_error_prop {
+            self.emit_exit_writebacks();
+        }
         if self.abort_error_prop {
             self.abort_failed_prop(v, nullable);
         } else if nullable {
@@ -687,7 +726,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
             // The checker marked this propagation as LIFTING: the payload is
             // re-raised wrapped into the prelude `Error`, gaining this site's
             // position (the abort path above keeps the original payload, so a
-            // never-wrapped chain renders as before).
+            // chain that never wraps renders that payload).
             let lifted = self.lift_propagated_err(v, span);
             self.b.terminate(Terminator::Return(lifted));
         } else {
@@ -828,10 +867,10 @@ impl<'a, 'p> FnLower<'a, 'p> {
     fn lower_field(&mut self, base: &Expr, name: &str) -> Operand {
         // `Type.Variant` with no fields is a compile-time unit-variant value.
         if let Expr::Ident(tname, _) = base
-            && self.lookup(tname).is_none()
+            && !self.is_bound(tname)
         {
             let tn = self.resolve_self_name(tname);
-            if let Some(info) = self.ctx.program.resolve_type(&self.module, &tn)
+            if let Some(info) = self.ctx.program.resolve_type_or_alias(&self.module, &tn)
                 && let Some(var) = info.variant(name)
                 && var.fields.is_empty()
             {
@@ -852,6 +891,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
 
     fn lower_index(&mut self, base: &Expr, idx: &Expr) -> Operand {
         let arr = self.lower_expr(base);
+        let arr = self.hold(arr, &assigned_names([idx]));
         let arr = self.b.make_local(arr);
         let i = self.lower_expr(idx);
         self.b.emit(Rvalue::Load(Place::projected(
@@ -860,33 +900,164 @@ impl<'a, 'p> FnLower<'a, 'p> {
         )))
     }
 
-    fn lower_array(&mut self, es: &[Expr], span: Span) -> Operand {
-        let mut ops = Vec::with_capacity(es.len());
-        for e in es {
-            let v = self.lower_expr(e);
-            ops.push(v);
+    /// The call of the function value field `name` of the record `obj`
+    /// holds, with `ops` as its arguments.
+    fn field_call(&mut self, obj: LocalId, name: &str, ops: Vec<Operand>) -> Rvalue {
+        let f = self.b.emit(Rvalue::Load(Place::projected(
+            obj,
+            vec![Projection::Field(name.to_string())],
+        )));
+        Rvalue::Call(Callee::Indirect(f), ops)
+    }
+
+    /// The instance method call `method(ops)` (receiver first) at `span`,
+    /// with its omitted trailing arguments completed from the resolved
+    /// method's signature. When the call's instances resolve `method` on
+    /// different owners whose signatures complete it differently (a generic
+    /// body calling `x.describe()` on a `Dog` and on a `Cat`), the receiver
+    /// is tested against each owner in turn and every arm calls with its
+    /// owner's completion; each instance folds the tests by its receiver's
+    /// type, so it compiles exactly its own call.
+    fn lower_method_call(&mut self, method: String, mut ops: Vec<Operand>, span: Span) -> Rvalue {
+        let Some(owners) = self.ctx.owner_defaults(span, &method) else {
+            let defaults = self.ctx.instance_call_defaults(span, &method);
+            self.complete_call_args(defaults.as_deref(), &mut ops, span);
+            return Rvalue::Call(Callee::Method(method), ops);
+        };
+        // The defaults that fill this call's omitted arguments: the run of
+        // optional parameters after the written arguments.
+        let given = ops.len();
+        let completion = |defaults: &Option<Vec<super::CallDefault>>| {
+            defaults.as_ref().map(|defaults| {
+                defaults
+                    .iter()
+                    .skip(given)
+                    .take_while(|d| **d != super::CallDefault::Required)
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+        };
+        let first = completion(&owners[0].1);
+        if owners
+            .iter()
+            .all(|(_, defaults)| completion(defaults) == first)
+        {
+            self.complete_call_args(owners[0].1.as_deref(), &mut ops, span);
+            return Rvalue::Call(Callee::Method(method), ops);
         }
+        let recv = self.b.make_local(ops[0].clone());
+        ops[0] = Operand::Local(recv);
+        let result = self.b.fresh_join_local();
+        let merge_bb = self.b.new_block();
+        let last = owners.len() - 1;
+        for (i, (owner, defaults)) in owners.into_iter().enumerate() {
+            let next_bb = (i < last).then(|| {
+                let test = self
+                    .b
+                    .emit_known(Rvalue::TypeTest(Operand::Local(recv), owner), Type::Bool);
+                let call_bb = self.b.new_block();
+                let next_bb = self.b.new_block();
+                self.b.terminate(Terminator::CondBranch {
+                    cond: test,
+                    then: call_bb,
+                    els: next_bb,
+                });
+                self.b.switch_to(call_bb);
+                next_bb
+            });
+            let mut arm_ops = ops.clone();
+            self.complete_call_args(defaults.as_deref(), &mut arm_ops, span);
+            let value = self
+                .b
+                .emit(Rvalue::Call(Callee::Method(method.clone()), arm_ops));
+            self.b.push(MirStmt::Assign(result, Rvalue::Use(value)));
+            self.b.terminate(Terminator::Goto(merge_bb));
+            if let Some(next_bb) = next_bb {
+                self.b.switch_to(next_bb);
+            }
+        }
+        self.b.switch_to(merge_bb);
+        Rvalue::Use(Operand::Local(result))
+    }
+
+    /// Lower `recv.name(args)` where some instantiations of the body call
+    /// the function-valued field `name` (the receivers matching
+    /// `field_receivers`) and the others a method `name`: the arguments are
+    /// evaluated once, then a type test on the receiver selects the field
+    /// call or the method call. Each instance folds the test by its
+    /// receiver's type, so only its own arm is typed and compiled.
+    fn lower_field_or_method_call(
+        &mut self,
+        recv: Operand,
+        name: &str,
+        args: &[Arg],
+        span: Span,
+        field_receivers: &[Type],
+    ) -> Rvalue {
+        let obj = self.b.make_local(recv);
+        let ops = self.lower_args(args);
+        let result = self.b.fresh_join_local();
+        let field_bb = self.b.new_block();
+        let method_bb = self.b.new_block();
+        let merge_bb = self.b.new_block();
+        for pattern in field_receivers {
+            let test = self.b.emit_known(
+                Rvalue::TypeTest(Operand::Local(obj), pattern.clone()),
+                Type::Bool,
+            );
+            let next = self.b.new_block();
+            self.b.terminate(Terminator::CondBranch {
+                cond: test,
+                then: field_bb,
+                els: next,
+            });
+            self.b.switch_to(next);
+        }
+        self.b.terminate(Terminator::Goto(method_bb));
+
+        self.b.switch_to(field_bb);
+        let call = self.field_call(obj, name, ops.clone());
+        let value = self.b.emit(call);
+        self.b.push(MirStmt::Assign(result, Rvalue::Use(value)));
+        self.b.terminate(Terminator::Goto(merge_bb));
+
+        self.b.switch_to(method_bb);
+        let mut method_ops = vec![Operand::Local(obj)];
+        method_ops.extend(ops);
+        let call = self.lower_method_call(name.to_string(), method_ops, span);
+        let value = self.b.emit(call);
+        self.b.push(MirStmt::Assign(result, Rvalue::Use(value)));
+        self.b.terminate(Terminator::Goto(merge_bb));
+
+        self.b.switch_to(merge_bb);
+        Rvalue::Use(Operand::Local(result))
+    }
+
+    fn lower_array(&mut self, es: &[Expr], span: Span) -> Operand {
+        let ops = self.lower_in_order(&es.iter().collect::<Vec<_>>());
         let rv = Rvalue::Array(ops);
         // A literal whose checked element representation differs from what the
-        // back end would re-derive (a nullable cell, a non-default numeric
-        // width) carries that type onto its result local, so the elements are
-        // built at the annotated representation from the start. An EMPTY
+        // back end would re-derive (`brass_hir::array_literal_needs_seed`)
+        // carries that type onto its result local, so the elements are built
+        // at the checked representation from the start; other literals keep
+        // an inferred `Var` (see [`is_seedable_result`]). An EMPTY
         // literal has no elements to derive from at all, so any recorded
         // checked type (the channel only records fully-known ones for it) is
         // its only source and is always carried.
-        match self.ctx.expr_type(span) {
-            Some(ty) if array_element_needs_seed(ty) || es.is_empty() => {
-                self.b.emit_known(rv, ty.clone())
-            }
-            _ => self.b.emit(rv),
-        }
+        let shared = self
+            .ctx
+            .expr_type(span)
+            .filter(|ty| brass_hir::array_literal_needs_seed(ty) || es.is_empty())
+            .cloned();
+        self.b.emit_seeded(rv, span, shared)
     }
 
-    /// The checker-resolved element type of a range expression, when its
-    /// non-default representation was recorded (the expr_types channel). The
-    /// counting locals must carry it: monomorphization would otherwise
-    /// re-derive the literal bound's default width, and a counter narrower
-    /// than the checked type wraps before a wide `hi` bound is reached.
+    /// The checker-resolved element type of a range expression (the
+    /// expr_types channel records every range whose instantiations agree on
+    /// it). The counting locals must carry it: monomorphization would
+    /// otherwise type the counter from `lo` alone, and a counter narrower than
+    /// the range's type (`[lo..256]` with `lo: uint8`) wraps before `hi` is
+    /// reached.
     pub(crate) fn range_elem_type(&self, span: Span) -> Option<Type> {
         match self.ctx.expr_type(span) {
             Some(Type::Slice(e)) => Some((**e).clone()),
@@ -894,24 +1065,58 @@ impl<'a, 'p> FnLower<'a, 'p> {
         }
     }
 
-    /// Materialize `op` into a local carrying the checker-resolved type when
-    /// one is known; a bare [`crate::builder::BodyBuilder::make_local`] otherwise.
-    pub(crate) fn make_local_seeded(&mut self, op: Operand, ty: Option<&Type>) -> LocalId {
-        match ty {
-            Some(t) => {
-                let id = self.b.fresh_local_typed(None, t.clone());
-                self.b.push(MirStmt::Assign(id, Rvalue::Use(op)));
-                id
-            }
-            None => self.b.make_local(op),
+    /// Lower a range's bounds into its counter (holding `lo`) and its end
+    /// (holding `hi`). With the checker's element type both carry it. Without
+    /// one (a generic body whose instantiations disagree on it) the counter
+    /// is a join local written `hi` and then `lo`: the `hi` write is
+    /// immediately overwritten, but it makes monomorphization type the counter
+    /// as the join of both bounds -- the operator rule's type for them -- so
+    /// a narrow `lo` with a wider `hi` still counts up to `hi`.
+    pub(crate) fn range_bounds(
+        &mut self,
+        lo: &Expr,
+        hi: &Expr,
+        elem: Option<&Type>,
+    ) -> (LocalId, LocalId) {
+        let lo_op = self.lower_expr(lo);
+        if elem.is_some() {
+            let i = self.make_local_seeded(lo_op, elem);
+            let hi_op = self.lower_expr(hi);
+            let end = self.make_local_seeded(hi_op, elem);
+            return (i, end);
         }
+        // `lo` is read before `hi` is evaluated, as written; a constant keeps
+        // its literal value for the join.
+        let lo_op = match lo_op {
+            Operand::Local(_) => self.b.emit(Rvalue::Use(lo_op)),
+            constant => constant,
+        };
+        let hi_op = self.lower_expr(hi);
+        let i = self.b.fresh_join_local();
+        self.b.push(MirStmt::Assign(i, Rvalue::Use(hi_op.clone())));
+        self.b.push(MirStmt::Assign(i, Rvalue::Use(lo_op)));
+        let end = self.make_local_seeded(hi_op, None);
+        (i, end)
+    }
+
+    /// Copy `op` into a FRESH local, carrying the checker-resolved type when
+    /// one is known. A range's counter and bound use this: the counter is
+    /// advanced in place, and the bound is the value at evaluation time, so
+    /// neither may share a slot with a variable the bound expression named
+    /// (`[x..n]` must neither advance `x` nor follow a later `n = ..`).
+    pub(crate) fn make_local_seeded(&mut self, op: Operand, ty: Option<&Type>) -> LocalId {
+        let id = match ty {
+            Some(t) => self.b.fresh_local_typed(None, t.clone()),
+            None => self.b.fresh_local(None),
+        };
+        self.b.push(MirStmt::Assign(id, Rvalue::Use(op)));
+        id
     }
 
     /// Lower `[lo..hi]` to an index loop that fills a fresh array with the
     /// half-open integer range: `arr = []; i = lo; while i < hi { arr.push(i);
-    /// i += 1 }`. The element type follows the checker's range type when it
-    /// was recorded (a non-default width); otherwise it is inferred from the
-    /// push.
+    /// i += 1 }`. The element type is the checker's range type when it was
+    /// recorded, else the bounds' join (see [`Self::range_bounds`]).
     fn lower_range(&mut self, lo: &Expr, hi: &Expr, span: Span) -> Operand {
         let elem = self.range_elem_type(span);
         let arr_op = match &elem {
@@ -921,10 +1126,7 @@ impl<'a, 'p> FnLower<'a, 'p> {
             None => self.b.emit(Rvalue::Array(Vec::new())),
         };
         let arr = self.b.make_local(arr_op);
-        let lo_op = self.lower_expr(lo);
-        let i = self.make_local_seeded(lo_op, elem.as_ref());
-        let hi_op = self.lower_expr(hi);
-        let end = self.make_local_seeded(hi_op, elem.as_ref());
+        let (i, end) = self.range_bounds(lo, hi, elem.as_ref());
 
         let cond_bb = self.b.new_block();
         let body_bb = self.b.new_block();
@@ -965,7 +1167,15 @@ impl<'a, 'p> FnLower<'a, 'p> {
     }
 
     fn lower_record(&mut self, name: &str, fields: &[(String, Expr)], span: Span) -> Operand {
-        let ty = self.resolve_self_name(name);
+        // An anonymous literal the checker accepted into a slot of a declared
+        // record (its fields are exactly the record's), and a literal written
+        // through a `type A = R { .. }` alias, are built AS that record; the
+        // checker recorded the record's symbol for the literal's span in the
+        // type-name channel.
+        let ty = match self.ctx.type_names.get(&span) {
+            Some(symbol) => symbol.clone(),
+            None => self.resolve_self_name(name),
+        };
         let fields = self.lower_named_fields(fields);
         let rv = Rvalue::Record { ty, fields };
         // The checker-resolved instance type seeds the literal's result local
@@ -974,10 +1184,34 @@ impl<'a, 'p> FnLower<'a, 'p> {
         // of an unannotated function-typed field, which the back end cannot
         // derive from the closure operand alone (the closure takes its
         // parameter types FROM that seed).
-        match self.ctx.expr_type(span) {
-            Some(t) if is_seedable_result(t) => self.b.emit_known(rv, t.clone()),
-            _ => self.b.emit(rv),
+        let shared = self
+            .ctx
+            .expr_type(span)
+            .filter(|ty| is_seedable_result(ty))
+            .cloned();
+        self.b.emit_seeded(rv, span, shared)
+    }
+
+    /// A static call `T.method(args)` on the type named `tn` (a type word or
+    /// the name a `typeof(v)` receiver resolved to). `string.from(x)` is the
+    /// rendering of `x` exactly as `"{x}"` and `print` show it -- a declared
+    /// `display` included -- so it lowers to the same `to_string` builtin as
+    /// an interpolation segment.
+    fn lower_static_call(&mut self, tn: &str, method: &str, args: &[Arg], span: Span) -> Rvalue {
+        let qualifier = self.ctx.static_qualifier(&self.module, tn);
+        let mut ops = self.lower_args(args);
+        if qualifier == "string" && method == "from" && ops.len() == 1 {
+            return Rvalue::Call(Callee::Builtin("to_string".into()), ops);
         }
+        let defaults = self.ctx.static_call_defaults(&self.module, tn, method);
+        self.complete_call_args(defaults.as_deref(), &mut ops, span);
+        Rvalue::Call(
+            Callee::Static {
+                ty: qualifier,
+                method: method.to_string(),
+            },
+            ops,
+        )
     }
 
     fn lower_variant(&mut self, ty: &str, variant: &str, fields: &[(String, Expr)]) -> Operand {
@@ -991,12 +1225,8 @@ impl<'a, 'p> FnLower<'a, 'p> {
     }
 
     fn lower_named_fields(&mut self, fields: &[(String, Expr)]) -> Vec<(String, Operand)> {
-        let mut out = Vec::with_capacity(fields.len());
-        for (n, e) in fields {
-            let v = self.lower_expr(e);
-            out.push((n.clone(), v));
-        }
-        out
+        let values = self.lower_in_order(&fields.iter().map(|(_, e)| e).collect::<Vec<_>>());
+        fields.iter().map(|(n, _)| n.clone()).zip(values).collect()
     }
 
     /// A string literal with interpolation: constant text stays a single
@@ -1025,390 +1255,5 @@ impl<'a, 'p> FnLower<'a, 'p> {
             acc = self.b.emit(Rvalue::Bin(BinOp::Add, acc, piece));
         }
         acc
-    }
-
-    /// Build the rvalue for a call, routing it structurally (same decisions as
-    /// `codegen::gen_call`). Side-effecting sub-expressions (receiver, args) are
-    /// evaluated here in source order.
-    pub(crate) fn lower_call(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Rvalue {
-        // `typeof(x)` in value position: the reflection builtin (the checker
-        // reserves the name before any user binding). The operand is lowered
-        // for its effects and the type NAME is left to the back ends, which
-        // derive it from the operand's per-instance monomorphized type
-        // (`Rvalue::TypeName`) -- baking a name here would fix one shared
-        // answer across every instance of a generic body.
-        if matches!(callee, Expr::Ident(n, _) if n == "typeof") {
-            let op = self
-                .lower_args(args)
-                .into_iter()
-                .next()
-                .unwrap_or_else(Operand::void);
-            return Rvalue::TypeName(op);
-        }
-        // `recv.method(args)` or `Type.method(args)`.
-        if let Expr::Field(base, method, _) = callee
-            && !callee.span().is_parenthesized()
-        {
-            // `typeof(v).method(args)`: a static call on v's type, whose name the
-            // checker resolved into the type-name channel keyed by the inner
-            // `typeof(v)` span. Route it exactly like a written `Type.method`.
-            if let Expr::Call(c, _, tspan) = &**base
-                && matches!(&**c, Expr::Ident(n, _) if n == "typeof")
-                && let Some(tname) = self.ctx.type_names.get(tspan)
-            {
-                let tn = tname.clone();
-                if method == "from" && self.ctx.record_field_names(&self.module, &tn).is_some() {
-                    let source = self
-                        .lower_args(args)
-                        .into_iter()
-                        .next()
-                        .unwrap_or_else(Operand::void);
-                    return Rvalue::RecordFrom { ty: tn, source };
-                }
-                let qualifier = self.ctx.static_qualifier(&self.module, &tn);
-                let mut ops = self.lower_args(args);
-                let defaults = self.ctx.static_call_defaults(&self.module, &tn, method);
-                self.complete_call_args(defaults.as_deref(), &mut ops, span);
-                return Rvalue::Call(
-                    Callee::Static {
-                        ty: qualifier,
-                        method: method.clone(),
-                    },
-                    ops,
-                );
-            }
-            // `T.default()` for a primitive type word folds to its zero
-            // value (the `Default` protocol's builtin implementations).
-            if let Expr::Ident(tname, _) = &**base
-                && self.lookup(tname).is_none()
-                && let Some(lit) = primitive_default_literal(tname, method)
-            {
-                return Rvalue::Use(Operand::Const(lit));
-            }
-            if let Expr::Ident(tname, _) = &**base
-                && self.lookup(tname).is_none()
-                && self.ctx.is_type_word_in(&self.module, tname)
-            {
-                let tn = self.resolve_self_name(tname);
-                // `T.from(v)` for a structure type `T`: a fallible structural
-                // conversion. The result is `T?` -- the record built from `v`'s
-                // fields when the (monomorphized) `v` has all of `T`'s, else null.
-                // The back ends read the fields and make the presence decision per
-                // instance, so the lowering only carries the target type and source.
-                if method == "from" && self.ctx.record_field_names(&self.module, &tn).is_some() {
-                    let source = self
-                        .lower_args(args)
-                        .into_iter()
-                        .next()
-                        .unwrap_or_else(Operand::void);
-                    return Rvalue::RecordFrom { ty: tn, source };
-                }
-                let qualifier = self.ctx.static_qualifier(&self.module, &tn);
-                let mut ops = self.lower_args(args);
-                let defaults = self.ctx.static_call_defaults(&self.module, &tn, method);
-                self.complete_call_args(defaults.as_deref(), &mut ops, span);
-                return Rvalue::Call(
-                    Callee::Static {
-                        ty: qualifier,
-                        method: method.clone(),
-                    },
-                    ops,
-                );
-            }
-            // A sum variant qualifier is a static receiver, including aliases
-            // and module markers; evaluating it as a value loses its type.
-            if let Expr::Field(sum, variant, _) = &**base
-                && let Expr::Ident(type_name, _) = &**sum
-                && self.lookup(type_name).is_none()
-                && let Some(info) = self
-                    .ctx
-                    .program
-                    .resolve_type_or_alias(&self.module, &self.resolve_self_name(type_name))
-                && info.variant(variant).is_some()
-            {
-                let ty = info.symbol.clone();
-                let defaults = self.ctx.static_call_defaults(&self.module, &ty, method);
-                let mut ops = self.lower_args(args);
-                self.complete_call_args(defaults.as_deref(), &mut ops, span);
-                return Rvalue::Call(
-                    Callee::Static {
-                        ty,
-                        method: method.clone(),
-                    },
-                    ops,
-                );
-            }
-            // No trailing-nullable padding here: `method` names a *method*, whose
-            // arity the checker enforces in full. Looking the name up as a free
-            // function (as free calls below do) would pad from an unrelated
-            // same-named function's signature and corrupt the argument list.
-            let recv = self.lower_expr(base);
-            // A name no type's method table (nor the primitive-method table)
-            // knows is a FIELD call: `a.func(4)` loads the function-typed field
-            // and calls it indirectly (the checker already resolved the name to
-            // a field). A field sharing its name with an unrelated type's
-            // method still routes as a method -- a limitation of this
-            // structural, type-free routing.
-            if !self.ctx.method_name_exists(method) {
-                let obj = self.b.make_local(recv);
-                let f = self.b.emit(Rvalue::Load(Place::projected(
-                    obj,
-                    vec![Projection::Field(method.clone())],
-                )));
-                let ops = self.lower_args(args);
-                return Rvalue::Call(Callee::Indirect(f), ops);
-            }
-            let mut ops = vec![recv];
-            ops.extend(self.lower_args(args));
-            let defaults = self.ctx.instance_call_defaults(span, method);
-            self.complete_call_args(defaults.as_deref(), &mut ops, span);
-            let method = self
-                .ctx
-                .keyed_dispatch
-                .get(&span)
-                .cloned()
-                .unwrap_or_else(|| method.clone());
-            return Rvalue::Call(Callee::Method(method), ops);
-        }
-        if let Expr::Ident(name, _) = callee {
-            // A local holding a closure/function value is called indirectly.
-            // `error` is a reserved callee name: a local binding (a match's
-            // `Err { error }` payload) never shadows the prelude function in
-            // call position.
-            if name != "error"
-                && let Some(local) = self.lookup(name)
-            {
-                let ops = self.lower_args(args);
-                return Rvalue::Call(Callee::Indirect(Operand::Local(local)), ops);
-            }
-            // A known free function resolves to its storage symbol. An argument
-            // the checker recorded as view-convertible (an anonymous structural
-            // value fitting an eligible parameter's row) is converted into that
-            // parameter's view at the call boundary, so every argument shape
-            // with the same view selects one callee instance.
-            if let Some(symbol) = self.ctx.resolve_fn_symbol(&self.module, name) {
-                let mut ops = Vec::with_capacity(args.len());
-                for (i, a) in args.iter().enumerate() {
-                    let v = self.lower_expr(&a.expr);
-                    if self.ctx.is_view_arg(a.expr.span()) {
-                        ops.push(self.b.emit(Rvalue::RecordView {
-                            callee: symbol.clone(),
-                            param: i,
-                            source: v,
-                        }));
-                    } else {
-                        ops.push(v);
-                    }
-                }
-                let defaults = self.ctx.free_call_defaults(&self.module, name);
-                self.complete_call_args(defaults.as_deref(), &mut ops, span);
-                return Rvalue::Call(Callee::Free(symbol), ops);
-            }
-            // A module GLOBAL holding a closure/function value is called
-            // indirectly, exactly like a local: `let inc = (n: int32) -> n + 1`
-            // at top level, then `inc(1)` anywhere in the module.
-            if self.ctx.is_global_name(&self.module, name) {
-                let g = self
-                    .b
-                    .emit(Rvalue::Global(self.ctx.global_symbol(&self.module, name)));
-                let ops = self.lower_args(args);
-                return Rvalue::Call(Callee::Indirect(g), ops);
-            }
-            // A program lowered without the prelude (unit tests, embedders)
-            // has no `error` function to resolve to; keep the legacy builtin
-            // desugar so such programs still construct the Err.
-            if name == "error" {
-                let payload = match args.first() {
-                    Some(a) => self.lower_expr(&a.expr),
-                    None => Operand::void(),
-                };
-                return Rvalue::Variant {
-                    ty: "Result".to_string(),
-                    variant: "Err".to_string(),
-                    fields: vec![("error".to_string(), payload)],
-                };
-            }
-            // Otherwise it is a runtime builtin.
-            let ops = self.lower_args(args);
-            return Rvalue::Call(Callee::Builtin(name.clone()), ops);
-        }
-        // Any other callee expression evaluates to a closure/function value.
-        let clo = self.lower_expr(callee);
-        let ops = self.lower_args(args);
-        Rvalue::Call(Callee::Indirect(clo), ops)
-    }
-
-    /// Build the `Location` record for the call at `span` (the implicit
-    /// caller-location argument).
-    fn location_operand(&mut self, span: Span) -> Operand {
-        let (file, line, col) = self.ctx.call_location(span);
-        self.b.emit(Rvalue::Record {
-            ty: self
-                .ctx
-                .program
-                .prelude_type("Location")
-                .map(|info| info.symbol.clone())
-                .unwrap_or_else(|| "Location".into()),
-            fields: vec![
-                ("file".to_string(), Operand::Const(Literal::Str(file))),
-                (
-                    "line".to_string(),
-                    Operand::Const(Literal::Int(line as i64)),
-                ),
-                ("col".to_string(), Operand::Const(Literal::Int(col as i64))),
-            ],
-        })
-    }
-
-    fn lower_args(&mut self, args: &[Arg]) -> Vec<Operand> {
-        let mut ops = Vec::with_capacity(args.len());
-        for a in args {
-            let v = self.lower_expr(&a.expr);
-            ops.push(v);
-        }
-        ops
-    }
-
-    /// Fill every omitted optional parameter from one resolved signature.
-    /// Nullable defaults and the implicit caller location may be interleaved in
-    /// the trailing optional run accepted by the checker.
-    fn complete_call_args(
-        &mut self,
-        defaults: Option<&[super::CallDefault]>,
-        ops: &mut Vec<Operand>,
-        span: Span,
-    ) {
-        let Some(defaults) = defaults else {
-            return;
-        };
-        for default in defaults.iter().skip(ops.len()) {
-            match default {
-                super::CallDefault::Nullable => ops.push(Operand::Const(Literal::Null)),
-                super::CallDefault::Location => {
-                    let location = self.location_operand(span);
-                    ops.push(location);
-                }
-                super::CallDefault::Required => break,
-            }
-        }
-    }
-
-    /// Lower a closure: capture the free variables in scope, lower its body into
-    /// its own MIR, register it in the program-wide table, and yield a closure
-    /// value naming the captured operands.
-    fn lower_closure(&mut self, params: &[Param], body: &Expr) -> Operand {
-        let block = closure_block(body);
-        let free = free_vars_of(params, &block);
-        let mut capture_names = Vec::new();
-        let mut capture_ops = Vec::new();
-        let mut cell_captures = Vec::new();
-        for n in &free {
-            if let Some(local) = self.lookup(n) {
-                capture_names.push(n.clone());
-                // A cell-promoted capture is the shared cell array (its local holds
-                // the array pointer); the closure body accesses it through element 0.
-                capture_ops.push(Operand::Local(local));
-                if self.is_cell(n) {
-                    cell_captures.push(n.clone());
-                }
-            }
-        }
-        let id = self.ctx.fresh_closure_id();
-        let closure = lower_closure_body(
-            self.ctx,
-            self.module.clone(),
-            self.self_type.clone(),
-            id,
-            &capture_names,
-            &cell_captures,
-            params,
-            body,
-        );
-        self.ctx.closures.borrow_mut().push(closure);
-        self.b.emit(Rvalue::Closure {
-            id,
-            captures: capture_ops,
-        })
-    }
-}
-
-/// View a closure body as a block (an expression body becomes a one-statement
-/// block whose value is returned).
-fn closure_block(body: &Expr) -> Block {
-    match body {
-        Expr::Block(b, _) => b.clone(),
-        other => Block {
-            stmts: vec![Stmt::Expr(other.clone())],
-            span: other.span(),
-        },
-    }
-}
-
-/// Lower a closure body into its own [`MirClosure`]. Captures are bound first
-/// (the closure environment), then parameters; the body returns its value.
-#[allow(clippy::too_many_arguments)]
-fn lower_closure_body(
-    ctx: &ProgramCtx,
-    module: Vec<String>,
-    self_type: Option<String>,
-    id: crate::ids::ClosureId,
-    capture_names: &[String],
-    cell_captures: &[String],
-    params: &[Param],
-    body: &Expr,
-) -> MirClosure {
-    let mut fl = FnLower::new(ctx, module.clone(), self_type);
-    // Cell candidates local to this closure: its own captured-and-mutated
-    // bindings (for nested closures). As in `lower_callable`, each binder
-    // decides for its own binding, so a parameter binds plainly (shadowing any
-    // same-named captured cell) while a `let` of a candidate name is promoted.
-    fl.cells = crate::analysis::cell_promotions(&closure_block(body));
-    let captures: Vec<_> = capture_names
-        .iter()
-        .map(|n| {
-            let l = fl.b.fresh_local(Some(n.clone()));
-            // A capture that is a shared cell in the enclosing body stays a
-            // cell binding here: its local holds the cell array, and the body
-            // reads/writes it through element 0.
-            fl.bind_as(n, l, cell_captures.contains(n));
-            l
-        })
-        .collect();
-    // Closure parameters are borrowed (never deep-copied on entry): the copy
-    // inference targets named functions and methods, and closure callbacks
-    // (`map`/`filter`/`fold`) read their arguments rather than mutating them.
-    let no_copies = vec![false; params.len()];
-    let param_locals = fl.bind_params(params, &no_copies);
-    match body {
-        // Block body: explicit returns drive control flow; a falling-off tail
-        // returns void.
-        Expr::Block(b, _) => {
-            fl.lower_body_stmts(&b.stmts);
-            if !fl.b.terminated() {
-                fl.b.terminate(Terminator::Return(Operand::void()));
-            }
-        }
-        // Expression body: its value is the closure result.
-        other => {
-            let v = fl.lower_expr(other);
-            if !fl.b.terminated() {
-                fl.b.terminate(Terminator::Return(v));
-            }
-        }
-    }
-    let mir_body = fl.b.finish(param_locals.clone(), BlockId(0));
-    // A closure has no return annotation, so its fallibility is always the
-    // inferred form: an `error(...)`/Result-`!` body returns a `Result` whose
-    // bare returns codegen Ok-wraps. A nullable-operand `!` (a `null_props`
-    // span) instead makes the return nullable, exactly as for functions.
-    let fallible = crate::analysis::fallible_block_except(&closure_block(body), ctx.null_props);
-    MirClosure {
-        id,
-        params: param_locals,
-        captures,
-        capture_names: capture_names.to_vec(),
-        module,
-        fallible,
-        body: mir_body,
     }
 }

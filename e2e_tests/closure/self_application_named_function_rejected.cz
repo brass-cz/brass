@@ -1,0 +1,12 @@
+// A parameter applied to itself inside a named function needs a type that
+// contains itself, like a closure's (see self_application_rejected): the
+// checker reports it at the application instead of handing the back ends an
+// untypeable callee.
+fun selfapp(x) {
+    return x(x)
+}
+
+fun main() {
+    let id = (y) -> y
+    println(typeof(selfapp(id)))
+}

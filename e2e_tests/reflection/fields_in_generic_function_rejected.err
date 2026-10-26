@@ -1,0 +1,2 @@
+`fields(..)` expands different field sets across instantiations of this generic function
+`fields(..)` requires a record value, got `int32`

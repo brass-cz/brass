@@ -1,0 +1,25 @@
+// @backends: all
+// A global's annotation is its type everywhere: `let cache: P? = null` holds a
+// `P?` (not the `never?` of its `null` initializer), so functions may store a
+// `P` into it and read it back.
+type P = { x: int32 }
+
+let cache: P? = null
+
+fun get() {
+    if cache == null {
+        cache = P { x: 7 }
+    }
+    return cache
+}
+
+fun main() {
+    println(get()!.x)
+    if let c = cache {
+        println(c.x)
+    }
+    cache = P { x: 1 }
+    if let c = cache {
+        println(c.x)
+    }
+}

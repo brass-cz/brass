@@ -1,0 +1,8 @@
+// Importing a module whose top-level code the checker rejects fails the
+// program before anything runs -- the importer never runs with that module's
+// init skipped.
+import holder
+
+fun main() {
+    println(holder.X)
+}

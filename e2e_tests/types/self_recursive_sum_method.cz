@@ -1,15 +1,11 @@
-// A SELF-RECURSIVE method on a wide sum must compile -- and in bounded time.
-//
-// A sum's methods are lowered into every variant's table, so one `e.render()`
-// resolves to one candidate per variant and the checker re-elaborates each. The
-// recursion guard keyed those elaborations by the `Sum.Variant` qualifier the
-// call resolved through, so a recursive call re-entered through a variant not yet
-// on the stack and the guard never fired: every level re-elaborated the body once
-// per not-yet-entered variant, and the work grew FACTORIALLY in the variant
-// count. On a sum this wide with a body this heavy, the compiler hung -- no
-// diagnostic, no progress. The guard is now keyed by the receiver TYPE, so a
-// recursive call falls back to the declared return exactly as it does for a free
-// function.
+// A SELF-RECURSIVE method on a wide sum compiles, in bounded time. A sum's
+// methods are lowered into every variant's table, so one `e.render()`
+// resolves to one candidate per variant and the checker elaborates each; the
+// recursion guard is keyed by the receiver TYPE, so a recursive call through
+// any variant falls back to the declared return exactly as it does for a
+// free function. Keyed by the variant instead, every level would re-elaborate
+// the body once per variant not yet entered, and the work would grow
+// factorially in the variant count.
 
 type Node =
     | Text { value: string }

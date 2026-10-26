@@ -1,0 +1,27 @@
+// `with(obj, f)` yields `f(obj)`: the closure's parameter takes `obj`'s type
+// and the call's type is the closure's result, so an `int64` field read under
+// the lock stays an `int64` -- also where the spawn auto-guard wraps an access
+// of a shared value in a `with` -- and is checked like any other value.
+type Node = {
+    value: int64
+}
+
+fun touch(n) {
+    let a = n
+    return a.value
+}
+
+fun main() {
+    let n = Node { value: 5000000000 }
+    let v = with(n, (m) -> m.value)
+    println(v)
+    let w: int64 = with(n, (m) -> m.value + 1)
+    println(w)
+    spawn(() -> {
+        let t = touch(n)
+    })
+    let s: int64 = 0
+    s = s + touch(n)
+    sync()
+    println(s)
+}

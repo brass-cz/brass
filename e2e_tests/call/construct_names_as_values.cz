@@ -1,0 +1,30 @@
+// @backends: all
+// Non-function construct bindings remain values, and an Err payload binding
+// leaves error calls available to raise a new error.
+fun raise_again() {
+    match error("first") {
+        Err { error } => {
+            println(error.value)
+            return error("second")
+        }
+        Ok { value } => { return 0 }
+    }
+}
+fun main() {
+    let typeof = 1
+    let fields = 2
+    let error = 3
+    println(typeof)
+    println(fields)
+    println(error)
+    println(typeof(error))
+    for name in fields({ n: 4 }) { println(name) }
+    match raise_again() {
+        Err { error } => println(error.value)
+        Ok { value } => println(value)
+    }
+    let len = (x: int32) -> x + 10
+    let sync = () -> 20
+    println(len(1))
+    println(sync())
+}

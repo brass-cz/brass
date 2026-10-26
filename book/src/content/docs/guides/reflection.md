@@ -69,7 +69,7 @@ println("{m} {k}")
 
 These pieces combine into reflective _deserialization_: filling a struct from
 name-keyed data, or a whole JSON-to-struct decoder written once as
-`fun Json.into(self) -> infer!`. See the
+`fun JsonValue.into(self) -> infer!`. See the
 [reflection reference](/references/reflection/) for the complete rules and
 the decoder pattern.
 

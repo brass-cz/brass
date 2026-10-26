@@ -1,7 +1,5 @@
 // A forwarded Result is single-layer, so unwrapping it twice is a static
-// error (the second `!` has a plain record operand). Before forwarding was
-// fixed, the checker typed this nested and `!!` was the only way to satisfy
-// it -- and then crashed at runtime.
+// error: the second `!` has a plain record operand.
 type Point = {
     x: int32
     y: int32

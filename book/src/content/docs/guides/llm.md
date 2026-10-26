@@ -57,8 +57,9 @@ whole-program verdict.
   opening brace as `\{`.
 - Equality is `==`; `=` is assignment. Compound assignments include `+=`,
   `-=`, `*=`, `/=`, and `%=`.
-- `if` and `match` are expressions. Loops are `while condition` and
-  `for item in iterable`; `break` and `continue` are supported.
+- `if` and `match` are expressions. Written as statements they have no
+  value, so their arms need not agree in type. Loops are `while condition`
+  and `for item in iterable`; `break` and `continue` are supported.
 - Closures are `(x) -> expression` or `(x) -> { return value }`; multiple
   statements in a block need newlines. `return` requires a function or closure.
 - `_` parameters are anonymous and may repeat; `_` is never a readable value.
@@ -86,14 +87,19 @@ println("{greeting}: {values}")
 - Primitive types are `int8/16/32/64`, `uint8/16/32/64`, `float32`,
   `float64`, `bool`, `string`, and `void`. There is no character type; one
   character is a `string`.
-- Integer literals default to `int32`, or `int64` when needed. Float literals
-  default to `float64`. Float literals must remain finite at their selected
-  width: `1e400` is invalid, as is `1e39` in a `float32` context. Rounding
-  (such as `0.1`) and underflow to zero remain valid. `len` returns `int64`.
+- A numeric literal next to a typed operand takes that operand's type when it
+  fits, so `uint8` arithmetic with a literal stays `uint8` and wraps. An
+  integer literal with nothing to adapt to is `int32` if it fits, else
+  `int64`, else `uint64`; a float literal is `float64`. Float literals must
+  remain finite at their selected width: `1e400` is invalid, as is `1e39` in
+  a `float32` context. Rounding (such as `0.1`) and underflow to zero remain
+  valid. `len` returns `int64`.
 - `T[]` is a growable array, `T[n]` a fixed-length array, `[T, U]` a tuple,
-  and `[lo..hi]` a half-open integer range.
+  and `[lo..hi]` a half-open integer range. Literal elements that join as
+  numbers make an array (`[1, 2.5]` is `float64[]`), not a tuple.
 - `T?` is nullable. Narrow it with `if value`, `if !value { return ... }`, or
-  `if let` before using it as `T`.
+  `if let` before using it as `T`. Only variables narrow: bind a field first
+  (`if let next = node.next { ... }`).
 - `T!` is a fallible Result. See Error handling below.
 - Most annotations are optional. An annotation constrains inference; it does
   not opt into type safety.
@@ -133,10 +139,16 @@ println(double(2.5))   // 5.0
   requires an array with an inferred element type.
 - `self` is a reference, so instance methods can mutate their receiver.
 - Closures capture live bindings by reference and may mutate them.
+- A closure literal bound by `let`/`const` with an unannotated parameter is
+  generic: each use instantiates it afresh. Any other closure value (a
+  parameter, an argument, a field) is fixed by its first call.
 - Closures may be fallible: a body using `error(...)` or a Result-operand `!`
   returns `Result<T, E>` (no `!` sugar on closure types); the caller unwraps
   with `!` or a `match`. `spawn` still requires a `void`-returning closure.
-- Mutual-recursion cycles should annotate their return types.
+- Recursion, mutual recursion included, needs no annotations unless every
+  value a function returns comes from the recursion; the checker then asks
+  for a return type. A recursive call at a growing type (`f([x])` inside
+  `f(x)`) is rejected.
 
 ## Records, methods, sums, and interfaces
 
@@ -181,16 +193,23 @@ type Names = Stack { item: string }   // alias pinning the slot
   method signature, not stored data.
 - Sum types use `type Name = Variant { fields } | Empty`. Construct a value
   as `Name.Variant { ... }` and match it as `Variant { ... }`.
-- A match on a sum must cover every variant or use `_`.
+- A match on a sum must cover every variant or use `_`; on a nullable sum it
+  also needs a `null` or `_` arm.
 - `type Child: Parent` declares structural conformance. Fields and complete
   method signatures are checked, including parameter passing modes,
   contravariant parameter compatibility, and return types; implementations
   are not inherited. Multiple parents are allowed.
 - An unannotated function parameter is structural without an explicit
   interface: only the fields and methods used by the body are required.
+- Structural subtyping (a record with more fields where fewer are required)
+  applies to function and method parameters only. An annotated binding,
+  return, field, array element, sum payload, map entry, or function-typed
+  value needs exactly the declared record; an anonymous literal with exactly
+  its fields is built as it, anything else converts with `T.from(v)`.
 - `{ field: value }` is an anonymous record. It can dispatch to exactly one
   in-scope nominal record whose fields and requested method fit.
-- `T.from(value) -> T?` performs structural conversion to record type `T`.
+- `T.from(value) -> T?` performs structural conversion to record type `T`,
+  unless `T` declares its own static `from`, which is called instead.
 - `type name` inside a record declares a type slot: a type parameter other
   fields reference as `Self.name`. A slot is not stored and never appears in
   a construction literal; an open slot is fixed by the first value stored.
@@ -315,7 +334,9 @@ match load_number("12") {
   protocol; a string debugs quoted: `"a".debug()` is `"\"a\""`). Primitives
   also have `v.display()` (a string displays unquoted). `"{v}"` and
   `print`/`println` render through a type's own `display` method when it
-  declares one, else through `debug`; `"{v.debug()}"` forces the debug form.
+  declares one, else through `debug`; a nullable renders `null` when absent
+  and otherwise exactly like its value. `string.from(v)` renders the same
+  text as `"{v}"`. `"{v.debug()}"` forces the debug form.
   `HashMap` declares `display`: JSON-style `"key": value` lines.
 
 ## Reflection and definite assignment
@@ -361,8 +382,12 @@ No import is needed for core names:
 - Reflection/concurrency builtins: `fields`, `typeof`, `spawn`, `with`,
   `sync`.
 
-The compiler-owned names `len`, `spawn`, `with`, `sync`, `error`, `fields`,
-and `typeof` cannot be redefined.
+- Do not declare functions named `len`, `sync`, `error`, `typeof`, `fields`,
+  `spawn`, or `with`.
+- Bindings shadow `len`, `sync`, and ordinary prelude functions; a module's
+  declaration of another prelude name shadows it in that module only.
+- Calls of `error`, `typeof`, `fields`, `spawn`, and `with` remain language
+  constructs (see [Identifiers and keywords](/references/syntax/#identifiers-and-keywords)).
 
 ## Standard library overview
 
@@ -405,7 +430,9 @@ but not in the browser playground.
 Concurrency is native-runtime only:
 
 - `spawn(() -> { ... })` starts a task and is legal only inside a function;
-  its closure takes no arguments and returns `void` (or remains open).
+  its closure takes no arguments and returns `void` (or remains open). The
+  task may not access a module global that any code writes, nor reassign a
+  captured variable; mutate a captured object instead.
 - `with(shared, (value) -> { ... })` acquires compiler-managed shared state.
 - `sync()` waits for spawned work before its results are observed.
 
@@ -419,7 +446,15 @@ reading results that tasks mutate.
 - `brass check file.cz`: complete check without execution; use in CI.
 - `brass --eager file.cz`: complete check before anything runs, then run;
   native compilation is first-use in both modes.
-- `brass repl`: eager interpreter session. Concurrency is unavailable.
+- `brass --no-jit-cache file.cz`: run without JIT cache reads or writes;
+  put the flag before the program filename, as with `--eager`.
+- `brass cache info`: show the shared JIT cache location and usage.
+- `brass cache clean`: remove all cached native objects and publication temp
+  files older than 24 hours; package downloads are unaffected.
+- `brass repl`: eager interpreter session. Concurrency is unavailable. Each
+  interactive input runs once; a later input can use only bindings whose
+  initializers have no side effects (no calls, interpolation, branches, or
+  `!`).
 - `czfmt --write file.cz`: format source. `czls`: language server.
 - Every run checks from source; only native code is cached
   (`$XDG_CACHE_HOME/brass/jit/`, `BRASS_JIT_CACHE=off` disables it).

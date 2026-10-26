@@ -1,0 +1,16 @@
+// @backends: all
+// The internal `_string_char_at` builtin answers null past the end of the
+// string (and inside a multibyte character); the checker types it `string?`
+// like the back ends do, so `!` propagates the null and `if let` narrows it.
+fun first_char(s: string) -> string? {
+    const c = _string_char_at(s, 0)!
+    return c + "!"
+}
+
+fun main() {
+    println(first_char("ab"))
+    println(first_char(""))
+    if let c = _string_char_at("xyz", 2) {
+        println(c)
+    }
+}

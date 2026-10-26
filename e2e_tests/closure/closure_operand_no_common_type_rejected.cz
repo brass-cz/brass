@@ -1,0 +1,9 @@
+// A closure parameter used next to an int64 must meet int64 by the operator
+// rule: a float64 argument has no value-preserving common type with int64,
+// so the call is rejected rather than computed at either type.
+fun main() {
+    let s = "abc"
+    let add = (v) -> v + s.len()
+    let f: float64 = 1.5
+    println(add(f))
+}

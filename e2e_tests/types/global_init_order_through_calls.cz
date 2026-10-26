@@ -1,0 +1,19 @@
+// @backends: all
+// Calls during module initialization may read the globals already initialized
+// above them, and functions may read any global once initialization is over.
+fun first_plus(n) {
+    return first + n
+}
+
+fun both() {
+    return first + second
+}
+
+let first = 1
+let x = first_plus(10)
+let second = 20
+
+fun main() {
+    println(x)
+    println(both())
+}

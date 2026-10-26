@@ -1,0 +1,25 @@
+// @backends: all
+// A `ref(mut(T))` closure parameter writes through to its argument, so a
+// `const` value cannot be passed to it -- whether the closure is called
+// through a binding or handed to a function that calls it with the const
+// through a reference parameter. (A function that calls it with its own
+// UNANNOTATED parameter receives a private copy, so a const is safe there; see
+// forwarded_param_into_ref_mut_closure_copies.cz.)
+
+type Box = { v: int32 }
+
+fun apply(f, v: ref(Box)) {
+    f(v)
+}
+
+fun main() {
+    const b = Box { v: 1 }
+    let set = (x: ref(mut(Box))) -> {
+        x.v = 10
+    }
+    set(b)
+    apply((x: ref(mut(Box))) -> {
+        x.v = 12
+    }, b)
+    println(b.v)
+}

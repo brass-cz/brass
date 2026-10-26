@@ -1,0 +1,18 @@
+// @backends: all
+// A function returning a curried closure, called at three different types:
+// the inner closures' parameter types are fixed per instance of `curried`
+// (the checker's per-instance seed of each closure literal), so every
+// instance builds and calls its own closures.
+
+fun curried(n) {
+    return (x) -> (y) -> n + x + y
+}
+
+fun main() {
+    let f = curried(1)
+    println(f(2)(3))
+    let g = curried(1.5)
+    println(g(2.5)(3.0))
+    let h = curried("a")
+    println(h("b")("c"))
+}

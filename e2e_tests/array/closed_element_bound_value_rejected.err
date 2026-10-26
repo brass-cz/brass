@@ -1,0 +1,3 @@
+cannot use `PushedBox<item=int32>` where `PushedBox<item=int64>` is required
+cannot use `InsertedBox<item=int32>` where `InsertedBox<item=int64>` is required
+cannot use `FixedBox<item=int32>` where `FixedBox<item=int64>` is required

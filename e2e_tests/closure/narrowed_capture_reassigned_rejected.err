@@ -1,0 +1,4 @@
+narrowed_capture_reassigned_rejected.cz:16:19: error: nullable value must be checked for null before use
+narrowed_capture_reassigned_rejected.cz:28:24: error: nullable value must be checked for null before use
+narrowed_capture_reassigned_rejected.cz:39:23: error: nullable value must be checked for null before use
+narrowed_capture_reassigned_rejected.cz:47:23: error: nullable value must be checked for null before use

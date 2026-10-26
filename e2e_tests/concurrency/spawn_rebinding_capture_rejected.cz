@@ -1,0 +1,27 @@
+// A spawned task gets its own copy of a captured primitive and shares the
+// object a captured heap binding refers to, so reassigning the captured
+// variable itself inside the task would only rebind the task's copy: the
+// write would be lost. The compiler rejects it -- a number and a string in
+// closure literals, and a record binding in a closure spawned through a
+// variable -- instead of compiling a silently lost write.
+type Box = {
+    value: int64
+}
+
+fun main() {
+    let n = 0
+    spawn(() -> {
+        n = 5
+    })
+    let s = "a"
+    spawn(() -> {
+        s += "b"
+    })
+    let b = Box { value: 1 }
+    const task = () -> {
+        b = Box { value: 9 }
+    }
+    spawn(task)
+    sync()
+    println(n)
+}

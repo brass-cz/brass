@@ -1,0 +1,3 @@
+cannot reassign captured `n` inside `spawn`: the task works on a copy; mutate a shared object instead
+cannot reassign captured `s` inside `spawn`
+cannot reassign captured `b` inside `spawn`

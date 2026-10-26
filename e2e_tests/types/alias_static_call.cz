@@ -2,9 +2,8 @@
 // target. A plain alias (`type B = Widget`) reaches the target's statics
 // unchanged; a refinement alias (`type Names = Stack { item: string }`)
 // additionally pins its slot types into the built instance, exactly like the
-// annotated `let s: Names = Stack.new()` form. Regression: the checker used
-// to leave such calls as silent open unknowns -- `check` passed and the
-// back end refused to lower the call's result temporary.
+// annotated `let s: Names = Stack.new()` form, so the call's result is fully
+// typed.
 
 type Widget = {
     n: int64

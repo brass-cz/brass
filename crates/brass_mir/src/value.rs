@@ -19,7 +19,10 @@ use crate::ids::{ClosureId, LocalId};
 /// always fully constant text.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Literal {
-    Int(i64),
+    /// An integer constant, sign included. Its range covers every Brass
+    /// integer type (`int64` through `uint64`); the type it takes is decided
+    /// by monomorphization from the value and the operand context.
+    Int(i128),
     Float(f64),
     Str(String),
     Bool(bool),
@@ -91,17 +94,25 @@ impl Place {
 ///
 /// The split is purely *syntactic / name-resolution* based, never type based:
 /// which concrete monomorphic instance a `Free`/`Method`/`Static` call selects
-/// is decided later from the argument types. This mirrors how the current
-/// AST-walking codegen routes calls (`codegen::gen_call`), so a later MIR-driven
-/// codegen is a faithful refactor.
+/// is decided later, by monomorphization, from the argument types.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Callee {
     /// A free function, named by its resolved module-qualified storage symbol.
     Free(String),
+    /// A free call with a return-origin contract selected per enclosing instance.
+    NumericFree {
+        base: String,
+        site: brass_parser::Span,
+    },
+    /// A method or static call with a negotiated body contract.
+    Numeric {
+        inner: Box<Callee>,
+        site: brass_parser::Span,
+    },
     /// An instance method `recv.method(args)`; the receiver is the first call
     /// operand. The receiving type is recovered from that operand's type.
     Method(String),
-    /// A static / UFCS call `Type.method(args)`. `ty` is the dispatch key: a
+    /// A static method call `Type.method(args)`. `ty` is the dispatch key: a
     /// user type's unique symbol, or a primitive type word (`int32`, ...).
     Static { ty: String, method: String },
     /// A runtime builtin or intrinsic with no user-level definition (`print`,
@@ -109,6 +120,18 @@ pub enum Callee {
     Builtin(String),
     /// An indirect call through a closure/function value operand.
     Indirect(Operand),
+    /// A reflective (`-> infer!`) method call that the instances of the
+    /// enclosing body key differently, so each dispatches to a different
+    /// generated specialization. `site` (the call's source span) keys the
+    /// checker's per-instance dispatch ([`crate::MirProgram::instance_dispatch`]);
+    /// monomorphization resolves it for the instance it types, and the call
+    /// then dispatches exactly like [`Callee::Method`] naming that
+    /// specialization (the receiver is the first operand). `method` is the
+    /// reflective template's name, for diagnostics.
+    Keyed {
+        method: String,
+        site: brass_parser::Span,
+    },
 }
 
 /// The single computation performed by an assignment statement.
@@ -135,8 +158,7 @@ pub enum Rvalue {
         ty: String,
         fields: Vec<(String, Operand)>,
     },
-    /// A sum-type variant construction. `error(x)` lowers to the built-in
-    /// `Result.Err { error: x }` form of this node.
+    /// A sum-type variant construction.
     Variant {
         ty: String,
         variant: String,
@@ -144,7 +166,8 @@ pub enum Rvalue {
     },
     /// `T.from(v)`: a fallible structural conversion to record type `T`. The result
     /// is `T?` -- the record built by reading every field of `T` from `source` when
-    /// the (monomorphized) source type has them all, otherwise null. The
+    /// the (monomorphized) source type has them all, each flowing into its field
+    /// type by a flow conversion, otherwise null. The
     /// field-presence decision is made per instance by the back ends, so a `source`
     /// missing a field becomes a runtime null rather than a static error.
     RecordFrom { ty: String, source: Operand },
@@ -174,7 +197,7 @@ pub enum Rvalue {
     /// evaluated for its effects like any other argument.
     TypeName(Operand),
     /// A type test (`if v: T`): whether the operand's monomorphized type
-    /// matches the checker-resolved pattern (`brass_hir::type_test_matches`;
+    /// matches the checker-resolved pattern (`brass_typesys::type_test_accepts`;
     /// `Unknown` positions are `infer` wildcards). Like `TypeName`, nothing is
     /// baked per instance: each back end folds it to a constant bool from the
     /// operand's own type, and branch folding prunes the untaken arm, so the
@@ -227,10 +250,19 @@ impl fmt::Display for Callee {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Callee::Free(sym) => write!(f, "fn {sym}"),
+            Callee::Numeric { inner, site } => {
+                write!(f, "numeric {inner}@{}..{}", site.lo, site.hi)
+            }
+            Callee::NumericFree { base, site } => {
+                write!(f, "numeric fn {base}@{}..{}", site.lo, site.hi)
+            }
             Callee::Method(m) => write!(f, "method .{m}"),
             Callee::Static { ty, method } => write!(f, "static {ty}.{method}"),
             Callee::Builtin(name) => write!(f, "builtin {name}"),
             Callee::Indirect(op) => write!(f, "indirect {op}"),
+            Callee::Keyed { method, site } => {
+                write!(f, "keyed .{method}@{}..{}", site.lo, site.hi)
+            }
         }
     }
 }

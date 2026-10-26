@@ -7,9 +7,9 @@ The standard library has two layers:
 
 - **`core` -- the implicit prelude**: every module under `core/` (`io`,
   `array`, `string`, `math`, `conv`, `assert`, `error`, `is`, `default`,
-  `collections`) plus the runtime builtins. It is embedded in the compiler,
-  and the public names of every core module are in scope in every program
-  with no import -- `HashMap` included.
+  `show`, `collections`) plus the runtime builtins. It is embedded in the
+  compiler, and the public names of every core module are in scope in every
+  program with no import -- `HashMap` included.
 - **`std` -- the shipped library tree**: the `std/` directory distributed
   beside the toolchain (`fs`, `net`, `process`, `path`, `env`, `hash`,
   `regex`, `semver`, `url`, `http`, `data.json`, `data.toml`, ...), imported
@@ -24,8 +24,10 @@ runtime primitives. Identifiers beginning with `_` (e.g. `_string_bytes`,
 their command-line interface is documented in the
 [package-manager guide](/guides/packages/).
 
-Reserved builtin names that cannot be redefined: `len`, `spawn`, `with`,
-`sync`, `error`, `fields`, `typeof`.
+The builtin names `len`, `spawn`, `with`, `sync`, `error`, `fields`, and
+`typeof` cannot be redefined by a function declaration; their binding and call
+rules are specified in
+[Identifiers and keywords](/references/syntax/#identifiers-and-keywords).
 
 ## Builtins
 
@@ -74,12 +76,9 @@ a user-defined `Location` is an ordinary record and its parameters remain
 required. Compiler-created traces use the prelude `Error`, `Location`, and
 `Frame` even when a module declares types with those names.
 
-The compiler's reserved handling of
-`error(...)` still validates that signature: one payload is required, only the
-trailing `Location` may be omitted, and other arities or argument types fail.
-The nullable overload belongs to the compiler because `T?` has no nominal
-type. Its `Result<T, E>?` case recognizes the prelude `Result` and removes the
-outer `?`; it never constructs `Result<Result<T, E>, ...>`.
+The nullable `context` overload belongs to the compiler because `T?` has no
+nominal type. Its `Result<T, E>?` case recognizes the prelude `Result` and
+removes the outer `?`; it never constructs `Result<Result<T, E>, ...>`.
 
 ## Type tests and defaults
 
@@ -128,8 +127,10 @@ mutate in place.
 ## `core.collections`
 
 Part of the implicit prelude: `HashMap` needs no import. Keys may be of any
-type that renders to a stable string and compares with `==`; values may be of
-any type. Key and value types are inferred from `set` or `from_pairs`.
+type that renders to a stable string and compares with `==` (structural
+[equality](/references/types/#equality)); values may be of any type. Key and
+value types are inferred from `set` or `from_pairs`, or pinned by a refinement
+(`type Counts = HashMap { key: string, value: int32 }`).
 
 | Method                      | Signature                    | Behavior                                   |
 | --------------------------- | ---------------------------- | ------------------------------------------ |
@@ -144,6 +145,7 @@ any type. Key and value types are inferred from `set` or `from_pairs`.
 | `m.keys()` / `m.values()`   | `() -> K[]` / `() -> V[]`    | unspecified slot order                     |
 | `m.pairs()`                 | `() -> [K, V][]`             | same order as `keys()`                     |
 | `m.clear()`                 | `() -> void`                 | remove all pairs, retaining inferred types |
+| `m.display()`               | `() -> string`               | JSON-style text; what `"{m}"` prints       |
 
 ## `core.string`
 
@@ -187,9 +189,32 @@ Free-function aliases of the conversion methods: `int32_from(x) -> int32!`,
 `int32_parse(s) -> int32!`, `float64_from(x) -> float64`,
 `float64_parse(s) -> float64!`, `string_from(x) -> string`. The method forms
 (`T.from`, `T.parse`) are described in the
-[type system](/references/types/#explicit-conversions). Integer-to-float
-conversion reads the full source width, so a `uint64` above `INT64_MAX` remains
-positive (with the expected floating-point rounding).
+[type system](/references/types/#explicit-conversions). `string.from(x)` (and
+`string_from(x)`) is the text `"{x}"` and `print(x)` show (see
+[`core.show`](#coreshow)). Integer-to-float conversion reads the full source
+width, so a `uint64` above `INT64_MAX` remains positive (with the expected
+floating-point rounding).
+
+## `core.show`
+
+The rendering protocols behind `print`, `println`, `"{v}"`, and
+`string.from`:
+
+| Type      | Shape                           | Satisfied by                                                             |
+| --------- | ------------------------------- | ------------------------------------------------------------------------ |
+| `Debug`   | `{ debug: (Self) -> string }`   | every type: the primitives declare it here, others use the built-in form |
+| `Display` | `{ display: (Self) -> string }` | the primitives, and a type declaring `fun T.display(self)`               |
+
+A value renders through its type's `display` when the type declares one, and
+otherwise in the built-in `debug` form; a nullable renders `null` or its
+present value's rendering. `debug` and `display` agree on every primitive
+except `string`, whose `debug` form is quoted, with quotes, backslashes, and
+control characters escaped (`"a".debug()` is `"\"a\""`). The built-in form
+writes a record or variant as its name and fields, one field per line, a tuple
+or array as `[a, b]`, and a function-valued field as `<opaque>`. The values
+inside it are in their own built-in form whatever `display` their types
+declare, except that the string elements of an array or tuple are unquoted
+(string fields are quoted). `v.debug()` forces the debug form.
 
 ## `core.assert`
 
@@ -299,7 +324,7 @@ answers with a path builds a new one, so a `Path` may be shared freely.
 | `Path.home()` / `temp_dir()`            | `() -> Path!`                          | the home / temporary directory                  |
 | `p.to_string()`                         | `() -> string`                         | `.` for the empty path                          |
 | `p.components()`                        | `() -> string[]`                       | a copy, the root included as `/`                |
-| `p.depth()`                             | `() -> int64`                          | component count (`len` is a reserved builtin)   |
+| `p.depth()`                             | `() -> int64`                          | component count                                 |
 | `p.is_absolute()` / `is_root()`         | `() -> bool`                           | shape of the path, not what is on disk          |
 | `p.parent()` / `basename()`             | `() -> Path`                           | the root is its own parent                      |
 | `p.join(s)`                             | `(string \| string[] \| Path) -> Path` | absolute `s` replaces `p`                       |
@@ -405,18 +430,18 @@ link in the tree is recreated as a link rather than followed, as `cp -R` does.
 `copy` and `move` take **either kind**, dispatching on what `source` turns out
 to be, which is handy when the caller does not know or does not care. Each half
 keeps its own rule about an existing target (a file is replaced, a tree is
-refused), so reach for the specific call when it matters which one you are doing.
+refused), so reach for the specific call when it matters which one you are
+doing.
 
-`create_dir` and `remove_dir` are both recursive: `create_dir` makes every missing parent
-and treats an existing directory as success, while `remove_dir` takes the whole
-tree, removing a symbolic link inside it as a link rather than following it. A
-directory that is not there is an **error** for `remove_dir` too, matching
-`remove_file`.
+`create_dir` and `remove_dir` are both recursive: `create_dir` makes every
+missing parent and treats an existing directory as success, while `remove_dir`
+takes the whole tree, removing a symbolic link inside it as a link rather than
+following it. A directory that is not there is an **error** for `remove_dir`
+too, matching `remove_file`.
 
 File I/O runs on both back ends: the plugin executes natively whether the
-program is JIT-compiled or interpreted, so the old "the REPL refuses file
-I/O" rule is gone (only `spawn` remains JIT-only). The playground has no
-filesystem, so the examples here are not runnable in it.
+program is JIT-compiled or interpreted. The playground has no filesystem, so
+the examples here are not runnable in it.
 
 ## `std.env`
 
@@ -455,10 +480,8 @@ import std.hash.{ sha256, hmac_sha256, hex, equal, Hasher }
 ```
 
 Message digests (MD5, SHA-1, SHA-2) and HMAC. A plugin under `std/`
-wrapping the RustCrypto implementations, since these algorithms are built
-from wrapping 32/64-bit arithmetic, which Brass does not have; a Brass
-implementation would be a hand-masked emulation whose failure mode is a
-silently wrong digest.
+wrapping the RustCrypto implementations rather than a Brass port, whose
+failure mode would be a silently wrong digest.
 
 A digest is a `uint8[]`: the algorithm's raw bytes. Hash text by its UTF-8
 bytes with the prelude's `to_bytes`, and render the result with `hex`:
@@ -686,7 +709,7 @@ so frame messages or read in a loop.
 **`TlsStream`**: TLS **client** connections, backed by rustls inside the
 plugin. Certificate verification uses the bundled Mozilla root set with the
 server name taken from `host`; there are no configuration knobs (no custom
-CAs, no server side yet). `TlsStream` mirrors `Tcp`, so code written against
+CAs, no server side). `TlsStream` mirrors `Tcp`, so code written against
 `read`/`write` structurally accepts either:
 
 | Method                          | Signature                       | Behavior                                                   |

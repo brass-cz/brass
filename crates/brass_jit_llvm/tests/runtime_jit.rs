@@ -1,24 +1,13 @@
-//! End-to-end test of the runtime JIT compilation backend: the
-//! `brass_engine`-defined `RuntimeJit` trait, implemented by the LLVM backend,
-//! compiles a monomorphized instance into the *live* execution engine after
-//! `finalize` and returns its callable address.
+//! Runtime compilation into a live engine: after `finalize`, the lazy JIT's
+//! resolver registers monomorphized batches with `LlvmCodegen::register_batch`
+//! and looks their bodies up with `address_of`. These tests drive that API
+//! directly, without the driver.
 
-use brass_engine::{
-    Codegen, MonomorphCache, RuntimeJit, boundary_record_type, instance_symbol,
-    monomorphize_instance, resolve_or_compile,
-};
-use brass_hir::{IntKind, Type};
-use brass_jit_llvm::{LlvmCodegen, RuntimeDispatcher, with_dispatcher};
+use brass_engine::Codegen;
 use inkwell::context::Context;
 
-/// After the engine is finalized (instances only declared), an instance compiled
-/// at runtime through `RuntimeJit::compile_instance` is callable and correct --
-/// the capability deferred monomorphization is built on, exercised through the
-/// clean engine-trait / jit_llvm-impl boundary.
-#[test]
-fn compiles_and_runs_an_instance_after_finalize() {
-    let src = "fun triple(n: int32) -> int32 {\n  return n + n + n\n}\n\
-               fun main() {\n  let x = triple(7)\n}\n";
+/// Parse a single-module program and lower it to HIR and MIR.
+fn lower(src: &str) -> (brass_hir::Program, brass_mir::MirProgram) {
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errs) = brass_hir::lower(&[brass_hir::LoadedModule {
         is_prelude: false,
@@ -27,233 +16,55 @@ fn compiles_and_runs_an_instance_after_finalize() {
     }]);
     assert!(errs.is_empty(), "lower: {errs:?}");
     let mir = brass_mir::lower_program(&program);
+    (program, mir)
+}
+
+/// After the engine is finalized with every instance only declared, a batch
+/// registered at runtime is callable and computes the right value.
+#[test]
+fn compiles_and_runs_an_instance_after_finalize() {
+    let (program, mir) = lower(
+        "fun triple(n: int32) -> int32 {\n  return n + n + n\n}\n\
+         fun main() {\n  let x = triple(7)\n}\n",
+    );
     let mono = brass_engine::monomorphize(&mir, &program).expect("monomorphize");
 
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
-    let mut backend = LlvmCodegen::new_backend(&ctx, &program);
+    let mut backend = brass_jit_llvm::LlvmCodegen::new_backend(&ctx, &program);
     // Declare every instance, then finalize -- no bodies are emitted statically.
     backend.begin_program(&mono);
     backend.finalize().expect("finalize");
 
-    // Compile `triple` at runtime and call it through the returned address.
-    let f = mono
+    let symbol = &mono
         .functions
         .iter()
         .find(|f| f.symbol.contains("triple"))
-        .expect("triple instance");
+        .expect("triple instance")
+        .symbol;
+    backend.register_batch(&mono).expect("runtime batch");
     let addr = backend
-        .compile_instance(&mono, f)
+        .address_of(symbol)
         .expect("runtime instance compiles");
     let triple: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(addr) };
     assert_eq!(triple(7), 21);
 }
 
-/// On-demand monomorphization: a consumer with a *deferred*
-/// parameter is specialized for a type discovered "at runtime" and compiled then.
-/// `get_age(p)` was never specialized statically (its `p` is unannotated and it is
-/// not called with `Person`); monomorphize_instance specializes it for `Person`,
-/// and the LLVM backend compiles that instance into the live engine.
-#[test]
-fn on_demand_monomorphize_and_compile_for_a_runtime_type() {
-    let src = "type Person = {\n  age: int32\n}\n\
-               fun get_age(p) -> int32 {\n  return p.age\n}\n\
-               fun main() {\n}\n";
-    let ast = brass_parser::parse(src).expect("parse");
-    let (program, errs) = brass_hir::lower(&[brass_hir::LoadedModule {
-        is_prelude: false,
-        path: vec!["main".into()],
-        ast,
-    }]);
-    assert!(errs.is_empty(), "lower: {errs:?}");
-    let mir = brass_mir::lower_program(&program);
-
-    // The type fixed "at runtime" (as the deserialize boundary would build it):
-    // a record nominal carrying its field types, exactly as a constructed record.
-    let person = brass_engine::boundary_record_type(&program, &["main".into()], "Person")
-        .expect("Person record type");
-    let get_age = mir
-        .functions
-        .iter()
-        .find(|f| f.name == "get_age")
-        .map(|f| f.symbol.clone())
-        .expect("get_age lowered");
-
-    // Specialize `get_age` for `p: Person` on demand. A type missing `age` would
-    // make this fail -- the structural check enforced at the boundary.
-    let mono = brass_engine::monomorphize_instance(&mir, &program, &get_age, vec![person.clone()])
-        .expect("on-demand monomorphization");
-    let inst = brass_engine::instance_symbol(&get_age, std::slice::from_ref(&person));
-    let f = mono.lookup(&inst).expect("the specialized instance");
-    assert_eq!(
-        f.type_args,
-        vec![person.clone()],
-        "p is specialized to Person"
-    );
-    assert_eq!(f.ret, Type::Int(IntKind::I32), "p.age is int32");
-
-    // Compile the on-demand instance into a live engine.
-    brass_jit_llvm::disable_jit_cache_for_tests();
-    let ctx = Context::create();
-    let mut backend = LlvmCodegen::new_backend(&ctx, &program);
-    backend.begin_program(&mono);
-    backend.finalize().expect("finalize");
-    let addr = backend
-        .compile_instance(&mono, f)
-        .expect("on-demand instance compiles");
-    assert!(addr != 0, "compiled instance has an address");
-}
-
-/// The full deferred-monomorphization flow: a consumer of an externally-typed
-/// value is compiled once per
-/// distinct runtime type (cached) and runs correctly on a value of that type;
-/// a runtime type missing a required field is rejected at the boundary rather
-/// than miscompiled. Driven here through the engine's `resolve_or_compile`
-/// orchestration over the LLVM `RuntimeJit` backend.
-#[test]
-fn deferred_monomorphization_end_to_end() {
-    let src = "type Person = {\n  age: int32\n}\n\
-               type Other = {\n  name: string\n}\n\
-               fun get_age(p) -> int32 {\n  return p.age\n}\n\
-               fun main() {\n}\n";
-    let ast = brass_parser::parse(src).expect("parse");
-    let (program, errs) = brass_hir::lower(&[brass_hir::LoadedModule {
-        is_prelude: false,
-        path: vec!["main".into()],
-        ast,
-    }]);
-    assert!(errs.is_empty(), "lower: {errs:?}");
-    let mir = brass_mir::lower_program(&program);
-
-    let person = boundary_record_type(&program, &["main".into()], "Person").expect("Person type");
-    let get_age = mir
-        .functions
-        .iter()
-        .find(|f| f.name == "get_age")
-        .map(|f| f.symbol.clone())
-        .expect("get_age");
-    let mono = monomorphize_instance(&mir, &program, &get_age, vec![person.clone()])
-        .expect("specialize get_age for Person");
-    let inst = instance_symbol(&get_age, &[person]);
-
-    brass_jit_llvm::disable_jit_cache_for_tests();
-    let ctx = Context::create();
-    let mut backend = LlvmCodegen::new_backend(&ctx, &program);
-    backend.begin_program(&mono);
-    backend.finalize().expect("finalize");
-
-    // Compile-once-per-type, cached: two requests for the same instance compile
-    // it once and return the same address.
-    let mut cache = MonomorphCache::new();
-    let addr1 = resolve_or_compile(&mut cache, &mut backend, &mono, &inst).expect("resolve");
-    let addr2 = resolve_or_compile(&mut cache, &mut backend, &mono, &inst).expect("cached");
-    assert_eq!(addr1, addr2);
-    assert_eq!(cache.len(), 1, "compiled once, then cached");
-
-    // Dispatch: build a `Person { age: 42 }` (header16 | age@16) as the boundary
-    // value and call the on-demand-compiled consumer on it.
-    let mut storage = [0u64; 3];
-    storage[2] = 42; // int32 `age` at byte offset 16
-    let person_ptr = storage.as_mut_ptr() as *mut std::ffi::c_void;
-    let get_age_fn: extern "C" fn(*mut std::ffi::c_void) -> i32 =
-        unsafe { std::mem::transmute(addr1) };
-    assert_eq!(
-        get_age_fn(person_ptr),
-        42,
-        "deferred dispatch returns p.age"
-    );
-
-    // A runtime type missing `age` is rejected before specialization.
-    let other = boundary_record_type(&program, &["main".into()], "Other").expect("Other type");
-    assert!(
-        monomorphize_instance(&mir, &program, &get_age, vec![other]).is_err(),
-        "a type missing `age` must be rejected at the boundary, not miscompiled"
-    );
-}
-
-/// The in-language end-to-end: a Brass program whose `run_it`
-/// calls the `__rt_dispatch` builtin triggers deferred monomorphization at
-/// runtime -- `get_age` is JIT-compiled for `Person` in the dispatcher's engine
-/// (separate from the engine running the program, so compiling never reentrantly
-/// mutates it) and dispatched on the value, returning `p.age`.
-#[test]
-fn brass_program_triggers_deferred_dispatch() {
-    let src = "type Person = {\n  age: int32\n}\n\
-               fun get_age(p) -> int32 {\n  return p.age\n}\n\
-               fun run_it(p: Person) -> int32 {\n  return __rt_dispatch(\"get_age\", \"Person\", p)\n}\n\
-               fun main() {\n  let seed = Person { age: 0 }\n  let _ = run_it(seed)\n}\n";
-    let ast = brass_parser::parse(src).expect("parse");
-    let (program, errs) = brass_hir::lower(&[brass_hir::LoadedModule {
-        is_prelude: false,
-        path: vec!["main".into()],
-        ast,
-    }]);
-    assert!(errs.is_empty(), "lower: {errs:?}");
-    let mir = brass_mir::lower_program(&program);
-    let static_mono = brass_engine::monomorphize(&mir, &program).expect("monomorphize");
-
-    let person = boundary_record_type(&program, &["main".into()], "Person").expect("Person type");
-    let run_it = mir
-        .functions
-        .iter()
-        .find(|f| f.name == "run_it")
-        .map(|f| f.symbol.clone())
-        .expect("run_it");
-    let run_it_inst = instance_symbol(&run_it, &[person]);
-
-    brass_jit_llvm::disable_jit_cache_for_tests();
-    let ctx = Context::create();
-    // The engine that runs the program (compiles `run_it`, whose body calls
-    // `__rt_dispatch` -> `pp_resolve`).
-    let mut main_backend = LlvmCodegen::new_backend(&ctx, &program);
-    main_backend.begin_program(&static_mono);
-    main_backend.codegen_program(&static_mono);
-    main_backend.finalize().expect("finalize main");
-
-    // A *separate* engine for the dispatcher, so compiling a deferred instance
-    // never reentrantly mutates the engine running the program.
-    let mut disp_backend = LlvmCodegen::new_backend(&ctx, &program);
-    disp_backend.begin_program(&static_mono);
-    disp_backend.finalize().expect("finalize dispatcher");
-
-    let run_it_addr = main_backend
-        .address_of(&run_it_inst)
-        .expect("run_it$Person compiled");
-    // A `Person { age: 42 }` value (header16 | age@16).
-    let mut storage = [0u64; 3];
-    storage[2] = 42;
-    let person_ptr = storage.as_mut_ptr() as *mut std::ffi::c_void;
-    let run_it_fn: extern "C" fn(*mut std::ffi::c_void) -> i32 =
-        unsafe { std::mem::transmute(run_it_addr) };
-
-    let mut dispatcher = RuntimeDispatcher::new(&mir, &program, &mut disp_backend);
-    let result = with_dispatcher(&mut dispatcher, || run_it_fn(person_ptr));
-    assert_eq!(
-        result, 42,
-        "a Brass program triggered deferred compilation + dispatch of get_age"
-    );
-}
-
-/// A runtime specialization includes its new callees, skips a startup definition,
-/// and can be submitted twice without redefining symbols or changing addresses.
+/// A runtime batch includes the requested instance's new callees, skips a
+/// definition supplied at startup, and can be registered twice without
+/// redefining symbols or changing addresses.
 #[test]
 fn runtime_batch_keeps_startup_definitions_and_registers_callees() {
-    let src = "fun seed() -> int32 { return 10 }\n\
-               fun helper() -> int32 { return 7 }\n\
-               fun answer() -> int32 { return seed() + helper() }\n\
-               fun main() { let value = answer() }\n";
-    let ast = brass_parser::parse(src).expect("parse");
-    let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
-        is_prelude: false,
-        path: vec!["main".into()],
-        ast,
-    }]);
-    assert!(errors.is_empty(), "{errors:?}");
-    let mir = brass_mir::lower_program(&program);
+    let (program, mir) = lower(
+        "fun seed() -> int32 { return 10 }\n\
+         fun helper() -> int32 { return 7 }\n\
+         fun answer() -> int32 { return seed() + helper() }\n\
+         fun main() { let value = answer() }\n",
+    );
     let mono = brass_engine::monomorphize(&mir, &program).expect("monomorphize");
-    brass_jit_llvm::disable_jit_cache_for_tests();
+    brass_jit_llvm::disable_jit_cache();
     let ctx = Context::create();
-    let mut backend = LlvmCodegen::new_backend(&ctx, &program);
+    let mut backend = brass_jit_llvm::LlvmCodegen::new_backend(&ctx, &program);
     backend.begin_program(&mono);
     let seed = mono
         .functions
@@ -263,18 +74,12 @@ fn runtime_batch_keeps_startup_definitions_and_registers_callees() {
     backend.codegen_function(&mono, seed);
     backend.finalize().expect("finalize startup");
     let seed_address = backend.address_of(&seed.symbol).expect("startup address");
-    let answer = mono
-        .functions
-        .iter()
-        .find(|f| f.symbol == "answer")
-        .expect("answer");
-    let first = backend
-        .compile_instance(&mono, answer)
-        .expect("register batch");
-    let second = backend
-        .compile_instance(&mono, answer)
-        .expect("repeat batch");
+
+    backend.register_batch(&mono).expect("register batch");
+    let first = backend.address_of("answer").expect("answer address");
+    backend.register_batch(&mono).expect("repeat batch");
+    let second = backend.address_of("answer").expect("answer address");
     assert_eq!(first, second);
     assert_eq!(backend.address_of(&seed.symbol), Some(seed_address));
-    assert_eq!(backend.run_entry_i32(&answer.symbol), Some(17));
+    assert_eq!(backend.run_entry_i32("answer"), Some(17));
 }

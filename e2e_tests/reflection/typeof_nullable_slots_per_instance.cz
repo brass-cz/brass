@@ -1,0 +1,25 @@
+// @backends: all
+// Each generic instance preserves the type denoted by a typeof annotation, even without a value witness.
+fun empty(v) {
+    let x: typeof(v)? = null
+    println(typeof(x))
+}
+fun through(v) { empty(v) }
+through(1)
+through("s")
+through(2)
+fun arrays(v) {
+    let xs: typeof(v)[] = []
+    println(typeof(xs))
+}
+arrays("s")
+arrays(1)
+fun captured(v) {
+    let x: typeof(v)? = null
+    let set = () -> { x = v }
+    println(typeof(x))
+    set()
+    println(x)
+}
+captured(1)
+captured("s")

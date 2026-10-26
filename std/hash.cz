@@ -7,10 +7,9 @@
 // further import is needed.
 //
 // This lives in `std` rather than `core`: the digests are RustCrypto
-// implementations behind a plugin. Every one of these algorithms is built from
-// wrapping 32/64-bit arithmetic, which Brass does not have, so a Brass
-// implementation would be a hand-masked emulation whose failure mode is a
-// silently wrong digest. A distributed toolchain binds the `std` package
+// implementations behind a plugin, reusing their one-shot and streaming APIs.
+// Brass's uint32 and uint64 arithmetic wraps; the plugin provides the digest
+// implementations. A distributed toolchain binds the `std` package
 // automatically (`<bin>/../std`); elsewhere declare it and import:
 //
 //     BRASS_PACKAGES=std=/path/to/toolchain

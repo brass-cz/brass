@@ -1,14 +1,26 @@
 //! Shared AST traversal used by the type-checking passes. Visits every
 //! expression reachable from function bodies, method bodies, and module-level
-//! statements.
+//! statements, and collects the values a statement-position expression
+//! discards ([`discarded_value_spans`]).
 
 use brass_hir::{Program, TypeKind};
+use brass_parser::Span;
 use brass_parser::ast::*;
 
+/// A pre-order expression visitor: the walk functions call [`Self::visit`] on
+/// each expression before descending into its subexpressions.
 pub trait ExprVisitor {
     fn visit(&mut self, e: &Expr);
+
+    /// Called by [`walk_program_exprs_in`] before it walks each body, with
+    /// the module the body belongs to (names in it resolve in that module's
+    /// scope). Visitors that resolve no names ignore it.
+    fn enter_module(&mut self, _module: &[String]) {}
 }
 
+/// Visit every expression of the function bodies, method bodies and module
+/// initializers of the modules `modules` checks, announcing each body's module
+/// first ([`ExprVisitor::enter_module`]).
 pub(crate) fn walk_program_exprs_in(
     program: &Program,
     modules: crate::AnalysisModules<'_>,
@@ -18,12 +30,14 @@ pub(crate) fn walk_program_exprs_in(
         if !modules.checks(&f.module) {
             continue;
         }
+        v.enter_module(&f.module);
         walk_block(&f.decl.body, v);
     }
     for t in program.types.values() {
         if !modules.checks(&t.module) {
             continue;
         }
+        v.enter_module(&t.module);
         match &t.kind {
             TypeKind::Record { methods, .. } => {
                 for m in methods.values() {
@@ -47,6 +61,7 @@ pub(crate) fn walk_program_exprs_in(
         if !modules.checks(&init.path) {
             continue;
         }
+        v.enter_module(&init.path);
         for s in &init.stmts {
             walk_stmt(s, v);
         }
@@ -131,6 +146,33 @@ pub fn walk_expr(e: &Expr, v: &mut impl ExprVisitor) {
         }
         Expr::Block(b, _) => walk_block(b, v),
         Expr::TypeTest(subject, _, _, _) => walk_expr(subject, v),
+        _ => {}
+    }
+}
+
+/// The spans of the values a statement-position `e` discards: `e` itself and,
+/// through `if`/`if let`/`match` arms and blocks, each arm's trailing
+/// expression -- the value of an arm is the value of the whole statement.
+pub(crate) fn discarded_value_spans(e: &Expr, out: &mut Vec<Span>) {
+    fn block_tail(b: &Block, out: &mut Vec<Span>) {
+        if let Some(Stmt::Expr(tail)) = b.stmts.last() {
+            discarded_value_spans(tail, out);
+        }
+    }
+    out.push(e.span());
+    match e {
+        Expr::If(_, then, els, _) | Expr::IfLet(_, _, then, els, _) => {
+            block_tail(then, out);
+            if let Some(els) = els {
+                discarded_value_spans(els, out);
+            }
+        }
+        Expr::Match(_, arms, _) => {
+            for arm in arms {
+                discarded_value_spans(&arm.body, out);
+            }
+        }
+        Expr::Block(b, _) => block_tail(b, out),
         _ => {}
     }
 }

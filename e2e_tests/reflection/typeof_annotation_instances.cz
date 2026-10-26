@@ -1,9 +1,6 @@
-// A `let y: typeof(x) = x` slot in a generic body must take each instance's
-// own type. The annotation's resolved type is span-keyed while all instances
-// share one MIR body, so on a cross-instance disagreement the checker drops
-// the recorded slot type and the binding is inferred per instance from its
-// initializer -- the string instance must not be read through the record's
-// layout (or vice versa).
+// A `let y: typeof(x) = x` slot in a generic body takes each instance's own
+// type: the string, the record and the integer instance of `dup` each bind
+// and return their own value, although all instances share one MIR body.
 type A = { v: int64 }
 
 fun dup(x) {

@@ -1,0 +1,36 @@
+// @backends: all
+// An integer literal in a float context becomes that float when the float
+// represents its value exactly, float32 included: an annotated binding, an
+// argument, array elements under a float annotation (alone or mixed with a
+// float literal), a push into a float array, and a tuple position (bound,
+// returned or passed).
+fun f32_param(x: float32) {
+    println("{x} {typeof(x)}")
+}
+
+fun pair() -> [float64, int64] {
+    return [1, 2]
+}
+
+fun show_pair(t: [float64, int64]) {
+    println(t)
+}
+
+fun main() {
+    let e: float32 = 3
+    println("{e} {typeof(e)}")
+    f32_param(3)
+    let xs: float32[] = [1, 2]
+    println(xs)
+    let a: float32[] = [2.5, 1]
+    println(a)
+    let ys: float64[] = []
+    ys.push(1)
+    println(ys)
+    let t: [float64, int64] = [1, 2]
+    println(t)
+    println(pair())
+    show_pair([3, 4])
+    let n: float32 = -16777216
+    println(n)
+}

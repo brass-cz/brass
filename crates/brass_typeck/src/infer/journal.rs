@@ -1,4 +1,12 @@
 //! Replayable observations made while elaborating callable bodies.
+//!
+//! The channel observations of a call-site elaboration go through `record_*`
+//! helpers (most of them here), which apply them and journal them in the
+//! elaboration's window. A clean elaboration's journal becomes a memo entry
+//! over canonical input variables (see `Checker::elaboration_memo`); a later
+//! call with the same canonical inputs replays the entry through the same
+//! helpers instead of walking the body again, so poisoning and conflict
+//! reports behave as in a real elaboration.
 
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
@@ -6,7 +14,12 @@ use std::hash::{Hash, Hasher};
 use brass_hir::{Constness, TypedExprKind};
 use fxhash::{FxHashMap, FxHasher};
 
+use super::instances::{InstanceTag, KeyedObservation, TagRef};
 use super::*;
+
+mod chunks;
+mod concrete;
+use chunks::Chunks;
 
 /// One open input variable after first-occurrence canonicalization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -18,6 +31,8 @@ pub(super) struct CanonVar {
 /// A callable elaboration key independent of the checker's inference ids.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct ElaborationMemoKey {
+    /// Separate ordinary observations from co-check observations and roots.
+    pub(super) flavor: MemoFlavor,
     pub(super) callable: String,
     pub(super) receiver: Option<Type>,
     pub(super) args: Vec<Type>,
@@ -25,7 +40,18 @@ pub(super) struct ElaborationMemoKey {
     pub(super) canon_vars: Vec<CanonVar>,
 }
 
+/// The observation contract under which a reusable body walk was performed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum MemoFlavor {
+    /// An ordinary call may publish its fully settled instance return.
+    Ordinary,
+    /// A co-check never publishes an instance return. Rootless walks cannot
+    /// consume entries recorded while an enclosing co-method owned effects.
+    CoCheck { has_root: bool },
+}
+
 /// The key plus the caller variables represented by its canonical slots.
+#[derive(Clone)]
 pub(super) struct ElaborationMemoContext {
     pub(super) key: ElaborationMemoKey,
     pub(super) inputs: Vec<(CanonVar, Type)>,
@@ -46,6 +72,11 @@ pub(super) enum ElaborationJournalEntry {
         span: Span,
         ty: Type,
         constness: Constness,
+        /// The instance the observation was made in (see
+        /// `Checker::current_instance`); a replay substitutes its argument
+        /// types like the observed type's, so a nested elaboration's
+        /// observations stay attributed to that nested instance.
+        instance: Option<TagRef>,
     },
     PropKind(Span, PropKind),
     NullProp(Span),
@@ -54,47 +85,129 @@ pub(super) enum ElaborationJournalEntry {
     LiftKind(Span, bool),
     LiftErr(Span),
     TypeName(Span, String),
+    /// An anonymous record literal built as the declared record (symbol).
+    LiteralNominal(Span, String),
     TypeOf(Span, Type),
     TypeTest(Span, Type),
     FieldsLoop(Span, Vec<String>),
     ViewArg(Span),
-    KeyedCall(Span, String, String, Type),
+    /// A reflective call at `span`: (receiver symbol, method, key), and the
+    /// instance it was made in (see the `Typed` entry's `instance`).
+    KeyedCall {
+        span: Span,
+        receiver: String,
+        method: String,
+        key: Type,
+        instance: Option<TagRef>,
+    },
+    /// The return-origin storage demanded by one enclosing numeric solution.
+    NumericCall {
+        span: Span,
+        ty: Option<brass_hir::NumericLayout>,
+        instance: Option<TagRef>,
+    },
     InstanceReturn(String, Vec<Type>, Type),
     /// A display-only observation that one application of a Fun-typed value
     /// instantiated an open parameter variable (first, kept as `Type::Unknown`
     /// so memo canonicalization and replay substitution apply) to a concrete
     /// type (second). See `Checker::record_closure_binding`.
     ClosureBinding(Type, Type),
+    /// One ordered return relation, attached to the replay's current co-method.
+    /// Unlike channel observations, identical links retain their multiplicity.
+    CoReturnLink {
+        left: Type,
+        right: Type,
+    },
+    /// A dependency on a global's provisional type, replayed as a set insertion.
+    CoGlobalRead {
+        name: String,
+    },
 }
 
-/// The reusable result of one clean elaboration.
+/// The reusable result of one clean elaboration (see
+/// `Checker::elaboration_memo` for what it retains and how a hit replays it).
 #[derive(Clone)]
 pub(super) struct ElaborationMemoEntry {
     pub(super) ret: Type,
     pub(super) bindings: Vec<(CanonVar, Type)>,
     pub(super) fresh: Vec<ElaborationFreshVar>,
     pub(super) shapes: Vec<(Type, ShapeConstraint)>,
-    journal: Vec<ElaborationJournalEntry>,
+    journal: Chunks<ElaborationJournalEntry>,
+    /// Exact global reads of the walk; absence certifies an empty read set.
+    pub(super) global_reads: Option<Rc<co_replay::GlobalReadProvenance>>,
+    /// Present only for a co method whose shared state must still match.
+    pub(super) method_dependencies: Option<Box<co_replay::MethodMemoDependencies>>,
 }
 
-#[derive(Default)]
+impl ElaborationMemoEntry {
+    /// Logical retained observations and co effects, counting shared child
+    /// chunks per entry. This is opt-in inventory, not physical heap accounting.
+    pub(super) fn observation_counts(&self) -> (usize, usize, usize) {
+        (
+            self.journal.len(),
+            self.journal
+                .iter()
+                .filter(|e| matches!(e, ElaborationJournalEntry::CoReturnLink { .. }))
+                .count(),
+            self.journal
+                .iter()
+                .filter(|e| matches!(e, ElaborationJournalEntry::CoGlobalRead { .. }))
+                .count(),
+        )
+    }
+}
+
+/// The window of one elaboration in progress (see
+/// `Checker::elaboration_journals`): the observations and shape constraints
+/// recorded since it began, its nested elaborations' included.
+#[derive(Clone, Default)]
 pub(super) struct ElaborationJournalFrame {
     /// A generic closure owns a lexical environment that this journal cannot
     /// replay. Re-elaborate such bodies so returned closures retain their checks.
     pub(super) has_closure_bodies: bool,
-    journal: Vec<ElaborationJournalEntry>,
-    shapes: Vec<(Type, ShapeConstraint)>,
+    /// The first inference variable id the elaboration could allocate: every
+    /// variable below it existed before the body walk began.
+    start_var: u32,
+    journal: Chunks<ElaborationJournalEntry>,
+    shapes: Chunks<(Type, ShapeConstraint)>,
     journal_seen: Option<FxHashMap<u64, Vec<usize>>>,
+    /// Qualified reads include nested walks and replayed child entries.
+    pub(super) global_reads: co_replay::GlobalReadProvenance,
+    /// Whether a nested hit supplied any part of this body window.
+    pub(super) memo_replayed: bool,
 }
 
 impl ElaborationJournalFrame {
+    /// Start an independent inventory journal at the current variable boundary.
+    pub(super) fn observation(start_var: u32) -> Self {
+        Self {
+            start_var,
+            ..Self::default()
+        }
+    }
+
+    /// Preserve observation order, including duplicate co-return links.
+    pub(super) fn observe_entry(&mut self, entry: ElaborationJournalEntry) {
+        self.push(entry);
+    }
+
+    /// Retain a shape dependency for the ordinary memo skeleton eligibility check.
+    pub(super) fn observe_shape(&mut self, ty: Type, constraint: ShapeConstraint) {
+        self.shapes.push((ty, constraint));
+    }
+
     fn push(&mut self, entry: ElaborationJournalEntry) {
+        if matches!(entry, ElaborationJournalEntry::CoReturnLink { .. }) {
+            self.journal.push(entry);
+            return;
+        }
         if let Some(seen) = &mut self.journal_seen {
             let hash = fx_hash(&entry);
-            if seen
-                .get(&hash)
-                .is_some_and(|indices| indices.iter().any(|index| self.journal[*index] == entry))
-            {
+            if seen.get(&hash).is_some_and(|indices| {
+                indices
+                    .iter()
+                    .any(|index| *self.journal.flat_at(*index) == entry)
+            }) {
                 return;
             }
             seen.entry(hash).or_default().push(self.journal.len());
@@ -111,26 +224,36 @@ impl ElaborationJournalFrame {
         }
         let mut seen: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
         let mut journal = Vec::with_capacity(self.journal.len());
-        for entry in std::mem::take(&mut self.journal) {
+        for entry in self.journal.iter() {
+            if matches!(entry, ElaborationJournalEntry::CoReturnLink { .. }) {
+                journal.push(entry.clone());
+                continue;
+            }
             let hash = fx_hash(&entry);
             if seen
                 .get(&hash)
-                .is_some_and(|indices| indices.iter().any(|index| journal[*index] == entry))
+                .is_some_and(|indices| indices.iter().any(|index| journal[*index] == *entry))
             {
                 continue;
             }
             seen.entry(hash).or_default().push(journal.len());
-            journal.push(entry);
+            journal.push(entry.clone());
         }
-        self.journal = journal;
+        self.journal = journal.into_iter().collect();
         self.journal_seen = Some(seen);
     }
 
     fn extend(&mut self, child: &Self) {
-        for entry in &child.journal {
-            self.push(entry.clone());
+        if self.journal_seen.is_some() {
+            for entry in child.journal.iter() {
+                self.push(entry.clone());
+            }
+        } else {
+            self.journal.append(&child.journal);
         }
-        self.shapes.extend(child.shapes.iter().cloned());
+        self.shapes.append(&child.shapes);
+        self.global_reads.extend(&child.global_reads);
+        self.memo_replayed |= child.memo_replayed;
     }
 }
 
@@ -138,6 +261,18 @@ struct MemoSkeleton {
     vars: BTreeMap<u32, Type>,
     next_placeholder: u32,
     fresh: Vec<ElaborationFreshVar>,
+    /// The elaboration's first variable id (see `ElaborationJournalFrame`).
+    start_var: u32,
+    /// Set when the recorded types mention a variable that existed before the
+    /// elaboration began and is neither an input nor a declaration's own.
+    outer: bool,
+    /// The template of each instance tag the journal mentions, made once.
+    tags: FxHashMap<TagRef, TagRef>,
+}
+
+/// The `Checker::typed_seen` bucket of one typed observation.
+pub(super) fn typed_hash(kind: &TypedExprKind, span: Span, ty: &Type, constness: Constness) -> u64 {
+    fx_hash(&(kind, span, ty, constness))
 }
 
 fn fx_hash(value: &impl Hash) -> u64 {
@@ -168,11 +303,14 @@ fn substitute_journal_entry(
             span,
             ty,
             constness,
+            instance,
         } => ElaborationJournalEntry::Typed {
             kind: kind.clone(),
             span: *span,
             ty: brass_hir::substitute_vars(ty, substitution),
             constness: *constness,
+            // A replay re-tags through `Checker::replay_tag`.
+            instance: instance.clone(),
         },
         ElaborationJournalEntry::SumView(span, ty) => {
             ElaborationJournalEntry::SumView(*span, brass_hir::substitute_vars(ty, substitution))
@@ -183,13 +321,24 @@ fn substitute_journal_entry(
         ElaborationJournalEntry::TypeTest(span, ty) => {
             ElaborationJournalEntry::TypeTest(*span, brass_hir::substitute_vars(ty, substitution))
         }
-        ElaborationJournalEntry::KeyedCall(span, receiver, method, key) => {
-            ElaborationJournalEntry::KeyedCall(
-                *span,
-                receiver.clone(),
-                method.clone(),
-                brass_hir::substitute_vars(key, substitution),
-            )
+        ElaborationJournalEntry::KeyedCall {
+            span,
+            receiver,
+            method,
+            key,
+            instance,
+        } => ElaborationJournalEntry::KeyedCall {
+            span: *span,
+            receiver: receiver.clone(),
+            method: method.clone(),
+            key: brass_hir::substitute_vars(key, substitution),
+            instance: instance.clone(),
+        },
+        ElaborationJournalEntry::CoReturnLink { left, right } => {
+            ElaborationJournalEntry::CoReturnLink {
+                left: brass_hir::substitute_vars(left, substitution),
+                right: brass_hir::substitute_vars(right, substitution),
+            }
         }
         ElaborationJournalEntry::ClosureBinding(var, ty) => {
             ElaborationJournalEntry::ClosureBinding(
@@ -218,21 +367,40 @@ impl Checker<'_> {
         Type::Unknown(id)
     }
 
+    #[inline]
     pub(super) fn journal_elaboration(&mut self, entry: ElaborationJournalEntry) {
+        if self.method_inventory.is_some() {
+            self.observe_method_entry(&entry);
+        }
         if let Some(frame) = self.elaboration_journals.last_mut() {
             frame.push(entry);
         }
     }
 
+    #[inline]
     pub(super) fn journal_elaboration_shape(&mut self, ty: Type, constraint: ShapeConstraint) {
+        if self.method_inventory.is_some() {
+            self.observe_method_shape(&ty, &constraint);
+        }
         if let Some(frame) = self.elaboration_journals.last_mut() {
             frame.shapes.push((ty, constraint));
         }
     }
 
+    /// Open the window of an elaboration about to walk a callee body.
     pub(super) fn begin_elaboration_journal(&mut self) {
-        self.elaboration_journals
-            .push(ElaborationJournalFrame::default());
+        self.elaboration_journals.push(ElaborationJournalFrame {
+            start_var: self.next_unknown,
+            ..ElaborationJournalFrame::default()
+        });
+    }
+
+    /// Whether `id` is one of the variables lowering embedded in the program's
+    /// declarations (`Program::next_infer_var`): a field's or method
+    /// signature's open type, which every elaboration sees as the same
+    /// variable. A memo skeleton keeps these as they are.
+    pub(super) fn is_declaration_var(&self, id: u32) -> bool {
+        id == brass_hir::INFER_VAR || id < self.program.next_infer_var
     }
 
     /// Close this callable's window and include its complete subtree in the
@@ -249,13 +417,27 @@ impl Checker<'_> {
         frame
     }
 
+    /// The memo entry of a finished elaboration, or `None` when replaying it
+    /// would not be equivalent to elaborating the body again.
+    ///
+    /// Replay re-binds the canonical inputs and gives every other variable of
+    /// the recorded result, bindings, shapes and observations a FRESH
+    /// placeholder (a declaration's own variables aside: every elaboration
+    /// sees the same ones, so they are kept). That is only right for a variable
+    /// the elaboration itself created. One that existed before it began and is
+    /// not an input -- a global's element type (`store.push(x)`), the
+    /// provisional return of an enclosing recursive elaboration -- is shared
+    /// state, and a fresh copy would detach the replayed call from it, so such
+    /// an elaboration is not memoized.
     pub(super) fn build_elaboration_memo_entry(
         &self,
         ret: &Type,
         frame: ElaborationJournalFrame,
         context: &ElaborationMemoContext,
-    ) -> ElaborationMemoEntry {
+    ) -> Option<ElaborationMemoEntry> {
         let mut skeleton = MemoSkeleton {
+            start_var: frame.start_var,
+            outer: false,
             vars: context
                 .inputs
                 .iter()
@@ -266,6 +448,7 @@ impl Checker<'_> {
                 .collect(),
             next_placeholder: context.inputs.len() as u32,
             fresh: Vec::new(),
+            tags: FxHashMap::default(),
         };
         let ret = self.memo_skeleton_type(ret, &mut skeleton);
         let bindings = context
@@ -275,7 +458,8 @@ impl Checker<'_> {
             .collect();
         let shapes = frame
             .shapes
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|(ty, constraint)| {
                 (
                     self.memo_skeleton_type(&ty, &mut skeleton),
@@ -283,27 +467,128 @@ impl Checker<'_> {
                 )
             })
             .collect();
-        let journal = frame
-            .journal
-            .into_iter()
-            .map(|entry| self.memo_skeleton_journal_entry(entry, &mut skeleton))
-            .collect();
-        ElaborationMemoEntry {
+        let journal = if frame.journal.iter().all(concrete::unchanged) {
+            frame.journal
+        } else {
+            frame
+                .journal
+                .iter()
+                .cloned()
+                .map(|entry| self.memo_skeleton_journal_entry(entry, &mut skeleton))
+                .collect()
+        };
+        if matches!(context.key.flavor, MemoFlavor::CoCheck { .. }) {
+            tracing::trace!(target: "brass::perf", callable = context.key.callable,
+                reason = if skeleton.outer { "outer_variable" } else { "stored" },
+                observations = journal.len(),
+                co_links = journal.iter().filter(|e| matches!(e, ElaborationJournalEntry::CoReturnLink { .. })).count(),
+                co_reads = journal.iter().filter(|e| matches!(e, ElaborationJournalEntry::CoGlobalRead { .. })).count(),
+                observation_bytes = std::mem::size_of::<ElaborationJournalEntry>(),
+                "check: co memo storage");
+        }
+        (!skeleton.outer).then_some(ElaborationMemoEntry {
             ret,
             bindings,
             fresh: skeleton.fresh,
             shapes,
             journal,
-        }
+            global_reads: frame.global_reads.retained(),
+            method_dependencies: None,
+        })
     }
 
-    /// Replay must traverse the same helper so poison semantics are those of a
-    /// real elaboration.
+    /// Replay through the ordinary memo journal. Closed entries have no
+    /// canonical inputs, fresh placeholders or solver bindings to substitute.
+    pub(super) fn replay_numeric_closure(&mut self, entry: &ElaborationMemoEntry) -> Type {
+        // Every expression here has a final numeric type, except the block
+        // ending in return. Binding identifiers cannot be divergent. These
+        // concrete observations therefore restore the flow marks as well,
+        // even when an enclosing body check has cleared its local flow set.
+        for observation in entry.journal.iter() {
+            if let ElaborationJournalEntry::Typed { span, ty, .. } = observation {
+                if matches!(ty, Type::Never) {
+                    self.diverging_exprs.insert(*span);
+                } else {
+                    self.diverging_exprs.remove(span);
+                }
+            }
+        }
+        let context = journal::ElaborationMemoContext {
+            key: journal::ElaborationMemoKey {
+                flavor: MemoFlavor::Ordinary,
+                callable: String::new(),
+                receiver: None,
+                args: Vec::new(),
+                scheme_inputs: Vec::new(),
+                canon_vars: Vec::new(),
+            },
+            inputs: Vec::new(),
+        };
+        self.replay_elaboration_memo_entry(entry, &context)
+    }
+
+    /// Retain only concrete typed observations of a closed arithmetic body.
+    /// Their exact types and tags are already final, so replay needs neither
+    /// canonical variables nor tag rebasing. The caller keys the enclosing
+    /// instance and admits no captured reads, calls, or diagnostic effects.
+    pub(super) fn build_numeric_closure_memo(
+        &self,
+        ret: &Type,
+        frame: ElaborationJournalFrame,
+    ) -> Option<ElaborationMemoEntry> {
+        fn concrete_observation(ty: &Type) -> bool {
+            match ty {
+                Type::Int(_) | Type::Float(_) | Type::Void | Type::Never => true,
+                Type::Fun(args, ret) => {
+                    args.iter().all(closure_memo::primitive_numeric)
+                        && closure_memo::primitive_numeric(ret)
+                }
+                _ => false,
+            }
+        }
+        let enclosing = self.current_instance();
+        let concrete_tag = |tag: &Option<instances::TagRef>| {
+            tag.as_ref().is_none_or(|tag| {
+                Some(tag) == enclosing.as_ref()
+                    || (matches!(tag.callable, brass_hir::InstanceCallable::Closure { .. })
+                        && tag.args.iter().all(closure_memo::primitive_numeric))
+            })
+        };
+        if !closure_memo::primitive_numeric(ret)
+            || frame.has_closure_bodies
+            || !frame.shapes.is_empty()
+            || !frame.journal.iter().all(|entry| match entry {
+                ElaborationJournalEntry::Typed { ty, instance, .. } => {
+                    concrete_observation(ty) && concrete_tag(instance)
+                }
+                ElaborationJournalEntry::NumericCall { instance, .. } => concrete_tag(instance),
+                _ => false,
+            })
+        {
+            return None;
+        }
+        Some(ElaborationMemoEntry {
+            ret: ret.clone(),
+            bindings: Vec::new(),
+            fresh: Vec::new(),
+            shapes: Vec::new(),
+            journal: frame.journal,
+            global_reads: frame.global_reads.retained(),
+            method_dependencies: None,
+        })
+    }
+
+    /// Replay `entry` at the call `context` describes and return the call's
+    /// result: bind the canonical inputs, give the entry's other variables
+    /// fresh ids, register its shapes, and re-record every observation
+    /// through its normal `record_*` helper, so poison semantics are those of
+    /// a real elaboration.
     pub(super) fn replay_elaboration_memo_entry(
         &mut self,
         entry: &ElaborationMemoEntry,
         context: &ElaborationMemoContext,
     ) -> Type {
+        self.replay_global_provenance(entry.global_reads.as_deref());
         if context.inputs.is_empty() && entry.fresh.is_empty() {
             if let Some(frame) = self.elaboration_journals.last_mut() {
                 frame.prepare_for_replay();
@@ -311,7 +596,7 @@ impl Checker<'_> {
             for (ty, constraint) in &entry.shapes {
                 self.record_shape(ty, constraint.clone());
             }
-            for observation in &entry.journal {
+            for observation in entry.journal.iter() {
                 self.replay_elaboration_journal_entry(observation);
             }
             return entry.ret.clone();
@@ -342,18 +627,28 @@ impl Checker<'_> {
         if let Some(frame) = self.elaboration_journals.last_mut() {
             frame.prepare_for_replay();
         }
-        for observation in &entry.journal {
+        let mut tags = FxHashMap::default();
+        for observation in entry.journal.iter() {
             if matches!(
                 observation,
                 ElaborationJournalEntry::Typed { .. }
                     | ElaborationJournalEntry::SumView(..)
                     | ElaborationJournalEntry::TypeOf(..)
                     | ElaborationJournalEntry::TypeTest(..)
-                    | ElaborationJournalEntry::KeyedCall(..)
+                    | ElaborationJournalEntry::KeyedCall { .. }
+                    | ElaborationJournalEntry::NumericCall { .. }
                     | ElaborationJournalEntry::InstanceReturn(..)
                     | ElaborationJournalEntry::ClosureBinding(..)
+                    | ElaborationJournalEntry::CoReturnLink { .. }
             ) {
-                let observation = substitute_journal_entry(observation, &substitution);
+                let mut observation = substitute_journal_entry(observation, &substitution);
+                if let ElaborationJournalEntry::Typed { instance, .. }
+                | ElaborationJournalEntry::KeyedCall { instance, .. }
+                | ElaborationJournalEntry::NumericCall { instance, .. } = &mut observation
+                    && let Some(tag) = instance
+                {
+                    *tag = self.replay_tag(tag, &substitution, &mut tags);
+                }
                 self.replay_elaboration_journal_entry(&observation);
             } else {
                 self.replay_elaboration_journal_entry(observation);
@@ -366,16 +661,23 @@ impl Checker<'_> {
         let resolved = self.resolve(ty);
         let mut needs_substitution = false;
         for id in brass_hir::type_vars(&resolved) {
+            if skeleton.vars.contains_key(&id) {
+                needs_substitution = true;
+                continue;
+            }
             // The shared `infer` sentinel in a decided type-test pattern is a
             // wildcard, not a solver variable. It must remain byte-identical
             // across replays or equal wildcard patterns would poison the span.
-            if id == brass_hir::INFER_VAR {
+            // A declaration's own variable is the same one every elaboration
+            // sees, so it stays too.
+            if self.is_declaration_var(id) {
+                continue;
+            }
+            if id < skeleton.start_var {
+                skeleton.outer = true;
                 continue;
             }
             needs_substitution = true;
-            if skeleton.vars.contains_key(&id) {
-                continue;
-            }
             let placeholder = skeleton.next_placeholder;
             skeleton.next_placeholder += 1;
             skeleton.vars.insert(id, Type::Unknown(placeholder));
@@ -404,22 +706,49 @@ impl Checker<'_> {
         }
     }
 
+    /// The memo template of instance tag `tag` (made once per skeleton).
+    fn memo_skeleton_tag(&self, tag: &TagRef, skeleton: &mut MemoSkeleton) -> TagRef {
+        if let Some(done) = skeleton.tags.get(tag) {
+            return done.clone();
+        }
+        let template = TagRef::template(InstanceTag {
+            callable: tag.callable.clone(),
+            numeric_layout: tag.numeric_layout.clone(),
+            args: tag
+                .args
+                .iter()
+                .map(|arg| self.memo_skeleton_type(arg, skeleton))
+                .collect(),
+        });
+        skeleton.tags.insert(tag.clone(), template.clone());
+        template
+    }
+
     fn memo_skeleton_journal_entry(
         &self,
         entry: ElaborationJournalEntry,
         skeleton: &mut MemoSkeleton,
     ) -> ElaborationJournalEntry {
         match entry {
+            ElaborationJournalEntry::NumericCall { span, ty, instance } => {
+                ElaborationJournalEntry::NumericCall {
+                    span,
+                    ty,
+                    instance: instance.map(|tag| self.memo_skeleton_tag(&tag, skeleton)),
+                }
+            }
             ElaborationJournalEntry::Typed {
                 kind,
                 span,
                 ty,
                 constness,
+                instance,
             } => ElaborationJournalEntry::Typed {
                 kind,
                 span,
                 ty: self.memo_skeleton_type(&ty, skeleton),
                 constness,
+                instance: instance.map(|tag| self.memo_skeleton_tag(&tag, skeleton)),
             },
             ElaborationJournalEntry::SumView(span, ty) => {
                 ElaborationJournalEntry::SumView(span, self.memo_skeleton_type(&ty, skeleton))
@@ -430,14 +759,19 @@ impl Checker<'_> {
             ElaborationJournalEntry::TypeTest(span, ty) => {
                 ElaborationJournalEntry::TypeTest(span, self.memo_skeleton_type(&ty, skeleton))
             }
-            ElaborationJournalEntry::KeyedCall(span, receiver, method, key) => {
-                ElaborationJournalEntry::KeyedCall(
-                    span,
-                    receiver,
-                    method,
-                    self.memo_skeleton_type(&key, skeleton),
-                )
-            }
+            ElaborationJournalEntry::KeyedCall {
+                span,
+                receiver,
+                method,
+                key,
+                instance,
+            } => ElaborationJournalEntry::KeyedCall {
+                span,
+                receiver,
+                method,
+                key: self.memo_skeleton_type(&key, skeleton),
+                instance: instance.map(|tag| self.memo_skeleton_tag(&tag, skeleton)),
+            },
             ElaborationJournalEntry::InstanceReturn(symbol, args, ret) => {
                 ElaborationJournalEntry::InstanceReturn(
                     symbol,
@@ -453,18 +787,37 @@ impl Checker<'_> {
                     self.memo_skeleton_type(&ty, skeleton),
                 )
             }
+            ElaborationJournalEntry::CoReturnLink { left, right } => {
+                ElaborationJournalEntry::CoReturnLink {
+                    left: self.memo_skeleton_type(&left, skeleton),
+                    right: self.memo_skeleton_type(&right, skeleton),
+                }
+            }
             other => other,
         }
     }
 
     fn replay_elaboration_journal_entry(&mut self, entry: &ElaborationJournalEntry) {
         match entry {
+            ElaborationJournalEntry::CoReturnLink { left, right } => {
+                self.record_co_return_link(left.clone(), right.clone());
+            }
+            ElaborationJournalEntry::CoGlobalRead { name } => {
+                self.record_co_global_read(name);
+            }
             ElaborationJournalEntry::Typed {
                 kind,
                 span,
                 ty,
                 constness,
-            } => self.record_typed(kind.clone(), *span, ty.clone(), *constness),
+                instance,
+            } => self.record_typed_in(
+                kind.clone(),
+                *span,
+                ty.clone(),
+                *constness,
+                instance.clone(),
+            ),
             ElaborationJournalEntry::PropKind(span, kind) => self.record_prop_kind(*span, *kind),
             ElaborationJournalEntry::NullProp(span) => self.record_null_prop(*span),
             ElaborationJournalEntry::SumView(span, ty) => {
@@ -478,15 +831,31 @@ impl Checker<'_> {
             ElaborationJournalEntry::TypeName(span, name) => {
                 self.record_type_name(*span, name.clone())
             }
+            ElaborationJournalEntry::LiteralNominal(span, symbol) => {
+                self.record_literal_nominal(*span, symbol.clone())
+            }
             ElaborationJournalEntry::TypeOf(span, ty) => self.record_typeof_type(*span, ty),
             ElaborationJournalEntry::TypeTest(span, ty) => self.record_type_test(*span, ty),
             ElaborationJournalEntry::FieldsLoop(span, fields) => {
                 self.record_fields_loop(*span, fields.clone());
             }
-            ElaborationJournalEntry::ViewArg(span) => self.record_view_arg(*span),
-            ElaborationJournalEntry::KeyedCall(span, receiver, method, key) => {
-                self.record_keyed_call(*span, receiver.clone(), method.clone(), key.clone())
+            ElaborationJournalEntry::NumericCall { span, ty, instance } => {
+                self.record_numeric_call(*span, ty.clone(), instance.clone());
             }
+            ElaborationJournalEntry::ViewArg(span) => self.record_view_arg(*span),
+            ElaborationJournalEntry::KeyedCall {
+                span,
+                receiver,
+                method,
+                key,
+                instance,
+            } => self.record_keyed_call_in(
+                *span,
+                receiver.clone(),
+                method.clone(),
+                key.clone(),
+                instance.clone(),
+            ),
             ElaborationJournalEntry::InstanceReturn(symbol, args, ret) => {
                 self.record_instance_return(symbol.clone(), args.clone(), ret.clone())
             }
@@ -501,6 +870,8 @@ impl Checker<'_> {
         }
     }
 
+    /// Add a typed observation to the sidecar (once per exact observation),
+    /// attributed to the innermost instance being elaborated.
     pub(super) fn record_typed(
         &mut self,
         kind: TypedExprKind,
@@ -508,27 +879,52 @@ impl Checker<'_> {
         ty: Type,
         constness: Constness,
     ) {
+        let instance = self.current_instance();
+        self.record_typed_in(kind, span, ty, constness, instance);
+    }
+
+    /// [`Checker::record_typed`] attributed to `instance` (the elaboration
+    /// that made the observation, which a memo replay names explicitly).
+    pub(super) fn record_typed_in(
+        &mut self,
+        kind: TypedExprKind,
+        span: Span,
+        ty: Type,
+        constness: Constness,
+        instance: Option<TagRef>,
+    ) {
+        // Only an observation that can seed per instance keeps its tag, in
+        // the journal too: replays then re-tag just those.
+        let instance = instance.filter(|_| self.seeds_per_instance(&kind, &ty));
         self.journal_elaboration(ElaborationJournalEntry::Typed {
             kind: kind.clone(),
             span,
             ty: ty.clone(),
             constness,
+            instance: instance.clone(),
         });
-        let hash = fx_hash(&(&kind, span, &ty, constness));
-        if self.typed_seen.get(&hash).is_some_and(|indices| {
-            indices.iter().any(|index| {
+        let hash = typed_hash(&kind, span, &ty, constness);
+        let recorded = self.typed_seen.get(&hash).and_then(|indices| {
+            indices.iter().copied().find(|index| {
                 let recorded = &self.typed.expressions[*index];
                 recorded.kind == kind
                     && recorded.span == span
                     && recorded.ty == ty
                     && recorded.constness == constness
             })
-        }) {
-            return;
+        });
+        let index = match recorded {
+            Some(index) => index,
+            None => {
+                let index = self.typed.expressions.len();
+                self.typed.push_kind(kind, span, ty, constness);
+                self.typed_seen.entry(hash).or_default().push(index);
+                index
+            }
+        };
+        if let Some(tag) = instance {
+            self.record_instance_typed(tag, index);
         }
-        let index = self.typed.expressions.len();
-        self.typed.push_kind(kind, span, ty, constness);
-        self.typed_seen.entry(hash).or_default().push(index);
     }
 
     /// Record what one application of a Fun-typed value instantiated the open
@@ -564,16 +960,29 @@ impl Checker<'_> {
 
     pub(super) fn record_null_prop(&mut self, span: Span) {
         self.journal_elaboration(ElaborationJournalEntry::NullProp(span));
+        self.channel_changes
+            .get_mut()
+            .mark(channel_changes::Channel::NullProp, span);
         self.null_props.insert(span);
     }
 
     pub(super) fn record_lift_err(&mut self, span: Span) {
         self.journal_elaboration(ElaborationJournalEntry::LiftErr(span));
+        self.channel_changes
+            .get_mut()
+            .mark(channel_changes::Channel::LiftErr, span);
         self.lift_errs.insert(span);
     }
 
+    /// Record the type a `typeof(v).method(..)` static call names, keyed by
+    /// the `typeof(v)` span (see [`Inference::type_names`]). One MIR body
+    /// serves every instantiation, so two instantiations naming different
+    /// types there are an error.
     pub(super) fn record_type_name(&mut self, span: Span, name: String) {
         self.journal_elaboration(ElaborationJournalEntry::TypeName(span, name.clone()));
+        self.channel_changes
+            .get_mut()
+            .mark(channel_changes::Channel::TypeName, span);
         if let Some(prev) = self.type_names.insert(span, name.clone())
             && prev != name
         {
@@ -588,12 +997,18 @@ impl Checker<'_> {
         }
     }
 
+    /// Record the resolved binding type of the `typeof`-bearing annotation at
+    /// `span`, once it is concrete. Two instantiations that disagree poison
+    /// the span (see `Checker::typeof_poisoned`).
     pub(super) fn record_typeof_type(&mut self, span: Span, ty: &Type) {
         let concrete = self.resolve(ty);
         if !is_concrete_type(&concrete) || self.typeof_poisoned.contains(&span) {
             return;
         }
         self.journal_elaboration(ElaborationJournalEntry::TypeOf(span, concrete.clone()));
+        self.channel_changes
+            .get_mut()
+            .mark(channel_changes::Channel::TypeOf, span);
         match self.typeof_types.get(&span) {
             Some(prev) if peel_modes(prev) != peel_modes(&concrete) => {
                 self.typeof_types.remove(&span);
@@ -605,6 +1020,9 @@ impl Checker<'_> {
         }
     }
 
+    /// Record the field list a `fields(..)` loop at `span` expands to. A
+    /// different list than an earlier instantiation's is an error, and
+    /// `false` is returned.
     pub(super) fn record_fields_loop(&mut self, span: Span, fields: Vec<String>) -> bool {
         self.journal_elaboration(ElaborationJournalEntry::FieldsLoop(span, fields.clone()));
         if let Some(prev) = self.fields_loops.get(&span)
@@ -618,15 +1036,49 @@ impl Checker<'_> {
             });
             return false;
         }
+        self.channel_changes
+            .get_mut()
+            .mark(channel_changes::Channel::FieldsLoop, span);
         self.fields_loops.insert(span, fields);
         true
     }
 
     pub(super) fn record_view_arg(&mut self, span: Span) {
         self.journal_elaboration(ElaborationJournalEntry::ViewArg(span));
+        self.channel_changes
+            .get_mut()
+            .mark(channel_changes::Channel::ViewArg, span);
         self.view_args.insert(span);
     }
 
+    /// Record how the `recv.name(..)` call at `span` resolved in this
+    /// elaboration: a call of the function value a record FIELD holds
+    /// (`field`, the receiver's type-test pattern), or a method call
+    /// (`None`). One MIR body serves every instantiation, so a call some
+    /// instantiations resolve to a field and others to a method is lowered
+    /// as a per-instance branch on the receiver's type (see
+    /// `Checker::field_call_map`).
+    ///
+    /// Not journaled: the observation mentions no inference variable (a
+    /// receiver pattern is a bare nominal), so a memo replay of the
+    /// elaboration that made it would only repeat it.
+    pub(super) fn record_call_kind(&mut self, span: Span, field: Option<Type>) {
+        self.channel_changes
+            .get_mut()
+            .mark(channel_changes::Channel::FieldCall, span);
+        let site = self.call_sites.entry(span).or_default();
+        match field {
+            Some(pattern) => {
+                if !site.field_receivers.contains(&pattern) {
+                    site.field_receivers.push(pattern);
+                }
+            }
+            None => site.method = true,
+        }
+    }
+
+    /// Record the reflective call at `span` keyed as (receiver symbol,
+    /// method, key), attributed to the innermost instance being elaborated.
     pub(super) fn record_keyed_call(
         &mut self,
         span: Span,
@@ -634,15 +1086,45 @@ impl Checker<'_> {
         method: String,
         key: Type,
     ) {
-        self.journal_elaboration(ElaborationJournalEntry::KeyedCall(
+        let instance = self.current_instance();
+        self.record_keyed_call_in(span, receiver, method, key, instance);
+    }
+
+    /// [`Checker::record_keyed_call`] attributed to `instance`. Every
+    /// observation is kept (see `Checker::settled_keyed_calls`): a generic
+    /// body's instances may key one call differently.
+    pub(super) fn record_keyed_call_in(
+        &mut self,
+        span: Span,
+        receiver: String,
+        method: String,
+        key: Type,
+        instance: Option<TagRef>,
+    ) {
+        self.journal_elaboration(ElaborationJournalEntry::KeyedCall {
             span,
-            receiver.clone(),
-            method.clone(),
-            key.clone(),
-        ));
+            receiver: receiver.clone(),
+            method: method.clone(),
+            key: key.clone(),
+            instance: instance.clone(),
+        });
+        self.record_keyed_observation(KeyedObservation {
+            instance,
+            span,
+            receiver: receiver.clone(),
+            method: method.clone(),
+            key: key.clone(),
+        });
+        self.channel_changes
+            .get_mut()
+            .mark(channel_changes::Channel::KeyedCall, span);
         self.keyed_calls.insert(span, (receiver, method, key));
     }
 
+    /// Record the return of the unannotated function instance `symbol` at
+    /// `args` (see [`Inference::instance_returns`]). Journaled in any case, so
+    /// a replay at concrete inputs records it; kept only once the arguments
+    /// and the return are fully known.
     pub(super) fn record_instance_return(&mut self, symbol: String, args: Vec<Type>, ret: Type) {
         let args: Vec<_> = args.iter().map(|arg| self.resolve(arg)).collect();
         let ret = self.resolve(&ret);
@@ -654,6 +1136,7 @@ impl Checker<'_> {
         if !args.iter().all(brass_hir::is_fully_known) || !brass_hir::is_fully_known(&ret) {
             return;
         }
+        self.channel_changes.get_mut().mark_return(&symbol, &args);
         self.instance_returns.insert((symbol, args), ret);
     }
 }
@@ -665,6 +1148,7 @@ mod tests {
     fn concrete_context() -> ElaborationMemoContext {
         ElaborationMemoContext {
             key: ElaborationMemoKey {
+                flavor: MemoFlavor::Ordinary,
                 callable: "test".to_string(),
                 receiver: None,
                 args: Vec::new(),
@@ -673,6 +1157,114 @@ mod tests {
             },
             inputs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn tagged_observations_keep_distinct_skeleton_templates() {
+        let program = Program::empty();
+        let rows = Rc::new(brass_typesys::RowInfo::analyze(&program));
+        let mut recorded = Checker::new(&program, Rc::clone(&rows));
+        let callable = brass_hir::InstanceCallable::Function("source".into());
+        let args = [Type::Int(IntKind::I32)];
+        let tag = recorded.intern_tag(callable.clone(), &args);
+        let mut frame = ElaborationJournalFrame::default();
+        frame.journal.push(ElaborationJournalEntry::Typed {
+            kind: TypedExprKind::TypeOfAnnotation,
+            span: Span::new(1, 2),
+            ty: Type::Int(IntKind::I32),
+            constness: Constness::Unknown,
+            instance: Some(tag.clone()),
+        });
+        let keep = frame.journal.clone();
+        let context = concrete_context();
+        let memo = recorded
+            .build_elaboration_memo_entry(&Type::Bool, frame, &context)
+            .unwrap();
+        assert!(!std::ptr::eq(
+            keep.iter().next().unwrap(),
+            memo.journal.iter().next().unwrap()
+        ));
+        let mut replayed = Checker::new(&program, rows);
+        let expected = replayed.intern_tag(callable, &args);
+        assert_ne!(tag, expected);
+        replayed.replay_elaboration_memo_entry(&memo, &context);
+        assert_eq!(replayed.instance_typed.len(), 1);
+        let template = &replayed.instance_typed[0].tag;
+        assert_ne!(*template, tag);
+        assert_ne!(*template, expected);
+        assert_eq!(template.callable, expected.callable);
+        assert_eq!(template.args, expected.args);
+    }
+
+    #[test]
+    fn concrete_memo_keeps_child_observation_storage() {
+        let program = Program::empty();
+        let mut checker =
+            Checker::new(&program, Rc::new(brass_typesys::RowInfo::analyze(&program)));
+        checker.begin_elaboration_journal();
+        checker.begin_elaboration_journal();
+        checker.record_typeof_type(Span::new(1, 2), &Type::Int(IntKind::I32));
+        let child = checker.finish_elaboration_journal();
+        let address = child.journal.iter().next().unwrap() as *const _;
+        let memo = checker
+            .build_elaboration_memo_entry(&Type::Bool, child, &concrete_context())
+            .unwrap();
+        let parent = checker.finish_elaboration_journal();
+        assert!(std::ptr::eq(address, memo.journal.iter().next().unwrap()));
+        assert!(std::ptr::eq(address, parent.journal.iter().next().unwrap()));
+    }
+
+    #[test]
+    fn resolved_variables_still_use_skeleton_conversion() {
+        let program = Program::empty();
+        let mut checker =
+            Checker::new(&program, Rc::new(brass_typesys::RowInfo::analyze(&program)));
+        checker.begin_elaboration_journal();
+        let variable = checker.fresh_unknown();
+        checker.solver.unify(&variable, &Type::Bool).unwrap();
+        let mut frame = checker.finish_elaboration_journal();
+        frame
+            .journal
+            .push(ElaborationJournalEntry::TypeOf(Span::new(1, 2), variable));
+        let keep = frame.journal.clone();
+        let memo = checker
+            .build_elaboration_memo_entry(&Type::Bool, frame, &concrete_context())
+            .unwrap();
+        assert!(!std::ptr::eq(
+            keep.iter().next().unwrap(),
+            memo.journal.iter().next().unwrap()
+        ));
+        assert!(matches!(
+            memo.journal.iter().next(),
+            Some(ElaborationJournalEntry::TypeOf(_, Type::Bool))
+        ));
+    }
+
+    #[test]
+    fn replay_dedup_keeps_first_occurrences_across_shared_children() {
+        let span = Span::new(0, 1);
+        let first = ElaborationJournalEntry::PropKind(span, PropKind::Null);
+        let conflict = ElaborationJournalEntry::PropKind(span, PropKind::Err);
+        let mut child = ElaborationJournalFrame::default();
+        child.push(first.clone());
+        child.push(conflict.clone());
+        child.push(first.clone());
+        let mut parent = ElaborationJournalFrame::default();
+        parent.push(first.clone());
+        parent.extend(&child);
+        assert_eq!(parent.journal.len(), 4);
+        parent.prepare_for_replay();
+        // Deduplication removes identical writes, not the intervening conflict.
+        parent.extend(&child);
+        assert_eq!(parent.journal.len(), 2);
+        assert!(parent.journal.iter().eq([&first, &conflict]));
+        // Shapes are ordered separately and are never observation-deduplicated.
+        child
+            .shapes
+            .push((Type::Bool, ShapeConstraint::Equals(Type::Bool)));
+        parent.extend(&child);
+        parent.extend(&child);
+        assert_eq!(parent.shapes.len(), 2);
     }
 
     #[test]
@@ -686,25 +1278,41 @@ mod tests {
         checker.record_lift_err(child_span);
         let child_frame = checker.finish_elaboration_journal();
         let context = concrete_context();
-        let child = checker.build_elaboration_memo_entry(&Type::Bool, child_frame, &context);
+        let child = checker
+            .build_elaboration_memo_entry(&Type::Bool, child_frame, &context)
+            .expect("self-contained entry");
 
         checker.begin_elaboration_journal();
         checker.record_null_prop(Span::new(0, 1));
         checker.replay_elaboration_memo_entry(&child, &context);
         checker.record_view_arg(Span::new(4, 5));
         let parent_frame = checker.finish_elaboration_journal();
-        let parent = checker.build_elaboration_memo_entry(&Type::Bool, parent_frame, &context);
+        let parent = checker
+            .build_elaboration_memo_entry(&Type::Bool, parent_frame, &context)
+            .expect("self-contained entry");
 
         // The skipped child's observation remains between the parent's writes,
         // matching the order of a real nested body walk.
         assert!(matches!(
-            parent.journal.as_slice(),
+            parent.journal.iter().collect::<Vec<_>>().as_slice(),
             [
                 ElaborationJournalEntry::NullProp(_),
                 ElaborationJournalEntry::LiftErr(span),
                 ElaborationJournalEntry::ViewArg(_),
             ] if *span == child_span
         ));
+        // Shared child chunks still replay through the channel authorities.
+        // Activate publication first so this exercises dirty keys, not the
+        // initial full-table read.
+        let mut replayed =
+            Checker::new(&program, Rc::new(brass_typesys::RowInfo::analyze(&program)));
+        let mut publication = stream::FlushState::default();
+        delta::flush_delta(&replayed, &mut publication, false);
+        replayed.replay_elaboration_memo_entry(&parent, &context);
+        let changed = delta::flush_delta(&replayed, &mut publication, false);
+        assert_eq!(changed.null_props, vec![Span::new(0, 1)]);
+        assert_eq!(changed.lift_errs, vec![child_span]);
+        assert_eq!(changed.view_args, vec![Span::new(4, 5)]);
     }
 
     #[test]
@@ -724,7 +1332,9 @@ mod tests {
         );
         let frame = recorded.finish_elaboration_journal();
         let context = concrete_context();
-        let memo = recorded.build_elaboration_memo_entry(&Type::Bool, frame, &context);
+        let memo = recorded
+            .build_elaboration_memo_entry(&Type::Bool, frame, &context)
+            .expect("self-contained entry");
 
         let mut replayed = Checker::new(&program, rows);
         replayed.record_prop_kind(span, PropKind::Err);
@@ -755,16 +1365,18 @@ mod tests {
                 span,
                 ty: vars[2].clone(),
                 constness: Constness::Unknown,
+                instance: None,
             },
             ElaborationJournalEntry::SumView(span, vars[3].clone()),
             ElaborationJournalEntry::TypeOf(span, vars[4].clone()),
             ElaborationJournalEntry::TypeTest(span, vars[5].clone()),
-            ElaborationJournalEntry::KeyedCall(
+            ElaborationJournalEntry::KeyedCall {
                 span,
-                "Receiver".to_string(),
-                "method".to_string(),
-                vars[6].clone(),
-            ),
+                receiver: "Receiver".to_string(),
+                method: "method".to_string(),
+                key: vars[6].clone(),
+                instance: None,
+            },
             ElaborationJournalEntry::InstanceReturn(
                 "callee".to_string(),
                 vec![vars[7].clone()],
@@ -772,7 +1384,9 @@ mod tests {
             ),
         ]);
 
-        let memo = checker.build_elaboration_memo_entry(&Type::Bool, frame, &concrete_context());
+        let memo = checker
+            .build_elaboration_memo_entry(&Type::Bool, frame, &concrete_context())
+            .expect("self-contained entry");
 
         // Every payload-only variable needs a replay-local placeholder; retaining
         // any checker-local id would couple otherwise independent memo hits.
@@ -792,6 +1406,7 @@ mod tests {
         };
         let context = ElaborationMemoContext {
             key: ElaborationMemoKey {
+                flavor: MemoFlavor::Ordinary,
                 callable: "input-binding".to_string(),
                 receiver: None,
                 args: vec![Type::Unknown(canon.slot)],
@@ -800,11 +1415,9 @@ mod tests {
             },
             inputs: vec![(canon, input)],
         };
-        let memo = recorded.build_elaboration_memo_entry(
-            &Type::Void,
-            ElaborationJournalFrame::default(),
-            &context,
-        );
+        let memo = recorded
+            .build_elaboration_memo_entry(&Type::Void, ElaborationJournalFrame::default(), &context)
+            .expect("self-contained entry");
 
         let mut replayed = Checker::new(&program, rows);
         let replay_input = replayed.fresh_unknown();

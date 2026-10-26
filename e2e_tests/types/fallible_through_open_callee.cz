@@ -1,0 +1,61 @@
+// @backends: all
+// A function is fallible when one of its live `!` sites propagates a
+// `Result`, even when that `Result` comes from a callee that is fallible only
+// at this instance -- a method on an unannotated parameter, a closure
+// parameter -- and so is invisible to the body's open definition. The
+// fallibility reaches every caller up the chain.
+type S = { k: int32 }
+
+fun S.get(self, n: int32) {
+    if n < 0 {
+        error("negative")!
+    }
+    return n
+}
+
+fun via(s, n: int32) {
+    return s.get(n)!
+}
+
+fun outer(s: S, n: int32) {
+    return via(s, n)!
+}
+
+fun via_plus(s, n: int32) {
+    return s.get(n)! + 1
+}
+
+fun outer_plus(s, n: int32) {
+    return via_plus(s, n)! + 1
+}
+
+fun apply(f, n: int32) {
+    return f(n)!
+}
+
+fun checked(n: int32) {
+    return apply((k) -> {
+        if k < 0 {
+            error("below zero")!
+        }
+        return k
+    }, n)!
+}
+
+fun main() {
+    match outer(S { k: 1 }, -5) {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.value}"),
+    }
+    println(outer(S { k: 1 }, 5)!)
+    match outer_plus(S { k: 1 }, -5) {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.value}"),
+    }
+    println(outer_plus(S { k: 1 }, 5)!)
+    match checked(-5) {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.value}"),
+    }
+    println(checked(5)!)
+}

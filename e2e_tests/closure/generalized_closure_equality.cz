@@ -1,0 +1,29 @@
+// @backends: all
+// Function values compare by identity, and each use of a let-polymorphic
+// closure binding builds its own closure value: such a use equals no other
+// value, itself included, whether the binding is local or module-level and
+// whether or not the other side's type pins the use's. A closure stored in a
+// variable (`h`) is one value.
+let gid = (x) -> x
+println(gid == gid)
+
+fun main() {
+    let id = (x) -> x
+    println(id(1))
+    println(id == id)
+    println(id != id)
+    let g = (x: int32) -> x
+    println(id == g)
+    println(g == id)
+    let h: (int32) -> int32 = id
+    println(h == h)
+    println(h == id)
+    println(gid == id)
+    if id == id {
+        println("same")
+    } else {
+        println("distinct")
+    }
+    let check = () -> id != id
+    println(check())
+}

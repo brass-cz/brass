@@ -1,0 +1,51 @@
+// @backends: all
+// A narrowed variable may be reassigned. A non-null value keeps it narrowed
+// (also across loop iterations); an arm that always returns does not end the
+// narrowing for the code after it; and a nullable value ends it only until
+// the next test, which is what a linked-list walk relies on.
+type Node = {
+    v: int32
+    next: Node?
+}
+fun pick(b: bool) -> string? {
+    if b { return "hello" }
+    return null
+}
+fun main() {
+    let x = pick(true)
+    if !x { return }
+    x = "bye"
+    println(x.len())
+    if x.len() > 10 {
+        x = null
+        return
+    }
+    println(x.len())
+    let i = 0
+    while i < 2 {
+        println(x.len())
+        x = "loop"
+        i = i + 1
+    }
+    let c = Node { v: 3, next: null }
+    let b = Node { v: 2, next: c }
+    let a = Node { v: 1, next: b }
+    let cur: Node? = a
+    while cur {
+        println(cur.v)
+        cur = cur.next
+    }
+    println(cur)
+    let node: Node? = a
+    let total = 0
+    let going = true
+    while going {
+        if node {
+            total = total + node.v
+            node = node.next
+        } else {
+            going = false
+        }
+    }
+    println(total)
+}

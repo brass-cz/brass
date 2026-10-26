@@ -1,0 +1,23 @@
+// @backends: all
+// A module-level closure binding is let-polymorphic like a local one and is
+// usable from top-level statements and from functions, at several types; a
+// closure that reads a global or updates one through its body works the same.
+let y = "abc"
+let g = (n) -> y.len() + n
+println(g(10))
+const add = (x) -> x + 1
+println(add(5))
+let total = 0
+const bump = (x: int32) -> {
+    total += x
+}
+bump(5)
+println(total)
+
+fun main() {
+    println(add(5))
+    let big: int64 = 5000000000
+    println(add(big))
+    println(add(1.5))
+    println(g(1))
+}

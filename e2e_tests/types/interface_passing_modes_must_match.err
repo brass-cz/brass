@@ -1,0 +1,12 @@
+`PlainAgainstRefImplementation` method `w` signature is not compatible with `PlainAgainstRefRequirement`
+`PlainAgainstMutImplementation` method `w` signature is not compatible with `PlainAgainstMutRequirement`
+`PlainAgainstRefMutImplementation` method `w` signature is not compatible with `PlainAgainstRefMutRequirement`
+`RefAgainstPlainImplementation` method `w` signature is not compatible with `RefAgainstPlainRequirement`
+`RefAgainstMutImplementation` method `w` signature is not compatible with `RefAgainstMutRequirement`
+`RefAgainstRefMutImplementation` method `w` signature is not compatible with `RefAgainstRefMutRequirement`
+`MutAgainstPlainImplementation` method `w` signature is not compatible with `MutAgainstPlainRequirement`
+`MutAgainstRefImplementation` method `w` signature is not compatible with `MutAgainstRefRequirement`
+`MutAgainstRefMutImplementation` method `w` signature is not compatible with `MutAgainstRefMutRequirement`
+`RefMutAgainstPlainImplementation` method `w` signature is not compatible with `RefMutAgainstPlainRequirement`
+`RefMutAgainstRefImplementation` method `w` signature is not compatible with `RefMutAgainstRefRequirement`
+`RefMutAgainstMutImplementation` method `w` signature is not compatible with `RefMutAgainstMutRequirement`

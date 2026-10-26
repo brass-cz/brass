@@ -1,0 +1,5 @@
+narrowing_ended_by_assignment.cz:20:13: error: nullable value must be checked for null before use
+narrowing_ended_by_assignment.cz:26:13: error: nullable value must be checked for null before use
+narrowing_ended_by_assignment.cz:33:17: error: nullable value must be checked for null before use: `x` was checked before this loop, but the loop can make it null again before a later iteration; check it inside the loop
+narrowing_ended_by_assignment.cz:44:17: error: nullable value must be checked for null before use: `x` was checked before this loop, but the loop can make it null again before a later iteration; check it inside the loop
+narrowing_ended_by_assignment.cz:55:17: error: nullable value must be checked for null before use

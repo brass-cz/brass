@@ -1,0 +1,16 @@
+// @backends: all
+// Direct imports, renamed imports, and qualified reads share global precedence.
+import value_precedence_lib.{ error, print, next as assert }
+import value_precedence_lib as values
+fun main() {
+    println(error)
+    println(print(3))
+    println(assert(3))
+    let f = print
+    println(f(4))
+    let g = assert
+    println(g(4))
+    println(values.error)
+    let h = values.print
+    println(h(5))
+}

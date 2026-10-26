@@ -1,0 +1,4 @@
+cannot assign to const value `x`
+cannot call mutating method `push` on const value `first`
+cannot call mutating method `push` on const value `lys`
+cannot assign to const value `a`

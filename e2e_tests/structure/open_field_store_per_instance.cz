@@ -1,0 +1,20 @@
+// @backends: all
+// A method that stores into an unannotated (per-construction) field is
+// instantiated per receiver instance: `set` on a `Box` built with an int, one
+// built with a string and one built with a float each stores at that
+// instance's own field type.
+type Box = { v, tag: string }
+fun Box.set(self, nv) {
+    self.v = nv
+}
+fun main() {
+    let a = Box { v: 1, tag: "int" }
+    let b = Box { v: "s", tag: "str" }
+    a.set(41)
+    b.set("t")
+    let c = Box { v: 2.5, tag: "f" }
+    c.set(3.5)
+    println(a.v + 1)
+    println(b.v + "!")
+    println(c.v)
+}

@@ -1,0 +1,74 @@
+// @backends: all
+// An inferred return type is the join of the returned values whatever the
+// order of the `return`s: `int32` before `int64` joins to `int64` just like the
+// other order, a declared sum subtype returned before its parent joins to the
+// parent, and a literal adapts to the other values when it fits. A closure's
+// block body joins its returns the same way, and a let-polymorphic closure's
+// expression body is typed per use (`inc` at `int32` and at `int64`).
+type Shape =
+    | Circle {
+        r: int32
+    }
+    | Square {
+        s: int32
+    }
+
+type Tagged: Shape =
+    | Circle {
+        r: int32
+        tag: string
+    }
+    | Square {
+        s: int32
+    }
+
+fun narrow_first(c: bool, a: int32, b: int64) {
+    if c {
+        return a
+    }
+    return b
+}
+
+fun wide_first(c: bool, a: int32, b: int64) {
+    if c {
+        return b
+    }
+    return a
+}
+
+fun child_first(c: bool) {
+    if c {
+        return Tagged.Circle { r: 1, tag: "t" }
+    }
+    return Shape.Square { s: 2 }
+}
+
+fun small_or_literal(c: bool, s: int8) {
+    if c {
+        return s
+    }
+    return 100
+}
+
+fun main() {
+    let a: int32 = 7
+    let b: int64 = 5000000000
+    println(narrow_first(true, a, b))
+    println(narrow_first(false, a, b))
+    println(wide_first(false, a, b))
+    println(child_first(true))
+    println(child_first(false))
+    let s: int8 = 3
+    let v = small_or_literal(false, s)
+    println("{v} {typeof(v)}")
+    let pick = (c: bool) -> {
+        if c {
+            return a
+        }
+        return b
+    }
+    println(pick(true) + pick(false))
+    let inc = (x) -> x + 1
+    println(inc(a))
+    println(inc(b))
+}

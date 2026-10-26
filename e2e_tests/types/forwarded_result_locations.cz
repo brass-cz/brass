@@ -1,0 +1,57 @@
+// @backends: all
+// Forwarded raw Result errors are lifted at each returned expression; traced errors keep their provenance.
+fun bound(text) -> int32! {
+    let r = int32.parse(text)
+    return r
+}
+fun direct() -> int32! {
+    return int32.parse("zz")
+}
+fun parameter(r) -> int32! {
+    return r
+}
+fun field() -> int32! {
+    let holder = { result: int32.parse("zz") }
+    return holder.result
+}
+fun index() -> int32! {
+    let results = [int32.parse("zz")]
+    return results[0]
+}
+fun conditional() -> int32! {
+    let r = int32.parse("zz")
+    return if true { r } else { int32.parse("7") }
+}
+fun matched() -> int32! {
+    let r = int32.parse("zz")
+    return match true { true => r, false => int32.parse("7") }
+}
+fun blocked() -> int32! {
+    let r = int32.parse("zz")
+    return { let result = r
+        result }
+}
+fun existing(fail) -> int32! {
+    if fail { error("bad")! }
+    return 7
+}
+fun traced_parameter(r: int32!) -> int32! { return r }
+fun report(r: int32!) {
+    match r {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("{error.value} at {error.location.line}:{error.location.col} ({error.frames.len()} frames)"),
+    }
+}
+fun main() {
+    report(bound("zz"))
+    report(direct())
+    report(parameter(int32.parse("zz")))
+    report(field())
+    report(index())
+    report(conditional())
+    report(matched())
+    report(blocked())
+    let traced = existing(true)
+    report(traced_parameter(traced.context("forwarded")))
+    println(bound("7")!)
+}

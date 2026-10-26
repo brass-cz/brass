@@ -1,0 +1,31 @@
+// @backends: all
+// Checked integer conversions read a `uint64` source over its whole unsigned
+// range: values above INT64_MAX are not reinterpreted as negative, so they are
+// out of range for every signed target and convert to `uint64` itself. Signed
+// sources keep their sign (`uint64.from(-1)` fails). The failure texts are the
+// same on every back end.
+
+fun show(r) -> string {
+    return match r {
+        Ok { value } => "Ok({value})",
+        Err { error } => "Err({error})",
+    }
+}
+
+fun main() {
+    const top: uint64 = 9223372036854775807
+    const max: uint64 = top * 2 + 1
+    const above: uint64 = top + 1
+    println(show(int64.from(max)))
+    println(show(int32.from(max)))
+    println(show(uint32.from(max)))
+    println(show(uint64.from(max)))
+    println(show(int64.from(above)))
+    println(show(uint64.from(above)))
+    println(show(int64.from(top)))
+    const minus: int64 = -1
+    println(show(uint64.from(minus)))
+    println(show(uint8.from(minus)))
+    println(float64.from(max))
+    println(show(uint64.parse("18446744073709551615")))
+}

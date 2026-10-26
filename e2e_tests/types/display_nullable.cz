@@ -1,0 +1,66 @@
+// @backends: all
+// A nullable value renders `null` when absent and, when present, exactly as
+// the non-null value would: through its type's own `display` when the type
+// declares one (records and sums alike), else in the built-in debug form.
+// This holds for `print`/`println` and `"{v}"` segments, whether or not the
+// non-null type is ever rendered elsewhere in the program, and for a value
+// narrowed by `if let`. `v.debug()` still forces the debug form.
+
+type Temp = {
+    celsius: int32
+}
+
+fun Temp.display(self) -> string {
+    return "{self.celsius}C"
+}
+
+type Plain = {
+    n: int32
+}
+
+type Light =
+    | Red
+    | Green { seconds: int32 }
+
+fun Light.display(self) -> string {
+    return match self {
+        Light.Red => "red",
+        Light.Green { seconds } => "green for {seconds}s",
+    }
+}
+
+fun pick(present: bool) -> Temp? {
+    if present {
+        return Temp { celsius: 21 }
+    }
+    return null
+}
+
+fun light(present: bool) -> Light? {
+    if present {
+        return Light.Green { seconds: 30 }
+    }
+    return null
+}
+
+fun main() {
+    let t = Temp { celsius: 30 }
+    println(t)
+    println("{t}")
+    const some = pick(true)
+    const none = pick(false)
+    println(some)
+    println("now {some}")
+    println(none)
+    println("now {none}")
+    if let inner = some {
+        println(inner)
+        println(inner.debug())
+    }
+    println(light(true))
+    println("light: {light(false)}")
+    const p: Plain? = Plain { n: 1 }
+    println(p)
+    const q: Plain? = null
+    println("{q}")
+}

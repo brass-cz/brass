@@ -54,6 +54,8 @@ type _ChunkScan = {
 
 // --- internal helpers ---
 
+// The text before the first `delim` and everything after it, as a two-element
+// array.
 fun _split_once(s: string, delim: string) {
     let parts = s.split(delim)
     if len(parts) < 2 {
@@ -99,7 +101,9 @@ fun _parse_header_lines(text: string) {
     let headers: Header[] = []
     for line in text.split("\r\n") {
         if len(line) > 0 {
-            let [name, val] = _split_once(line, ":")!
+            const parts = _split_once(line, ":")!
+            const name = parts[0]
+            const val = parts[1]
             if !_is_token(name) {
                 return error("invalid HTTP header name: {name}")
             }
@@ -126,7 +130,9 @@ fun _parse_head(text: string, kind: string) {
 }
 
 fun _parse_message(raw: string, kind: string) {
-    const [head, body_text] = _split_once(raw, "\r\n\r\n")!
+    const parts = _split_once(raw, "\r\n\r\n")!
+    const head = parts[0]
+    const body_text = parts[1]
     return _HttpMessage {
         head: _parse_head(head, kind)!,
         body: to_bytes(body_text),

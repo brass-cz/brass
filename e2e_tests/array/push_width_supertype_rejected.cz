@@ -1,6 +1,6 @@
-// Array elements are invariant storage: a record that structurally satisfies
-// the element type but has a wider layout (extra fields, different offsets)
-// must not be pushed -- reading it back would reinterpret the wider layout.
+// Array elements are storage sites: records keep their declared layout and a
+// stored value is never converted, so a `Q`, which has `P`'s `x` and more,
+// cannot be pushed into a `P[]`.
 type P = { x: int32 }
 type Q = { y: string, x: int32 }
 

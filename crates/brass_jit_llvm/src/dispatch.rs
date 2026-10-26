@@ -1,88 +1,18 @@
-//! The runtime dispatch service for deferred monomorphization.
+//! The runtime resolution service behind the lazy JIT's deferred call sites.
 //!
-//! When a type is fixed by the outside world at runtime (e.g. JSON deserialize),
-//! the consumer of that value must be specialized and JIT-compiled *then*. This
-//! module holds the live compiler service -- the MIR template program, the HIR
-//! program, the running LLVM backend, and the runtime [`MonomorphCache`] -- and
-//! exposes the [`pp_resolve`] trampoline that generated code calls to obtain (and
-//! lazily compile) the consumer specialized for a boundary value's runtime type.
+//! A deferred site (see `LlvmCodegen::deferred_call`) asks `pp_resolve` for
+//! the address of the instance named by its symbol the first time execution
+//! reaches it. Already-resolved symbols answer from a cross-thread cache; on
+//! the main thread a miss goes to the driver's resolver, installed for the
+//! duration of the run by `with_deferred_resolver`, which checks, lowers,
+//! monomorphizes and compiles the instance into the live engine.
 //!
-//! The service is reached through a thread-local raw pointer installed for the
-//! duration of the program run ([`with_dispatcher`]); the pointer is only valid
-//! while installed, and the trampoline is only emitted at deferred call sites, so
-//! it is never reached otherwise.
+//! The resolver is reached through a thread-local raw pointer that is only
+//! valid while installed; deferred sites only exist in code that runs inside
+//! that installation.
 
 use std::cell::Cell;
 use std::ptr;
-
-use brass_engine::{
-    MonomorphCache, RuntimeJit, boundary_record_type_by_name, boundary_record_type_from_fields,
-    instance_symbol, monomorphize_instance, parse_structural_descriptor,
-};
-use brass_hir::Program;
-use brass_mir::MirProgram;
-
-use crate::codegen::LlvmCodegen;
-
-/// The live deferred-monomorphization service: the MIR template program, the HIR
-/// program, the running JIT backend, and the runtime cache of compiled instances.
-pub struct RuntimeDispatcher<'a, 'ctx, 'p> {
-    mir: &'a MirProgram,
-    program: &'a Program,
-    backend: &'a mut LlvmCodegen<'ctx, 'p>,
-    cache: MonomorphCache,
-}
-
-impl<'a, 'ctx, 'p> RuntimeDispatcher<'a, 'ctx, 'p> {
-    pub fn new(
-        mir: &'a MirProgram,
-        program: &'a Program,
-        backend: &'a mut LlvmCodegen<'ctx, 'p>,
-    ) -> Self {
-        Self {
-            mir,
-            program,
-            backend,
-            cache: MonomorphCache::new(),
-        }
-    }
-
-    /// Resolve -- compiling on first use, caching after -- the consumer `base`
-    /// specialized for a runtime type, returning its callable address. The type is
-    /// given either by name (a declared type) or, when `type_name` is a structural
-    /// descriptor (`"field:tag,..."`), built data-driven from that
-    /// descriptor. Errors if the type is unfit (it lacks a field the consumer
-    /// reads): the boundary's structural check, enforced before specialization
-    /// rather than miscompiled.
-    pub fn resolve(&mut self, base: &str, type_name: &str) -> Result<usize, String> {
-        // A descriptor (data-driven `Type::Record`) over a declared-type name: a
-        // ':' separates a field from its type tag, which a type name never has.
-        let ty = if type_name.contains(':') {
-            let fields = parse_structural_descriptor(type_name)
-                .ok_or_else(|| format!("malformed structural type descriptor `{type_name}`"))?;
-            boundary_record_type_from_fields(&fields)
-        } else {
-            boundary_record_type_by_name(self.program, type_name)
-                .ok_or_else(|| format!("no record type named `{type_name}`"))?
-        };
-        let inst = instance_symbol(base, std::slice::from_ref(&ty));
-        if let Some(addr) = self.cache.get(&inst) {
-            return Ok(addr);
-        }
-        let mono = monomorphize_instance(self.mir, self.program, base, vec![ty])?;
-        let f = mono
-            .lookup(&inst)
-            .ok_or_else(|| format!("no instance `{inst}`"))?;
-        let addr = self.backend.compile_instance(&mono, f)?;
-        self.cache.insert(inst, addr);
-        Ok(addr)
-    }
-}
-
-thread_local! {
-    /// Raw pointer to the [`RuntimeDispatcher`] installed for the current run.
-    static CURRENT: Cell<*mut ()> = const { Cell::new(ptr::null_mut()) };
-}
 
 /// Restores a thread-local service slot when a scoped installation ends.
 struct SlotRestore {
@@ -96,27 +26,12 @@ impl Drop for SlotRestore {
     }
 }
 
-/// Install `dispatcher` as this thread's dispatch service for the duration of
-/// `body` (running `main`), so [`pp_resolve`] reaches it. The raw pointer is valid
-/// only within `body`; `body` must not otherwise touch `dispatcher` (the
-/// trampoline uses the pointer reentrantly).
-pub fn with_dispatcher<R>(dispatcher: &mut RuntimeDispatcher, body: impl FnOnce() -> R) -> R {
-    let ptr = dispatcher as *mut RuntimeDispatcher as *mut ();
-    let prev = CURRENT.with(|c| c.replace(ptr));
-    let _restore = SlotRestore {
-        slot: &CURRENT,
-        previous: prev,
-    };
-    body()
-}
-
 /// Deferred-site addresses already resolved, readable from ANY thread. A
 /// worker thread executing spawned code answers its deferred calls here --
 /// workers cannot compile (the LLVM engine lives on the main thread), so the
 /// main thread primes every recorded target before a spawning batch runs
 /// (see the driver's spawn drain), and this cache is how those answers
-/// cross threads. Keyed by instance symbol (the empty-type-string flavor of
-/// [`pp_resolve`]).
+/// cross threads. Keyed by instance symbol.
 static RESOLVED: std::sync::LazyLock<std::sync::RwLock<fxhash::FxHashMap<String, usize>>> =
     std::sync::LazyLock::new(|| std::sync::RwLock::new(fxhash::FxHashMap::default()));
 
@@ -170,9 +85,9 @@ thread_local! {
 }
 
 /// Install the lazy resolver for the duration of `body` (running the
-/// program), so [`pp_resolve`] reaches it. Same discipline as
-/// [`with_dispatcher`]: the raw pointers are valid only within `body`, and
-/// `body` must not otherwise touch the backend or the closure.
+/// program), so [`pp_resolve`] reaches it. The raw pointers are valid only
+/// within `body`, and `body` must not otherwise touch the backend or the
+/// closure (the trampoline uses them reentrantly).
 pub(crate) fn with_deferred_resolver<'ctx, 'p, R>(
     backend: &mut crate::codegen::LlvmCodegen<'ctx, 'p>,
     resolve: &mut dyn FnMut(&mut crate::codegen::LlvmCodegen<'ctx, 'p>, &str) -> usize,
@@ -212,73 +127,48 @@ pub(crate) fn call_f64(address: usize) -> f64 {
     unsafe { std::mem::transmute::<usize, extern "C" fn() -> f64>(address)() }
 }
 
-/// The dispatch trampoline generated code calls: resolve-or-
-/// compile the consumer named by `[name_ptr, name_len]` for the runtime type
-/// named by `[type_ptr, type_len]`, returning its callable address (0 if no
-/// service is installed, a name is invalid, or the type is unfit -- the caller
-/// treats 0 as a failed dispatch).
+/// The trampoline a deferred call site calls: the callable address of the
+/// instance named by `[name_ptr, name_len]`, compiling it on first use. Returns
+/// 0 when no resolver is installed on this thread and the symbol was not
+/// primed, when the name is not UTF-8, or when the resolver could not supply
+/// the instance; the site traps on 0.
 ///
 /// # Safety
-/// Call only while a [`RuntimeDispatcher`] is installed on this thread (within
-/// [`with_dispatcher`]); the two `(ptr, len)` pairs must describe valid UTF-8.
-pub unsafe extern "C" fn pp_resolve(
-    name_ptr: *const u8,
-    name_len: usize,
-    type_ptr: *const u8,
-    type_len: usize,
-) -> usize {
+/// `[name_ptr, name_len]` must describe a readable byte range. A resolver
+/// installed by [`with_deferred_resolver`] must still be live, which holds for
+/// every call made from code run inside that installation.
+pub(crate) unsafe extern "C" fn pp_resolve(name_ptr: *const u8, name_len: usize) -> usize {
     // SAFETY: installed scoped slots outlive this call. Execution releases all
     // compiler borrows before entering native code; resolver callbacks do not
     // execute native entries. ORC materializers use only their own session state.
     unsafe {
-        // The lazy JIT's sites pass the instance symbol with an empty type
-        // string. Already-resolved targets answer from the cross-thread
-        // cache -- the only path a worker thread (spawned code) can take,
-        // and the fast path for everyone else.
-        if type_len == 0 {
-            let name = std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len));
-            if let Ok(name) = name
-                && let Ok(map) = RESOLVED.read()
-                && let Some(&addr) = map.get(name)
-            {
-                return addr;
-            }
+        let Ok(name) = std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)) else {
+            return 0;
+        };
+        // Already-resolved targets answer from the cross-thread cache -- the
+        // only path a worker thread (spawned code) can take, and the fast
+        // path for everyone else.
+        if let Ok(map) = RESOLVED.read()
+            && let Some(&addr) = map.get(name)
+        {
+            return addr;
         }
         // The compiling resolver: main-thread only. A worker reaching a
         // target the spawn drain did not prime reads null here and the site
         // traps -- kept defined, and unreachable while the drain invariant
         // holds.
         let deferred = CURRENT_DEFERRED.with(|c| c.get());
-        if !deferred.is_null() {
-            let slot = &mut *(deferred as *mut DeferredSlot);
-            let backend =
-                &mut *(slot.backend as *mut crate::codegen::LlvmCodegen<'static, 'static>);
-            let resolve = &mut *(slot.resolve
-                as *mut &mut dyn FnMut(
-                    &mut crate::codegen::LlvmCodegen<'static, 'static>,
-                    &str,
-                ) -> usize);
-            let Some(name) =
-                std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)).ok()
-            else {
-                return 0;
-            };
-            return resolve(backend, name);
-        }
-        let cur = CURRENT.with(|c| c.get());
-        if cur.is_null() {
+        if deferred.is_null() {
             return 0;
         }
-        // The installed dispatcher outlives every call made within `with_dispatcher`;
-        // its concrete lifetimes are erased through the raw pointer but its borrows are
-        // live, so the methods operate on valid data.
-        let dispatcher = &mut *(cur as *mut RuntimeDispatcher<'static, 'static, 'static>);
-        let utf8 = |ptr, len| std::str::from_utf8(std::slice::from_raw_parts(ptr, len)).ok();
-        let (Some(name), Some(type_name)) = (utf8(name_ptr, name_len), utf8(type_ptr, type_len))
-        else {
-            return 0;
-        };
-        dispatcher.resolve(name, type_name).unwrap_or(0)
+        let slot = &mut *(deferred as *mut DeferredSlot);
+        let backend = &mut *(slot.backend as *mut crate::codegen::LlvmCodegen<'static, 'static>);
+        let resolve = &mut *(slot.resolve
+            as *mut &mut dyn FnMut(
+                &mut crate::codegen::LlvmCodegen<'static, 'static>,
+                &str,
+            ) -> usize);
+        resolve(backend, name)
     }
 }
 
@@ -289,72 +179,6 @@ mod tests {
     use brass_engine::Codegen;
     use inkwell::context::Context;
 
-    /// The full in-engine deferred flow through the trampoline: a deferred-param
-    /// consumer is resolved-and-compiled for a runtime type via `pp_resolve` and
-    /// run on a value of that type. `pp_resolve` is called directly here (as
-    /// generated code would), exercising the service + trampoline end to end.
-    #[test]
-    fn pp_resolve_compiles_and_returns_a_consumer_for_a_runtime_type() {
-        let src = "type Person = {\n  age: int32\n}\n\
-                   fun get_age(p) -> int32 {\n  return p.age\n}\n\
-                   fun main() {\n}\n";
-        let ast = brass_parser::parse(src).expect("parse");
-        let (program, errs) = brass_hir::lower(&[brass_hir::LoadedModule {
-            is_prelude: false,
-            path: vec!["main".into()],
-            ast,
-        }]);
-        assert!(errs.is_empty(), "lower: {errs:?}");
-        let mir = brass_mir::lower_program(&program);
-        let static_mono = brass_engine::monomorphize(&mir, &program).expect("monomorphize");
-        let get_age = mir
-            .functions
-            .iter()
-            .find(|f| f.name == "get_age")
-            .map(|f| f.symbol.clone())
-            .expect("get_age");
-        let ty = "Person";
-
-        let ctx = Context::create();
-        let mut backend = LlvmCodegen::new_backend(&ctx, &program);
-        backend.begin_program(&static_mono);
-        backend.finalize().expect("finalize");
-
-        let mut dispatcher = RuntimeDispatcher::new(&mir, &program, &mut backend);
-        let addr = with_dispatcher(&mut dispatcher, || unsafe {
-            pp_resolve(get_age.as_ptr(), get_age.len(), ty.as_ptr(), ty.len())
-        });
-        assert!(addr != 0, "trampoline resolved + compiled the consumer");
-
-        // Run it on a `Person { age: 42 }` boundary value (header16 | age@16).
-        let mut storage = [0u64; 3];
-        storage[2] = 42;
-        let get_age_fn: extern "C" fn(*mut std::ffi::c_void) -> i32 =
-            unsafe { std::mem::transmute(addr) };
-        assert_eq!(
-            get_age_fn(storage.as_mut_ptr() as *mut std::ffi::c_void),
-            42
-        );
-
-        // Scoped dispatcher slots return to their prior state after unwinding.
-        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            with_dispatcher(&mut dispatcher, || panic!("test unwind"));
-        }));
-        assert!(unwind.is_err());
-
-        // No service installed -> the trampoline reports a failed dispatch (0).
-        let miss = unsafe { pp_resolve(get_age.as_ptr(), get_age.len(), ty.as_ptr(), ty.len()) };
-        assert_eq!(miss, 0, "no dispatcher installed -> 0");
-
-        drop(dispatcher);
-        let mut resolve = |_: &mut LlvmCodegen<'_, '_>, _: &str| 0;
-        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            with_deferred_resolver(&mut backend, &mut resolve, || panic!("test unwind"));
-        }));
-        assert!(unwind.is_err());
-        assert!(CURRENT_DEFERRED.with(|slot| slot.get().is_null()));
-    }
-
     /// Resolved entries belong to one execution session and can be drained
     /// before the session's engine is released.
     #[test]
@@ -362,23 +186,18 @@ mod tests {
         let symbol = "__dispatch_session_scope_test";
         let session = resolved_session();
         prime_resolved(symbol, 17);
-        let found = unsafe { pp_resolve(symbol.as_ptr(), symbol.len(), ptr::null(), 0) };
+        let found = unsafe { pp_resolve(symbol.as_ptr(), symbol.len()) };
         assert_eq!(found, 17);
         drop(session);
-        let missing = unsafe { pp_resolve(symbol.as_ptr(), symbol.len(), ptr::null(), 0) };
-        assert_eq!(missing, 0);
+        let missing = unsafe { pp_resolve(symbol.as_ptr(), symbol.len()) };
+        assert_eq!(missing, 0, "no resolver installed and nothing primed -> 0");
     }
 
-    /// Deferred monomorphization from a *structural* descriptor: the
-    /// consumer's argument type is built data-driven from `"score:int32"` -- no
-    /// declared record has a `score` field -- then specialized and run on a value of
-    /// that shape. This exercises the data-driven `Type::Record` construction the
-    /// named-lookup path does not.
+    /// The installed resolver answers an unprimed symbol, and the scoped slot
+    /// returns to its prior (empty) state when the run unwinds.
     #[test]
-    fn pp_resolve_builds_a_structural_type_from_a_descriptor() {
-        let src = "fun get_score(p) -> int32 {\n  return p.score\n}\n\
-                   fun main() {\n}\n";
-        let ast = brass_parser::parse(src).expect("parse");
+    fn deferred_resolver_slot_is_scoped() {
+        let ast = brass_parser::parse("fun main() {\n}\n").expect("parse");
         let (program, errs) = brass_hir::lower(&[brass_hir::LoadedModule {
             is_prelude: false,
             path: vec!["main".into()],
@@ -386,42 +205,25 @@ mod tests {
         }]);
         assert!(errs.is_empty(), "lower: {errs:?}");
         let mir = brass_mir::lower_program(&program);
-        let static_mono = brass_engine::monomorphize(&mir, &program).expect("monomorphize");
-        let get_score = mir
-            .functions
-            .iter()
-            .find(|f| f.name == "get_score")
-            .map(|f| f.symbol.clone())
-            .expect("get_score");
-        let descriptor = "score:int32";
-
+        let mono = brass_engine::monomorphize(&mir, &program).expect("monomorphize");
         let ctx = Context::create();
         let mut backend = LlvmCodegen::new_backend(&ctx, &program);
-        backend.begin_program(&static_mono);
-        backend.finalize().expect("finalize");
+        backend.begin_program(&mono);
 
-        let mut dispatcher = RuntimeDispatcher::new(&mir, &program, &mut backend);
-        let addr = with_dispatcher(&mut dispatcher, || unsafe {
-            pp_resolve(
-                get_score.as_ptr(),
-                get_score.len(),
-                descriptor.as_ptr(),
-                descriptor.len(),
-            )
+        let symbol = "__dispatch_resolver_scope_test";
+        let mut resolve = |_: &mut LlvmCodegen<'_, '_>, name: &str| {
+            assert_eq!(name, symbol);
+            23
+        };
+        let found = with_deferred_resolver(&mut backend, &mut resolve, || unsafe {
+            pp_resolve(symbol.as_ptr(), symbol.len())
         });
-        assert!(
-            addr != 0,
-            "structural descriptor resolved + compiled the consumer"
-        );
+        assert_eq!(found, 23, "the installed resolver supplies the address");
 
-        // Run it on a `{ score: 7 }` boundary value (header16 | score@16).
-        let mut storage = [0u64; 3];
-        storage[2] = 7;
-        let get_score_fn: extern "C" fn(*mut std::ffi::c_void) -> i32 =
-            unsafe { std::mem::transmute(addr) };
-        assert_eq!(
-            get_score_fn(storage.as_mut_ptr() as *mut std::ffi::c_void),
-            7
-        );
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_deferred_resolver(&mut backend, &mut resolve, || panic!("test unwind"));
+        }));
+        assert!(unwind.is_err());
+        assert!(CURRENT_DEFERRED.with(|slot| slot.get().is_null()));
     }
 }

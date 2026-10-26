@@ -1,0 +1,23 @@
+// A map's key and value types are pinned by the map instance, and `set`
+// stores its arguments in the map's own slots: they are storage, not
+// parameters instantiated at the argument's type. A record of another type
+// (`Narrow` for `Wide`, `Wide` for an anonymous `{ a }` key) or a literal
+// without exactly the value record's fields cannot be stored there.
+type Wide = {
+    a: int32
+    b: string
+}
+
+type Narrow = {
+    a: int32
+}
+
+fun main() {
+    let m = HashMap.new()
+    m.set("x", Wide { a: 1, b: "s" })
+    m.set("y", Narrow { a: 2 })
+    m.set("z", { a: 3 })
+    let keys = HashMap.new()
+    keys.set({ a: 2 }, 1)
+    keys.set(Wide { a: 1, b: "s" }, 2)
+}

@@ -1,0 +1,13 @@
+// @backends: all
+// A module that declares a function with a prelude name shadows the prelude
+// in that module only. Every other module still resolves the bare name to the
+// prelude's definition (`abs`, `println` here), and the shadowing module's
+// definitions stay reachable qualified.
+import shadowlib
+
+fun main() {
+    println(abs(-3))
+    println(shadowlib.shout("hi"))
+    println(shadowlib.abs("q"))
+    println(shadowlib.println("direct") * 2)
+}

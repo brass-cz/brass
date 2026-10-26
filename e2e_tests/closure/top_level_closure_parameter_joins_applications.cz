@@ -1,0 +1,24 @@
+// @backends: all
+// Module top-level code follows the same rule as a function body: a closure
+// binding that is not let-polymorphic (here: it is reassigned) has one type,
+// and its unannotated parameter is the value join of the arguments of all of
+// its applications in the rest of the module's code, whatever their order.
+let a: int32 = 7
+let b: int64 = 5000000000
+let f = (x) -> x + 1
+println(f(a))
+println(f(b))
+f = (y) -> y * 2
+println(f(a))
+let total: int64 = 0
+let add = (x) -> {
+    total = total + x
+}
+if total == 0 {
+    add(a)
+}
+add(b)
+println(total)
+add = (y) -> {
+    total = total - y
+}

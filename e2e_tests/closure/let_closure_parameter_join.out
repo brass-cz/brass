@@ -1,0 +1,135 @@
+local literal: small first
+int64
+5
+int64
+20
+local literal: large first
+int64
+20
+int64
+5
+local reassigned: small first
+int64
+10
+int64
+40
+local reassigned: large first
+int64
+40
+int64
+10
+local recursive: small first
+int64
+120
+int64
+2432902008176640000
+local recursive: large first
+int64
+2432902008176640000
+int64
+120
+local factory: small first
+int64
+[5]
+int64
+[20]
+local factory: large first
+int64
+[20]
+int64
+[5]
+local indexed: small first
+int64
+5
+int64
+20
+local indexed: large first
+int64
+20
+int64
+5
+local conditional: small first
+int64
+5
+int64
+20
+local conditional: large first
+int64
+20
+int64
+5
+local block: small first
+int64
+5
+int64
+20
+local block: large first
+int64
+20
+int64
+5
+local field: small first
+int64
+5
+int64
+20
+local field: large first
+int64
+20
+int64
+5
+local destructured: both orders
+int64
+20
+int64
+5
+global literal: small first
+int64
+5
+int64
+20
+global literal: large first
+int64
+20
+int64
+5
+global reassigned: small first
+int64
+10
+int64
+40
+global reassigned: large first
+int64
+40
+int64
+10
+global recursive: small first
+int64
+120
+int64
+2432902008176640000
+global recursive: large first
+int64
+2432902008176640000
+int64
+120
+global factory: small first
+int64
+[5]
+int64
+[20]
+global factory: large first
+int64
+[20]
+int64
+[5]
+global indexed: small first
+int64
+5
+int64
+20
+global indexed: large first
+int64
+20
+int64
+5

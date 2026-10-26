@@ -1,0 +1,7 @@
+// @backends: all
+// An out-of-range growable array store reports the shared bounds diagnostic.
+fun main() {
+    let a = [1]
+    a.push(2)
+    a[2] = 2
+}

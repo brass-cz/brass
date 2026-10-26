@@ -1,0 +1,39 @@
+// @backends: all
+// Applying a local closure types the application by checking the closure's
+// body at the argument types: `(q) -> q.b` applied to a record yields that
+// record's field type, and a block body yields the join of its returns. The
+// results flow on at those types (a `string` annotation accepts them).
+type P = {
+    a: int32
+    b: string
+}
+
+fun helper(p) {
+    return p.b
+}
+
+fun f(p) {
+    if p.a > 0 {
+        let h = (q) -> q.b
+        return h(p)
+    }
+    return helper(p)
+}
+
+fun g(p) {
+    if p.a > 0 {
+        let h = (q) -> {
+            return q.a * 2
+        }
+        return h(p)
+    }
+    return 7
+}
+
+fun main() {
+    println(f(P { a: 1, b: "x" }))
+    println(f(P { a: 0, b: "y" }))
+    println(g(P { a: 2, b: "z" }))
+    const s: string = f(P { a: 1, b: "w" })
+    println(s)
+}

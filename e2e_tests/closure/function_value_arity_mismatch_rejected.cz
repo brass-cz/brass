@@ -1,0 +1,13 @@
+// A function value whose result does not fit the expected function type is
+// rejected even when its optional trailing parameter is dropped.
+fun greet(name: string, title: string?) -> string {
+    return name
+}
+
+fun call_one(f: (string) -> int32) -> int32 {
+    return f("one")
+}
+
+fun main() {
+    println(call_one(greet))
+}

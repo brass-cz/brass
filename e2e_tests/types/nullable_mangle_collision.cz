@@ -1,8 +1,7 @@
-// Pins that the engine-symbol -> LLVM-name mapping is injective: `int32?[]`
-// (slice of nullable) and `int32[]?` (nullable slice) instantiate `probe`
-// twice, and the two instances must get distinct LLVM functions. The old
-// sanitize folded every punctuation char to `_`, merging the two names and
-// SIGSEGV-ing the JIT.
+// Pins that distinct instances get distinct compiled functions even when
+// their type names differ only in punctuation: `int32?[]` (array of
+// nullables) and `int32[]?` (nullable array) instantiate `probe` twice, and
+// each call runs its own instance.
 fun probe(x) -> int64 {
     if x {
         return x.len()

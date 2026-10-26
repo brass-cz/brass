@@ -1,0 +1,20 @@
+// An array or tuple pattern never matches an absent value, so on a nullable
+// subject it is refutable: `let` and a `for` head over nullable elements
+// reject it, and `if let` or `match` must be used instead (their else / `_`
+// arm takes the null).
+fun pairs(n: int32) -> int32[]? {
+    if n > 0 {
+        return [n, n]
+    }
+    return null
+}
+
+fun main() {
+    let p: int32[]? = null
+    let [q] = p
+    let t: [int32, string]? = null
+    let [a, b] = t
+    for [c, d] in [pairs(1), pairs(0)] {
+        println(c + d)
+    }
+}

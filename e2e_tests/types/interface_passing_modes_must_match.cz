@@ -1,0 +1,51 @@
+// Interface implementations require the same parameter passing mode as each
+// required member; every distinct pair is rejected in both directions.
+type Big = { a: int32 }
+
+type PlainAgainstRefRequirement = { w(self, x: ref(Big)) -> int32 }
+type PlainAgainstRefImplementation: PlainAgainstRefRequirement = { n: int32 }
+fun PlainAgainstRefImplementation.w(self, x: Big) -> int32 { return 1 }
+
+type PlainAgainstMutRequirement = { w(self, x: mut(Big)) -> int32 }
+type PlainAgainstMutImplementation: PlainAgainstMutRequirement = { n: int32 }
+fun PlainAgainstMutImplementation.w(self, x: Big) -> int32 { return 1 }
+
+type PlainAgainstRefMutRequirement = { w(self, x: ref(mut(Big))) -> int32 }
+type PlainAgainstRefMutImplementation: PlainAgainstRefMutRequirement = { n: int32 }
+fun PlainAgainstRefMutImplementation.w(self, x: Big) -> int32 { return 1 }
+
+type RefAgainstPlainRequirement = { w(self, x: Big) -> int32 }
+type RefAgainstPlainImplementation: RefAgainstPlainRequirement = { n: int32 }
+fun RefAgainstPlainImplementation.w(self, x: ref(Big)) -> int32 { return 1 }
+
+type RefAgainstMutRequirement = { w(self, x: mut(Big)) -> int32 }
+type RefAgainstMutImplementation: RefAgainstMutRequirement = { n: int32 }
+fun RefAgainstMutImplementation.w(self, x: ref(Big)) -> int32 { return 1 }
+
+type RefAgainstRefMutRequirement = { w(self, x: ref(mut(Big))) -> int32 }
+type RefAgainstRefMutImplementation: RefAgainstRefMutRequirement = { n: int32 }
+fun RefAgainstRefMutImplementation.w(self, x: ref(Big)) -> int32 { return 1 }
+
+type MutAgainstPlainRequirement = { w(self, x: Big) -> int32 }
+type MutAgainstPlainImplementation: MutAgainstPlainRequirement = { n: int32 }
+fun MutAgainstPlainImplementation.w(self, x: mut(Big)) -> int32 { return 1 }
+
+type MutAgainstRefRequirement = { w(self, x: ref(Big)) -> int32 }
+type MutAgainstRefImplementation: MutAgainstRefRequirement = { n: int32 }
+fun MutAgainstRefImplementation.w(self, x: mut(Big)) -> int32 { return 1 }
+
+type MutAgainstRefMutRequirement = { w(self, x: ref(mut(Big))) -> int32 }
+type MutAgainstRefMutImplementation: MutAgainstRefMutRequirement = { n: int32 }
+fun MutAgainstRefMutImplementation.w(self, x: mut(Big)) -> int32 { return 1 }
+
+type RefMutAgainstPlainRequirement = { w(self, x: Big) -> int32 }
+type RefMutAgainstPlainImplementation: RefMutAgainstPlainRequirement = { n: int32 }
+fun RefMutAgainstPlainImplementation.w(self, x: ref(mut(Big))) -> int32 { return 1 }
+
+type RefMutAgainstRefRequirement = { w(self, x: ref(Big)) -> int32 }
+type RefMutAgainstRefImplementation: RefMutAgainstRefRequirement = { n: int32 }
+fun RefMutAgainstRefImplementation.w(self, x: ref(mut(Big))) -> int32 { return 1 }
+
+type RefMutAgainstMutRequirement = { w(self, x: mut(Big)) -> int32 }
+type RefMutAgainstMutImplementation: RefMutAgainstMutRequirement = { n: int32 }
+fun RefMutAgainstMutImplementation.w(self, x: ref(mut(Big))) -> int32 { return 1 }

@@ -3,12 +3,13 @@
 //! This crate runs a checked program without LLVM: it reuses
 //! `brass_engine`'s monomorphization to produce a [`brass_engine::MonoProgram`]
 //! of concretely-typed instances, then *interprets* that MIR by walking the
-//! control-flow graph (see [`interp`]). It is the alternative to the typed LLVM JIT
-//! (`brass_jit_llvm`): it depends only on the backend-agnostic engine, so it
-//! builds and runs on any host. The interpreter covers the typed sequential subset
-//! (scalars, strings, arrays, records, sums, closures, nullable/`Result`, control
-//! flow, recursion); runtime features outside that subset (concurrency, file I/O,
-//! deferred type dispatch) report a clear error rather than executing.
+//! control-flow graph (see the `interp` module). It is the alternative to the
+//! typed LLVM JIT (`brass_jit_llvm`): it depends only on the backend-agnostic
+//! engine, so it builds and runs on any host. The interpreter covers the
+//! sequential language (scalars, strings, arrays, records, sums, closures,
+//! nullable/`Result`, control flow, recursion, stdin/stdout and native-plugin
+//! calls); concurrency (`spawn`/`sync`/`with`) reports a clear error rather
+//! than executing.
 
 mod format;
 mod interp;
@@ -59,8 +60,9 @@ fn validate_monomorphized(
         // `main_skip` is the first construct that made `main` untypeable --
         // the diagnostic the user needs, same as the JIT engine's error path.
         return Err(match &mono.main_skip {
-            Some(reason) => format!(
-                "program uses constructs outside the REPL runtime's supported subset: {reason}"
+            Some(reason) => brass_engine::refusal(
+                "program uses constructs outside the REPL runtime's supported subset",
+                reason,
             ),
             None => {
                 "program uses constructs outside the REPL runtime's supported subset".to_string()

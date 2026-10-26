@@ -1,0 +1,10 @@
+// A branch value flowing into a declared record slot is built as that record
+// only when its fields are exactly the record's: a literal missing a field is
+// rejected at the literal, as a direct initializer would be.
+type Named = { name: string, id: int32 }
+
+fun main() {
+    let c = true
+    let p: Named = if c { { id: 1, name: "a" } } else { { id: 2 } }
+    println(p.name)
+}

@@ -25,9 +25,24 @@ impl Fixture {
     }
 
     fn run(&self, mode: Option<&str>) -> Output {
-        let mut command = support::brass_command(env!("CARGO_BIN_EXE_brass"));
-        command.args(mode).arg(self.root.join("main.cz"));
-        command.output().expect("run diagnostic fixture")
+        // The same fixture pins both policies' held-diagnostic, warning and
+        // keyed-continuation boundaries; source spans remain byte-identical.
+        let run = |policy| {
+            support::brass_command(env!("CARGO_BIN_EXE_brass"))
+                .env("BRASS_LAZY_COMPLETE", policy)
+                .args(mode)
+                .arg(self.root.join("main.cz"))
+                .output()
+                .expect("run diagnostic fixture")
+        };
+        let output = run("off");
+        if mode.is_none() {
+            let auto = run("auto");
+            assert_eq!(auto.status, output.status, "policy exit status");
+            assert_eq!(auto.stdout, output.stdout, "policy output boundary");
+            assert_eq!(auto.stderr, output.stderr, "policy diagnostic order");
+        }
+        output
     }
 
     fn rejects(&self, expected: &[&str], lazy_stdout: &str) {
@@ -62,6 +77,47 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+/// A clean annotated caller of an erroneous body must stay outside the region.
+#[test]
+#[cfg(feature = "jit")]
+fn completed_region_keeps_bad_callee_callers_deferred() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../e2e_tests/lazy/region_closure_held_error.cz");
+    let run = |policy: &str, traced: bool| {
+        support::brass_command(env!("CARGO_BIN_EXE_brass"))
+            .env("BRASS_LAZY_COMPLETE", policy)
+            .env(
+                "BRASS_LOG",
+                if traced { "brass::perf=debug" } else { "off" },
+            )
+            .arg(&path)
+            .output()
+            .expect("run region closure fixture")
+    };
+    let off = run("off", false);
+    let auto = run("auto", false);
+    assert_eq!(off.status.code(), Some(1));
+    assert_eq!(off.stdout, fs::read(path.with_extension("out")).unwrap());
+    assert!(
+        String::from_utf8_lossy(&off.stderr).contains(
+            fs::read_to_string(path.with_extension("err"))
+                .unwrap()
+                .trim()
+        )
+    );
+    assert_eq!(auto.status, off.status);
+    assert_eq!(auto.stdout, off.stdout);
+    assert_eq!(auto.stderr, off.stderr);
+    let traced = run("auto", true);
+    assert_eq!(traced.status, off.status);
+    assert_eq!(traced.stdout, off.stdout);
+    let trace = String::from_utf8_lossy(&traced.stderr);
+    assert!(
+        trace.contains("lazy: policy complete phase=\"runtime\" resolves=32"),
+        "{trace}"
+    );
 }
 
 #[test]
@@ -198,7 +254,7 @@ fn uninstantiated_templates_and_pruned_branches_follow_ordinary_rules() {
 
 #[test]
 fn duplicate_method_parameter_stops_before_entry() {
-    // Both checker paths reject the second named parameter before execution.
+    // The second named parameter is rejected before execution, reported once.
     Fixture::new(
         "type T = { v: int32 }\n\
          fun T.m(self, x, x) {\n    return self.v\n}\n\
@@ -210,17 +266,14 @@ fn duplicate_method_parameter_stops_before_entry() {
          }\n",
     )
     .rejects(
-        &[
-            ":2:18: error: duplicate parameter `x` in method\n",
-            ":2:18: error: duplicate parameter `x` in method `T.m`",
-        ],
+        &[":2:18: error: duplicate parameter `x` in method `T.m`"],
         "",
     );
 }
 
 #[test]
 fn receiver_body_errors_precede_native_compilation() {
-    // sf1: self is T in the checker; retain both source diagnostics, not an LLVM error.
+    // `self` is `T` in the checker; report the source diagnostic, not an LLVM error.
     Fixture::new(
         "type T = { v: int32 }\n\
          fun T.m(self: int32) {\n    return self + 1\n}\n\
@@ -231,10 +284,7 @@ fn receiver_body_errors_precede_native_compilation() {
          }\n",
     )
     .rejects(
-        &[
-            ":3:12: error: operator `+` is not defined for `T` and `int32` (no applicable conversion)",
-            ":3:19: error: integer literal used where `T` is required",
-        ],
+        &[":3:12: error: operator `+` is not defined for `T` and `int32` (no applicable conversion)"],
         "",
     );
 }
@@ -291,7 +341,8 @@ fn method_definite_assignment_gates_execution() {
 
 #[test]
 fn method_untaken_branch_is_still_checked() {
-    // HM errors in an untaken branch belong to the complete called body.
+    // A type mismatch in an untaken branch belongs to the complete called
+    // body, so the infer pass's diagnostic stops the run all the same.
     Fixture::new(
         "type T = { v: int32 }\n\
          fun T.m(self) { if false { let x: int32 = \"bad\" } }\n\
@@ -496,4 +547,85 @@ fn uncalled_method_errors_remain_lazy_across_modules() {
     assert_eq!(output.stdout, b"1\n");
     assert!(!fixture.run(Some("check")).status.success());
     assert!(!fixture.run(Some("--eager")).status.success());
+}
+
+#[test]
+fn a_mismatch_is_reported_once() {
+    // Every mode reports the infer pass's diagnostic for these mismatches
+    // exactly once, never with a second line restating it with different
+    // wording or a different span.
+    let cases = [
+        (
+            "fun main() {\n  let a = int32.from(\"12\")\n  println(a)\n}\n",
+            ":2:22: error: `int32.from` expects a numeric value, found `string`",
+        ),
+        // Branches with no value-preserving common type (`int32` and `int64`
+        // branches join at `int64`; `int64` and `uint64` have none).
+        (
+            "fun pick(c: bool, a: int64, b: uint64) -> int64 {\n  let v = if c { a } else { b }\n  \
+             return v\n}\nfun main() { println(pick(true, 1, 2)) }\n",
+            ":2:11: error: `if` branches have incompatible types `int64` and `uint64`",
+        ),
+    ];
+    for (source, diagnostic) in cases {
+        let fixture = Fixture::new(source);
+        fixture.rejects(&[diagnostic], "");
+        let check = fixture.run(Some("check"));
+        let stderr = String::from_utf8_lossy(&check.stderr);
+        assert_eq!(stderr.matches("error:").count(), 1, "{stderr}");
+    }
+}
+
+#[test]
+fn a_body_conflict_is_reported_once() {
+    // A body whose inputs are all known conflicts identically in its own
+    // definition and in the re-elaboration at each call: one diagnostic stands
+    // for the site, in every mode.
+    let cases = [
+        (
+            "type ErrA = { msg: string }\ntype ErrB = { code: int64, msg: string }\n\
+             fun f(n: int32) {\n  if n == 0 { return error(ErrA { msg: \"a\" }) }\n  \
+             if n == 1 { return error(ErrB { code: 42, msg: \"b\" }) }\n  return n\n}\n\
+             fun main() {\n  for i in [0, 1, 2] {\n    match f(i) {\n      \
+             Ok { value } => println(\"ok {value}\")\n      \
+             Err { error } => println(\"err {error.msg}\")\n    }\n  }\n}\n",
+            ":5:22: error: incompatible error payloads: `Error<value=ErrA>` and `Error<value=ErrB>`",
+        ),
+        (
+            "fun g(c: bool) {\n  if c { return 1 }\n  return \"x\"\n}\n\
+             fun main() { println(g(true)) }\n",
+            ":3:10: error: incompatible return types: `int32` and `string`",
+        ),
+    ];
+    for (source, diagnostic) in cases {
+        let fixture = Fixture::new(source);
+        fixture.rejects(&[diagnostic], "");
+        let check = fixture.run(Some("check"));
+        let stderr = String::from_utf8_lossy(&check.stderr);
+        assert_eq!(stderr.matches("error:").count(), 1, "{stderr}");
+    }
+}
+
+#[test]
+fn failed_entry_reports_the_complete_verdict_once() {
+    // An entry rejected for its own error must still report the errors of the
+    // bodies it calls, and a body the lazy run checks at a demanded instance
+    // must read exactly like the call-site elaboration that found the same
+    // error: one line per diagnostic, the whole-program check's text.
+    Fixture::new(
+        "type Animal = { name: string }\ntype Dog = { age: int32, name: string }\n\
+         type Kennel = { pet: Animal }\n\
+         fun keep(a: Animal) -> Animal { return a }\n\
+         fun house(k: Kennel, a: Animal) { k.pet = a }\n\
+         fun main() {\n let d = Dog { age: 3, name: \"rex\" }\n let bad: Animal = d\n\
+         println(keep(d).name)\n house(Kennel { pet: Animal { name: \"cat\" } }, d)\n}\n",
+    )
+    .rejects(
+        &[
+            ":4:40: error: cannot store a `Dog` in a slot of type `Animal`",
+            ":5:43: error: cannot store a `Dog` in a slot of type `Animal`",
+            ":8:20: error: cannot store a `Dog` in a slot of type `Animal`",
+        ],
+        "",
+    );
 }

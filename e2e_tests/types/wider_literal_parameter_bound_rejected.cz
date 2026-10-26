@@ -1,0 +1,7 @@
+// Literal adaptation preserves storage shape and bound-value type restrictions.
+type A = { n: int64 }
+fun take(a: A) { println(a.n) }
+fun main() {
+    let a = { n: 1, m: 2 }
+    take(a)
+}

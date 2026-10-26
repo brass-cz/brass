@@ -77,7 +77,8 @@ What this means in practice:
   function: an error anywhere in a function the run calls counts, even in a
   branch execution would never take.
 - Unused code may continue checking in the background until the program
-  exits, but its diagnostics never change the current run's outcome.
+  exits. Its errors never stop a run, but a run that fails for another
+  reason reports them together with the error that stopped it.
 - `brass --eager hello.cz` runs with the check-everything-first behavior
   (identical to `brass check` followed by the run). The REPL and the
   interpreter back end always check eagerly.

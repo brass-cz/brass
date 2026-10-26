@@ -1,0 +1,46 @@
+// @backends: all
+// Bare variant names resolve through scope. `main` imports only `describe`,
+// so `speed.Mode` (imported by `describe`, not here) is not in scope: the
+// names `fast` and `slow` are ordinary bindings in this module. A braced
+// head that is both a record type and another sum's variant (`P`) is told
+// apart by the matched value: a `P` record destructures as the record, a
+// `Collision` value as its variant -- also per instance of a generic body.
+import describe
+
+type Collision = | P { x: int32 }
+type P = { x: int32, y: int32 }
+
+fun main() {
+    println(describe.describe_pick())
+
+    let n = 5
+    let r = match n {
+        1 => "one",
+        fast => "bound {fast}",
+    }
+    println(r)
+    let slow = n * 2
+    println(slow)
+
+    let p = P { x: 1, y: 2 }
+    let P { x, y } = p
+    println(x + y)
+    match p {
+        P { x, y } => println(x * 10 + y),
+    }
+    let c = Collision.P { x: 7 }
+    match c {
+        P { x } => println(x),
+    }
+    match c {
+        Collision.P { x } => println(x + 1),
+    }
+    println(first_x(p))
+    println(first_x(c))
+}
+
+fun first_x(v) -> int32 {
+    return match v {
+        P { x, .. } => x,
+    }
+}

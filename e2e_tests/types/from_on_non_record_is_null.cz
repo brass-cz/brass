@@ -1,9 +1,10 @@
-// `T.from(v)` builds `T` out of `v`'s FIELDS, and accepts a `v` of any type: one
-// that has none of them answers null rather than failing to compile. A SUM value
-// is such a `v` -- its fields live in its variants, which the conversion does
-// not read -- so this takes the null path at run time. (Rejecting it statically,
-// as the checker once did, also rejected the useful shape: a function that asks
-// "is this argument a T?" about a value whose type differs per call site.)
+// `T.from(v)` builds `T` out of `v`'s FIELDS, and accepts a `v` of any
+// type: one that has none of them answers null rather than failing to
+// compile. A SUM value is such a `v` -- its fields live in its variants,
+// which the conversion does not read -- so this takes the null path at run
+// time. (Rejecting it statically would also reject the useful shape: a
+// function that asks "is this argument a T?" about a value whose type
+// differs per call site.)
 type Shape =
     | Circle { r: int64 }
     | Square { w: int64 }

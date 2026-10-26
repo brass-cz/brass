@@ -1,0 +1,70 @@
+// @backends: all
+// Variant patterns accept a nullable sum subject like record patterns do: the
+// pattern tests the present value and `null` takes the `else` / `_` / `null`
+// arm. This holds for braced and unit variants, bare or qualified, in
+// `if let`, in `match` (as an expression and with returning arms), and for a
+// nullable sum field nested in a record pattern.
+type S = | A { x: int32 } | B
+type H = { s: S? }
+
+fun f(n: int32) -> S? {
+    if n > 0 {
+        return S.A { x: n }
+    }
+    if n == 0 {
+        return S.B
+    }
+    return null
+}
+
+fun describe(n: int32) -> string {
+    return match f(n) {
+        A { x } => "A {x}",
+        B => "B",
+        _ => "null",
+    }
+}
+
+fun qualified(n: int32) -> string {
+    match f(n) {
+        S.A { x } => {
+            return "S.A {x}"
+        }
+        S.B => {
+            return "S.B"
+        }
+        null => {
+            return "nothing"
+        }
+    }
+}
+
+fun main() {
+    if let A { x } = f(2) {
+        println(x + 1)
+    } else {
+        println("none")
+    }
+    if let A { x } = f(-1) {
+        println(x)
+    } else {
+        println("none")
+    }
+    if let S.B = f(0) {
+        println("is B")
+    }
+    println(describe(1))
+    println(describe(0))
+    println(describe(-1))
+    println(qualified(3))
+    println(qualified(0))
+    println(qualified(-3))
+    for h in [H { s: S.B }, H { s: null }, H { s: S.A { x: 4 } }] {
+        let label = match h {
+            H { s: B } => "field B",
+            H { s: A { x } } => "field A {x}",
+            _ => "field null",
+        }
+        println(label)
+    }
+}

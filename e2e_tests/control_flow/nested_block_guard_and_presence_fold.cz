@@ -1,0 +1,51 @@
+// @backends: all
+// A block nested in an `if` arm, a `match` arm or a closure body is checked
+// like a function body: a guard narrows the rest of the nested block, and a
+// presence test whose taken arm returns makes the fall-through dead for the
+// instantiations that take it.
+type P = {
+    name: string
+}
+fun pick(b: bool) -> string? {
+    if b { return "hello" }
+    return null
+}
+fun nested_guard(k: int32) {
+    let x = pick(true)
+    if k == 3 {
+        if !x { return }
+        println(x.len())
+    }
+}
+fun nested_fold(v, c: bool) -> string {
+    if c {
+        if v.name { return v.name }
+        return v
+    }
+    return "z"
+}
+fun in_match(k: int32) -> int64 {
+    let x = pick(k > 0)
+    let none: int64 = 0
+    return match k {
+        0 => none,
+        _ => {
+            if !x { return -1 }
+            x.len()
+        },
+    }
+}
+fun main() {
+    nested_guard(3)
+    println(nested_fold(P { name: "a" }, true))
+    println(nested_fold("b", true))
+    println(in_match(2))
+    println(in_match(0))
+    let f = (b: bool) -> {
+        let y = pick(b)
+        if !y { return 0 }
+        return y.len()
+    }
+    println(f(true))
+    println(f(false))
+}

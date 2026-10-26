@@ -1,0 +1,20 @@
+// @backends: all
+// A declared sum subtype pushed into (or inserted in) an array of its parent
+// is rebuilt as the parent, as at every other value flow site; the extra
+// payload fields of the subtype are dropped.
+type Base =
+    | A { v: int32 }
+    | B
+
+type Wide: Base =
+    | A { v: int32, extra: string }
+    | B
+
+fun main() {
+    const w = Wide.A { v: 4, extra: "x" }
+    let arr: Base[] = [Base.B]
+    arr.push(w)
+    arr.push(Wide.B)
+    arr.insert(0, Wide.A { v: 7, extra: "y" })
+    println(arr)
+}

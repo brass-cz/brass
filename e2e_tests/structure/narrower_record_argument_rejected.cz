@@ -1,0 +1,24 @@
+// Structural subtyping is directional: a record with FEWER fields never flows
+// into a parameter that requires more, even when the value reaches the call
+// through an unannotated function's result, where the checker cannot lean on
+// a declared type. Reading `x.b` would read a field the value does not have.
+type Big = {
+    a: int32
+    b: string
+}
+
+type Small = {
+    a: int32
+}
+
+fun use_big(x: Big) {
+    println(x.b)
+}
+
+fun make_small() {
+    return Small { a: 1 }
+}
+
+fun main() {
+    use_big(make_small())
+}

@@ -1,0 +1,47 @@
+// @backends: all
+// Inside a `match`, a new line that parses as `pattern =>` starts the next
+// arm, even when it begins with a token that could continue the previous
+// arm's expression: a negative literal pattern (`-1 =>`) is not a
+// subtraction and an array/tuple pattern (`[x, y] =>`) is not an index.
+// Inside parentheses or brackets, and when the line is no arm, the same
+// tokens still continue the expression.
+
+fun name(n: int32) -> string {
+    return match n {
+        1 => "one"
+        -1 => "minus one"
+        -2 => "minus two"
+        _ => "other"
+    }
+}
+
+fun sum2(p: int32[]) -> int32 {
+    let base = [100, 200]
+    return match p {
+        [0, y] => y
+        [x, y] => x + y
+        _ => base
+            [1]
+    }
+}
+
+fun offset(n: int32) -> int32 {
+    return match n {
+        0 => (10
+            - 1)
+        _ => n
+            - 1
+    }
+}
+
+fun main() {
+    println(name(1))
+    println(name(-1))
+    println(name(-2))
+    println(name(5))
+    println(sum2([0, 4]))
+    println(sum2([3, 4]))
+    println(sum2([1, 2, 3]))
+    println(offset(0))
+    println(offset(5))
+}

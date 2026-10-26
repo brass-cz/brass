@@ -1,0 +1,55 @@
+// @backends: all
+// A `let` annotation is the binding's type for return inference too: a
+// fallible body returning an annotated local returns the annotated type, not
+// the type of the initializer it started from (an `int64` that outgrows
+// `int32`, a `string?` that starts as `null`, an `int64[]` built from int32
+// literals) -- for functions and methods alike.
+type Acc = { base: int32 }
+
+fun scaled(fail: bool) {
+    let x: int64 = 5
+    x = x * 1000000000
+    if fail {
+        error("boom")!
+    }
+    return x
+}
+
+fun Acc.scaled(self, fail: bool) {
+    let x: int64 = 5
+    x = x * 1000000000
+    if fail {
+        error("boom")!
+    }
+    return x
+}
+
+fun label(fail: bool) {
+    let x: string? = null
+    x = "hello"
+    if fail {
+        error("boom")!
+    }
+    return x
+}
+
+fun counts(flag: bool) {
+    let xs: int64[] = [1, 2]
+    if flag {
+        return error("e")
+    }
+    return xs
+}
+
+fun main() {
+    let v = scaled(false)!
+    println(typeof(v))
+    println(v)
+    let m = Acc { base: 1 }.scaled(false)!
+    println(typeof(m))
+    println(m)
+    let l = label(false)!
+    println(typeof(l))
+    println(l)
+    println(counts(false)!)
+}

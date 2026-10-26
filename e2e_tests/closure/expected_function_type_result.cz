@@ -1,0 +1,30 @@
+// @backends: all
+// A closure checked against an expected function type returns that type's
+// result representation: a body returning a plain `int32` or `string` where
+// the expected result is nullable produces a present nullable, and an
+// `int32` body behind an `int64` result widens. A null-propagating `!` on a
+// builtin container's `get` makes an unannotated closure's result nullable.
+fun call(pred: (int32) -> int32?) -> int32? {
+    return pred(3)
+}
+
+fun calls(pred: (int32) -> string?) {
+    let r = pred(3)
+    println(r)
+    if let s = r {
+        println(s.len())
+    }
+}
+
+fun main() {
+    println(call((u) -> u + 1))
+    calls((u) -> "xy")
+    let f: (int32) -> int64 = (u) -> u
+    println(f(4))
+    let m = HashMap.new()
+    m.set("a", 1)
+    let g = (k: string) -> m.get(k)!
+    const v: int32? = g("a")
+    println(v)
+    println(g("b"))
+}

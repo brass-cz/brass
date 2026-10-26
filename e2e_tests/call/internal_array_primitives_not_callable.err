@@ -1,0 +1,4 @@
+9:3: error: unknown function `_array_push`
+10:11: error: unknown function `_array_pop`
+12:3: error: unknown function `_array_insert`
+13:3: error: unknown function `_array_remove`

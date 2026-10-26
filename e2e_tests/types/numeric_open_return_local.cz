@@ -1,0 +1,14 @@
+// @backends: all
+fun seed() {
+ let x = 0
+ println(typeof(x))
+ return x
+}
+fun main() {
+ let wide: int64 = 5000000000
+ let a = seed()
+ a = wide
+ let b = seed()
+ println(typeof(a))
+ println(typeof(b))
+}

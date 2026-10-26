@@ -1,0 +1,54 @@
+// @backends: all
+// A range `[lo..hi]` has the element type the operator rule gives its bounds,
+// and its counter runs at that type: a uint8 `lo` with a 256 `hi` counts in
+// int32 (a uint8 counter would wrap at 255 and never finish), while a `hi`
+// that fits uint8 keeps the range uint8. A generic counting function called
+// with differently typed bounds counts each instance at its own bounds'
+// type. The counter is a copy: a variable bound stays unchanged.
+fun count(lo, hi) {
+    let n = 0
+    for i in [lo..hi] {
+        n += 1
+    }
+    return n
+}
+
+fun last(lo, hi) {
+    let out = hi
+    for i in [lo..hi] {
+        out = i
+    }
+    return out
+}
+
+fun main() {
+    const lo: uint8 = 250
+    let n = 0
+    for i in [lo..256] {
+        n += 1
+    }
+    println(n)
+    const xs = [lo..256]
+    println("{xs.len()} {typeof(xs)} {xs[5]}")
+    println(typeof([lo..255]))
+    println(len([lo..255]))
+    const b: int8 = 120
+    let c = 0
+    for k in [b..200] {
+        c += 1
+    }
+    println(c)
+    println(count(lo, 256))
+    let a: int64 = 1
+    let z: int64 = 4
+    println(count(a, z))
+    let far: int64 = 5000000000
+    println(last(far, far + 3))
+    println(last(lo, 256))
+    let x = 0
+    for i in [x..3] {
+        print("{i} ")
+    }
+    println(x)
+    println(typeof([0..xs.len()]))
+}

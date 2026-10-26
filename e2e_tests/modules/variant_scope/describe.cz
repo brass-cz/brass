@@ -1,0 +1,14 @@
+// A whole-module import (`import speed`) brings `speed.Mode` into scope, so
+// its bare variant names are variant tests here.
+import speed
+
+fun describe(m) -> string {
+    return match m {
+        fast => "fast",
+        slow => "slow",
+    }
+}
+
+fun describe_pick() -> string {
+    return describe(speed.pick())
+}

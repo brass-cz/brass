@@ -1,7 +1,7 @@
 // Pins that mutation of an unannotated parameter is detected in EVERY
 // expression position, so the parameter is inferred as a private deep copy and
 // the caller's value is never drained/changed. Each helper hides the mutation
-// in a position a partial traversal used to miss: a while condition, an
+// in a position a shallow walk would miss: a while condition, an
 // assignment's right-hand side, a binary subexpression, an if condition, and a
 // nested for loop writing back through its own loop variable.
 

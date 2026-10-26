@@ -1,0 +1,12 @@
+// The applications of a monomorphic closure all see the parameter at the
+// join of their arguments, so the result of `f(a32)` is the `int64` the
+// closure computes at that join -- binding it to an `int32` is the lossy
+// narrowing it would be at run time, reported at check time.
+fun main() {
+    let a: int32 = 7
+    let b: int64 = 5000000000
+    let f = (x) -> x + 1
+    let r: int32 = f(a)
+    println(f(b))
+    f = (y) -> y * 2
+}

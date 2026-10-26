@@ -62,8 +62,8 @@ const BUILTIN_TYPES: &[&str] = &[
     "float64", "string", "void", "never", "Self", "Result",
 ];
 
-/// A small set of prelude functions referenced by bare name (not via UFCS), so
-/// they highlight as functions even outside call position.
+/// A small set of prelude functions referenced by bare name, so they highlight
+/// as functions even outside call position.
 const PRELUDE_FUNCTIONS: &[&str] = &[
     "print", "println", "input", "len", "assert", "panic", "range",
 ];
@@ -237,7 +237,7 @@ fn gather(module: &Module, names: &mut DeclaredNames) {
                 if let TypeBody::Sum(_) = t.body {
                     names.sum_types.insert(t.name.clone());
                 }
-                // A record's methods are reachable by name through UFCS.
+                // A record's method signatures (`{ m() -> T }`) name functions too.
                 if let TypeBody::Record(members) = &t.body {
                     for m in members {
                         if let Member::Method(method) = m {

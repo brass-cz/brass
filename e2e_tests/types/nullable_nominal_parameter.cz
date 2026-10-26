@@ -1,0 +1,90 @@
+// @backends: all
+// A parameter declared `T?` of a record or sum type stays nullable in every
+// instance: a non-null argument flows in by nullable promotion and a `null`
+// argument takes the declared type, so the body's null tests run instead of
+// being folded away for the caller's argument type.
+
+type Node = { v: int32, next: Node? }
+
+type R = { v: int32 }
+
+type Shape =
+    | Circle { r: int32 }
+    | Dot
+
+type Box = { item }
+
+fun total(n: Node?) -> int64 {
+    let t: int64 = 0
+    let cur = n
+    while cur {
+        if let c = cur {
+            t += c.v
+            cur = c.next
+        }
+    }
+    return t
+}
+
+fun after_first(b: Node?) -> string {
+    let cur = b
+    if let c = cur {
+        cur = c.next
+    }
+    if cur {
+        return "some"
+    }
+    return "none"
+}
+
+fun flag(t: R?) {
+    if !t {
+        println("n")
+    } else {
+        println("s")
+    }
+}
+
+fun describe(s: Shape?) {
+    if s == null {
+        println("null")
+        return
+    }
+    match s {
+        Shape.Circle { r } => println("circle {r}"),
+        Shape.Dot => println("dot"),
+    }
+}
+
+fun R.pick(self, other: R?) -> int32 {
+    if let o = other {
+        return o.v
+    }
+    return self.v
+}
+
+fun open(b: Box?) -> string {
+    if let x = b {
+        return "item {x.item}"
+    }
+    return "empty"
+}
+
+fun main() {
+    const list = Node { v: 1, next: Node { v: 2, next: null } }
+    println(total(list))
+    println(total(null))
+    println(after_first(Node { v: 1, next: null }))
+    println(after_first(list))
+    flag(R { v: 1 })
+    flag(null)
+    describe(Shape.Circle { r: 3 })
+    describe(null)
+    describe(Shape.Dot)
+    let r = R { v: 5 }
+    println(r.pick(R { v: 7 }))
+    println(r.pick(null))
+    println(open(Box { item: 3 }))
+    println(open(null))
+    println(open(Box { item: "s" }))
+}

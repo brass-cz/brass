@@ -1,0 +1,28 @@
+// @backends: all
+// `string.from(x)` (and the prelude's `string_from`) is the text `"{x}"` and
+// `print` show: a type that declares `display` renders through it, a
+// nullable renders `null` or its present value's rendering, and any other
+// value its built-in form.
+type P = { x: int32 }
+
+fun P.display(self) -> string {
+    return "P<{self.x}>"
+}
+
+type Q = { y: int32 }
+
+fun main() {
+    const p = P { x: 1 }
+    println(string.from(p))
+    println(string_from(p))
+    println(string.from(p) == "{p}")
+    const present: P? = p
+    const absent: P? = null
+    println(string.from(present))
+    println(string.from(absent))
+    println(string.from(Q { y: 2 }) == "{Q { y: 2 }}")
+    println(string.from(3) + string.from(true) + string.from("s"))
+    let n: int32? = 5
+    println(string.from(n))
+    println(p.debug())
+}

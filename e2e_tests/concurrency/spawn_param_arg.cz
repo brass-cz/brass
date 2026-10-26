@@ -1,6 +1,7 @@
 // Pins: spawning a closure received as a PARAMETER is rejected: the closure's
-// captures belong to another function's scope, so this function cannot promote
-// or guard them. Compiling it silently was an unguarded cross-thread share.
+// captures belong to another function's scope, so this function cannot
+// promote or guard them, and compiling it would share them across threads
+// unguarded.
 fun run(f) {
     spawn(f)
 }

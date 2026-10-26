@@ -1,0 +1,4 @@
+[say] anonymous {}
+[say_a] anonymous {
+    a: 2,
+} 2

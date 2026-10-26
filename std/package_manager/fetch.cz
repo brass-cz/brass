@@ -17,24 +17,14 @@ import std.http.fetch
 import std.path.Path
 import std.process.{ Command, Stdio }
 
-// Duplicated from resolve.cz deliberately: importing it from there would pull
-// the manifest/TOML closure into this entry, and importing it from here would
-// pull HTTP into czpm -- the exact coupling this file exists to break.
-fun _packages_dir() {
-    return Path.home()!.join(".brass").join("packages")
-}
+import cache.{ tarball_entry, staging_dir }
 
 fun download_and_extract_tarball(url: string, hash: string) {
-    if !_valid_sha256(hash) {
-        return error(
-            "tarball hash must be exactly 64 lowercase hexadecimal characters",
-        )
-    }
-    const cache = _packages_dir()!.join("tarball")
+    const path = tarball_entry(hash)!
+    const cache = path.parent()
     if !cache.is_dir() {
         create_dir(cache)!
     }
-    const path = cache.join(hash)
     if _complete(path) {
         return path
     }
@@ -48,7 +38,7 @@ fun download_and_extract_tarball(url: string, hash: string) {
             "Downloaded tarball hash `{downloaded_hash}` is differ from expected one `{hash}`",
         )!
     }
-    const staging = _staging_dir(cache, hash)!
+    const staging = staging_dir(cache, hash, "tarball")!
     const populated = _populate(staging, downloaded.body)
     match populated {
         Err { error } => {
@@ -77,7 +67,7 @@ fun _populate(path: Path, body: uint8[]) {
     let cmd = Command.new("tar")
     cmd.args(["xz", "-C", path.to_string()])
     cmd.stdin(Stdio.Pipe)
-    const child = cmd.spawn()!
+    let child = cmd.spawn()!
     let tar_in = child.stdin()!
     tar_in.write(body)!
     tar_in.close()!
@@ -92,40 +82,6 @@ fun _populate(path: Path, body: uint8[]) {
 
 fun _complete(path: Path) -> bool {
     return path.is_dir() && path.join(".czpm-complete").is_dir()
-}
-
-fun _valid_sha256(hash: string) -> bool {
-    if len(hash) != 64 {
-        return false
-    }
-    for b in to_bytes(hash) {
-        if !((b >= 48 && b <= 57) || (b >= 97 && b <= 102)) {
-            return false
-        }
-    }
-    return true
-}
-
-// Use a short-lived shell's process id to reserve a sibling directory. mkdir
-// is the exclusive operation; a concurrent fetch therefore gets its own tree.
-fun _staging_dir(parent: Path, key: string) -> Path! {
-    let cmd = Command.new("sh")
-    cmd.args(
-        [
-            "-c",
-            "umask 077; stage=\"$1/.$2.$$\"; mkdir \"$stage\" && printf '%s' \"$stage\"",
-            "czpm-stage",
-            parent.to_string(),
-            key,
-        ],
-    )
-    cmd.stdout(Stdio.Pipe)
-    const child = cmd.spawn()!
-    const out = child.output()!
-    if out.code != 0 {
-        return error("failed to create a tarball staging directory")
-    }
-    return Path.parse(to_text(out.stdout)!)
 }
 
 // The entry `main` runs automatically; an explicit top-level call would run

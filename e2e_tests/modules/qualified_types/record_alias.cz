@@ -1,0 +1,21 @@
+// @backends: all
+// A record named through an alias across modules: an alias imported by name
+// (`Spot`), a qualified alias (`kinds.Box64`, a refinement), and a local
+// alias of a qualified record build literals and conversions of the record.
+import kinds
+import kinds.{ Spot }
+
+type Local = kinds.Pt
+
+fun boxed(v) {
+    return kinds.Box64 { item: v }
+}
+
+fun main() {
+    println(Spot { x: 1, y: 2 }.sum())
+    println(Local { x: 3, y: 4 }.sum())
+    println(boxed(7).item + 5000000000)
+    if let p = Local.from({ x: 5, y: 6 }) {
+        println(p.sum())
+    }
+}

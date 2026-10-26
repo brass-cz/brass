@@ -1,0 +1,20 @@
+// @backends: all
+// Returning an open record payload through a Result subtype's `!` keeps the
+// enclosing function fallible, including forwarding and subsequent propagation.
+type Box = { item }
+type MyResult: Result =
+    | Ok { value, message }
+    | Err { error: string }
+
+fun nested() {
+    return MyResult.Ok { value: Box { item: 4 }, message: "b" }!
+}
+fun forwarded() { return nested() }
+fun unpacked() { return nested()!.item }
+
+fun main() {
+    println(typeof(nested()))
+    println(nested())
+    println(forwarded())
+    println(unpacked())
+}

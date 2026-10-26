@@ -1,10 +1,9 @@
-// An `if`/`match` branch that DIVERGES (`error(..)!`, which propagates or aborts)
-// produces a value nothing constrains: the Ok payload of the `error(..)` is a
-// fresh variable no path ever builds. Joining the branches only PROBED that the
-// two types could unify, so that variable stayed open, and the back end -- which
-// defaults an unresolved local to `void` -- had the branch assign a void into the
-// expression's rc-managed slot: `pp_retain(i1 false)`, rejected by the LLVM
-// verifier. Both branches of one `if` yield one type, so the join binds them.
+// An `if`/`match` branch that DIVERGES (`error(..)!`, which propagates or
+// aborts) produces a value nothing constrains: the Ok payload of the
+// `error(..)` is a fresh variable no path ever builds. The branch join binds
+// it to the other branch's type, so the expression has that type (a record
+// or a string here) in an `if let`, a nested `if let`, a plain `if` and a
+// `match`.
 type Report = {
     status: int32
 }

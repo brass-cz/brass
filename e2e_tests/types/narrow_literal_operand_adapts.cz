@@ -1,0 +1,49 @@
+// @backends: all
+// An integer literal operand adapts to the other operand's type when its
+// value fits that type, and the operation is computed (and wraps) there:
+// `a + 100` on the uint8 200 is the uint8 44 wherever it goes -- printed,
+// pushed into the operand's own array, stored into a uint8[] inside a generic
+// function, or type-tested. A literal that does not fit keeps its default and
+// both sides meet at their common type (`a + 300` is the int32 500). The
+// checker and the compiled code apply the same rule, so they agree on it.
+fun show(v) {
+    if v: uint8 {
+        println("uint8 {v}")
+    } else {
+        println("other {v}")
+    }
+}
+
+fun store(x) {
+    let ys: uint8[] = [x]
+    return ys
+}
+
+fun main() {
+    let a: uint8 = 200
+    println(a + 100)
+    println(typeof(a + 100))
+    println(a + 300)
+    println(typeof(a + 300))
+    println(a - 201)
+    let xs = [a]
+    xs.push(a + 100)
+    println(xs)
+    let b: int8 = 100
+    let ys = [b]
+    ys.push(b * 2)
+    println(ys)
+    show(a + 100)
+    let c: uint8 = 255
+    println(store(c + 1))
+    let h: int16 = 30000
+    println(h + 10000)
+    let w: uint16 = 65535
+    println(w + 1)
+    println(a < 300)
+    println(a == 200)
+    let f: float32 = 1.5
+    println(typeof(f * 2))
+    println(typeof(2 * f))
+    println(typeof(f * 16777217))
+}

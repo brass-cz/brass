@@ -1,0 +1,43 @@
+element joins and shapes
+int32[]
+int32[]
+int64[]
+int64[]
+float64[]
+[int64, uint64]
+[int64, uint64]
+string[]
+[int32, string]
+int32[]
+int64[]
+nested and block bodies
+int32[][]
+int32[]
+int64[]
+array and tuple bindings
+int32[]
+[1, 2]
+[int32, int32]
+contextual tuple contracts and independent uses
+[int32, int32]
+[int32, int32]
+[int32, int32]
+[int32, int32]
+int32[]
+partial annotations and literal elements
+int64[]
+int64[]
+[string, int32]
+int32[]
+returned closure
+int64[]
+[1, 2]
+[5000000000, 5000000000]
+indexed closure
+int64[]
+int64[]
+captured elements
+int32[]
+[1, 2]
+[int32, string]
+[1, x]

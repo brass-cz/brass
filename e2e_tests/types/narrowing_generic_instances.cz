@@ -1,0 +1,28 @@
+// @backends: all
+// In a generic body the narrowing effects of a still-open value are decided
+// per instantiation: printing a `v` ends a narrowed global only when `v` is
+// a type with a `display` method, and storing `v` into a narrowed variable
+// ends the narrowing only when `v` may be null. These instantiations do
+// neither, so the generic bodies are accepted.
+let g: string? = "a"
+type T = { a: int32 }
+fun T.display(self) -> string {
+    g = null
+    return "T"
+}
+fun show(v) {
+    if g {
+        println(v)
+        println(g.len())
+    }
+}
+fun keep(v) {
+    let x: string? = "abc"
+    if !x { return }
+    x = v
+    println(x.len())
+}
+fun main() {
+    show(1)
+    keep("zz")
+}

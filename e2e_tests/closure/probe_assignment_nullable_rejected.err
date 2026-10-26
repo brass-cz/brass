@@ -1,0 +1,5 @@
+probe_assignment_nullable_rejected.cz:6:20: error: cannot use `int64` where `never?` is required
+probe_assignment_nullable_rejected.cz:12:20: error: cannot use `int64` where `never?` is required
+probe_assignment_nullable_rejected.cz:18:29: error: cannot use `int64` where `never?` is required
+probe_assignment_nullable_rejected.cz:24:20: error: cannot use `int64[]` where `never?` is required
+probe_assignment_nullable_rejected.cz:30:29: error: cannot use `int32` where `never?` is required

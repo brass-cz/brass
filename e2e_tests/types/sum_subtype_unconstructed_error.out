@@ -1,0 +1,12 @@
+Result.Ok {
+    value: 2,
+}
+Result.Ok {
+    value: 2,
+}
+Result.Ok {
+    value: 3,
+}
+Result.Ok {
+    value: 4,
+}

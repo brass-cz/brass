@@ -1,0 +1,24 @@
+// @backends: all
+// A narrowed module global stays narrowed across operations that run no user
+// code: rendering a value whose type declares no `display` (a primitive, or a
+// record printed by the built-in renderer), builtin methods, and a call made
+// only on an arm that always returns.
+let g: string? = "abc"
+type P = {
+    a: int32
+}
+fun log(s: string) {
+    println("log {s}")
+}
+fun main() {
+    let p = P { a: 1 }
+    if !g { return }
+    println(p)
+    println("{p} {g} {g.len()}")
+    println(g.len())
+    if g.len() > 5 {
+        log("long")
+        return
+    }
+    println(g.len())
+}

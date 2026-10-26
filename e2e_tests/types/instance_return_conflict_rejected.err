@@ -1,0 +1,4 @@
+incompatible return types `int32` and `string` in this instantiation of `pick`
+incompatible error payloads `Error<value=int32>` and `Error<value=string>` in this instantiation of `fail_with`
+incompatible return types `int64` and `string` in this instantiation of `Box.choose`
+incompatible return types `int32` and `string` in this instantiation of `Box.pick`

@@ -1,6 +1,8 @@
-//! Interface enforcement: `type B: A` requires B to provide
-//! every field and method of A with compatible types. For a sum type, every
-//! variant must satisfy the interface.
+//! Interface conformance, checked at the declaration. `type B: A` with a
+//! record `A` requires `B` to provide every field and method of `A` with
+//! compatible types (for a sum `B`, every variant must). With a sum `A` it
+//! declares `B` a sum subtype of `A`: the same variant set, each variant's
+//! fields satisfying the parent variant's.
 
 use fxhash::FxHashMap as HashMap;
 
@@ -9,10 +11,12 @@ use brass_typesys::structural::member_provided_by_method;
 
 use crate::TypeError;
 
+/// Check every type's declared interfaces (`type B: A`).
 pub fn check(program: &Program) -> Vec<TypeError> {
     check_in(program, crate::AnalysisModules::all())
 }
 
+/// [`check`] over the modules `modules` checks.
 pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -> Vec<TypeError> {
     let mut errors = Vec::new();
     for info in program.types.values() {
@@ -45,8 +49,9 @@ pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -
             // subtyping: the child must cover exactly the parent's variant
             // set, and each child variant's record must satisfy the parent
             // variant's (width allowed, annotated fields invariant). The
-            // declaration is also the gate for the value coercion (SumView)
-            // at flow sites, mirroring records' declared-id gating.
+            // declaration is also what lets a child value flow where the
+            // parent is required: it is rebuilt as the parent (SumView) at
+            // that flow site.
             if let TypeKind::Sum {
                 variants: ivariants,
             } = &iface.kind

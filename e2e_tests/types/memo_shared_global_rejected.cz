@@ -1,0 +1,17 @@
+// Two calls of a function that returns a global container hand back the SAME
+// container, so storing a string key through one and an int32 key through the
+// other is a type error -- also when the second call reuses the first one's
+// elaboration (the result is the global's own type, not a fresh copy of it).
+let store = HashMap.new()
+
+fun get_store(n) {
+    return store
+}
+
+fun main() {
+    let a = get_store(1)
+    let b = get_store(1)
+    a.set("k", "text")
+    b.set(5, 7)
+    println("done")
+}

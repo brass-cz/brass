@@ -1,0 +1,39 @@
+// @backends: all
+// Instances of one sum that differ only in refinement (`Opt.Nothing` knows
+// nothing about the `Some.v` payload, `Opt.Some { v: 1 }` pins it to int32)
+// unify into one element type, so a bracket literal mixing them is an array
+// -- iterable and indexable -- in either order, not a two-element tuple.
+type Opt =
+    | Some { v }
+    | Nothing
+
+fun total(xs) {
+    let sum = 0
+    for x in xs {
+        match x {
+            Some { v } => sum += v,
+            Nothing => sum += 100,
+        }
+    }
+    return sum
+}
+
+fun main() {
+    let a = Opt.Some { v: 1 }
+    let b = Opt.Nothing
+    let xs = [b, a, Opt.Some { v: 2 }]
+    for x in xs {
+        match x {
+            Some { v } => println(v + 1),
+            Nothing => println("-"),
+        }
+    }
+    let ys = [a, b]
+    println(ys.len())
+    println(total(ys))
+    println(total([Opt.Nothing, Opt.Nothing, Opt.Some { v: 7 }]))
+    match xs[2] {
+        Some { v } => println("third {v}"),
+        Nothing => println("third nothing"),
+    }
+}

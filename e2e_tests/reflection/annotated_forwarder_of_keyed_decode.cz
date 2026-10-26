@@ -1,0 +1,44 @@
+// @backends: all
+// A function annotated `-> T!` may forward a reflective decode with `!`: the
+// keyed call fails with the prelude `Error`, so the forwarder's error type is
+// inferred from it. The same holds when the forwarder is passed on as a
+// function value: its type carries the inferred error type, so a function
+// taking `(Json) -> int64!` and the caller returning its Result forward it too.
+type Json =
+    | JNum { value: int64 }
+    | JStr { value: string }
+
+fun Json.into(self) -> infer! {
+    match self {
+        Json.JNum { value } => { return infer.from(value) }
+        Json.JStr { value } => { return infer.from(value) }
+    }
+}
+
+fun as_int(j: Json) -> int64! {
+    let n: int64 = j.into()!
+    return n
+}
+
+fun apply(f: (Json) -> int64!, j: Json) -> int64! {
+    return f(j)
+}
+
+fun go(j: Json) -> int64! {
+    return apply(as_int, j)
+}
+
+type Holder = { j: Json }
+
+fun Holder.number(self) -> int64! {
+    return self.j.into()!
+}
+
+fun main() {
+    println(go(Json.JNum { value: 7 })!)
+    match go(Json.JStr { value: "x" }) {
+        Ok { value } => println("ok {value}")
+        Err { error } => println("err {error.value}")
+    }
+    println(Holder { j: Json.JNum { value: 9 } }.number()!)
+}

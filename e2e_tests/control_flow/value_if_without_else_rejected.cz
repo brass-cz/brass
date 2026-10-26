@@ -1,0 +1,10 @@
+// An `if` whose value is used still joins its arms: without an `else` the
+// missing arm is `void`, which no `int32` joins with.
+fun get() -> int32 {
+    return 3
+}
+
+fun main() {
+    let c = true
+    let x = if c { get() }
+}

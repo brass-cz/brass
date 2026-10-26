@@ -1,0 +1,32 @@
+// @backends: all
+// A local value that shadows a function name (a `let`-bound closure, a
+// parameter) is what a call through that name invokes within its scope;
+// after the shadowing block the name calls the function again. The local
+// receives the anonymous argument's full value, not a view of the fields the
+// shadowed function uses, so the field the local closure reads is there.
+fun helper(x) {
+    return x.a
+}
+
+fun via_let(p) {
+    let helper = (q) -> q.b
+    return helper(p)
+}
+
+fun via_param(p, helper) {
+    return helper(p)
+}
+
+fun after_block(p) {
+    if true {
+        let helper = (q) -> q.b
+        println(helper(p))
+    }
+    return helper(p)
+}
+
+fun main() {
+    println(via_let({ a: 1, b: "bee" }))
+    println(via_param({ a: 1, b: "bee" }, (q) -> q.b))
+    println(after_block({ a: 1, b: "bee" }))
+}

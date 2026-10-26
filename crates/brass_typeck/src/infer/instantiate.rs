@@ -1,9 +1,17 @@
-//! Per-call instantiation of function and method signatures: building
-//! the argument frame, specializing annotated/scheme types with the
-//! actual argument types, and re-inferring returns from the frame.
+//! Call-site elaboration of function and method bodies: a call re-checks its
+//! callee's body at the call's argument types (memoized per canonical
+//! instantiation, bounded in depth and in total), and the call's result is
+//! the return that instantiation produces. This module builds the callee's
+//! argument frame (annotations and receiver schemes instantiated at the
+//! arguments), types a recursive call against the elaboration in progress,
+//! and settles an unannotated body's return from its full and light walks.
 
 use super::*;
 use std::sync::OnceLock;
+
+mod canonical;
+mod methods;
+mod observed;
 
 /// How deep the re-elaboration of callee bodies at call sites may nest. Each
 /// level is a distinct callable (a repeat is already caught as recursion), so a
@@ -15,11 +23,22 @@ const MAX_ELABORATION_DEPTH: usize = 64;
 /// e2e suite and examples (the http library) settles at ~34k, some sixty times
 /// under -- and low enough that a chain which expands instead of converging is
 /// reported rather than left to run forever.
-const ELABORATION_BUDGET: u64 = 2_000_000;
+pub(super) const ELABORATION_BUDGET: u64 = 2_000_000;
 
 fn memo_check_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("BRASS_MEMO_CHECK").is_ok_and(|value| value == "1"))
+}
+
+struct FunctionCall<'a> {
+    symbol: &'a str,
+    module: &'a [String],
+    params: &'a [ParamInfo],
+    body: &'a Block,
+    declared_ret: Option<Type>,
+    fallback_ret: Type,
+    arg_types: &'a [Type],
+    span: brass_parser::Span,
 }
 
 impl<'a> Checker<'a> {
@@ -33,6 +52,7 @@ impl<'a> Checker<'a> {
     fn elaboration_allowed(&mut self, what: &str, span: brass_parser::Span) -> bool {
         if self.instantiating.len() >= MAX_ELABORATION_DEPTH {
             tracing::debug!(callee = %what, "elaboration depth limit, using fallback return type");
+            self.depth_capped += 1;
             return false;
         }
         self.elaborations += 1;
@@ -54,62 +74,228 @@ impl<'a> Checker<'a> {
         false
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn instantiate_function_call(
-        &mut self,
-        symbol: &str,
-        module: &[String],
-        params: &[ParamInfo],
-        body: &Block,
-        declared_ret: Option<Type>,
-        fallback_ret: Type,
-        arg_types: &[Type],
-        span: brass_parser::Span,
-    ) -> Type {
+    fn instantiate_function_call_inner(&mut self, call: FunctionCall<'_>) -> Type {
+        let FunctionCall {
+            symbol,
+            module,
+            params,
+            body,
+            declared_ret,
+            fallback_ret,
+            arg_types,
+            span,
+        } = call;
         if params.len() != arg_types.len() {
             return fallback_ret;
         }
+        // An annotated result ends origin flow. A structurally zero-growth
+        // body has no storage negotiation to retain, so its ordinary memo is
+        // valid even inside its caller's private numeric walk.
+        if self.numeric.probing
+            && declared_ret.is_some()
+            && self.numeric_eligibility().transitive(body.span)
+        {
+            let mut numeric = std::mem::take(&mut self.numeric);
+            let enabled = std::mem::replace(&mut self.numeric_enabled, false);
+            let depth = self.speculation_depth;
+            if depth == 1 {
+                self.speculation_depth = 0;
+            }
+            let co_suspended = self.co_memo_suspended;
+            self.co_memo_suspended |= self.co_checking;
+            let result = self.instantiate_function_call(
+                symbol,
+                module,
+                params,
+                body,
+                declared_ret,
+                fallback_ret,
+                arg_types,
+                span,
+            );
+            self.speculation_depth = depth;
+            self.co_memo_suspended = co_suspended;
+            self.numeric_enabled = enabled;
+            numeric.result = None;
+            self.numeric = numeric;
+            return result;
+        }
         let unannotated = declared_ret.is_none();
+        let numeric_layout = (unannotated && self.numeric_enabled)
+            .then(|| {
+                self.numeric_callable_layout(
+                    &brass_hir::InstanceCallable::Function(symbol.to_owned()),
+                    arg_types,
+                    body.span,
+                )
+            })
+            .flatten();
+        if unannotated && self.numeric_enabled {
+            self.record_numeric_call(span, numeric_layout.clone(), self.current_instance());
+        }
         let key = format!("fn:{symbol}");
-        // Co-checking records return links, and an active type-test probe commits
-        // bindings for its holes. Recursive calls must read the shared fallback
-        // return instead of consulting or populating the body memo.
-        let memo_enabled = !self.co_checking
+        // Co-check effects share the ordinary journal under a distinct flavor.
+        // Type-test probes commit hole bindings, and recursion must read the
+        // shared fallback instead of consulting or populating the body memo.
+        let co_method = self.co_checking && !self.co_free_function(symbol);
+        let method_rejection = co_method
+            .then(|| {
+                self.method_co_precheck(None, arg_types, &[], declared_ret.as_ref(), &fallback_ret)
+            })
+            .flatten();
+        if let Some(reason) = method_rejection {
+            tracing::trace!(target: "brass::perf", callable = symbol, reason, "check: method memo bypass");
+        }
+        let numeric_replay = self.numeric.probing && self.numeric_pure_body(symbol);
+        let memo_enabled = (!self.numeric.probing || numeric_replay)
+            && (!self.co_checking
+                || self.co_memo_eligible(symbol)
+                || (co_method && method_rejection.is_none()))
             && self.type_test_holes.is_empty()
-            && self.closure_recheck_depth == 0
             && !self.instantiating.contains(&key);
-        let memo_key = memo_enabled
+        let mut memo_key = memo_enabled
             .then(|| self.elaboration_memo_key("fn", symbol, None, arg_types, &[]))
             .flatten();
-        let mut memo_validation = None;
-        if let Some(memo_key) = &memo_key
-            && let Some(entry) = self.elaboration_memo.get(&memo_key.key).cloned()
+        memo_key = self.co_memo_context(memo_key);
+        if numeric_replay && let Some(context) = &mut memo_key {
+            self.numeric_memo_flavor(context);
+        }
+        if unannotated
+            && let Some(layout) = numeric_layout.clone()
+            && let Some(context) = &mut memo_key
         {
+            context
+                .key
+                .callable
+                .push_str(&format!(":numeric-layout={layout:?}"));
+        }
+        let method_dependencies = (co_method && memo_key.is_some())
+            .then(|| self.method_memo_dependencies(declared_ret.as_ref(), &fallback_ret));
+        let mut method_validation = None;
+        let mut memo_validation = None;
+        let mut co_replayed = None;
+        if let Some(memo_key) = &memo_key
+            && let Some(entry) =
+                self.lookup_elaboration_entry(memo_key, method_dependencies.as_ref())
+        {
+            if memo_check_enabled() && method_dependencies.is_some() {
+                method_validation = entry.method_dependencies.clone();
+            }
+            self.stats.memo_hits += 1;
+            self.observe_co_lookup(&memo_key.key, true);
             tracing::debug!(callable = %memo_key.key.callable, "elaboration memo hit");
+            let validate_co = self.co_checking && memo_check_enabled();
+            if validate_co {
+                self.begin_co_validation(true);
+            }
             let replay_errors_before = self.errors.len();
             let replayed = self.replay_elaboration_memo_entry(&entry, memo_key);
             let replay_errors = self.errors.len() - replay_errors_before;
+            if validate_co {
+                co_replayed = Some(self.finish_co_validation());
+            }
             if !memo_check_enabled() {
+                if numeric_replay {
+                    self.replay_numeric_origin(memo_key, body.span);
+                }
                 return replayed;
             }
             memo_validation = Some((replayed, replay_errors));
         } else if let Some(memo_key) = &memo_key {
+            self.stats.memo_misses += 1;
+            self.observe_co_lookup(&memo_key.key, false);
             tracing::debug!(callable = %memo_key.key.callable, "elaboration memo miss");
         }
+        let first_touch = memo_validation.is_none()
+            && method_dependencies.is_some()
+            && memo_key
+                .as_ref()
+                .is_some_and(|context| !self.method_co_storage_ready(&context.key));
+        if first_touch {
+            memo_key = None;
+        }
         let errors_before = self.errors.len();
+        let warnings_before = self.warnings.len();
         if !self.instantiating.insert(key.clone()) {
+            self.record_untracked_method_dependency();
             // Recursive call: re-checking the body again would not terminate, so
-            // fall back to the declared/precomputed return type. Remember that it
-            // happened -- the fallback is the SHARED table entry, and only a body
-            // that read it needs its variables tied to the real return.
-            tracing::debug!(symbol = %symbol, "recursive call, using fallback return type");
-            self.recursed.insert(key);
-            return fallback_ret;
+            // the call is typed against what the elaboration in progress
+            // assumes it returns: the settled return while a recursive
+            // instantiation is re-elaborated (see `settle_recursive_return`),
+            // else its PROVISIONAL return (see `recursion_provisional`), else
+            // the declared/precomputed one. Remember that it happened: the
+            // assumed type is tied to what the body really returns once the
+            // body is done.
+            tracing::debug!(symbol = %symbol, "recursive call, using provisional return type");
+            let name = self
+                .program
+                .functions
+                .get(symbol)
+                .map_or(symbol, |f| f.signature.name.as_str());
+            let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+            self.check_polymorphic_recursion(
+                &brass_hir::InstanceCallable::Function(symbol.to_string()),
+                name,
+                &names,
+                arg_types,
+                span,
+            );
+            self.recursed.insert(key.clone());
+            if self.elaboration_stack.last() != Some(&key) {
+                self.mutually_recursed.insert(key.clone());
+            }
+            if let Some(assumed) = self.recursion_assumption(&key, arg_types) {
+                return assumed;
+            }
+            let in_progress = self
+                .recursion_provisional
+                .get(&key)
+                .map(|(args, provisional)| {
+                    let same_args = args.len() == arg_types.len()
+                        && args
+                            .iter()
+                            .zip(arg_types)
+                            .all(|(arg, now)| *arg == self.resolve(now));
+                    (same_args, provisional.clone())
+                });
+            return match in_progress {
+                Some((true, provisional)) => provisional,
+                // A recursive call at other argument types (polymorphic
+                // recursion) gets a provisional type of its own.
+                Some((false, _)) => {
+                    self.instance_provisional_return(&fallback_ret, params, arg_types)
+                }
+                None => fallback_ret,
+            };
         }
         if !self.elaboration_allowed(symbol, span) {
             self.instantiating.remove(&key);
             return fallback_ret;
         }
+        if co_replayed.is_some() {
+            self.begin_co_validation(false);
+        }
+        let method_observation =
+            self.begin_receiver_inventory(symbol, arg_types, declared_ret.as_ref(), &fallback_ret);
+        if co_method {
+            tracing::trace!(target: "brass::perf", callable = key,
+                reason = method_rejection.unwrap_or(if first_touch { "first_touch" } else if memo_key.is_some() { "memo_miss" } else { "ineligible_key" }),
+                "check: method body walk");
+        }
+        self.observe_body_walk(&key, memo_key.is_some() || first_touch);
+        let capped_before = self.depth_capped;
+        if unannotated {
+            let provisional = self.instance_provisional_return(&fallback_ret, params, arg_types);
+            let args = arg_types.iter().map(|arg| self.resolve(arg)).collect();
+            self.recursion_provisional
+                .insert(key.clone(), (args, provisional));
+        }
+        self.elaboration_stack.push(key.clone());
+        self.enter_instance(
+            brass_hir::InstanceCallable::Function(symbol.to_string()),
+            arg_types,
+        );
+        self.settle_numeric_instance(unannotated.then(|| numeric_layout.clone()).flatten());
         if memo_key.is_some() {
             self.begin_elaboration_journal();
         }
@@ -125,311 +311,415 @@ impl<'a> Checker<'a> {
         let frame = self.signature_call_frame(params, arg_types, &[], None);
         let mut scopes = frame.clone();
         let full_ret = self.check_block_root(body, &mut scopes, declared_ret.as_ref());
+        let numeric_result = self.numeric.result.clone();
         let ret = match declared_ret {
             Some(ret) => ret,
             None => {
-                let ret = self.prefer_full_return(full_ret, body, frame);
-                // A RECURSIVE call inside this body could only read the PRECOMPUTED
-                // return -- the full one is what we just computed -- and it shares
-                // that entry's variables. Tie the two together, so a container the
-                // body pins (a `HashMap.new()` filled by `set`) is no longer OPEN
-                // where the recursion hands it back: a method called on it
-                // (`collect(..)!.pairs()`) would otherwise monomorphize at an open
-                // type, which the typed back end refuses -- a program the checker
-                // accepted. Only a body that actually recursed: the entry is shared
-                // by every call site, so pinning it for a function that never reads
-                // it back would fix a generic callee at its first call.
+                let site = self.instance_site(
+                    symbol.to_string(),
+                    span,
+                    key.clone(),
+                    arg_types.iter().cloned(),
+                );
+                let mut ret = self.prefer_full_return(full_ret, body, frame.clone(), site);
+                // What this body's recursive calls were typed against: the
+                // instance's provisional return, or -- when that is a concrete
+                // type the real return contradicts (a `return 0` default against
+                // a float instantiation) -- the return the body is elaborated
+                // again with, until the two agree.
+                let mut read = self
+                    .recursion_provisional
+                    .get(&key)
+                    .map(|(_, provisional)| provisional.clone());
+                if self.recursed.contains(&key) {
+                    let first = read.clone().unwrap_or_else(|| fallback_ret.clone());
+                    let (settled, assumed) =
+                        self.settle_recursive_return(&key, arg_types, &first, ret, |this| {
+                            let mut scopes = frame.clone();
+                            let full_ret = this.check_block_root(body, &mut scopes, None);
+                            let site = this.instance_site(
+                                symbol.to_string(),
+                                span,
+                                key.clone(),
+                                arg_types.iter().cloned(),
+                            );
+                            this.prefer_full_return(full_ret, body, frame.clone(), site)
+                        });
+                    ret = settled;
+                    if assumed.is_some() {
+                        read = assumed;
+                    }
+                }
+                self.recursion_provisional.remove(&key);
+                // Tie what the recursive calls read to what the body really
+                // returns, so a container the body pins (a `HashMap.new()`
+                // filled by `set`) is not left OPEN where the recursion hands
+                // it back: a method called on it (`collect(..)!.pairs()`) would
+                // otherwise monomorphize at an open type, which the typed back
+                // end refuses. The provisional type belongs to THIS instance
+                // alone, so pinning it never fixes the generic callee for its
+                // other call sites.
+                let mutual = self.mutually_recursed.remove(&key);
                 if self.recursed.remove(&key) {
-                    self.link_inferred_return(&fallback_ret, &ret);
+                    if let Some(read) = read {
+                        self.link_inferred_return(&read, &ret, symbol, span);
+                    }
+                    self.report_unsettled_recursive_return(symbol, arg_types, &ret, mutual, span);
                 }
                 ret
             }
         };
+        // A closure this instance returns is compiled with the instance:
+        // fix its parameter types from its body before the return settles.
+        if arg_types
+            .iter()
+            .all(|arg| brass_hir::is_fully_known(&self.resolve(arg)))
+        {
+            self.settle_escaping_closures(&ret);
+        }
+        self.leave_instance();
+        self.elaboration_stack.pop();
         self.current_module = saved_module;
         self.instantiating.remove(&key);
-        if let Some((replayed, replay_errors)) = memo_validation {
+        let co_validation = co_replayed.map(|replay| (replay, self.finish_co_validation()));
+        // A replay recorded where the nesting was shallow is exact; this
+        // re-elaboration may have fallen back past the depth limit instead.
+        if let Some((replayed, replay_errors)) = memo_validation
+            && self.depth_capped == capped_before
+        {
             debug_assert_eq!(
                 self.canonical_memo_check_return(&replayed),
                 self.canonical_memo_check_return(&ret)
             );
             debug_assert_eq!(replay_errors, self.errors.len() - errors_before);
+            if let (Some(stored), Some(initial)) = (&method_validation, &method_dependencies) {
+                self.assert_method_dependencies(&key, stored, initial);
+            }
+            if let Some((replay, walk)) = co_validation {
+                self.assert_co_validation(symbol, replay, walk, &replayed, &ret);
+            }
         }
+        self.numeric.result = numeric_result;
         if let Some(memo_key) = memo_key {
             let resolved = self.resolve(&ret);
-            let memoizable = self.errors.len() == errors_before;
-            if memoizable && unannotated {
+            // A nested call typed from a depth-capped fallback leaves the
+            // return an approximation: it is neither replayed nor reported.
+            let memoizable =
+                self.errors.len() == errors_before && self.depth_capped == capped_before;
+            if memoizable && unannotated && !self.co_checking {
                 self.record_instance_return(
-                    symbol.to_string(),
+                    brass_hir::numeric_instance_base(symbol, numeric_layout.clone().as_ref()),
                     arg_types.iter().map(|arg| self.resolve(arg)).collect(),
                     resolved.clone(),
                 );
             }
             let frame = self.finish_elaboration_journal();
-            if memoizable && !frame.has_closure_bodies {
-                // Recursive return pinning changes the shared solver entry during
-                // this first walk. It is not a journal observation: later hits see
-                // the already-linked entry, just as repeated elaborations do.
-                let entry = self.build_elaboration_memo_entry(&resolved, frame, &memo_key);
+            let nested_replay = frame.memo_replayed;
+            let rejected = if !memoizable {
+                Some(if self.depth_capped != capped_before {
+                    "depth_cap"
+                } else {
+                    "error_walk"
+                })
+            } else if self.co_checking && self.warnings.len() != warnings_before {
+                Some("warning_walk")
+            } else if frame.has_closure_bodies {
+                Some("closure_body")
+            } else if self.speculation_depth != 0 && !numeric_replay {
+                Some("speculative")
+            } else {
+                None
+            };
+            if rejected.is_none()
+                && (!numeric_replay || self.save_numeric_origin(&memo_key))
+                && self.method_storage_precheck(
+                    &memo_key.key.callable,
+                    method_dependencies.is_some(),
+                    &frame,
+                )
+                && let Some(mut entry) =
+                    self.build_elaboration_memo_entry(&resolved, frame, &memo_key)
+                && self.certify_method_entry(
+                    &memo_key.key.callable,
+                    nested_replay,
+                    &mut entry,
+                    method_dependencies,
+                )
+            {
                 self.elaboration_memo.insert(memo_key.key, Rc::new(entry));
+            } else if self.co_checking
+                && let Some(reason) = rejected
+            {
+                tracing::trace!(target: "brass::perf", callable = memo_key.key.callable,
+                    reason, "check: co memo storage");
             }
         }
+        self.finish_method_inventory(method_observation, &ret);
         ret
     }
 
-    /// Build a key whose open variables depend on first-occurrence structure,
-    /// not on the checker's allocation order. Receiver, arguments, and scheme
-    /// inputs share one slot namespace so aliases across them remain visible.
-    fn elaboration_memo_key(
-        &self,
-        kind: &str,
-        callable: &str,
-        receiver: Option<&Type>,
-        arg_types: &[Type],
-        scheme_inputs: &[Option<Type>],
-    ) -> Option<ElaborationMemoContext> {
-        let resolved_receiver = receiver.map(|ty| self.resolve(ty));
-        let resolved_args: Vec<_> = arg_types.iter().map(|ty| self.resolve(ty)).collect();
-        let resolved_scheme_inputs: Vec<_> = scheme_inputs
-            .iter()
-            .map(|ty| ty.as_ref().map(|ty| self.resolve(ty)))
-            .collect();
-        if resolved_receiver
-            .iter()
-            .chain(resolved_args.iter())
-            .chain(resolved_scheme_inputs.iter().flatten())
-            .all(brass_hir::is_fully_known)
-        {
-            return Some(ElaborationMemoContext {
-                key: ElaborationMemoKey {
-                    callable: format!("{kind}:{callable}"),
-                    receiver: resolved_receiver,
-                    args: resolved_args,
-                    scheme_inputs: resolved_scheme_inputs,
-                    canon_vars: Vec::new(),
-                },
-                inputs: Vec::new(),
-            });
+    /// Elaborate the free function `name`, referenced as a VALUE at `span`,
+    /// when the lazy profile is on and its body can reach a keyed
+    /// (`-> infer!`) call (see `Checker::keyed_tainted`). The value runs
+    /// wherever it is applied, out of this pass's sight, so its keyed calls are
+    /// discovered here -- at its declared parameter types -- before execution
+    /// starts, rather than when a running program first calls it.
+    pub(super) fn elaborate_keyed_function_value(&mut self, name: &str, span: brass_parser::Span) {
+        if !self.lazy_profile {
+            return;
         }
-        let mut slots = HashMap::default();
-        let mut inputs = Vec::new();
-        let receiver = match resolved_receiver {
-            Some(ty) => Some(self.canonicalize_resolved_memo_type(ty, &mut slots, &mut inputs)?),
-            None => None,
+        let Some(info) = self.lookup_function(name) else {
+            return;
         };
-        let args = resolved_args
-            .into_iter()
-            .map(|ty| self.canonicalize_resolved_memo_type(ty, &mut slots, &mut inputs))
-            .collect::<Option<Vec<_>>>()?;
-        let scheme_inputs = resolved_scheme_inputs
-            .into_iter()
-            .map(|ty| match ty {
-                Some(ty) => self
-                    .canonicalize_resolved_memo_type(ty, &mut slots, &mut inputs)
-                    .map(Some),
-                None => Some(None),
-            })
-            .collect::<Option<Vec<_>>>()?;
-        let canon_vars = inputs.iter().map(|(var, _)| *var).collect();
-        Some(ElaborationMemoContext {
-            key: ElaborationMemoKey {
-                callable: format!("{kind}:{callable}"),
-                receiver,
-                args,
-                scheme_inputs,
-                canon_vars,
-            },
-            inputs,
-        })
-    }
-
-    fn canonicalize_resolved_memo_type(
-        &self,
-        ty: Type,
-        slots: &mut HashMap<u32, CanonVar>,
-        inputs: &mut Vec<(CanonVar, Type)>,
-    ) -> Option<Type> {
-        match ty {
-            Type::Unknown(id) => {
-                if id == brass_hir::INFER_VAR {
-                    return None;
-                }
-                let kind = self.solver.kind_of(id).unwrap_or(InferenceVarKind::Source);
-                if matches!(
-                    kind,
-                    InferenceVarKind::ErrorOnlyOk | InferenceVarKind::Invalid
-                ) {
-                    return None;
-                }
-                let var = *slots.entry(id).or_insert_with(|| {
-                    let var = CanonVar {
-                        slot: inputs.len() as u32,
-                        kind,
-                    };
-                    inputs.push((var, Type::Unknown(id)));
-                    var
-                });
-                Some(Type::Unknown(var.slot))
-            }
-            Type::Array(inner, len) => Some(Type::Array(
-                Box::new(self.canonicalize_resolved_memo_type(*inner, slots, inputs)?),
-                len,
-            )),
-            Type::Slice(inner) => Some(Type::Slice(Box::new(
-                self.canonicalize_resolved_memo_type(*inner, slots, inputs)?,
-            ))),
-            Type::Tuple(elements) => Some(Type::Tuple(
-                elements
-                    .into_iter()
-                    .map(|ty| self.canonicalize_resolved_memo_type(ty, slots, inputs))
-                    .collect::<Option<Vec<_>>>()?,
-            )),
-            Type::Fun(params, ret) => Some(Type::Fun(
-                params
-                    .into_iter()
-                    .map(|ty| self.canonicalize_resolved_memo_type(ty, slots, inputs))
-                    .collect::<Option<Vec<_>>>()?,
-                Box::new(self.canonicalize_resolved_memo_type(*ret, slots, inputs)?),
-            )),
-            Type::Nullable(inner) => Some(Type::Nullable(Box::new(
-                self.canonicalize_resolved_memo_type(*inner, slots, inputs)?,
-            ))),
-            Type::ConstOf(inner) => Some(Type::ConstOf(Box::new(
-                self.canonicalize_resolved_memo_type(*inner, slots, inputs)?,
-            ))),
-            Type::Mut(inner) => Some(Type::Mut(Box::new(
-                self.canonicalize_resolved_memo_type(*inner, slots, inputs)?,
-            ))),
-            Type::Ref(inner) => Some(Type::Ref(Box::new(
-                self.canonicalize_resolved_memo_type(*inner, slots, inputs)?,
-            ))),
-            Type::Record(nominal) => self
-                .canonicalize_resolved_memo_nominal(nominal, slots, inputs)
-                .map(Type::Record),
-            Type::Sum(nominal) => self
-                .canonicalize_resolved_memo_nominal(nominal, slots, inputs)
-                .map(Type::Sum),
-            resolved => Some(resolved),
+        if !self.keyed_tainted.contains(&info.symbol) {
+            return;
         }
-    }
-
-    fn canonicalize_resolved_memo_nominal(
-        &self,
-        nominal: NominalType,
-        slots: &mut HashMap<u32, CanonVar>,
-        inputs: &mut Vec<(CanonVar, Type)>,
-    ) -> Option<NominalType> {
-        let mut substitution = Substitution::empty();
-        for (name, ty) in nominal.substitution.iter() {
-            substitution.insert(
-                name,
-                self.canonicalize_resolved_memo_type(ty.clone(), slots, inputs)?,
-            );
-        }
-        Some(NominalType::with_substitution(
-            nominal.id,
-            nominal.name,
-            substitution,
-        ))
-    }
-
-    fn canonical_memo_check_return(&self, ty: &Type) -> (Type, Vec<InferenceVarKind>) {
-        let resolved = self.resolve(ty);
-        let mut slots = HashMap::default();
-        let mut inputs = Vec::new();
-        if let Some(canonical) =
-            self.canonicalize_resolved_memo_type(resolved.clone(), &mut slots, &mut inputs)
-        {
-            return (
-                canonical,
-                inputs.into_iter().map(|(var, _)| var.kind).collect(),
-            );
-        }
-
-        // Error-classified variables are deliberately rejected from memo keys,
-        // but can be fresh outputs of an otherwise clean elaboration. Normalize
-        // them here so validation compares their structure rather than allocation
-        // ids while still comparing their solver kinds.
-        let vars: Vec<_> = brass_hir::type_vars(&resolved)
-            .into_iter()
-            .filter(|id| *id != brass_hir::INFER_VAR)
-            .collect();
-        let substitution = vars
+        let symbol = info.symbol.clone();
+        let module = info.module.clone();
+        let params = info.signature.params.clone();
+        let decl = info.decl.clone();
+        let declared_ret = info.signature.ret_ty.clone();
+        let args: Vec<Type> = params
             .iter()
-            .enumerate()
-            .map(|(slot, id)| (*id, Type::Unknown(slot as u32)))
+            .map(|p| {
+                p.resolved_ty
+                    .clone()
+                    .unwrap_or_else(|| self.fresh_unknown())
+            })
             .collect();
-        let kinds = vars
-            .into_iter()
-            .map(|id| self.solver.kind_of(id).unwrap_or(InferenceVarKind::Source))
-            .collect();
-        (brass_hir::substitute_vars(&resolved, &substitution), kinds)
+        let fallback = declared_ret
+            .clone()
+            .or_else(|| self.function_returns.get(&symbol).cloned())
+            .unwrap_or_else(|| self.fresh_unknown());
+        self.instantiate_function_call(
+            &symbol,
+            &module,
+            &params,
+            &decl.body,
+            declared_ret,
+            fallback,
+            &args,
+            span,
+        );
     }
 
     /// Choose an inferred-return body's return type: the full check's
     /// reconciliation when it produced one and the body raises no propagation
     /// (the full check observes the stores/pushes the light pass misses),
-    /// otherwise the light assembly -- a fallible body's `Result` from its
-    /// error sites, wrapped in `?` when a nullable `expr!` can return null --
-    /// which the normal-return reconciliation does not build.
+    /// otherwise the light assembly's SHAPE -- a fallible body's `Result` from
+    /// its error sites, wrapped in `?` when a nullable `expr!` can return null,
+    /// which the normal-return reconciliation does not build -- over the full
+    /// check's Ok payload.
+    ///
+    /// `site` names the instantiation when its inputs are fully known: its
+    /// returns and error payloads must then join, and a conflict -- one the
+    /// open definitional pass could not see -- is reported against it.
     fn prefer_full_return(
         &mut self,
         full_ret: Option<Type>,
         body: &Block,
         frame: ScopeStack,
+        site: Option<super::returns::InstanceSite>,
+    ) -> Type {
+        let errors_before = self.errors.len();
+        let reported_key = site.as_ref().map(|site| site.key.clone());
+        let saved_site = std::mem::replace(&mut self.conflict_site, site);
+        let report = self.conflict_site.is_some();
+        let ret = self.prefer_full_return_at(full_ret, body, frame, report);
+        self.conflict_site = saved_site;
+        if let Some(key) = reported_key
+            && self.errors.len() > errors_before
+        {
+            self.reported_instances.insert(key);
+        }
+        ret
+    }
+
+    fn prefer_full_return_at(
+        &mut self,
+        full_ret: Option<Type>,
+        body: &Block,
+        frame: ScopeStack,
+        report: bool,
     ) -> Type {
         let mut env = frame;
         let mut normal = Vec::new();
         let mut props = LightProps::default();
+        // The walk follows the arms the full check of this elaboration just
+        // selected (see `Checker::light_folds`).
+        let decisions = std::mem::take(&mut self.last_static_folds);
+        let saved = std::mem::replace(&mut self.light_folds, decisions);
         self.infer_returns_block(body, &mut env, &mut normal, &mut props);
+        self.light_folds = saved;
+        let normal = self.split_forwarded_returns(normal, &mut props);
         let has_props = !props.errors.is_empty() || !props.nulls.is_empty();
-        // Call-site re-inference does not report conflicts; the definition
-        // site already did.
-        let normal_ty = self.reconcile_return_types(&normal, false);
-        let base = self.result_from_payloads(normal_ty, &props.errors, false);
-        let light = super::precompute::wrap_null_propagated_return(base, &props.nulls);
         let collected = std::mem::take(&mut self.last_returns);
+        if report {
+            self.report_instance_return_conflict(&collected, has_props);
+        }
+        // Every value this instance's live paths return is an error and the
+        // body cannot fall through (which would succeed with `void`): it has
+        // no Ok value at all, whatever the light walk (which does not see a
+        // `return` nested in an initializer, nor this instance's pruning)
+        // assembled. Its Ok payload is the uninhabited marker, so reading it
+        // is rejected.
+        let error_only = !collected.is_empty()
+            && block_always_returns(body)
+            && collected.iter().all(|(ty, _)| {
+                self.resolve(ty)
+                    .result_payloads()
+                    .is_some_and(|(ok, _)| ok.is_unknown())
+            });
         if let Some(t) = full_ret
             && !has_props
         {
-            return t;
+            return if error_only {
+                self.with_error_only_ok(t)
+            } else {
+                t
+            };
         }
         // A propagating body's `Result`/`?` WRAPPING is the light assembly's -- the
         // full check's reconciliation does not rebuild it -- but its Ok PAYLOAD is
         // the full check's. The light pass cannot re-elaborate a method's body, so a
         // container the body fills (`HashMap.new()` then `set`) keeps OPEN element
-        // types there while the full check pins them. Take the light shape and fill
-        // it from what the body really returns, or the map reaches the back end with
-        // its element types unset.
+        // types there while the full check pins them; and where the two disagree
+        // outright the light pass approximated, so the full check's payload is the
+        // one the call site gets.
         //
-        // Reconciled HERE rather than taken from `full_ret`: an `error(..)` return
-        // carries no Ok value (its payload is a variable no path produces), and
-        // reconciled in it wins and leaves the payload open.
-        let mut values = Vec::with_capacity(collected.len());
-        for (ty, span) in collected {
-            let resolved = self.resolve(&ty);
-            if resolved
-                .result_payloads()
-                .is_some_and(|(ok, _)| ok.is_unknown())
-            {
-                continue;
-            }
-            values.push((ty, span));
-        }
-        if let Some(ok) = self.reconcile_return_types(&values, false) {
-            self.link_inferred_return(&light, &ok);
+        // Call-site re-inference does not report the normal returns' conflicts
+        // here (the full check's collected returns were judged above); the
+        // light pass's error payloads are the only record of the error sites,
+        // so an instantiation reports their conflict here.
+        let light_normal = self.reconcile_return_types(&normal, false);
+        let full_normal = self.full_normal_return(collected);
+        let normal_ty = self.settle_light_payload(light_normal, full_normal);
+        let base = self.result_from_payloads(normal_ty, &props.errors, report);
+        let light = super::precompute::wrap_null_propagated_return(base, &props.nulls);
+        if error_only {
+            return self.with_error_only_ok(light);
         }
         light
     }
 
-    /// Type a method call's result by instantiating the method's scheme against
-    /// the receiver instance: the scheme expresses the return over the type's
-    /// inferred parameters, and matching the scheme's field types to the
-    /// receiver's resolved field substitution fixes them (`get`'s `-> V?` becomes
-    /// `-> string?` for a `string`-valued map). Returns `None` when the receiver
-    /// is not a scheme'd record, the method is not in the scheme, or the return
-    /// still has an open parameter the instance did not pin (a parameter that only
-    /// flows through `==`, never a store or field read) -- the caller then keeps
-    /// the re-elaborated return.
+    /// The full check's reconciliation of a propagating body's VALUE returns,
+    /// from the `return` types `check_block_root` collected. An `error(..)`
+    /// return carries no Ok value (its payload is a variable no path produces);
+    /// reconciled in, it would win and leave the payload open, so it is skipped.
+    /// Where forwarded `Result`s mix with bare values, each forward takes part
+    /// by its Ok payload, as in `split_forwarded_returns`.
+    pub(super) fn full_normal_return(&mut self, collected: Vec<(Type, Span)>) -> Option<Type> {
+        let values: Vec<(Type, Span)> = collected
+            .into_iter()
+            .map(|(ty, span)| (self.resolve(&ty), span))
+            .filter(|(ty, _)| !ty.result_payloads().is_some_and(|(ok, _)| ok.is_unknown()))
+            .collect();
+        let forwards = values
+            .iter()
+            .filter(|(ty, _)| ty.result_payloads().is_some())
+            .count();
+        let values: Vec<(Type, Span)> = if forwards == 0 || forwards == values.len() {
+            values
+        } else {
+            values
+                .into_iter()
+                .map(|(ty, span)| match ty.result_payloads() {
+                    Some((ok, _)) => (ok.clone(), span),
+                    None => (ty, span),
+                })
+                .collect()
+        };
+        self.reconcile_return_types(&values, false)
+    }
+
+    /// Settle a light-pass normal return against the full check's, which is
+    /// the authority: their Ok payloads are unified when they agree (so an open
+    /// light variable takes the full check's pin), and the full check's payload
+    /// replaces the light one when they do not -- inside the forwarded
+    /// `Result` the light pass saw, if it saw one.
+    fn settle_light_payload(&mut self, light: Option<Type>, full: Option<Type>) -> Option<Type> {
+        let (Some(light), Some(full)) = (light.clone(), full.clone()) else {
+            return light.or(full);
+        };
+        let got = Self::ok_payload(&self.resolve(&full));
+        if got.is_unknown() {
+            return Some(light);
+        }
+        let light = self.resolve(&light);
+        let want = Self::ok_payload(&light);
+        let snapshot = self.solver.snapshot();
+        if self.solver.unify(&want, &got).is_ok() {
+            return Some(light);
+        }
+        self.solver.rollback(snapshot);
+        Some(
+            match (
+                light.result_payloads(),
+                self.resolve(&full).result_payloads(),
+            ) {
+                (Some((_, err)), None) => light.rebuild_result(got, err.clone()),
+                _ => full,
+            },
+        )
+    }
+
+    /// The return a recursive call inside an elaboration of `params` at
+    /// `arg_types` is typed against before the body's own return is known: the
+    /// precomputed (declaration-level) entry with each signature variable
+    /// replaced by the argument it is instantiated with here, and every other
+    /// variable fresh. The entry describes the callable for ALL its call sites;
+    /// linking it to one instance's real return (see `link_inferred_return`)
+    /// would pin a generic function to its first instantiation, and every other
+    /// instance's recursive calls would then read that instance's type.
+    fn instance_provisional_return(
+        &mut self,
+        entry: &Type,
+        params: &[ParamInfo],
+        arg_types: &[Type],
+    ) -> Type {
+        let entry = self.resolve(entry);
+        let mut map: HashMap<u32, Type> = HashMap::default();
+        for (param, arg) in params.iter().zip(arg_types) {
+            let Some(declared) = param.resolved_ty.as_ref() else {
+                continue;
+            };
+            let declared = self.resolve(declared);
+            let vars: Vec<u32> = brass_hir::type_vars(&declared).into_iter().collect();
+            match_scheme_param(&declared, &self.resolve(arg), &vars, &mut map);
+        }
+        let mut substitution: std::collections::BTreeMap<u32, Type> = map.into_iter().collect();
+        for var in brass_hir::type_vars(&entry) {
+            if var != brass_hir::INFER_VAR && !substitution.contains_key(&var) {
+                let fresh = self.fresh_unknown();
+                substitution.insert(var, fresh);
+            }
+        }
+        brass_hir::substitute_vars(&entry, &substitution)
+    }
+
+    /// `ret` (a `Result`, possibly nullable) with its Ok payload replaced by
+    /// a fresh uninhabited-payload variable; any other type is unchanged.
+    fn with_error_only_ok(&mut self, ret: Type) -> Type {
+        let ok = self.fresh_uninhabited_ok();
+        self.with_ok_payload(ret, ok)
+    }
+
+    /// `ret` (a `Result`, possibly nullable) with its Ok payload replaced by
+    /// `ok`; any other type is unchanged.
+    fn with_ok_payload(&self, ret: Type, ok: Type) -> Type {
+        match self.resolve(&ret) {
+            Type::Nullable(inner) => Type::nullable(self.with_ok_payload(*inner, ok)),
+            resolved @ Type::Sum(_) => match resolved.result_payloads() {
+                Some((_, err)) => {
+                    let err = err.clone();
+                    resolved.rebuild_result(ok, err)
+                }
+                None => resolved,
+            },
+            _ => ret,
+        }
+    }
+
     /// For a method call on a scheme'd record receiver, the type each non-`self`
     /// parameter instantiates to for this receiver instance -- the map's `set`
     /// value parameter becomes `int64` for a `string -> int64` map. `Some(t)`
@@ -443,19 +733,9 @@ impl<'a> Checker<'a> {
         recv_ty: &Type,
         method: &str,
     ) -> Vec<Option<Type>> {
-        let Some(nominal) = self.scheme_receiver_record(recv_ty) else {
+        let Some((scheme_method, map)) = self.scheme_method_instance(recv_ty, method) else {
             return Vec::new();
         };
-        let Some(info) = self.program.type_by_id(nominal.id) else {
-            return Vec::new();
-        };
-        let Some(scheme) = self.schemes.get(&info.symbol) else {
-            return Vec::new();
-        };
-        let Some(scheme_method) = scheme.methods.get(method) else {
-            return Vec::new();
-        };
-        let map = scheme_instance_map(scheme, &nominal, |ty| self.resolve(ty));
         scheme_method
             .params
             .iter()
@@ -467,6 +747,54 @@ impl<'a> Checker<'a> {
             .collect()
     }
 
+    /// For each non-`self` parameter of `method` on a scheme'd record
+    /// receiver (aligned like [`Self::scheme_method_param_types`]), whether
+    /// the receiver instance PINS its type: the scheme states the parameter
+    /// over a type parameter of the record that this instance binds (a map's
+    /// `set` value is the map's own value type). The method stores such an
+    /// argument into the receiver's slots, so the argument is checked as
+    /// storage, not as an ordinary parameter instantiated at its own type.
+    pub(super) fn scheme_method_param_pinned(&self, recv_ty: &Type, method: &str) -> Vec<bool> {
+        let Some((scheme_method, map)) = self.scheme_method_instance(recv_ty, method) else {
+            return Vec::new();
+        };
+        scheme_method
+            .params
+            .iter()
+            .filter(|(name, _)| name != "self")
+            .map(|(_, ty)| {
+                brass_hir::type_vars(ty)
+                    .iter()
+                    .any(|var| map.contains_key(var))
+            })
+            .collect()
+    }
+
+    /// The scheme of `method` on the scheme'd record receiver `recv_ty`, with
+    /// the map from the scheme's type parameters to this receiver instance's
+    /// types.
+    fn scheme_method_instance(
+        &self,
+        recv_ty: &Type,
+        method: &str,
+    ) -> Option<(&SchemeMethod, HashMap<u32, Type>)> {
+        let nominal = self.scheme_receiver_record(recv_ty)?;
+        let info = self.program.type_by_id(nominal.id)?;
+        let scheme = self.schemes.get(&info.symbol)?;
+        let scheme_method = scheme.methods.get(method)?;
+        let map = scheme_instance_map(scheme, &nominal, |ty| self.resolve(ty));
+        Some((scheme_method, map))
+    }
+
+    /// Type a method call's result by instantiating the method's scheme against
+    /// the receiver instance: the scheme expresses the return over the type's
+    /// inferred parameters, and matching the scheme's field types to the
+    /// receiver's resolved field substitution fixes them (`get`'s `-> V?` becomes
+    /// `-> string?` for a `string`-valued map). Returns `None` when the receiver
+    /// is not a scheme'd record, the method is not in the scheme, or the return
+    /// still has an open parameter the instance did not pin (a parameter that only
+    /// flows through `==`, never a store or field read) -- the caller then keeps
+    /// the re-elaborated return.
     pub(super) fn scheme_method_return(&self, recv_ty: &Type, method: &str) -> Option<Type> {
         let nominal = self.scheme_receiver_record(recv_ty)?;
         let info = self.program.type_by_id(nominal.id)?;
@@ -499,142 +827,9 @@ impl<'a> Checker<'a> {
         }
     }
 
-    pub(super) fn instantiate_method_call(&mut self, call: MethodCall<'_>) -> Type {
-        let MethodCall {
-            owner,
-            self_type,
-            name: method_name,
-            method,
-            signature_params,
-            receiver_ty,
-            declared_ret,
-            fallback_ret,
-            arg_types,
-            scheme_params,
-            span,
-        } = call;
-        let has_self = signature_params.first().is_some_and(|p| p.name == "self");
-        if signature_params.len().saturating_sub(usize::from(has_self)) != arg_types.len() {
-            return fallback_ret;
-        }
-        // Keyed by the receiver TYPE, not by `owner` (the `Sum.Variant` qualifier
-        // this call resolved through): a sum's method lives in every variant's
-        // table, so one call resolves to one candidate per variant, all sharing
-        // the same body. Per-qualifier keys let a recursive call re-enter through
-        // a variant not yet on the stack, and the work grew factorially in the
-        // variant count -- see `Checker::instantiating`.
-        let key = format!("method:{self_type}.{method_name}");
-        // A co-check records return links and an active type-test probe commits
-        // bindings for its holes. Recursive calls must take the fallback path.
-        let memo_enabled = !self.co_checking
-            && self.type_test_holes.is_empty()
-            && self.closure_recheck_depth == 0
-            && !self.instantiating.contains(&key);
-        let memo_key = memo_enabled.then(|| {
-            receiver_ty
-                .clone()
-                // Static methods have no value receiver; their declaring nominal
-                // is the fixed receiver identity that supplies `Self`.
-                .or_else(|| self.program.types.get(self_type).map(TypeInfo::type_ref))
-        });
-        let memo_key = memo_key.flatten().and_then(|resolved_receiver| {
-            let variant = owner.split_once('.').map_or("", |(_, variant)| variant);
-            let callable = format!("{self_type}:{variant}:{method_name}");
-            // Receiver-scheme parameters are derived from the resolved receiver;
-            // an unpinned scheme parameter falls back to its argument type. The
-            // receiver and arguments therefore cover every frame binding. An
-            // ordinary method is not expectation-directed: expected returns only
-            // select reflective methods, whose template bodies do not reach here.
-            self.elaboration_memo_key(
-                "m",
-                &callable,
-                Some(&resolved_receiver),
-                arg_types,
-                scheme_params,
-            )
-        });
-        let mut memo_validation = None;
-        if let Some(memo_key) = &memo_key
-            && let Some(entry) = self.elaboration_memo.get(&memo_key.key).cloned()
-        {
-            tracing::debug!(callable = %memo_key.key.callable, "elaboration memo hit");
-            let replay_errors_before = self.errors.len();
-            let replayed = self.replay_elaboration_memo_entry(&entry, memo_key);
-            let replay_errors = self.errors.len() - replay_errors_before;
-            if !memo_check_enabled() {
-                return replayed;
-            }
-            memo_validation = Some((replayed, replay_errors));
-        } else if let Some(memo_key) = &memo_key {
-            tracing::debug!(callable = %memo_key.key.callable, "elaboration memo miss");
-        }
-        let errors_before = self.errors.len();
-        if !self.instantiating.insert(key.clone()) {
-            return fallback_ret;
-        }
-        if !self.elaboration_allowed(&format!("{owner}.{method_name}"), span) {
-            self.instantiating.remove(&key);
-            return fallback_ret;
-        }
-        if memo_key.is_some() {
-            self.begin_elaboration_journal();
-        }
-        let saved = self.self_type.replace(self_type.to_string());
-        let saved_variant = self.self_variant.clone();
-        self.self_variant = owner
-            .split_once('.')
-            .map(|(_, variant)| (self_type.to_string(), variant.to_string()));
-        // Re-check the method body in its defining type's module.
-        let owner_type = self_type.to_string();
-        let saved_module =
-            self.swap_module_for(|p| p.types.get(&owner_type).map(|t| t.module.clone()));
-        let frame =
-            self.signature_call_frame(signature_params, arg_types, scheme_params, receiver_ty);
-        let full_ret = if let Some(body) = &method.body {
-            let mut scopes = frame.clone();
-            let ret = self.check_block_root(body, &mut scopes, declared_ret.as_ref());
-            // The concrete receiver and arguments can reveal a sum that the
-            // open method pass could not identify. Publish its coverage errors
-            // in this call's delta, before a lazy consumer compiles the method.
-            if self.lazy_profile {
-                self.errors.extend(crate::exhaustive::check_block(
-                    self.program,
-                    &self.typed,
-                    body,
-                ));
-            }
-            ret
-        } else {
-            None
-        };
-        let ret = match (&method.body, declared_ret) {
-            (_, Some(ret)) => ret,
-            (Some(body), None) => self.prefer_full_return(full_ret, body, frame),
-            (None, None) => Type::Void,
-        };
-        self.self_type = saved;
-        self.self_variant = saved_variant;
-        self.current_module = saved_module;
-        self.instantiating.remove(&key);
-        if let Some((replayed, replay_errors)) = memo_validation {
-            debug_assert_eq!(
-                self.canonical_memo_check_return(&replayed),
-                self.canonical_memo_check_return(&ret)
-            );
-            debug_assert_eq!(replay_errors, self.errors.len() - errors_before);
-        }
-        if let Some(memo_key) = memo_key {
-            let resolved = self.resolve(&ret);
-            let memoizable = self.errors.len() == errors_before;
-            let frame = self.finish_elaboration_journal();
-            if memoizable && !frame.has_closure_bodies {
-                let entry = self.build_elaboration_memo_entry(&resolved, frame, &memo_key);
-                self.elaboration_memo.insert(memo_key.key, Rc::new(entry));
-            }
-        }
-        ret
-    }
-
+    /// The scope stack a callee body is checked in for one call: the globals
+    /// visible from the callee's module, and a frame binding each parameter
+    /// to the type it takes for these arguments (see the branches below).
     pub(super) fn signature_call_frame(
         &mut self,
         params: &[ParamInfo],
@@ -663,7 +858,7 @@ impl<'a> Checker<'a> {
             } else if let Some(annotated) = param_expected_type(param).cloned() {
                 let ty = arg_types
                     .get(arg_idx)
-                    .map(|arg| self.instantiate_annotated_type(&annotated, arg))
+                    .map(|arg| self.instantiate_param_type(&annotated, arg))
                     .unwrap_or(annotated);
                 arg_idx += 1;
                 ty
@@ -685,9 +880,99 @@ impl<'a> Checker<'a> {
                 frame.insert(param.name.clone(), ty);
             }
         }
-        vec![Scope::shared(self.global_scope()), Scope::new(frame)]
+        let mut frame = Scope::new(frame);
+        if self.numeric.probing {
+            let origins = self
+                .numeric
+                .arguments
+                .get(&self.numeric.calls)
+                .cloned()
+                .unwrap_or_default();
+            let offset = arg_types.len().saturating_sub(origins.len());
+            let mut index = 0;
+            for param in params {
+                if param.name == "self" && receiver_ty.is_some() {
+                    continue;
+                }
+                if param.ty.is_none()
+                    && scheme_params.get(index).is_none_or(Option::is_none)
+                    && let Some(Some(binding_joins::numeric::Source::Root(id))) =
+                        index.checked_sub(offset).and_then(|i| origins.get(i))
+                {
+                    frame.numeric.insert(param.name.clone(), *id);
+                }
+                index += 1;
+            }
+        }
+        vec![Scope::shared(self.global_scope()), frame]
     }
 
+    /// The type a callee body is checked at for a parameter annotated
+    /// `annotated` that receives an argument of type `actual`: the annotation
+    /// instantiated against the argument ([`Self::instantiate_annotated_type`]),
+    /// except where the annotation names a record and the argument carries a
+    /// value of another declaration there -- a structurally wider record, an
+    /// anonymous record, a primitive satisfying a protocol record. The back
+    /// ends instantiate the callee at the argument's own type in that case,
+    /// so the body is checked at it too: a store of the parameter into a slot
+    /// of the annotated type is then seen as the representation change it is.
+    /// An argument that is not usable as the annotation at all is already
+    /// rejected at the call; the body is then checked at the annotation.
+    /// Wrappers, nullables and arrays are followed to reach such positions; a
+    /// declared sum subtype is rebuilt as the parent at the call, so a sum
+    /// position keeps the annotation.
+    pub(super) fn instantiate_param_type(&self, annotated: &Type, actual: &Type) -> Type {
+        let actual_value = peel_value_wrappers(&self.resolve(actual)).clone();
+        match (self.resolve(annotated), &actual_value) {
+            (Type::ConstOf(want), _) => {
+                Type::ConstOf(Box::new(self.instantiate_param_type(&want, &actual_value)))
+            }
+            (Type::Mut(want), _) => {
+                Type::Mut(Box::new(self.instantiate_param_type(&want, &actual_value)))
+            }
+            (Type::Ref(want), _) => {
+                Type::Ref(Box::new(self.instantiate_param_type(&want, &actual_value)))
+            }
+            (Type::Nullable(want), Type::Nullable(have)) => {
+                Type::Nullable(Box::new(self.instantiate_param_type(&want, have)))
+            }
+            (Type::Nullable(want), have) if !matches!(have, Type::Never) => {
+                Type::Nullable(Box::new(self.instantiate_param_type(&want, have)))
+            }
+            (Type::Slice(want), Type::Slice(have) | Type::Array(have, _)) => {
+                Type::Slice(Box::new(self.instantiate_param_type(&want, have)))
+            }
+            (Type::Array(want, n), Type::Array(have, _) | Type::Slice(have)) => {
+                Type::Array(Box::new(self.instantiate_param_type(&want, have)), n)
+            }
+            (Type::Record(want), have)
+                if !matches!(have, Type::Unknown(_) | Type::Never)
+                    && !matches!(have, Type::Record(h) if h.id == want.id && h.name == want.name)
+                    && crate::structural::types_compatible(
+                        self.program,
+                        have,
+                        &Type::Record(want.clone()),
+                    ) =>
+            {
+                have.clone()
+            }
+            (annotated, _) => self.instantiate_annotated_type(&annotated, &actual_value),
+        }
+    }
+
+    /// Whether a callee with a parameter annotated `annotated` is checked at
+    /// another type than the annotation's instantiation when it receives
+    /// `actual` (see [`Self::instantiate_param_type`]): its body then depends
+    /// on the argument, not on the signature alone.
+    pub(super) fn param_instance_follows_argument(&self, annotated: &Type, actual: &Type) -> bool {
+        self.instantiate_param_type(annotated, actual)
+            != self.instantiate_annotated_type(annotated, actual)
+    }
+
+    /// The annotation `annotated` with its open positions (`infer` holes,
+    /// a generic record's or sum's inferred fields and method signatures)
+    /// filled from the matching positions of `actual`; concrete positions
+    /// keep the annotation.
     pub(super) fn instantiate_annotated_type(&self, annotated: &Type, actual: &Type) -> Type {
         // Match against the actual value type, looking through `const`/`mut`/`ref`
         // wrappers (an argument's mutability/reference does not change which
@@ -818,12 +1103,10 @@ impl<'a> Checker<'a> {
                                 .cloned()
                                 .or_else(|| have_method.signature.ret_ty.clone())
                                 .or_else(|| {
-                                    self.method_returns
-                                        .get(&(
-                                            self.program.type_by_id(have.id)?.symbol.clone(),
-                                            method_name.clone(),
-                                        ))
-                                        .cloned()
+                                    self.read_method_return(&(
+                                        self.program.type_by_id(have.id)?.symbol.clone(),
+                                        method_name.clone(),
+                                    ))
                                 });
                             if let Some(have_ret) = have_ret {
                                 substitution.insert(key, have_ret);
@@ -881,8 +1164,8 @@ impl<'a> Checker<'a> {
 
 /// Map each scheme parameter to the receiver instance's concrete type by matching
 /// the scheme's field types against the receiver's resolved field substitution
-/// (`entries : _Entry<K, V>[]` vs `entries : _Entry<string, string>[]` gives `K
-/// -> string`, `V -> string`). Used to instantiate a method's scheme at a call.
+/// (`_entries: _Entry<K, V>?[]` vs `_entries: _Entry<string, int32>?[]` gives
+/// `K -> string`, `V -> int32`). Used to instantiate a method's scheme at a call.
 pub(super) fn scheme_instance_map(
     scheme: &TypeScheme,
     recv: &NominalType,

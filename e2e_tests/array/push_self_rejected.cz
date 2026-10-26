@@ -1,8 +1,7 @@
-// Pushing an array into itself makes the element type infinitely recursive; the
-// occurs check must reject it instead of leaving the element unbound (which let
-// the call site mistype it and crashed the JIT). The array is empty so the
-// element is still open at the push -- a call site whose literal already pinned
-// the element reports a plain element mismatch instead (see
+// Pushing an array into itself makes the element type infinitely recursive,
+// so the checker rejects it at the push. The array is empty, so the element
+// is still open there -- a call site whose literal already pinned the
+// element reports a plain element mismatch instead (see
 // push_self_concrete_rejected).
 fun main() {
     let a = []

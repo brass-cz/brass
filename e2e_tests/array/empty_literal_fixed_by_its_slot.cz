@@ -1,0 +1,23 @@
+// @backends: all
+// An empty array literal takes its element type from the first fully known
+// slot or parameter it flows into (bracket literal rule 1: the requirement
+// decides), so a `[]` bound without an annotation is complete once it is
+// stored in a typed field or passed to a typed parameter.
+type Holder = { items: int64[] }
+
+fun total(xs: float64[]) -> float64 {
+    let t = 0.0
+    for x in xs {
+        t += x
+    }
+    return t
+}
+
+fun main() {
+    let v = []
+    let h = Holder { items: v }
+    h.items.push(5000000000)
+    println(h.items)
+    let w = []
+    println(total(w))
+}

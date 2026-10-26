@@ -1,0 +1,16 @@
+// @backends: all
+// An anonymous record literal whose fields are exactly the map's value
+// record is built as that record when it is stored with `set`.
+type Wide = {
+    a: int32
+    b: string
+}
+
+fun main() {
+    let m = HashMap.new()
+    m.set("x", Wide { a: 1, b: "s" })
+    m.set("y", { a: 2, b: "t" })
+    if let w = m.get("y") {
+        println("{w.a} {w.b}")
+    }
+}

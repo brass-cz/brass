@@ -1,11 +1,10 @@
 //! The program-level MIR: every callable in a `brass_hir::Program` lowered to
 //! a body, plus the closures they spawn.
 //!
-//! The collection mirrors how the current codegen enumerates work
-//! (`codegen::gen_functions`/`gen_inits`): free functions, then record and sum
-//! methods, then module init bodies, with nested closures gathered into a shared
-//! table keyed by [`crate::ClosureId`]. Each item keeps the identifying metadata
-//! a back end needs to mangle its symbol and route calls to it.
+//! The collection holds free functions, record and sum methods, and module
+//! init bodies, with nested closures gathered into a shared table keyed by
+//! [`crate::ClosureId`]. Each item keeps the identifying metadata a back end
+//! needs to mangle its symbol and route calls to it.
 
 use crate::cfg::MirBody;
 use crate::ids::{ClosureId, LocalId};
@@ -47,6 +46,12 @@ pub struct MirMethod {
 /// the enclosing [`crate::Rvalue::Closure`] supplies the capture operands in the
 /// same order as `captures`.
 pub struct MirClosure {
+    /// Source body identity shared with checker observations.
+    pub source: brass_parser::Span,
+    /// Source use creating this closure value, including generalized uses.
+    pub created_at: Option<brass_parser::Span>,
+    /// Whether each physical capture stores a mutable binding cell.
+    pub capture_cells: Vec<bool>,
     pub id: ClosureId,
     pub params: Vec<LocalId>,
     pub captures: Vec<LocalId>,
@@ -59,8 +64,9 @@ pub struct MirClosure {
     /// closure returns `Result<ok, err>` and a bare `return v` is implicitly
     /// wrapped as `Ok { value: v }`, exactly like a named function whose
     /// unannotated body raises (closures have no return annotation, so this is
-    /// always the inferred form). Per instance the backend still requires a
-    /// live error site (see the monomorphizer's `live_fallible_site`).
+    /// always the inferred form). Monomorphization keeps an instance fallible
+    /// only while a block live in that instance holds an error site (see its
+    /// `live_fallible_site`).
     pub fallible: bool,
     pub body: MirBody,
 }
@@ -80,4 +86,21 @@ pub struct MirProgram {
     pub methods: Vec<MirMethod>,
     pub closures: Vec<MirClosure>,
     pub inits: Vec<MirInit>,
+    /// The checker's fully-known return of each unannotated function instance
+    /// its call-site elaborations settled, keyed by (function symbol, argument
+    /// types). Monomorphization types a call into an instance still being
+    /// typed (mutual recursion without annotations) against it.
+    pub instance_returns: fxhash::FxHashMap<(String, Vec<brass_hir::Type>), brass_hir::Type>,
+    /// The checker's per-instance aggregate seeds, for the spans whose
+    /// instances disagree (see [`brass_hir::InstanceChannel`]):
+    /// monomorphization seeds a local whose [`crate::LocalDecl::seed_site`]
+    /// is such a span from the entry of the instance it is typing, never
+    /// from the span-shared seed.
+    pub instance_seeds: brass_hir::InstanceChannel<brass_hir::Type>,
+    /// The generated specialization each instance's reflective call
+    /// dispatches to, for the calls whose instances key them differently
+    /// (lowered as [`crate::Callee::Keyed`]).
+    pub instance_dispatch: brass_hir::InstanceChannel<String>,
+    /// Settled return-origin contracts, keyed by call and enclosing instance.
+    pub numeric_calls: brass_hir::NumericCalls,
 }

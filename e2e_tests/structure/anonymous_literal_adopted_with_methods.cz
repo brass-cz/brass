@@ -1,0 +1,28 @@
+// @backends: all
+// An anonymous record literal whose fields are exactly a declared record's is
+// built as that record wherever the record is required -- an argument, an
+// annotated `let`, a return, a nullable parameter, an array element -- also
+// when the record declares methods.
+type Point = { x: int32, y: int32 }
+fun Point.describe(self) -> string {
+  return "point {self.x},{self.y}"
+}
+fun show(p: Point) -> string {
+  return p.describe()
+}
+fun mk() -> Point {
+  return { x: 5, y: 6 }
+}
+fun maybe(p: Point?) -> string {
+  if p { return p.describe() }
+  return "none"
+}
+fun main() {
+  println(show({ x: 1, y: 2 }))
+  let p: Point = { x: 3, y: 4 }
+  println(p.describe())
+  println(mk().describe())
+  println(maybe({ x: 7, y: 8 }))
+  let ps: Point[] = [{ x: 9, y: 10 }]
+  println(ps[0].describe())
+}

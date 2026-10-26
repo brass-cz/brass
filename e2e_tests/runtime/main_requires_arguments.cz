@@ -1,0 +1,4 @@
+// An entry point with a required parameter cannot run without an argument.
+fun main(value: int32) {
+    println(value)
+}

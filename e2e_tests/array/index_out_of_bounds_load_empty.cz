@@ -1,0 +1,6 @@
+// @backends: all
+// An out-of-range empty array load reports the shared bounds diagnostic.
+fun main() {
+    let a: int32[] = []
+    println(a[0])
+}

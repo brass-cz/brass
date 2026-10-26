@@ -1,5 +1,6 @@
 //! Numeric flow: which implicit conversions exist between numeric types, and
-//! the common type two operands of a binary operator convert to.
+//! the common type two numeric types meet at -- the lattice the operator rule
+//! (`crate::operators`) and the value join (`crate::join`) build on.
 //!
 //! The rule is value preservation: a conversion is implicit only when EVERY
 //! value of the source type is exactly representable in the target type.
@@ -44,7 +45,8 @@ pub fn numeric_flow(from: &Type, to: &Type) -> Flow {
     }
 }
 
-/// Compatibility wrapper for call sites that only need allowed-or-not.
+/// Whether `from` flows into `to` implicitly (identity or widening), for
+/// callers that need no hint.
 pub fn numeric_flows_into(from: &Type, to: &Type) -> bool {
     matches!(numeric_flow(from, to), Flow::Identity | Flow::Widen)
 }
@@ -94,11 +96,12 @@ fn float_bits(f: FloatKind) -> u32 {
     }
 }
 
-/// The result type of an arithmetic or comparison operator between two
-/// numeric operands: the smallest type BOTH flow into implicitly. `None` when
-/// either operand is not numeric or no value-preserving common type exists
-/// (e.g. `int64` with `uint64`, or `int64` with `float64`) -- the operands
-/// must then be converted explicitly.
+/// The smallest numeric type BOTH `a` and `b` flow into implicitly: the type
+/// two non-literal numeric operands meet at (the full rule, literals
+/// included, is [`crate::common_operand_type`]). `None` when either type is
+/// not numeric or no value-preserving common type exists (e.g. `int64` with
+/// `uint64`, or `int64` with `float64`) -- the operands must then be
+/// converted explicitly.
 pub fn common_numeric_type(a: &Type, b: &Type) -> Option<Type> {
     if !is_numeric(a) || !is_numeric(b) {
         return None;

@@ -1,10 +1,10 @@
-// A method's fallibility must follow its DECLARED return, exactly as a free
-// function's does: `-> T!` wraps plain returns in `Result.Ok` even when the body
-// never builds an error itself. MIR judged a method by its body alone, so a
-// declared-fallible method with no `error(..)` and no `!` was not marked
-// fallible: it returned its bare value where the caller's `!` expected a Result.
-// An array payload then read back as `never` ("indexing non-array `never`"), and
-// a scalar payload silently read back as `null` -- a wrong answer, not an error.
+// A method's fallibility follows its DECLARED return, exactly as a free
+// function's does: `-> T!` wraps plain returns in `Result.Ok` even when the
+// body never builds an error itself, so the caller's `!` unwraps a Result
+// from an instance, a static and a sum method, with an array or a scalar
+// payload. Judged by its body alone, such a method would hand the caller's
+// `!` a bare value. A declared-fallible method that does error still
+// reports it.
 
 type Box = { tag: int64 }
 

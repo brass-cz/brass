@@ -1,0 +1,36 @@
+// @backends: all
+// A top-level destructuring `let` binds module globals exactly like the
+// local form binds locals: record patterns (with shorthand, renamed and
+// nested sub-patterns), the variant of a one-variant sum, and array/tuple
+// patterns. Functions read and assign the globals afterwards.
+
+type P = { x: int32, y: int32 }
+type Line = { from: P, to: P, tag: string }
+type Only = | One { a: int32, b: string }
+
+let P { x, y } = P { x: 3, y: 4 }
+let Line { from: P { x: fx, .. }, to, tag: label } = Line {
+    from: P { x: 1, y: 2 },
+    to: P { x: 5, y: 6 },
+    tag: "diag",
+}
+let One { a, b } = Only.One { a: 7, b: "seven" }
+let [i, s] = [10, "ten"]
+let [m, n] = [20, 30]
+
+fun show() {
+    println(x + y)
+    println("{fx} {to.x} {to.y} {label}")
+    println("{a} {b}")
+    println("{i} {s} {m + n}")
+}
+
+fun bump() {
+    x = x + 100
+    to.y = 60
+}
+
+show()
+bump()
+println(x)
+println(to.y)

@@ -1,0 +1,15 @@
+// @backends: all
+// Passing a narrowed `T?` binding to a `ref(mut(T?))` parameter ends its
+// narrowing: the callee holds a mutable reference to the binding, so after the
+// call the binding is its declared `T?` again and must be checked before use.
+fun clear(x: ref(mut(string?))) {
+    x = null
+}
+
+fun main() {
+    let s: string? = "abc"
+    if s {
+        clear(s)
+        println(s.len())
+    }
+}

@@ -207,6 +207,36 @@ fn git_dependencies_clone_and_checkout_in_the_cache() {
         String::from_utf8_lossy(&created.stderr)
     );
     let manifest_path = scaffold.join("app/package.toml");
+    // Both scaffold commands publish the documented tarball dependency example.
+    let expected_manifest = |name: &str| {
+        format!(
+            "[package]\nname = \"{name}\"\nauthors = \"\"\nlicense = \"MIT\"\n\n[dependencies]\n# mylib = {{ git = \"https://github.com/user/mylib\", rev = \"<rev>\" }}\n# mylib = {{ path = \"../mylib\" }}\n# mylib = {{ tarball = \"https://example.com/mylib.tar.gz\", hash = \"<sha256>\" }}\n"
+        )
+    };
+    assert_eq!(
+        std::fs::read_to_string(&manifest_path).unwrap(),
+        expected_manifest("app")
+    );
+    let initialized = czpm(&["init", "initialized"]);
+    assert!(
+        initialized.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    let initialized_manifest = scaffold.join("package.toml");
+    assert_eq!(
+        std::fs::read_to_string(&initialized_manifest).unwrap(),
+        expected_manifest("initialized")
+    );
+    let repeated_init = czpm(&["init", "initialized"]);
+    assert!(
+        !repeated_init.status.success(),
+        "init overwrote an existing manifest"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&initialized_manifest).unwrap(),
+        expected_manifest("initialized")
+    );
     std::fs::write(&manifest_path, "sentinel\n").expect("replace fixture manifest");
     let repeated = czpm(&["new", "app"]);
     assert!(

@@ -1,0 +1,28 @@
+// @backends: all
+// A read-only value -- an immutable `ref(T)` parameter or a `const` -- may
+// still be handed to a function value that only reads it: a named function
+// taking `ref(T)`, a closure that reads its argument, or a parameter whose
+// function type takes `ref(T)`. Only a write-through `ref(mut(T))` parameter
+// is refused (see read_only_ref_into_write_through_function_value_rejected.cz).
+type P = { x: int32 }
+
+fun show(p: ref(P)) {
+    println(p.x)
+}
+
+fun apply(f, v: ref(P)) {
+    f(v)
+}
+
+fun annotated(f: (ref(P)) -> void, v: ref(P)) {
+    f(v)
+}
+
+fun main() {
+    let w = P { x: 2 }
+    apply(show, w)
+    apply((p) -> println(p.x + 1), w)
+    annotated(show, w)
+    const c = P { x: 5 }
+    apply(show, c)
+}

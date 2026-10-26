@@ -1,0 +1,19 @@
+// Every name a destructuring `const` binds is const, at the top level and in a
+// function: mutating a part of the value through it (a mutating method, a
+// field store, an element store) is rejected, also when a function body
+// mutates a destructured global.
+type P = { xs: int32[] }
+type W = { inner: P }
+
+const [ga, gb] = [[1], [2]]
+const W { inner: gi } = W { inner: P { xs: [5] } }
+
+fun main() {
+    ga.push(4)
+    gi.xs.push(3)
+    const [a, b] = [[1], [2]]
+    a.push(4)
+    const W { inner } = W { inner: P { xs: [5] } }
+    inner.xs = [1]
+    b[0] = 9
+}

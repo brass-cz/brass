@@ -1,0 +1,35 @@
+// @backends: all
+// A narrowed `T?` binding may be passed to a `ref(mut(T?))` parameter: the
+// parameter refers to the binding itself, at its declared nullable type, so
+// the narrowed view is not what is passed. Field writes through the
+// reference reach the caller; rebinding the parameter name does not.
+type Box = { v: int32 }
+
+fun clear(x: ref(mut(string?))) {
+    if x {
+        println("callee sees {x}")
+    }
+    x = null
+}
+
+fun bump(b: ref(mut(Box?))) {
+    if b {
+        b.v = b.v + 10
+    }
+}
+
+fun main() {
+    let s: string? = "abc"
+    if s {
+        println(s.len())
+        clear(s)
+        println(s)
+    }
+    let b: Box? = Box { v: 1 }
+    if b {
+        bump(b)
+        if b {
+            println(b.v)
+        }
+    }
+}

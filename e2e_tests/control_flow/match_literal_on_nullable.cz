@@ -1,0 +1,36 @@
+// @backends: all
+// A value literal pattern on a nullable scrutinee matches a present value
+// equal to it, and an integer literal pattern follows the literal flow rule
+// (its value must fit the scrutinee's type): `-1` and `5000000000` match an
+// `int64?`, `255` a `uint8`, and a string literal a `string?`.
+fun classify(n: int64?) -> string {
+    return match n {
+        -1 => "minus one",
+        null => "none",
+        5000000000 => "big",
+        _ => "other",
+    }
+}
+
+fun word(s: string?) -> string {
+    return match s {
+        "a" => "letter a",
+        null => "nothing",
+        _ => "something",
+    }
+}
+
+fun main() {
+    println(classify(-1))
+    println(classify(null))
+    println(classify(5000000000))
+    println(classify(3))
+    println(word("a"))
+    println(word(null))
+    println(word("b"))
+    let b: uint8 = 255
+    match b {
+        255 => println("max"),
+        _ => println("not max"),
+    }
+}

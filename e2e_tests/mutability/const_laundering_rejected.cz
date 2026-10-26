@@ -1,19 +1,19 @@
-// Pins that a const cannot be laundered into a write-through position through
-// call indirection:
-//  - through a local fn-valued alias (`let f = mutate; f(o)`),
-//  - through a higher-order call (`apply(mutate, o)` where apply calls f(v)).
-//
-// An unannotated parameter that mutates -- a self-mutating method on it, or
-// forwarding it into a `ref(mut)` position -- is a PRIVATE DEEP COPY, so
-// passing a const there is safe and is NOT rejected (see
-// method_mutation_copies_param.cz).
+// A const cannot reach a write-through `ref(mut)` parameter through call
+// indirection: not through a local alias of the function (`let f = mutate;
+// f(o)`), and not through a higher-order function that calls the function
+// value it receives on its REFERENCE parameter (`apply_ref(mutate, o)`, whose
+// `v: ref(P)` is passed to `f`). An unannotated parameter that is mutated --
+// by a self-mutating method, or by forwarding it into a `ref(mut)` position,
+// a function value's included -- is a private deep copy instead, so a const
+// is accepted there (see method_mutation_copies_param.cz and
+// closure/forwarded_param_into_ref_mut_closure_copies.cz).
 type P = { x: int32 }
 
 fun mutate(p: ref(mut(P))) {
     p.x = 42
 }
 
-fun apply(f, v) {
+fun apply_ref(f, v: ref(P)) {
     f(v)
 }
 
@@ -22,5 +22,5 @@ fun main() {
     let f = mutate
     f(o)
 
-    apply(mutate, o)
+    apply_ref(mutate, o)
 }

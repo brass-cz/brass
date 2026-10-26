@@ -1,0 +1,1 @@
+9:24: error: nullable value must be checked for null before use: a field is not narrowed by testing it; bind it first: `if let n = p.n { ... }`

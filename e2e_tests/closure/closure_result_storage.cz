@@ -1,0 +1,24 @@
+// @backends: all
+// A closure literal checked against a function type returns into that
+// type's result slot: a declared sum subtype is rebuilt as the parent there
+// (so the closure has the required signature), while a record result must
+// already be the required record.
+type Shape = | Circle { r: float64 } | Sq { s: float64 }
+type Tagged: Shape = | Circle { tag: string, r: float64 } | Sq { tag: string, s: float64 }
+
+fun area(s: Shape) -> float64 {
+    return match s {
+        Circle { r } => r * r
+        Sq { s } => s * s
+    }
+}
+
+fun run(f: () -> Shape) -> float64 {
+    return area(f())
+}
+
+fun main() {
+    let f: () -> Shape = () -> Tagged.Sq { tag: "x", s: 3.0 }
+    println(area(f()))
+    println(run(() -> Tagged.Circle { tag: "y", r: 2.0 }))
+}

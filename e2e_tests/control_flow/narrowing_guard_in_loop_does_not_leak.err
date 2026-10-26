@@ -1,0 +1,3 @@
+narrowing_guard_in_loop_does_not_leak.cz:16:13: error: nullable value must be checked for null before use
+narrowing_guard_in_loop_does_not_leak.cz:23:13: error: nullable value must be checked for null before use
+narrowing_guard_in_loop_does_not_leak.cz:33:13: error: nullable value must be checked for null before use

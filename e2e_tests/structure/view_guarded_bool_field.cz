@@ -1,0 +1,39 @@
+// @backends: all
+// A guarded `bool` field of an anonymous argument is tested for its VALUE,
+// exactly as for a nominal record: the view keeps the argument's own `bool`
+// slot, so `if !p.flag` / `p.a && p.b` read the booleans instead of asking
+// whether the fields are present. An absent field still reads as null.
+type F = { flag: bool }
+
+fun off(p) -> string {
+    if !p.flag {
+        return "off"
+    }
+    return "on"
+}
+
+fun both(p) -> string {
+    if p.a && p.b {
+        return "both"
+    }
+    return "not both"
+}
+
+fun check(p) -> string {
+    if p.flag {
+        return "yes"
+    }
+    return "no"
+}
+
+fun main() {
+    println(off({ flag: false }))
+    println(off({ flag: true }))
+    println(off(F { flag: false }))
+    println(both({ a: true, b: false }))
+    println(both({ a: true, b: true }))
+    let n = { count: 0, name: "" }
+    println(check({ flag: n.count == 1 }))
+    println(check({ flag: n.count == 0, extra: 1 }))
+    println(check({ other: 1 }))
+}

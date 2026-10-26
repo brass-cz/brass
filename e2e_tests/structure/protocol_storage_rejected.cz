@@ -1,0 +1,16 @@
+// A protocol record type (one whose members are methods, like `Display`) is
+// valid as a parameter annotation, where the callee is instantiated at the
+// argument's type; as a storage type it would need a value of that very
+// type, so storing a value that merely satisfies it is rejected.
+type Temp = { celsius: float64 }
+type Holder = { item: Display }
+
+fun Temp.display(self) -> string {
+    return "{self.celsius}C"
+}
+
+fun main() {
+    let n: Display = 42
+    let s: Debug = "s"
+    let h = Holder { item: Temp { celsius: 1.5 } }
+}

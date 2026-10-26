@@ -1,0 +1,12 @@
+// The same conflict as `value_restriction_conflict_rejected` with the two
+// uses swapped: the array's push fixes the element type first, and the
+// closure's application at another type is the one rejected.
+fun main() {
+    let r = []
+    let add = (v) -> {
+        r.push(v)
+    }
+    r.push("s")
+    add(1)
+    println(r.len())
+}

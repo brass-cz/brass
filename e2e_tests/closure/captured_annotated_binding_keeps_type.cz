@@ -1,0 +1,34 @@
+// @backends: all
+// A binding a closure assigns lives in a shared cell; its annotation types
+// that cell, whatever the initializer is written as. `let total: int64 = 0`
+// stays an `int64` (the literal `0` alone would be an `int32` and the stored
+// value would lose its high bits), and `let last: int64? = null` holds a value
+// once the closure stores one.
+type Point = {
+    x: int32
+}
+
+fun main() {
+    let big: int64 = 5000000000
+    let total: int64 = 0
+    let add = (v: int64) -> {
+        total = total + v
+    }
+    add(big)
+    add(big)
+    println(total)
+    let last: int64? = null
+    let remember = (v: int64) -> {
+        last = v
+    }
+    remember(big)
+    println(last)
+    let seen: Point? = null
+    let keep = (p: Point) -> {
+        seen = p
+    }
+    keep(Point { x: 3 })
+    if seen {
+        println(seen.x)
+    }
+}

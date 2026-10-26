@@ -1,0 +1,5 @@
+// @backends: all
+// A function parameter annotated with typeof accepts only the operand's type.
+let v: int64 = 5
+let f: (typeof(v)) -> typeof(v) = (x) -> x
+f("not an int64")

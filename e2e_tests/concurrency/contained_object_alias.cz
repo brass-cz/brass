@@ -1,0 +1,32 @@
+// Pins: an object stored INTO the shared record (`let o = Outer { inner: i }`)
+// stays reachable through the spawner's own handle `i`. The handle is guarded
+// by o's lock like any alias of o's graph -- otherwise the two increment loops
+// race and lose updates -- and it is promoted with the capture, so its
+// reference count is atomic before the task starts.
+type Inner = {
+    value: int64
+}
+type Outer = {
+    inner: Inner
+}
+
+fun Inner.add(self, n: int64) { self.value = self.value + n }
+
+fun main() {
+    let i = Inner { value: 0 }
+    let o = Outer { inner: i }
+    spawn(() -> {
+        let k = 0
+        while k < 100000 {
+            o.inner.add(1)
+            k = k + 1
+        }
+    })
+    let j = 0
+    while j < 100000 {
+        i.add(1)
+        j = j + 1
+    }
+    sync()
+    println("value = {o.inner.value}")
+}

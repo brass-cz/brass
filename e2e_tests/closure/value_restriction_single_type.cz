@@ -1,0 +1,13 @@
+// @backends: all
+// A closure whose parameter is tied to a captured empty array, applied at one
+// type: the application fixes the array's element type.
+fun main() {
+    let r = []
+    let add = (v) -> {
+        r.push(v)
+    }
+    add(1)
+    add(2)
+    println(r.len())
+    println(r)
+}

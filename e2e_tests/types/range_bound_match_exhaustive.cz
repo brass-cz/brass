@@ -1,6 +1,6 @@
-// Pins that the exhaustiveness pass sees inside RANGE literal bounds: a
-// non-exhaustive sum match hidden in `[0..(match ...)]` must be rejected (the
-// shared expression walk used to skip Expr::Range entirely).
+// Pins that the exhaustiveness check sees inside RANGE literal bounds: a
+// non-exhaustive sum match hidden in `[0..(match ...)]` is rejected like one
+// anywhere else.
 type S =
     | A { v: int32 }
     | B { v: int32 }

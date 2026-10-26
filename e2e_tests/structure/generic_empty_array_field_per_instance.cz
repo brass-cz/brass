@@ -1,0 +1,18 @@
+// @backends: all
+// A record with an open field built from an empty array literal inside a
+// generic body, then filled by a push: each instantiation builds the record
+// (and the literal) at its own element type.
+
+type Bag = { items }
+
+fun mkbag(v) {
+    let b = Bag { items: [] }
+    b.items.push(v)
+    return b
+}
+
+fun main() {
+    println(mkbag(1).items)
+    println(mkbag("s").items)
+    println(mkbag(2.5).items.len())
+}

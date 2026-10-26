@@ -17,6 +17,17 @@ fun main() {
     if cmd == "help" || cmd == "--help" || cmd == "-h" {
         help(0)
     }
+    if cmd == "cache" {
+        // Keep manifest traversal out of ordinary command startup. Replacing
+        // this process also releases its compiler before the cache walk starts.
+        const entry = Path.parse(_PATH).parent().join("cache_commands.cz")
+        let cache_args = [entry.to_string()]
+        for arg in args.slice(2, args.len()) {
+            cache_args.push(arg)
+        }
+        exec_brass(cache_args, "")!
+        return
+    }
     if cmd == "new" {
         if args.len() < 3 {
             help(1)
@@ -147,7 +158,9 @@ fun help(code: int64) {
             "    czpm run         -> Run the current package\n" +
             "    czpm check       -> Type-check the current package\n" +
             "    czpm fmt         -> Format all brass files\n" +
-            "    czpm lsp         -> Start the Language Server (czls)\n",
+            "    czpm lsp         -> Start the Language Server (czls)\n" +
+            "    czpm cache info  -> Show the package store and its local dependencies\n" +
+            "    czpm cache clean [NAME...] -> Remove all cached packages or named dependencies\n",
     )
     exit(code)
 }
@@ -188,7 +201,7 @@ fun init_dir(path: Path, name: string) {
             "[dependencies]\n" +
             "# mylib = \{ git = \"https://github.com/user/mylib\", rev = \"<rev>\" \}\n" +
             "# mylib = \{ path = \"../mylib\" \}\n" +
-            "# mylib = \{ tarball = \"http:///github.com/...\", hash = \"<hash>\" \}\n",
+            "# mylib = \{ tarball = \"https://example.com/mylib.tar.gz\", hash = \"<sha256>\" \}\n",
     )!
 
     _write_new(source_path, "println(\"Hello, {name}!\")")!

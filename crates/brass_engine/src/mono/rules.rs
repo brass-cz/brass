@@ -1,17 +1,22 @@
 //! Shared typing rules of the monomorphizer: literal/operand typing,
 //! the supported-type subset the typed back end accepts, nominal
-//! resolution, binary-operator checking, and return-type merging.
+//! resolution, binary-operator checking, and the refinement relation between
+//! instances of one nominal declaration.
 
 use super::*;
 
-/// The default concrete type of a constant literal (integers default to int32,
-/// floats to float64). Errors on non-scalar constants.
+/// The default concrete type of a constant literal: an integer by its value
+/// (`brass_typesys::int_literal_kind`), a float `float64`.
 pub(super) fn const_type(lit: &brass_mir::Literal) -> Result<Type, String> {
     use brass_mir::Literal;
     match lit {
-        // An integer literal defaults by magnitude: int32 when it fits, int64
-        // otherwise (a 64-bit constant like INT64_MAX must not truncate).
-        Literal::Int(v) => Ok(Type::Int(int_literal_kind(*v))),
+        Literal::Int(v) => brass_typesys::int_literal_kind(*v)
+            .map(Type::Int)
+            .ok_or_else(|| {
+                format!(
+                    "internal error: integer literal {v} is out of range for every integer type"
+                )
+            }),
         Literal::Float(_) => Ok(Type::Float(FloatKind::F64)),
         Literal::Bool(_) => Ok(Type::Bool),
         Literal::Void => Ok(Type::Void),
@@ -28,10 +33,6 @@ pub(super) fn is_supported(ty: &Type) -> bool {
     is_supported_rec(ty, &mut HashSet::default())
 }
 
-/// `is_supported` with a guard against self-referential record types (e.g.
-/// `type Node = { next: Node? }`): a nominal already on the visiting path is assumed
-/// supported, so the check terminates. A recursive field is a heap pointer, so the
-/// layout is finite even though the type definition is cyclic.
 /// Fill a record's field-type substitution from its HIR declaration when it is a
 /// bare reference (empty substitution -- a sum variant field's declared type once
 /// bound, or a nested declared field). The resolved record is self-describing, so
@@ -80,6 +81,13 @@ pub(super) fn resolve_nominal(program: &Program, ty: &Type) -> Type {
             Type::Nullable(inner) => Type::Nullable(Box::new(go(program, inner, stack))),
             Type::Slice(inner) => Type::Slice(Box::new(go(program, inner, stack))),
             Type::Array(inner, k) => Type::Array(Box::new(go(program, inner, stack)), *k),
+            Type::Tuple(elems) => {
+                Type::Tuple(elems.iter().map(|e| go(program, e, stack)).collect())
+            }
+            Type::Fun(params, ret) => Type::Fun(
+                params.iter().map(|p| go(program, p, stack)).collect(),
+                Box::new(go(program, ret, stack)),
+            ),
             _ => ty.clone(),
         }
     }
@@ -99,6 +107,10 @@ pub(super) fn variant_field_layoutable(program: &Program, ty: &Option<Type>) -> 
     }
 }
 
+/// `is_supported` with a guard against self-referential record types (e.g.
+/// `type Node = { next: Node? }`): a nominal already on the visiting path is assumed
+/// supported, so the check terminates. A recursive field is a heap pointer, so the
+/// layout is finite even though the type definition is cyclic.
 fn is_supported_rec(ty: &Type, visiting: &mut HashSet<i32>) -> bool {
     match ty {
         Type::Bool | Type::Int(_) | Type::Float(_) | Type::Void | Type::Str => true,
@@ -160,8 +172,30 @@ fn is_supported_rec(ty: &Type, visiting: &mut HashSet<i32>) -> bool {
     }
 }
 
-/// Check that a binary operator's operands have compatible, in-scope types.
-pub(super) fn check_bin(program: &Program, op: BinOp, a: &Type, b: &Type) -> Result<(), String> {
+/// The value of a numeric-literal operand (a MIR constant), which the
+/// shared operator rule needs to decide whether the literal adapts to the
+/// other operand.
+pub(super) fn operand_literal(op: &Operand) -> Option<brass_typesys::NumericLiteral> {
+    match op {
+        Operand::Const(brass_mir::Literal::Int(v)) => Some(brass_typesys::NumericLiteral::Int(*v)),
+        Operand::Const(brass_mir::Literal::Float(v)) => {
+            Some(brass_typesys::NumericLiteral::Float(*v))
+        }
+        _ => None,
+    }
+}
+
+/// Check that a binary operator's operands (each its monomorphized type and
+/// operand) have compatible, in-scope types. Numeric pairs are decided by the
+/// shared operator rule (`brass_typesys::numeric_binary`) -- the one the
+/// checker typed the expression with -- so a checked program never fails
+/// here on a numeric pair.
+pub(super) fn check_bin(
+    program: &Program,
+    op: BinOp,
+    (a, a_op): (&Type, &Operand),
+    (b, b_op): (&Type, &Operand),
+) -> Result<(), String> {
     // `x == null` / `x != null` (or comparing nullables) is a null/identity test.
     if matches!(op, BinOp::Eq | BinOp::Ne)
         && (matches!(a, Type::Nullable(_)) || matches!(b, Type::Nullable(_)))
@@ -178,106 +212,59 @@ pub(super) fn check_bin(program: &Program, op: BinOp, a: &Type, b: &Type) -> Res
     if matches!(a, Type::Never) || matches!(b, Type::Never) {
         return Ok(());
     }
+    let numeric = brass_typesys::numeric_binary(
+        op,
+        brass_typesys::NumericOperand::new(a, operand_literal(a_op)),
+        brass_typesys::NumericOperand::new(b, operand_literal(b_op)),
+    );
+    let error = match numeric {
+        Ok(_) => return Ok(()),
+        Err(brass_typesys::OperatorError::NotNumeric) => None,
+        Err(brass_typesys::OperatorError::NoCommonType) => Some("no common numeric type"),
+        Err(brass_typesys::OperatorError::IntegerOnly) => Some("integer operands required"),
+    };
     let same = a == b;
-    let integer = |t: &Type| matches!(t, Type::Int(_));
-    let both_int = integer(a) && integer(b);
-    match op {
-        // `+` is numeric addition or string concatenation. Two integers may
-        // differ in width (a literal adapts to the other's type; the back end
-        // coerces both to the operand type).
-        // Numeric operands of differing types implicitly convert to their common
-        // type (mixed width, signedness, and int-with-float); `+` also concatenates
-        // two strings.
-        BinOp::Add => {
-            if brass_typesys::common_numeric_type(a, b).is_some()
-                || (same && matches!(a, Type::Str))
-            {
-                Ok(())
-            } else {
-                Err(format!(
-                    "`Add` needs two numeric/string operands, got {} and {}",
-                    a.display(),
-                    b.display()
-                ))
-            }
+    let accepted = match op {
+        // `+` also concatenates two strings.
+        BinOp::Add => same && matches!(a, Type::Str),
+        // Equality also applies to two operands of one type -- bools,
+        // strings, records, sums, arrays, tuples, function values -- compared
+        // structurally by the shared definition in `crate::equality`.
+        BinOp::Eq | BinOp::Ne => crate::equality::equality_defined(program, a, b),
+        BinOp::And | BinOp::Or => {
+            return Err(format!(
+                "internal error: `{op:?}` is unsupported on the typed backend"
+            ));
         }
-        BinOp::Sub | BinOp::Mul | BinOp::Div => {
-            if brass_typesys::common_numeric_type(a, b).is_some() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "`{op:?}` needs two numeric operands, got {} and {}",
-                    a.display(),
-                    b.display()
-                ))
-            }
-        }
-        // Remainder is integer-only but the widths may differ (coerced to the
-        // common int); the bitwise/shift operators need two equal integers.
-        BinOp::Rem => {
-            if both_int {
-                Ok(())
-            } else {
-                Err(format!(
-                    "`Rem` needs two integer operands, got {} and {}",
-                    a.display(),
-                    b.display()
-                ))
-            }
-        }
-        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
-            if same && integer(a) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "`{op:?}` needs two equal integer operands, got {} and {}",
-                    a.display(),
-                    b.display()
-                ))
-            }
-        }
-        // A numeric comparison converts mixed operands to a common type; equality
-        // also applies to two bools, two strings, or two instances of the same
-        // record layout. Record equality is field-wise in both back ends.
-        BinOp::Eq | BinOp::Ne => {
-            if brass_typesys::common_numeric_type(a, b).is_some()
-                || (same && matches!(a, Type::Bool | Type::Str))
-                || (matches!((a, b), (Type::Record(ra), Type::Record(rb)) if ra.id == rb.id)
-                    && brass_typesys::types_invariant(program, a, b))
-            {
-                Ok(())
-            } else {
-                Err(format!(
-                    "`{op:?}` needs two comparable operands, got {} and {}",
-                    a.display(),
-                    b.display()
-                ))
-            }
-        }
-        BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
-            if brass_typesys::common_numeric_type(a, b).is_some() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "`{op:?}` needs two comparable numeric operands, got {} and {}",
-                    a.display(),
-                    b.display()
-                ))
-            }
-        }
-        BinOp::And | BinOp::Or => Err(format!("`{op:?}` is unsupported on the typed backend")),
+        _ => false,
+    };
+    if accepted && error.is_none() {
+        return Ok(());
     }
+    Err(format!(
+        "internal error: `{op:?}` is not defined for {} and {}{}",
+        a.display(),
+        b.display(),
+        error.map(|e| format!(" ({e})")).unwrap_or_default()
+    ))
 }
 
-/// Shared operand-type rule used by both the typer and the typed dispatch to
-/// pick a binary op's operand type: for two integers of different widths, the
-/// wider (so a narrower operand is coerced up); otherwise a `Local` operand's
-/// type, preferring a non-constant.
+/// Whether a binary operator is a comparison (its result is `bool`, whatever
+/// its operand types are). Shared by the monomorphizer and the back ends.
+pub fn is_comparison(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
+    )
+}
+
+/// The type a binary operator's operands are converted to, shared by the
+/// typer and the back ends (which compute a comparison at it). A comparison
+/// against the null literal keeps the nullable type (the back end compares
+/// pointers); otherwise `binary_operand_common` decides.
 pub fn binary_operand_type(a: &Operand, b: &Operand, local_types: &[Type]) -> Type {
     let ra = operand_type_of(a, local_types);
     let rb = operand_type_of(b, local_types);
-    // A comparison against the null literal keeps the nullable type (the back end
-    // compares pointers); other nullables narrow to their element type.
     let null_lit = |t: &Type| matches!(t, Type::Nullable(inner) if matches!(**inner, Type::Never));
     if null_lit(&ra) {
         return rb;
@@ -285,110 +272,34 @@ pub fn binary_operand_type(a: &Operand, b: &Operand, local_types: &[Type]) -> Ty
     if null_lit(&rb) {
         return ra;
     }
-    binary_operand_common(
-        &ra,
-        &rb,
-        matches!(a, Operand::Local(_)),
-        matches!(b, Operand::Local(_)),
-    )
+    binary_operand_common((&ra, a), (&rb, b))
 }
 
 /// The one operand-type rule shared by the typer (`Monomorphizer::
 /// binary_operand_type`) and the back ends' comparison-operand pick
-/// ([`binary_operand_type`]), given both resolved operand types. Nullables
-/// narrow to their element type (a guarded `int32?` compares as `int32`). An
-/// integer literal adapts to the variable operand's int kind (`byte - 32`
-/// stays uint8) -- but only when its magnitude-derived kind fits that kind's
-/// width. A wider literal (`uint8 < 300`) must not truncate, so the operands
-/// take their common (wider) numeric type instead, matching the checker's
-/// numeric-flow rules.
-pub(super) fn binary_operand_common(ta: &Type, tb: &Type, a_local: bool, b_local: bool) -> Type {
+/// ([`binary_operand_type`]), given each operand's resolved type and MIR
+/// operand. Nullables narrow to their element type (a guarded `int32?`
+/// compares as `int32`). Two numbers meet where the checker's operator rule
+/// puts them (`brass_typesys::common_operand_type`): an integer-literal
+/// constant adapts to the other operand when its value fits (`byte - 32`
+/// stays `uint8`), otherwise both take their common type (`byte < 300`
+/// compares as `int32`). Any other pair keeps a non-constant operand's type.
+pub(super) fn binary_operand_common(
+    (ta, a): (&Type, &Operand),
+    (tb, b): (&Type, &Operand),
+) -> Type {
     let na = unwrap_nullable(ta);
     let nb = unwrap_nullable(tb);
-    if let (Type::Int(ka), Type::Int(kb)) = (na, nb)
-        && a_local != b_local
-    {
-        let (lit, var) = if a_local { (kb, ka) } else { (ka, kb) };
-        if lit.bits() <= var.bits() {
-            return Type::Int(*var);
-        }
-    }
-    // Mixed numeric operands implicitly convert to their common type (wider
-    // width, signedness, and int-with-float).
-    if let Some(common) = brass_typesys::common_numeric_type(na, nb) {
+    if let Some(common) = brass_typesys::common_operand_type(
+        brass_typesys::NumericOperand::new(na, operand_literal(a)),
+        brass_typesys::NumericOperand::new(nb, operand_literal(b)),
+    ) {
         return common;
     }
-    if a_local || !b_local {
+    if matches!(a, Operand::Local(_)) || !matches!(b, Operand::Local(_)) {
         na.clone()
     } else {
         nb.clone()
-    }
-}
-
-/// The operand-type pair `validate` should check for a binary statement: a
-/// const integer literal takes the kind it adapts to at codegen (the first
-/// clause of [`binary_operand_common`]), so validation sees the pair the back
-/// ends actually emit -- `u64_counter + 1` is uint64/uint64, not the
-/// literal's magnitude-default uint64/int32. Every other pair validates at
-/// its own types.
-pub(super) fn bin_validation_types(
-    ta: &Type,
-    tb: &Type,
-    a_local: bool,
-    b_local: bool,
-) -> (Type, Type) {
-    if let (Type::Int(ka), Type::Int(kb)) = (unwrap_nullable(ta), unwrap_nullable(tb))
-        && a_local != b_local
-    {
-        let (lit, var) = if a_local { (kb, ka) } else { (ka, kb) };
-        if lit.bits() <= var.bits() {
-            return (Type::Int(*var), Type::Int(*var));
-        }
-    }
-    (ta.clone(), tb.clone())
-}
-
-/// Scan a body for `arr.push(elem)` calls, mapping each array local (resolved
-/// through `Use` aliases) to a pushed element operand. Used to infer the element
-/// Join two return-operand types of an unannotated non-fallible callable. The
-/// front end has already checked the returns are mutually consistent, so this only
-/// reconciles the nullable/never lattice: a `return null` path (`never?`) combined
-/// with a value-returning path yields that value's nullable type, and an
-/// unreachable `Never` arm is absorbed by the other. Without this join the inferred
-/// return type would be whichever return block the fixpoint typed first, so a `get`
-/// returning `value` or `null` could freeze to the bare `value` type and then have
-/// its `null` path rejected as "returns a null value where `T` is required".
-pub(super) fn merge_return_types(a: &Type, b: &Type) -> Type {
-    fn nullable_of(t: Type) -> Type {
-        match t {
-            Type::Nullable(_) => t,
-            other => Type::Nullable(Box::new(other)),
-        }
-    }
-    match (a, b) {
-        _ if a == b => a.clone(),
-        // `Never` types only a statically-unreachable path; the other arm wins.
-        (Type::Never, _) => b.clone(),
-        (_, Type::Never) => a.clone(),
-        // A bare `null` return joining a void fall-through (a nullable `!`
-        // used as a statement): the callable is void -- the null carries no
-        // value a caller could observe, and a `void?` return would give the
-        // fall-through path no representable value.
-        (Type::Nullable(x), Type::Void) | (Type::Void, Type::Nullable(x))
-            if matches!(**x, Type::Never) =>
-        {
-            Type::Void
-        }
-        (Type::Nullable(x), Type::Nullable(y)) => {
-            Type::Nullable(Box::new(merge_return_types(x, y)))
-        }
-        // One nullable and one bare value (commonly `never?` from `null` vs a real
-        // value): the result is nullable over the joined element type.
-        (Type::Nullable(x), y) => nullable_of(merge_return_types(x, y)),
-        (x, Type::Nullable(y)) => nullable_of(merge_return_types(x, y)),
-        // Two distinct non-null types should not occur in a checked program; keep
-        // the first so inference stays deterministic rather than panicking.
-        _ => a.clone(),
     }
 }
 
@@ -415,6 +326,40 @@ pub(super) fn is_refinement_of(general: &Type, specific: &Type) -> bool {
                 })
         }
         _ => general == specific,
+    }
+}
+
+/// The common type of two instances of one nominal declaration that differ
+/// only in how much payload information they carry: the union of both
+/// substitutions, or `None` when a slot both pin disagrees (or the types are
+/// not instances of one declaration). Mirrors the checker's unification of
+/// same-id records and sums, which relates exactly these types: an
+/// `Opt.Nothing` (no `Some.v` entry) and an `Opt.Some { v: 1 }`
+/// (`Some.v=int32`) are one element type, `Opt<Some.v=int32>`.
+pub(super) fn join_refinements(a: &Type, b: &Type) -> Option<Type> {
+    if a == b {
+        return Some(a.clone());
+    }
+    let join = |x: &NominalType, y: &NominalType| -> Option<NominalType> {
+        if x.id != y.id || (x.id < 0 && x.name() != y.name()) {
+            return None;
+        }
+        let mut joined = x.clone();
+        for (key, yt) in y.substitution.iter() {
+            match x.substitution.get(key) {
+                Some(xt) => {
+                    let common = join_refinements(xt, yt)?;
+                    joined.substitution.insert(key, common);
+                }
+                None => joined.substitution.insert(key, yt.clone()),
+            }
+        }
+        Some(joined)
+    };
+    match (a, b) {
+        (Type::Record(x), Type::Record(y)) => join(x, y).map(Type::Record),
+        (Type::Sum(x), Type::Sum(y)) => join(x, y).map(Type::Sum),
+        _ => None,
     }
 }
 

@@ -1,0 +1,11 @@
+// A task can acquire its shared object when the spawner releases it before waiting.
+type Cell = { n: int32 }
+fun start(a: ref(mut(Cell))) {
+    spawn(() -> { with(a, (y) -> { y.n = 1 }) })
+}
+fun main() {
+    let a = Cell { n: 0 }
+    with(a, (held) -> { start(a) })
+    sync()
+    with(a, (held) -> println(held.n))
+}

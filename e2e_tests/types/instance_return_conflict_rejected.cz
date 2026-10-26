@@ -1,0 +1,53 @@
+// @lazy: fail
+// @eager: fail
+//
+// An unannotated function is re-checked at every call site with the
+// argument types. When one instantiation's returns -- or its error payloads
+// -- have no common type, that instantiation is rejected at the conflicting
+// return, naming the call that created it (the back ends must never pick one
+// side and read the value at the wrong type). Methods are instantiated the
+// same way. A failed lazy run reports every rejected instantiation, like the
+// whole-program check.
+type Box = {
+    v: int64
+}
+
+fun pick(c, n) {
+    if c {
+        return 1
+    }
+    return n
+}
+
+fun fail_with(c, e) {
+    if c {
+        error(e)!
+    }
+    error("boom")!
+    return 1
+}
+
+fun Box.choose(self, b, x) {
+    if b {
+        return self.v
+    }
+    return x
+}
+
+fun Box.pick(self, b, x) {
+    if b {
+        return 0
+    }
+    return x
+}
+
+fun main() {
+    println(pick(false, "hello"))
+    match fail_with(false, 42) {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.value}"),
+    }
+    let bx = Box { v: 1 }
+    println(bx.choose(false, "x"))
+    println(bx.pick(false, "str"))
+}

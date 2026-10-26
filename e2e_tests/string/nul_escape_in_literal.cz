@@ -1,0 +1,11 @@
+// @backends: all
+// A `\0` escape is an ordinary byte of a string literal: a string carries
+// its length, so the bytes after the NUL are kept, measured, compared and
+// printed on every back end, also through an interpolation.
+println("a\0bc")
+let s = "x\0yz"
+println(s.len())
+println(s == "x\0yz")
+println(s == "x")
+let t = "{s}!\0"
+println(t.len())

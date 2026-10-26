@@ -1,9 +1,8 @@
 // Pins that a bare-record parameter (`q: Point`, deep-copied at entry) that is
 // forwarded into a `ref(mut(..))` position does NOT become a write-through
 // position itself: the callee mutates f's private copy, so a const argument is
-// accepted and the caller's value is unchanged. (The write-through fixpoint
-// and the back ends' copy decision must agree on this; a divergent copy
-// predicate used to reject the const spuriously.)
+// accepted and the caller's value is unchanged. The checker's write-through
+// analysis and the back ends' copy decision agree on this.
 type Point = {
     x: int32
 }

@@ -1,0 +1,25 @@
+// The result of a deep fallible chain is a `Result`, not its payload: using it
+// as a number without `!` or a `match` is a type error at the use.
+fun a1(n) {
+    return b1(n)! + 1
+}
+
+fun b1(n) {
+    return c1(n)! + 1
+}
+
+fun c1(n) {
+    return d1(n)! + 1
+}
+
+fun d1(n) {
+    if n < 0 {
+        error("negative")!
+    }
+    return n
+}
+
+fun main() {
+    let v = a1(-5)
+    println(v + 100)
+}

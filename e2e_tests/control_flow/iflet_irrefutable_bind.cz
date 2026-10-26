@@ -1,8 +1,7 @@
 // Pins `if let x = <non-nullable>` as an irrefutable bind: ANY non-nullable
 // subject -- including a false bool and a zero int -- always takes the
-// then-arm (presence test, not truthiness). Only a nullable subject branches
-// at runtime, on non-null. A bool subject used to fall through static
-// truthiness and branch on its value, taking the else arm for `false`.
+// then-arm (presence test, not truthiness), binding `false` or `0`. Only a
+// nullable subject branches at runtime, on non-null.
 fun main() {
     let f = false
     if let x = f {

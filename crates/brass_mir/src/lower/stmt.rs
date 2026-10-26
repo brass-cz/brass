@@ -1,17 +1,18 @@
-//! Statement and control-flow lowering.
+//! Statement lowering: blocks, `let` (annotated slots, and the default
+//! skeleton of an uninitialized `let x: T`), assignment places, and the loops.
 //!
-//! All branching constructs decompose into basic blocks here. The result of a
-//! value-producing construct (`if`/`match`/`if let`/`&&`/`||`/`expr!`) is held
-//! in a dedicated result local that each arm writes and the merge block reads;
-//! because MIR locals are mutable slots this needs no phi nodes (see
-//! [`crate::cfg`]). Loop targets are tracked so `break`/`continue` jump to the
-//! right blocks.
+//! `while` and `for` decompose into basic blocks here (a `for` over a literal
+//! range counts in place; a `for` whose body reassigns its variable writes
+//! the element back on every edge leaving the iteration). Loop targets are
+//! tracked so `break`/`continue` jump to the right blocks. The
+//! value-producing branching constructs live in the `expr` module.
 
 use brass_hir::{FloatKind, IntKind, Type};
 use brass_parser::ast::{AssignOp, Block, Expr, Pattern, Stmt, TypeExpr};
 
 use crate::cfg::{MirStmt, Terminator};
 use crate::ids::LocalId;
+use crate::lower::order::{assigned_names, assigned_names_block};
 use crate::lower::{FnLower, compound_op};
 use crate::value::{Literal, Operand, Place, Projection, Rvalue};
 
@@ -23,7 +24,7 @@ use crate::value::{Literal, Operand, Place, Projection, Rvalue};
 pub fn resolve_simple_type(te: &TypeExpr) -> Option<Type> {
     match te {
         TypeExpr::Named(name, _) => primitive_type(name),
-        TypeExpr::Nullable(inner, _) => Some(Type::Nullable(Box::new(resolve_simple_type(inner)?))),
+        TypeExpr::Nullable(inner, _) => Some(Type::nullable(resolve_simple_type(inner)?)),
         TypeExpr::Array(inner, len, _) => {
             let e = resolve_simple_type(inner)?;
             Some(match len {
@@ -88,8 +89,8 @@ enum PlaceTarget {
     Local(LocalId),
     Global(String),
     Projected(Place),
-    /// An unsupported target shape; assignment is a no-op (matches codegen,
-    /// which silently ignores non-place targets).
+    /// A target that is not a place. The checker rejects such an assignment
+    /// ("invalid assignment target"); lowering keeps it a no-op.
     Discard,
 }
 
@@ -105,6 +106,14 @@ impl FnLower<'_, '_> {
             }
             self.lower_stmt(s);
         }
+    }
+
+    /// Lower a block in statement position: open a scope and run its
+    /// statements, the trailing one included as a statement.
+    pub(crate) fn lower_block_stmts(&mut self, b: &Block) {
+        self.push_scope();
+        self.lower_body_stmts(&b.stmts);
+        self.pop_scope();
     }
 
     /// Lower a block used as an expression: open a scope, run the statements
@@ -129,6 +138,14 @@ impl FnLower<'_, '_> {
     pub(crate) fn lower_stmt(&mut self, s: &Stmt) {
         match s {
             Stmt::Let { pat, ty, value, .. } => match value {
+                // A generalized closure binding builds no value here: every
+                // use builds its own (see `lower::closure`).
+                Some(Expr::Closure(params, body, _))
+                    if let Pattern::Binding(name, None, span) = pat
+                        && self.ctx.tables.generalized.contains(span) =>
+                {
+                    self.bind_closure_template(name, params, body)
+                }
                 Some(value) => self.lower_let(pat, ty.as_ref(), value),
                 None => self.lower_let_uninit(pat, ty.as_ref()),
             },
@@ -202,6 +219,8 @@ impl FnLower<'_, '_> {
                     }
                     None => Operand::void(),
                 };
+                // Returning ends every enclosing iteration of this body.
+                self.emit_exit_writebacks();
                 self.b.terminate(Terminator::Return(v));
             }
             // `break`/`continue` end the current iteration, so a pending `for`
@@ -222,15 +241,38 @@ impl FnLower<'_, '_> {
         }
     }
 
-    /// An expression used as a statement: evaluate for side effects, discard the
-    /// result. A bare call emits an `eval` (no junk temporary); everything else
-    /// reuses the value-producing path and drops the operand.
-    fn lower_expr_stmt(&mut self, e: &Expr) {
+    /// Lower an expression used as a statement: evaluate it for its side
+    /// effects and discard the result. A bare call emits an `eval` (no junk
+    /// temporary). A branching expression yields no value at all -- its arms
+    /// run for their effects and their trailing values are dropped --
+    /// matching the checker, which does not join the arms of a statement
+    /// `if`/`if let`/`match`. Everything else reuses the value-producing path
+    /// and drops the operand.
+    pub(super) fn lower_expr_stmt(&mut self, e: &Expr) {
         match e {
+            // An `error(..)` statement's Result is kept in a local: the
+            // callable's error type joins its payload (see
+            // `analysis::fallible_block`), which monomorphization reads from
+            // the call's result.
+            Expr::Call(callee, args, span) if matches!(&**callee, Expr::Ident(name, _) if name == "error") =>
+            {
+                let rv = self.lower_call(callee, args, *span);
+                let _ = self.b.emit(rv);
+            }
             Expr::Call(callee, args, span) => {
                 let rv = self.lower_call(callee, args, *span);
                 self.b.push(MirStmt::Eval(rv));
             }
+            Expr::If(cond, then, els, span) => {
+                self.lower_if(cond, then, els.as_deref(), false, *span);
+            }
+            Expr::IfLet(pat, scrut, then, els, span) => {
+                self.lower_iflet(pat, scrut, then, els.as_deref(), false, *span);
+            }
+            Expr::Match(scrut, arms, span) => {
+                self.lower_match(scrut, arms, false, *span);
+            }
+            Expr::Block(b, _) => self.lower_block_stmts(b),
             _ => {
                 let _ = self.lower_expr(e);
             }
@@ -240,7 +282,7 @@ impl FnLower<'_, '_> {
     /// The concrete slot type for a `let` annotation: the checker-resolved type
     /// for a `typeof`-bearing annotation (which the scope-free
     /// [`resolve_simple_type`] cannot handle), else the simple resolution.
-    fn slot_type(&self, ty: &TypeExpr) -> Option<Type> {
+    pub(super) fn slot_type(&self, ty: &TypeExpr) -> Option<Type> {
         if let Some(t) = self.ctx.typeof_types.get(&ty.span()) {
             return Some(t.clone());
         }
@@ -256,9 +298,9 @@ impl FnLower<'_, '_> {
     fn resolve_concrete_annotation(&self, te: &TypeExpr) -> Option<Type> {
         match te {
             TypeExpr::Named(name, _) => self.ctx.concrete_nominal_ref(&self.module, name),
-            TypeExpr::Nullable(inner, _) => Some(Type::Nullable(Box::new(
-                self.resolve_concrete_annotation(inner)?,
-            ))),
+            TypeExpr::Nullable(inner, _) => {
+                Some(Type::nullable(self.resolve_concrete_annotation(inner)?))
+            }
             TypeExpr::Array(inner, len, _) => {
                 let e = resolve_simple_type(inner)
                     .or_else(|| self.resolve_concrete_annotation(inner))?;
@@ -277,22 +319,28 @@ impl FnLower<'_, '_> {
             // own slot. A resolvable annotation fixes the slot's type so an
             // annotation the initializer cannot express (e.g. `int32?` for `null`)
             // survives into monomorphization.
-            Pattern::Binding(name, _, _) => {
+            // A captured-and-mutated binding is heap-promoted to a shared
+            // cell; the annotation then types the cell's element, so
+            // `let total: int64 = 0` keeps an `int64` cell however its
+            // initializer is written.
+            Pattern::Binding(name, _, span) => {
                 let v = self.lower_expr(value);
-                // A captured-and-mutated binding is heap-promoted to a shared cell
-                // by `bind_value`; the scalar type annotation does not apply to the
-                // cell array, so the cell case takes precedence over it.
-                if self.is_cell(name) {
-                    self.bind_value(name, v);
+                if let Some(annotation) = ty {
+                    let shared = self.slot_type(annotation);
+                    let local = self.b.fresh_seeded_local(annotation.span(), shared);
+                    self.b.push(MirStmt::Assign(local, Rvalue::Use(v)));
+                    // Promotion derives its element type from the seeded local,
+                    // which may have a different type in each instance.
+                    self.bind_value(name, Operand::Local(local));
+                } else if self.ctx.expr_types.contains_key(span)
+                    || self.ctx.instance_seeds.contains_key(span)
+                {
+                    let shared = self.ctx.expr_type(*span).cloned();
+                    let local = self.b.fresh_seeded_local(*span, shared);
+                    self.b.push(MirStmt::Assign(local, Rvalue::Use(v)));
+                    self.bind_value(name, Operand::Local(local));
                 } else {
-                    match ty.and_then(|t| self.slot_type(t)) {
-                        Some(t) => {
-                            let local = self.b.fresh_local_typed(Some(name.clone()), t);
-                            self.b.push(MirStmt::Assign(local, Rvalue::Use(v)));
-                            self.bind(name, local);
-                        }
-                        None => self.bind_value(name, v),
-                    }
+                    self.bind_value(name, v);
                 }
             }
             // `let _ = e`: evaluate for effects, bind nothing.
@@ -324,13 +372,11 @@ impl FnLower<'_, '_> {
         // the skeleton; resolving only its base declaration would recover the
         // open field types the alias concretized.
         if let Some(slot_ty @ Type::Record(_)) = ty.and_then(|ty| self.slot_type(ty)) {
-            let local = self
-                .b
-                .fresh_local_typed(Some(name.clone()), slot_ty.clone());
+            let local = self.annotation_local(name, ty, Some(slot_ty.clone()));
             if let Some(op) = self.default_operand(&slot_ty, &mut Vec::new()) {
                 self.b.push(MirStmt::Assign(local, Rvalue::Use(op)));
             }
-            self.bind_uninitialized(name, local, &slot_ty);
+            self.bind_typed_slot(name, local, &slot_ty);
             return;
         }
         // Other nominal annotations are not "simple" types; resolve them
@@ -345,38 +391,50 @@ impl FnLower<'_, '_> {
                 });
             if let Some(info) = info {
                 let slot_ty = info.type_ref();
-                let local = self
-                    .b
-                    .fresh_local_typed(Some(name.clone()), slot_ty.clone());
+                let local = self.annotation_local(name, ty, Some(slot_ty.clone()));
                 if let Some(op) = self.default_operand(&slot_ty, &mut Vec::new()) {
                     self.b.push(MirStmt::Assign(local, Rvalue::Use(op)));
                 }
-                self.bind_uninitialized(name, local, &slot_ty);
+                self.bind_typed_slot(name, local, &slot_ty);
                 return;
             }
         }
-        match ty.and_then(resolve_simple_type) {
+        match ty.and_then(|ty| self.slot_type(ty)) {
             Some(t) => {
-                let local = self.b.fresh_local_typed(Some(name.clone()), t.clone());
+                let local = self.annotation_local(name, ty, Some(t.clone()));
                 if let Some(op) = self.default_operand(&t, &mut Vec::new()) {
                     self.b.push(MirStmt::Assign(local, Rvalue::Use(op)));
                 }
-                self.bind_uninitialized(name, local, &t);
+                self.bind_typed_slot(name, local, &t);
             }
             None => {
                 // No resolvable annotation (the checker already required one);
                 // bind an untyped slot so later whole assignments type it.
-                let local = self.b.fresh_local(Some(name.clone()));
+                let local = self.annotation_local(name, ty, None);
                 self.bind(name, local);
             }
         }
     }
 
-    /// Bind an annotated uninitialized slot, promoting it when a closure shares
-    /// later mutations. The slot already contains the type's hidden default
-    /// whenever one is constructible, so copying it into the cell preserves the
-    /// declared element representation without exposing the value to source code.
-    fn bind_uninitialized(&mut self, name: &str, local: LocalId, ty: &Type) {
+    fn annotation_local(
+        &mut self,
+        name: &str,
+        annotation: Option<&TypeExpr>,
+        shared: Option<Type>,
+    ) -> LocalId {
+        match annotation {
+            Some(annotation) => self.b.fresh_seeded_local(annotation.span(), shared),
+            None => self.b.fresh_local(Some(name.to_string())),
+        }
+    }
+
+    /// Bind the annotated slot `local` of type `ty` to `name`, promoting it
+    /// to a shared cell of `ty` elements when a closure shares later
+    /// mutations. An uninitialized slot already contains the type's hidden
+    /// default whenever one is constructible, so copying it into the cell
+    /// preserves the declared element representation without exposing the
+    /// value to source code.
+    fn bind_typed_slot(&mut self, name: &str, local: LocalId, ty: &Type) {
         if self.cells.contains(name) {
             let cell = self.b.emit_known(
                 Rvalue::Array(vec![Operand::Local(local)]),
@@ -455,21 +513,31 @@ impl FnLower<'_, '_> {
 
     // ----- assignment -----
 
+    /// `place = value` / `place op= value`. The place's subexpressions (its
+    /// receiver and index) are evaluated first, left to right, then -- for a
+    /// compound assignment -- the place's current value is read, then the
+    /// right-hand side runs, and finally the store happens. Each part keeps
+    /// the value it was evaluated with even when the right-hand side rebinds
+    /// a variable it named (see [`crate::lower::order`]).
     fn lower_assign(&mut self, target: &Expr, op: AssignOp, value: &Expr) {
-        let rhs = self.lower_expr(value);
-        let place = self.lower_place(target);
+        let later = assigned_names([value]);
+        let place = self.lower_place(target, &later);
         let new_value = if op == AssignOp::Eq {
-            rhs
+            self.lower_expr(value)
         } else {
             let cur = self.load_target(&place);
+            let cur = self.hold(cur, &later);
+            let rhs = self.lower_expr(value);
             self.b.emit(Rvalue::Bin(compound_op(op), cur, rhs))
         };
         self.store_target(place, new_value);
     }
 
     /// Resolve an assignment target, evaluating any base/index sub-expressions
-    /// exactly once.
-    fn lower_place(&mut self, target: &Expr) -> PlaceTarget {
+    /// exactly once. `later` names the variables the code that runs between
+    /// this evaluation and the store (the right-hand side) may rebind; a base
+    /// or index naming one of them is held at its current value.
+    fn lower_place(&mut self, target: &Expr, later: &fxhash::FxHashSet<String>) -> PlaceTarget {
         match target {
             // A cell-promoted name writes element 0 of its one-element cell array --
             // but only when it is actually a local here. A module global that a
@@ -488,6 +556,7 @@ impl FnLower<'_, '_> {
             },
             Expr::Field(base, field, _) => {
                 let recv = self.lower_expr(base);
+                let recv = self.hold(recv, later);
                 let recv = self.b.make_local(recv);
                 PlaceTarget::Projected(Place::projected(
                     recv,
@@ -496,8 +565,12 @@ impl FnLower<'_, '_> {
             }
             Expr::Index(base, idx, _) => {
                 let arr = self.lower_expr(base);
+                let mut before_store = assigned_names([&**idx]);
+                before_store.extend(later.iter().cloned());
+                let arr = self.hold(arr, &before_store);
                 let arr = self.b.make_local(arr);
                 let i = self.lower_expr(idx);
+                let i = self.hold(i, later);
                 PlaceTarget::Projected(Place::projected(arr, vec![Projection::Index(i)]))
             }
             _ => PlaceTarget::Discard,
@@ -557,18 +630,43 @@ impl FnLower<'_, '_> {
     /// the variable's current value is stored back into the array slot on every
     /// edge that ends the iteration.
     fn emit_loop_writeback(&mut self) {
-        let Some((arr, idx, var)) = self.loops.last().and_then(|f| f.writeback.clone()) else {
-            return;
+        if let Some(wb) = self.loops.last().and_then(|f| f.writeback) {
+            self.emit_writeback(wb);
+        }
+    }
+
+    /// Emit the write-back of EVERY enclosing loop, innermost first: the edge
+    /// being built (a `return`, or a failed `!` propagating out of the
+    /// callable) leaves all of them at once.
+    pub(crate) fn emit_exit_writebacks(&mut self) {
+        let pending: Vec<crate::lower::LoopWriteBack> = self
+            .loops
+            .iter()
+            .rev()
+            .filter_map(|f| f.writeback)
+            .collect();
+        for wb in pending {
+            self.emit_writeback(wb);
+        }
+    }
+
+    fn emit_writeback(&mut self, wb: crate::lower::LoopWriteBack) {
+        let value = if wb.cell {
+            self.b.emit(Rvalue::Load(Place::projected(
+                wb.var,
+                vec![Projection::Index(Operand::Const(Literal::Int(0)))],
+            )))
+        } else {
+            Operand::Local(wb.var)
         };
-        let e = self.lower_ident(&var);
         self.b.push(MirStmt::Store(
-            Place::projected(arr, vec![Projection::Index(Operand::Local(idx))]),
-            e,
+            Place::projected(wb.arr, vec![Projection::Index(Operand::Local(wb.idx))]),
+            value,
         ));
     }
 
-    /// `for v in iter` desugars to an index loop over the iterable's length,
-    /// matching codegen: `i = 0; while i < len(iter) { v = iter[i]; body; i+=1 }`.
+    /// `for v in iter` desugars to an index loop over the iterable's length:
+    /// `i = 0; while i < len(iter) { v = iter[i]; body; i+=1 }`.
     ///
     /// A literal range iterable never escapes the loop, so it skips the array
     /// materialization entirely and counts in place.
@@ -580,7 +678,10 @@ impl FnLower<'_, '_> {
         {
             return self.lower_for_range(var, lo, hi, *span, body);
         }
+        // The iterable is evaluated once: a body rebinding the variable it
+        // named iterates (and writes back into) the original array.
         let arr = self.lower_expr(iter);
+        let arr = self.hold(arr, &assigned_names_block(body));
         let arr = self.b.make_local(arr);
         let i = self.b.fresh_local(None);
         self.b.push(MirStmt::Assign(
@@ -628,7 +729,15 @@ impl FnLower<'_, '_> {
         let writeback = match pat {
             Pattern::Binding(var, _, _) => {
                 self.bind_value(var, elem);
-                reassigns_var(body, var).then(|| (arr, i, var.to_string()))
+                let (local, cell) = self
+                    .local_binding(var)
+                    .expect("the loop variable was just bound");
+                reassigns_var(body, var).then_some(crate::lower::LoopWriteBack {
+                    arr,
+                    idx: i,
+                    var: local,
+                    cell,
+                })
             }
             _ => {
                 let el = self.b.make_local(elem);
@@ -678,10 +787,7 @@ impl FnLower<'_, '_> {
         body: &Block,
     ) {
         let elem = self.range_elem_type(span);
-        let lo_op = self.lower_expr(lo);
-        let i = self.make_local_seeded(lo_op, elem.as_ref());
-        let hi_op = self.lower_expr(hi);
-        let end = self.make_local_seeded(hi_op, elem.as_ref());
+        let (i, end) = self.range_bounds(lo, hi, elem.as_ref());
 
         let cond_bb = self.b.new_block();
         let body_bb = self.b.new_block();

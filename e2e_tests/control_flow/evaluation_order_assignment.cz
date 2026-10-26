@@ -1,0 +1,70 @@
+// @backends: all
+// An assignment evaluates its place first (receiver, then index, left to
+// right), then the right-hand side, then stores. A compound assignment reads
+// the place's current value before the right-hand side runs. A place part
+// keeps the value it was evaluated with even when the right-hand side
+// rebinds the variable it named.
+
+type Box = { v: int32 }
+
+fun main() {
+    let log: string[] = []
+    let idx = () -> {
+        log.push("idx")
+        return 0
+    }
+    let val = () -> {
+        log.push("val")
+        return 5
+    }
+    let arr = [1, 2]
+    arr[idx()] = val()
+    println(log)
+    println(arr)
+
+    // Compound: index, read, right-hand side, store.
+    let trace: string[] = []
+    let counts = [10, 20]
+    let at = () -> {
+        trace.push("at")
+        return 1
+    }
+    let step = () -> {
+        trace.push("step {counts[1]}")
+        counts[1] = 0
+        return 3
+    }
+    counts[at()] += step()
+    println(trace)
+    println(counts)
+
+    // The right-hand side rebinding the base or the index variable stores
+    // into the place evaluated before it.
+    let xs = [1, 2, 3]
+    let keep = xs
+    let i = 0
+    xs[i] = {
+        xs = [7, 8, 9]
+        i = 2
+        100
+    }
+    println(keep)
+    println(xs)
+
+    let b = Box { v: 1 }
+    let first = b
+    b.v = {
+        b = Box { v: 50 }
+        2
+    }
+    println(first.v)
+    println(b.v)
+
+    // A compound assignment to a variable reads it before the right-hand side.
+    let t = 1
+    t += {
+        t = 10
+        5
+    }
+    println(t)
+}

@@ -2,12 +2,12 @@
 //! through `brass repl`.
 //!
 //! The interpreter is held to the same observable behavior as the LLVM JIT for the
-//! typed sequential subset, so the main test runs each case through *both*
-//! `brass run` (JIT) and `brass repl` (interpreter) and asserts their stdout is
-//! identical -- a self-validating parity check that needs no recorded `.out`
-//! files. A second test pins exact output for a file run, and a third drives an
-//! interactive session over stdin (definitions, statements, and an echoed bare
-//! expression).
+//! typed sequential subset, so the parity tests run each case through *both*
+//! `brass <file>` (JIT) and `brass repl <file>` (interpreter) and assert their
+//! output is identical -- a self-validating parity check that needs no recorded
+//! `.out` files. Further tests pin exact output for a file run and drive
+//! interactive sessions over stdin (definitions, statements, echoed bare
+//! expressions, and which earlier inputs run again).
 
 mod support;
 
@@ -45,8 +45,8 @@ fn run_mode(mode: &str, path: &str) -> (bool, String, String) {
 }
 
 /// Examples within the interpreter's supported subset (everything but the
-/// concurrency example; file I/O runs on the interpreter too now, through the
-/// fs plugin). The JIT and the REPL must produce identical output.
+/// concurrency example; file I/O runs on the interpreter through the fs
+/// plugin). The JIT and the REPL must produce identical output.
 const PARITY_CASES: &[&str] = &[
     "examples/01_records.cz",
     "examples/02_sum_types.cz",
@@ -81,7 +81,7 @@ const PARITY_CASES: &[&str] = &[
     "e2e_tests/reflection/typeof_annotation_instances.cz",
     // A generic whose argument is view-converted in one instance and a nominal
     // record in another: the identity pass-through must balance ownership on
-    // the typed back end (it crashed after the right output without it).
+    // the typed back end.
     "e2e_tests/structure/view_arg_nominal_instance.cz",
     // A type-test if (`if v: T`) selects a different arm per instance; both
     // back ends must fold every test through the same pattern predicate,
@@ -218,4 +218,48 @@ fn interactive_repl_does_not_repeat_prior_input_effects() {
     let out = child.wait_with_output().expect("wait for brass repl");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(stdout, "first\ndone\n", "interactive REPL stdout");
+}
+
+#[test]
+fn interactive_repl_keeps_side_effect_free_bindings() {
+    // A binding computed without side effects stays available to later
+    // inputs, and so do in-place updates of it; a binding whose value came
+    // from a call is not re-run, so a later use reports it unavailable, and a
+    // binding a loop (not re-run) changed is unavailable rather than stale.
+    let mut child = support::brass_command(env!("CARGO_BIN_EXE_brass"))
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn brass repl");
+
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(
+                b"let b = 3 + 1\n\
+                  println(b * 10)\n\
+                  let xs = [1, b]\n\
+                  xs.push(5)\n\
+                  println(xs)\n\
+                  let n = \"abc\".len()\n\
+                  println(n)\n\
+                  for i in [0..2] { xs.push(i) }\n\
+                  println(xs)\n\
+                  let xs = [9]\n\
+                  println(xs)\n",
+            )
+            .unwrap();
+    }
+
+    let out = child.wait_with_output().expect("wait for brass repl");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout, "40\n[1, 4, 5]\n[9]\n", "interactive REPL stdout");
+    assert!(
+        stderr.contains("`n` is not available in this input"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("may have changed `xs`"), "{stderr}");
 }

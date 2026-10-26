@@ -1,0 +1,27 @@
+// @backends: all
+// An instantiation whose only live path errors has no Ok value (the
+// reference's `length` example: only `length(true)` selects the `else`).
+// Matching its Result is fine, but reading the Ok payload -- a used
+// `Ok { value }` binding, or `!` in a value position -- is rejected at
+// compile time instead of reading a value that never exists.
+fun length(val) {
+    const bytes = if val: infer {
+        to_bytes(val)
+    } else if val: uint8[] {
+        val
+    } else if val: infer[] {
+        val
+    } else {
+        return error("unsupported")
+    }
+    return bytes.len()
+}
+
+fun main() {
+    println(length("hi"))
+    match length(true) {
+        Ok { value } => println(value),
+        Err { error } => println("err {error.value}"),
+    }
+    println(length(false)!)
+}

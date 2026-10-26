@@ -1,0 +1,31 @@
+// @backends: all
+// A float literal pattern adapts to a `float32` scrutinee like a float literal
+// in an expression does (it is compared at the scrutinee's width, so `0.1`
+// matches the `float32` value 0.1), also through a nullable scrutinee.
+fun cls(f: float32) -> string {
+    match f {
+        0.5 => {
+            return "half"
+        }
+        0.1 => {
+            return "tenth"
+        }
+        -2.25 => {
+            return "neg"
+        }
+        _ => {
+            return "?"
+        }
+    }
+}
+fun main() {
+    println(cls(0.5))
+    println(cls(0.1))
+    println(cls(-2.25))
+    println(cls(3.0))
+    let g: float32? = 0.5
+    match g {
+        0.5 => println("present half"),
+        _ => println("other"),
+    }
+}

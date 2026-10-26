@@ -1,0 +1,19 @@
+// @backends: all
+// A `ref(T)` closure parameter is an immutable reference and an `infer`
+// closure parameter a read-only copy, exactly as for functions: mutating
+// either is a compile error.
+
+type Box = { v: int32 }
+
+fun main() {
+    let b = Box { v: 1 }
+    let set = (x: ref(Box)) -> {
+        x.v = 10
+    }
+    set(b)
+    let grow = (a: infer) -> {
+        a.push(1)
+    }
+    grow([1])
+    println(b.v)
+}

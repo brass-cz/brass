@@ -1,0 +1,27 @@
+// @backends: all
+// A declared sum subtype is rebuilt as its parent at a value flow site, and
+// the rebuild composes with nullable promotion: a `Tagged` flows into a
+// `Shape?` parameter or binding, and the stored value is a `Shape` (its `tag`
+// dropped).
+type Shape = | Circle { r: float64 } | Sq { s: float64 }
+type Tagged: Shape = | Circle { tag: string, r: float64 } | Sq { tag: string, s: float64 }
+
+fun area(s: Shape?) -> float64 {
+    if let x = s {
+        return match x {
+            Circle { r } => r * r
+            Sq { s } => s * s
+        }
+    }
+    return 0.0
+}
+
+fun main() {
+    let t = Tagged.Circle { tag: "a", r: 2.0 }
+    println(area(t))
+    let s: Shape? = t
+    println(area(s))
+    println(s)
+    let none: Shape? = null
+    println(area(none))
+}

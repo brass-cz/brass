@@ -1,4 +1,5 @@
-//! Concurrency runtime: real-thread `spawn` and the cown acquire/release lock. The language exposes only `spawn(f)` and `with(cown, f)`; the
+//! Concurrency runtime: real-thread `spawn` and the cown acquire/release lock.
+//! The language exposes only `spawn(f)`, `sync()` and `with(cown, f)`; the
 //! compiler decides ownership (move/freeze/cown) and inserts acquire/release, so
 //! these primitives are the dynamic half of the two-stage safety model: a cown's
 //! shared mutable object is reached only while its lock is held, which makes
@@ -15,7 +16,7 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::rt::{Header, OWNER_COWN};
+use crate::rt::{Header, OWNER_COWN, OWNER_IMMUTABLE};
 
 thread_local! {
     /// Per-thread reentrancy depth for each cown this thread currently holds,
@@ -113,21 +114,25 @@ fn spawn_waiters() -> &'static (Mutex<usize>, Condvar) {
 /// the count's atomicity) is fixed before the first cross-thread reference; a later
 /// `with` re-tags it as the region bridge, which is also an `rc_atomic` class, so
 /// the count stays atomic across that transition. Shallow: the region interior is
-/// governed by the `with` region barrier.
+/// governed by the `with` region barrier. A value a `with` callback hands out of
+/// the locked graph is promoted the same way before the lock is released, since
+/// the code holding it outside the lock and a task inside it may both count it.
 ///
 /// # Safety
 /// `obj` must be a valid object header (or null).
 pub unsafe extern "C-unwind" fn pp_make_cown(obj: *mut Header) {
     unsafe {
-        if !obj.is_null() {
+        // A deeply immutable object (a frozen capture, an interned literal)
+        // already counts atomically and must stay read-only.
+        if !obj.is_null() && (*obj).owner != OWNER_IMMUTABLE {
             (*obj).owner = OWNER_COWN;
         }
     }
 }
 
 /// The lock byte of a heap object: the header's `flags` field (offset 11),
-/// accessed atomically. `0` = free, `1` = held. The bump allocator zeroes it and
-/// never otherwise uses it, so a per-object spinlock can live there.
+/// accessed atomically. `0` = free, `1` = held. The allocator zeroes it and
+/// nothing else uses it, so a per-object spinlock can live there.
 unsafe fn lock_byte<'a>(obj: *mut Header) -> &'a AtomicU8 {
     unsafe { &*((obj as *mut u8).add(11) as *const AtomicU8) }
 }
@@ -157,19 +162,16 @@ fn stall_budget() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Fail loudly on a suspected deadlock: a cown lock stayed contended past the
-/// stall budget, which in a correct program only happens when two threads hold
-/// locks the other needs (e.g. hand-written nested `with` scopes acquiring the
-/// same two cowns in opposite orders). Hanging forever would hide the bug; a
-/// clear runtime error surfaces it. Under unit tests this panics (unwinds) so
-/// the diagnostic is observable in-process; in a real program it exits through
-/// the runtime error path.
+/// Report contention beyond the stall budget as a suspected deadlock. This
+/// timeout does not establish a lock cycle; long-running holders can also
+/// exhaust the budget. Tests panic to expose the diagnostic in-process;
+/// normal execution uses the runtime error path.
 fn stall_fail(obj: *mut Header) -> ! {
     let msg = format!(
         "suspected deadlock: the lock of cown {obj:p} was not acquired within the stall \
-         budget; nested `with` scopes probably acquire the same cowns in opposite orders \
-         (acquire them together with `with([a, b], ...)`, or set BRASS_LOCK_STALL_SECS \
-         to raise the budget / 0 to disable this check)"
+         budget; acquire shared objects in a consistent order across tasks and do not \
+         wait for tasks (`sync`) while holding a lock they need; increase \
+         BRASS_LOCK_STALL_SECS to raise the budget, or set it to 0 to disable this check"
     );
     #[cfg(test)]
     panic!("{msg}");
@@ -186,7 +188,7 @@ fn stall_fail(obj: *mut Header) -> ! {
 ///
 /// A contended acquire yields periodically (so a deadlocked or oversubscribed
 /// program does not burn CPU pointlessly) and, after a generous wall-clock
-/// budget, aborts with a suspected-deadlock error (see [`stall_fail`]) rather
+/// budget, aborts with a suspected-deadlock error (see `stall_fail`) rather
 /// than hanging forever. The uncontended fast path pays for none of this.
 ///
 /// # Safety
@@ -245,9 +247,9 @@ pub unsafe extern "C-unwind" fn pp_unlock(obj: *mut Header) {
 }
 
 /// The cown pointers held in a growable array `{ header16 | len@16 | data@32 }`,
-/// sorted by address and de-duplicated. Sorting gives a global lock order so
-/// `with([a, b], ..)` over several cowns cannot deadlock against `with([b, a],
-/// ..)`; de-duplication avoids self-deadlock on a repeated cown.
+/// sorted by address and de-duplicated. Sorting gives group acquisitions a
+/// consistent order; callers must also account for locks they already hold.
+/// De-duplication acquires each distinct cown once.
 unsafe fn array_cowns(arr: *mut Header) -> Vec<*mut Header> {
     unsafe {
         if arr.is_null() {
@@ -262,8 +264,8 @@ unsafe fn array_cowns(arr: *mut Header) -> Vec<*mut Header> {
     }
 }
 
-/// Acquire every cown in an array, in a deterministic (address) order so
-/// multiple `with([..])` acquisitions cannot deadlock.
+/// Acquire every cown in an array in address order. This orders the group
+/// internally; locks held before entry still constrain the caller's lock order.
 ///
 /// # Safety
 /// `arr` must be a growable-array object of cown pointers (or null).
@@ -303,9 +305,9 @@ unsafe fn span_cowns(ptrs: *const *mut Header, n: i64) -> Vec<*mut Header> {
     v
 }
 
-/// Acquire every cown in a raw pointer span, in address order, so any two group
-/// acquisitions of overlapping cown sets use one global lock order and cannot
-/// deadlock -- regardless of the textual order the compiler emitted the span in.
+/// Acquire every cown in a raw pointer span in address order, independently
+/// of the compiler's textual ordering. Locks held before entry are outside
+/// this group ordering and must be considered by the caller.
 ///
 /// # Safety
 /// `ptrs` must point to `n` readable object-header pointers (each valid or null).
@@ -384,10 +386,12 @@ pub unsafe extern "C-unwind" fn pp_spawn(closure: *mut Header) {
     threads().lock().unwrap().push(handle);
 }
 
-/// Join every spawned thread. The driver calls this in `main`'s epilogue so the
-/// program waits for spawned work before exiting. With all threads joined the main
-/// thread is again the sole mutator, so it runs a collection to reclaim any cycle
-/// garbage whose collection was deferred while spawned threads ran.
+/// Join every spawned thread: the `sync()` builtin, and the back end's run after
+/// `main` returns, so the program waits for spawned work before exiting. With all
+/// threads joined the main thread is again the sole mutator, so it runs a
+/// collection to reclaim any cycle garbage whose collection was deferred while
+/// spawned threads ran. On a spawned thread (`sync()` inside a task) it instead
+/// waits until every active task has finished or reached the same barrier.
 ///
 /// A joined thread that terminated by unwinding (possible only in test/embedding
 /// runs; a real program's runtime errors exit the process) is not silently

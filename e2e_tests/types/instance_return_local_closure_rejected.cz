@@ -1,0 +1,26 @@
+// @backends: all
+// A local closure applied inside an instantiation returns what its body
+// returns at the argument types (`(q) -> q.b` on a record is the field's
+// type), so its result joins the instantiation's other returns like any
+// value: here `string` and `int32` have no join and the instantiation is
+// rejected (a matching pair is accepted, see local_closure_application).
+type P = {
+    a: int32
+    b: string
+}
+
+fun helper(p) {
+    return p.a
+}
+
+fun f(p) {
+    if p.a > 0 {
+        let h = (q) -> q.b
+        return h(p)
+    }
+    return helper(p)
+}
+
+fun main() {
+    println(f(P { a: 1, b: "x" }))
+}

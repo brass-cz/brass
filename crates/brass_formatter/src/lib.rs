@@ -388,4 +388,45 @@ mod expression_boundary_tests {
         assert!(formatted.contains("(box.callback)(\n"), "{formatted}");
         assert_eq!(format(&formatted).unwrap(), formatted);
     }
+
+    /// A closure's `-> {` always opens a block body, so a record-literal body
+    /// keeps its parentheses, flat and broken alike; dropping them would turn
+    /// the literal into a block.
+    #[test]
+    fn record_literal_closure_body_keeps_parentheses() {
+        let src = "fun main() {\n    let mk = () -> ({ id: 1 })\n    let wide = (a, b) -> ({ id: a, name: b, something_long: a + b, another_field: [a, b, a, b] })\n}\n";
+        let once = format(src).unwrap();
+        assert_eq!(format(&once).unwrap(), once, "formatting is not idempotent");
+        assert_eq!(
+            once,
+            "fun main() {\n    let mk = () -> ({ id: 1 })\n    let wide = (a, b) -> ({\n        id: a,\n        name: b,\n        something_long: a + b,\n        another_field: [a, b, a, b],\n    })\n}\n"
+        );
+    }
+
+    /// An immediately applied closure with a block body (and any other callee
+    /// that only renders on several lines) is laid out inside exactly one
+    /// pair of parentheses, so formatting is idempotent.
+    #[test]
+    fn immediately_applied_block_closure_is_idempotent() {
+        let src = "fun main() {\n    let r = ((x) -> { x + 1 })(b)\n    let s = ((x) -> x + 1)(b)\n    let t = (if c { f } else { g })(b)\n}\n";
+        let once = format(src).unwrap();
+        assert_eq!(format(&once).unwrap(), once, "formatting is not idempotent");
+        assert_eq!(
+            once,
+            "fun main() {\n    let r = ((x) -> {\n        x + 1\n    })(b)\n    let s = ((x) -> x + 1)(b)\n    let t = (if c {\n        f\n    } else {\n        g\n    })(b)\n}\n"
+        );
+    }
+
+    /// A match arm's `=> {` opens a block body too, so a record-literal arm
+    /// body keeps its parentheses, flat and broken alike.
+    #[test]
+    fn record_literal_match_arm_keeps_parentheses() {
+        let src = "fun f(n: int32) {\n    let r = match n {\n        1 => ({ id: 5 }),\n        _ => ({ id: n, name: \"a fairly long name\", other: n + n, more: [n, n, n, n] }),\n    }\n}\n";
+        let once = format(src).unwrap();
+        assert_eq!(format(&once).unwrap(), once, "formatting is not idempotent");
+        assert_eq!(
+            once,
+            "fun f(n: int32) {\n    let r = match n {\n        1 => ({ id: 5 }),\n        _ => ({\n            id: n,\n            name: \"a fairly long name\",\n            other: n + n,\n            more: [n, n, n, n],\n        }),\n    }\n}\n"
+        );
+    }
 }

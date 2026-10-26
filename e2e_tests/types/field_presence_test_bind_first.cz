@@ -1,0 +1,28 @@
+// @backends: all
+// The working forms next to a field presence test: binding the field with
+// `if let` narrows the binding, and a presence test of a field the record
+// type declares non-nullable (the anonymous record `{ n: 7 }`) folds to
+// true, so the field is read as the plain value it is.
+type N = { n: int32? }
+
+fun widen(p) -> int64 {
+    if let n = p.n {
+        let a: int64 = n
+        return a
+    }
+    return -1
+}
+
+fun present(p) -> int64 {
+    if p.n {
+        let a: int64 = p.n
+        return a
+    }
+    return -1
+}
+
+fun main() {
+    println(widen(N { n: 5 }))
+    println(widen(N { n: null }))
+    println(present({ n: 7 }))
+}

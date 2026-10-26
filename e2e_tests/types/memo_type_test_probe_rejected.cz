@@ -1,0 +1,17 @@
+// A call inside a type-tested arm pins a global's element type: the probe the
+// checker runs to decide the test is undone, but the arm's own check is not,
+// so the later string read of the int32 element is rejected.
+let store = []
+
+fun add(x) {
+    store.push(x)
+}
+
+fun main() {
+    let v = 5
+    if v: int32 {
+        add(v)
+    }
+    let s: string = store[0]
+    println(s)
+}

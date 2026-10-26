@@ -1,0 +1,7 @@
+1: int64, string
+2: int64, int32
+6: int64, never?
+7: int64, bool
+8: int64, string
+9: int64, string
+10: int64, string

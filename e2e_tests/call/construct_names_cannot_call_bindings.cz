@@ -1,0 +1,64 @@
+// Construct calls reject same-named function bindings in locals, parameters,
+// and typeof receivers, with a distinct diagnostic for each call site.
+
+fun error_local() {
+    let error = (x: int32) -> x
+    error(1)
+}
+
+fun error_parameter(error: (int32) -> int32) {
+    error(1)
+}
+
+fun fields_local() {
+    let fields = (x: int32) -> x
+    for f in fields({ n: 1 }) { println(f) }
+}
+
+fun fields_parameter(fields: (int32) -> int32) {
+    for f in fields({ n: 1 }) { println(f) }
+}
+
+fun spawn_local() {
+    let spawn = (x: int32) -> x
+    spawn(() -> {})
+}
+
+fun spawn_parameter(spawn: (int32) -> int32) {
+    spawn(() -> {})
+}
+
+fun typeof_local() {
+    let typeof = (x: int32) -> x
+    typeof(1)
+}
+
+fun typeof_parameter(typeof: (int32) -> int32) {
+    typeof(1)
+}
+
+fun with_local() {
+    let with = (x: int32) -> x
+    with({ n: 1 }, (x) -> x.n)
+}
+
+fun with_parameter(with: (int32) -> int32) {
+    with({ n: 1 }, (x) -> x.n)
+}
+
+fun typeof_receiver() {
+    let typeof = (x: int32) -> x
+    println(typeof(1).default())
+}
+
+error_local()
+error_parameter((x: int32) -> x)
+fields_local()
+fields_parameter((x: int32) -> x)
+spawn_local()
+spawn_parameter((x: int32) -> x)
+typeof_local()
+typeof_parameter((x: int32) -> x)
+with_local()
+with_parameter((x: int32) -> x)
+typeof_receiver()

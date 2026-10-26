@@ -1,0 +1,3 @@
+18:16: error: cannot use `Narrow` where `Wide` is required
+19:16: error: cannot store this record literal in a slot of type `Wide`: a literal is built as `Wide` only when its fields are exactly `Wide`'s (missing field(s) `b`)
+22:14: error: cannot store a `Wide` in a slot of type `anonymous { a: int32 }`: a slot of an anonymous record type holds only anonymous records with exactly its fields

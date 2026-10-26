@@ -1,0 +1,12 @@
+// Distinct value types have no inferred return join through structural subtyping.
+fun pick(c: bool) {
+    if c {
+        return { a: 1, b: "two" }
+    }
+    return { a: 3 }
+}
+
+const r = pick(true)
+println(r)
+const s = pick(false)
+println(s)

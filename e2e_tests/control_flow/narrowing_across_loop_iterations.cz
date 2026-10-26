@@ -1,0 +1,41 @@
+// @backends: all
+// A narrowing made before a loop holds inside it as long as no path through
+// the body can make the variable null before the next iteration. A path that
+// leaves the loop with `break` does not reach the next iteration, a fresh test
+// inside the loop narrows on its own, and builtin calls never end a narrowed
+// global.
+let g: string? = "global"
+fun pick(b: bool) -> string? {
+    if b { return "hello" }
+    return null
+}
+fun main() {
+    let x = pick(true)
+    if !x { return }
+    let i = 0
+    while true {
+        println(x.len())
+        i = i + 1
+        if i == 2 {
+            x = null
+            break
+        }
+    }
+    println(x)
+    let y = pick(true)
+    if !y { return }
+    let n = 0
+    while n < 3 {
+        if y {
+            println("{n}: {y.len()}")
+        } else {
+            println("{n}: gone")
+        }
+        y = pick(n == 0)
+        n = n + 1
+    }
+    if !g { return }
+    for s in ["a", "bb"] {
+        println(g.len() + s.len())
+    }
+}

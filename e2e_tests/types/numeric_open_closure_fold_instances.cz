@@ -1,0 +1,11 @@
+// @backends: all
+fun main() {
+ let f = (v) -> {
+  let x = 0
+  if v : int64 { x = 5000000000 }
+  return x
+ }
+ let wide: int64 = 5000000000
+ println(f(wide))
+ println(f(1))
+}

@@ -1,0 +1,17 @@
+// Library declaring its own `abs` and `println`, both prelude names. They
+// shadow the prelude inside this module only (see
+// prelude_name_shadowed_in_declaring_module_only.cz).
+fun abs(text: string) -> string {
+    return "|{text}|"
+}
+
+fun println(text: string) -> int32 {
+    print("[shadowlib] {text}\n")
+    return 3
+}
+
+fun shout(text: string) -> int32 {
+    // The module's own `println` returns a value: the call is typed by its
+    // declaration, not as the prelude's `void` printer.
+    return println(abs(text)) + 1
+}

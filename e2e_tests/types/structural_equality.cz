@@ -1,0 +1,81 @@
+// @backends: all
+// `==` / `!=` are structural on every back end: records field by field (a
+// nullable field compares null-safely by value, not by cell identity), sums by
+// variant then payload, arrays by length then element, tuples by position,
+// floats by IEEE equality, and function values by identity.
+
+type R = {
+    n: int64?
+    s: string?
+}
+
+type Shape =
+    | Circle { r: int64 }
+    | Rect { w: int64, h: int64 }
+    | Empty
+
+type Node = {
+    v: int32
+    next: Node?
+}
+
+type Tagged = {
+    tags: string[]
+    shape: Shape
+    pair: [int32, string]
+}
+
+type Holder = {
+    f: (int32) -> int32
+}
+
+fun main() {
+    println(R { n: 5, s: "a" } == R { n: 5, s: "a" })
+    println(R { n: 5, s: null } == R { n: 5, s: null })
+    println(R { n: 5, s: null } == R { n: 5, s: "a" })
+    println(R { n: null, s: "a" } != R { n: 6, s: "a" })
+
+    println(Shape.Circle { r: 1 } == Shape.Circle { r: 1 })
+    println(Shape.Circle { r: 1 } == Shape.Circle { r: 2 })
+    println(Shape.Circle { r: 1 } == Shape.Rect { w: 1, h: 1 })
+    println(Shape.Empty == Shape.Empty)
+    println(Shape.Empty != Shape.Circle { r: 0 })
+
+    let a = [1, 2, 3]
+    println(a == [1, 2, 3])
+    println(a == [1, 2])
+    println(a != [1, 2, 4])
+    let e: int32[] = []
+    let f: int32[] = []
+    println(e == f)
+    println([[1], [2, 3]] == [[1], [2, 3]])
+    println([[1], [2, 3]] == [[1], [3, 2]])
+    println([1, "x"] == [1, "x"])
+    println([1, "x"] == [2, "x"])
+
+    let l1 = Node { v: 1, next: Node { v: 2, next: null } }
+    let l2 = Node { v: 1, next: Node { v: 2, next: null } }
+    println(l1 == l2)
+    println(l1 == Node { v: 1, next: null })
+
+    let t1 = Tagged { tags: ["a", "b"], shape: Shape.Rect { w: 2, h: 3 }, pair: [1, "p"] }
+    let t2 = Tagged { tags: ["a", "b"], shape: Shape.Rect { w: 2, h: 3 }, pair: [1, "p"] }
+    let t3 = Tagged { tags: ["a"], shape: Shape.Rect { w: 2, h: 3 }, pair: [1, "p"] }
+    println(t1 == t2)
+    println(t1 == t3)
+
+    println(int32.parse("4") == int32.parse("4"))
+    println(int32.parse("4") == int32.parse("x"))
+
+    let z = 0.0
+    let nan = z / z
+    println([nan] == [nan])
+    println([0.0] == [-0.0])
+
+    const inc = (x: int32) -> x + 1
+    const same_body = (x: int32) -> x + 1
+    println(inc == inc)
+    println(inc == same_body)
+    println(Holder { f: inc } == Holder { f: inc })
+    println(Holder { f: inc } == Holder { f: same_body })
+}

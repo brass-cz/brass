@@ -1,0 +1,5 @@
+// @backends: all
+// Exported globals may share names with prelude functions.
+let error = 3
+let print = (x: int32) -> x + 1
+let next = (x: int32) -> x + 2

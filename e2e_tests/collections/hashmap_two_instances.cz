@@ -1,13 +1,8 @@
-// Two HashMap instantiations with different value types in one program. The
-// JIT memoizes per-type glue (destructor, to_string, deep copy, tracer) by a
-// rendered type key; HashMap's members are all `_`-private, so the
-// user-facing rendering of every instance is the bare name `HashMap`, and a
-// name-only key handed one instance's glue to the other -- dropping an int32
-// value as a heap pointer, which crashed at scope exit. The keys must include
-// the full field substitution.
-
-// The string-valued map is declared FIRST so its glue is emitted first: a
-// shared key would then release the second map's int32 values as pointers.
+// Two HashMap instantiations with different value types in one program. Both
+// render as the bare name `HashMap` (their members are all `_`-private), yet
+// each instance keeps its own per-type code -- destructor, rendering, deep
+// copy -- so each map prints, reads and releases its own values. The
+// string-valued map comes first, so its per-type code is generated first.
 fun main() {
     let a = HashMap.new()
     a.set("s", "seven")

@@ -165,7 +165,6 @@ dependencies = [
  "brass_hir",
  "brass_mir",
  "brass_parser",
- "brass_solver",
  "brass_typeck",
  "brass_typesys",
  "brass_utils",

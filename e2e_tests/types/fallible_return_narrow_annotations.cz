@@ -1,0 +1,27 @@
+// @backends: all
+// An annotated `float32`, `int32?` or `uint8` local returned from a fallible
+// body through an inferred `Result` keeps its annotated type (and value) on
+// every back end, not the default type of its initializer literal.
+fun f(flag: bool) {
+    let t: float32 = 1.5
+    if flag { return error("e") }
+    return t
+}
+fun g(flag: bool) {
+    let t: int32? = 5
+    if flag { return error("e") }
+    return t
+}
+fun h(flag: bool) {
+    let t: uint8 = 200
+    if flag { return error("e") }
+    return t
+}
+fun main() {
+    println(f(false)!)
+    println(typeof(f(false)!))
+    println(g(false)!)
+    println(typeof(g(false)!))
+    println(h(false)!)
+    println(typeof(h(false)!))
+}

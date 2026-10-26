@@ -14,7 +14,7 @@ An array literal is `[1, 2, 3]`. Arrays index with `arr[i]`, grow with
 `push`, and know their `len`:
 
 ```brass
-let nums = [5, 3, 8, 1, 9, 2]
+let nums: int64[] = [5, 3, 8, 1, 9, 2]
 println("len      = {nums.len()}")
 println("sorted   = {nums.sort()}")
 println("reversed = {nums.reverse()}")
@@ -102,4 +102,5 @@ for pair in ages.pairs() {
 
 `keys()`, `values()`, `delete(k)`, `clear()`, and
 `HashMap.from_pairs([[k, v], ...])` round out the API. Keys may be any type
-that compares with `==`: integers, strings, even records.
+that compares with `==`: integers, strings, even records, sums, tuples, and
+arrays, all compared by value.

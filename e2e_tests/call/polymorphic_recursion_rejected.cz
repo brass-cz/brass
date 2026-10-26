@@ -1,0 +1,16 @@
+// A function calling itself with its parameter wrapped in a larger type
+// (`f([x])`) would need one instance per level: polymorphic recursion is
+// rejected by the checker instead of overflowing the compiler. A type the
+// diagnostic cannot decide yet prints as `_` (`_[]` is an array of an open
+// element type), never as the nullable marker `?`.
+
+fun f(x, n: int32) -> int32 {
+    if n == 0 {
+        return 0
+    }
+    return 1 + f([x], n - 1)
+}
+
+fun main() {
+    println(f(1, 3))
+}

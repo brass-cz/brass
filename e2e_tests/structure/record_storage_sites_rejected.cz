@@ -1,0 +1,33 @@
+// @lazy: fail
+// @eager: fail
+// Every storage site keeps its declared representation: records have
+// reference semantics and nothing converts a stored value, so a record of
+// another declaration is rejected even when it has every field the slot's
+// type declares -- an annotated binding, an annotated return, a field
+// initializer and a field store, an array element, a sum payload, a nullable
+// slot, and a `Result` payload.
+type Animal = { name: string }
+type Dog = { age: int32, name: string }
+type Kennel = { pet: Animal }
+type Holder = | Full { a: Animal } | Empty
+
+fun get() -> Animal {
+    return Dog { age: 7, name: "rex" }
+}
+
+fun found() -> Dog! {
+    return Dog { age: 1, name: "pup" }
+}
+
+fun main() {
+    let d = Dog { age: 5, name: "rex" }
+    let a: Animal = d
+    let k = Kennel { pet: d }
+    k.pet = d
+    let arr: Animal[] = [d]
+    arr.push(d)
+    let h = Holder.Full { a: d }
+    let n: Animal? = d
+    let r: Animal! = found()
+    println(get().name)
+}

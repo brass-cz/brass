@@ -1,0 +1,12 @@
+Ops {
+    step: <opaque>,
+    count: 2,
+}
+Ops {
+    step: <opaque>,
+    count: 2,
+}
+Action.Run {
+    go: <opaque>,
+}
+3

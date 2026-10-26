@@ -1,8 +1,8 @@
-// A reflective `-> infer!` call must key off a receiver produced by a SUM's
-// STATIC method. A sum's static has no `self`, so it never resolves through the
-// receiver path; the static path only knew how to answer for records, so the call
-// typed as an unknown, the `into` below was never keyed, and it reached the back
-// end as an undeclared method (`no method `into` for `Doc``).
+// A reflective `-> infer!` call keys off a receiver produced by a SUM's
+// STATIC method: a sum's static has no `self`, so its result is typed through
+// the static path, which answers for sums as for records. `into` is keyed at
+// `Pair` on a bound value and chained straight off the static call, and the
+// static's `!` makes an unannotated caller fallible.
 type Doc =
     | Text { value: string }
     | Num { value: int64 }

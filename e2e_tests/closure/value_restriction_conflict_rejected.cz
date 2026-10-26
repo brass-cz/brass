@@ -1,0 +1,15 @@
+// A closure parameter tied to a captured binding is not generalized (the
+// value restriction): `remember` pushes into `names`, so its first
+// application fixes the element type and a later push of another type is
+// rejected instead of mixing an int and a string in one array.
+fun main() {
+    let names = []
+    let remember = (v) -> {
+        names.push(v)
+    }
+    remember(42)
+    names.push("bob")
+    for n in names {
+        println("hello {n}")
+    }
+}

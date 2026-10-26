@@ -1,0 +1,15 @@
+// Applying a closure that pushes into a global list fixes the list's element
+// type, like calling the function it wraps directly: reading the element back
+// as a string after `f(5)` is rejected.
+let store = []
+
+fun add(x) {
+    store.push(x)
+}
+
+fun main() {
+    let f = (y) -> add(y)
+    f(5)
+    let s: string = store[0]
+    println(s)
+}

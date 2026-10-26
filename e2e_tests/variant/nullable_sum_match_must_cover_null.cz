@@ -1,0 +1,18 @@
+// A `match` over a nullable sum must cover `null` as well as every variant:
+// naming all variants without a `null` or `_` arm is non-exhaustive.
+type S = | A { x: int32 } | B
+
+fun f(n: int32) -> S? {
+    if n > 0 {
+        return S.A { x: n }
+    }
+    return null
+}
+
+fun main() {
+    let label = match f(1) {
+        A { x } => "A {x}",
+        B => "B",
+    }
+    println(label)
+}

@@ -1,0 +1,31 @@
+// @backends: all
+fun unsigned_conflict() {
+    let x = 0
+    let value: uint64 = 1
+    x = value
+}
+fun typed_copy() {
+    let typed: int32 = 0
+    let x = typed
+    let wide: int64 = 5000000000
+    x = wide
+}
+fun field_read() {
+    let record = { value: 0 }
+    let x = record.value
+    let wide: int64 = 5000000000
+    x = wide
+}
+fun cyclic_fold() {
+    let x = 0
+    if x: int32 {
+        let wide: int64 = 5000000000
+        x = wide
+    }
+}
+fun main() {
+    unsigned_conflict()
+    typed_copy()
+    field_read()
+    cyclic_fold()
+}

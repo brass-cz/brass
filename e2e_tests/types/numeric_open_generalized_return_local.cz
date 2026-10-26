@@ -1,0 +1,12 @@
+// @backends: all
+fun main() {
+ let f = (unused) -> { let x = 0
+ println(typeof(x))
+ return x }
+ let wide: int64 = 5000000000
+ let a = f(1)
+ a = wide
+ let b = f(1)
+ println(typeof(a))
+ println(typeof(b))
+}

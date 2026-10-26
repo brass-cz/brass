@@ -1,8 +1,8 @@
 // A record field may hold a closure whose type names the enclosing type with
-// `self` (`transform: (self, string) -> string`, as in test1.cz). A closure
-// literal in that field is checked against the field's declared function type, so
-// a body that returns the wrong type is rejected: the closure here returns an
-// integer where the field's `-> string` requires a string.
+// `self` (`transform: (self, string) -> string`). A closure literal in that
+// field is checked against the field's declared function type, so a body that
+// returns the wrong type is rejected: the closure here returns an integer
+// where the field's `-> string` requires a string.
 type Obj = {
     name: string
     transform: (self, string) -> string

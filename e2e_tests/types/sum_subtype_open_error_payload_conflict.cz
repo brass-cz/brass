@@ -1,0 +1,9 @@
+// Different known Ok payload layouts conflict even when Err stays open.
+type MyResult: Result =
+    | Ok { value, message }
+    | Err { error }
+fun unwrap(value) { return value! }
+fun main() {
+    println(unwrap(MyResult.Ok { value: 1, message: "n" }))
+    println(unwrap(MyResult.Ok { value: "two", message: "s" }))
+}

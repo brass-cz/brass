@@ -1,6 +1,6 @@
 //! Module-level name resolution: validate that every imported name exists and
-//! is public. The file-system module graph is resolved by
-//! the driver; this checks the resulting program for import errors.
+//! is public. The file-system module graph is loaded by [`crate::loader`];
+//! this checks the resulting program for import errors.
 
 use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 

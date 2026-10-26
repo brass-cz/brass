@@ -1,0 +1,15 @@
+// @backends: all
+fun make() {
+ let x = 0
+ return (v) -> {
+  if v : int64 { x = 5000000000 }
+  return x
+ }
+}
+fun main() {
+ let a = make()
+ let b = make()
+ let wide: int64 = 5000000000
+ println(a(wide))
+ println(b(1))
+}

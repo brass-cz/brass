@@ -273,13 +273,13 @@ fn reject_frozen_write() -> ! {
     crate::builtins::pp_panic_str(msg)
 }
 
-/// Reduced write barrier retained for the typed back end's current field-store
-/// path: same as [`pp_add_reference`] but also performs the local-value
-/// transfer used when no `src` owner is known. `src` is the container, `value` the
-/// stored value; equivalent to `pp_add_reference` with the container as `src`.
+/// Reduced write barrier for the typed back end's field stores: same as
+/// [`pp_add_reference`] but also performs the local-value transfer used when no
+/// `src` owner is known. `src` is the container, `value` the stored value;
+/// equivalent to `pp_add_reference` with the container as `src`.
 ///
 /// A store whose container is *frozen* (deeply immutable, shared lock-free across
-/// threads) is rejected loudly: see [`reject_frozen_write`]. A cown container is
+/// threads) is rejected loudly: see `reject_frozen_write`. A cown container is
 /// legal here -- the back end emits this barrier for stores it performs under the
 /// cown's lock (a group-acquired `with` leaves the owner tag as `Cown`).
 ///
@@ -594,7 +594,7 @@ mod tests {
 
     /// Closing a region disposes its metadata and the id is never reused, so the
     /// table is bounded by the number of open regions rather than growing once per
-    /// `with` (the previous unbounded leak).
+    /// `with`.
     #[test]
     fn closing_a_region_disposes_it_with_monotonic_ids() {
         let _serial = serial_region();

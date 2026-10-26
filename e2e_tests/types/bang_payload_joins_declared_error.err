@@ -1,0 +1,3 @@
+bang_payload_joins_declared_error.cz:22:16: error: incompatible error payloads: `Error<value=BadInput>` and `Error<value=string>`: this `return` raises `Error<value=string>`
+bang_payload_joins_declared_error.cz:32:13: error: incompatible error payloads: `Error<value=string>` and `Error<value=BadInput>`: this `!` propagates `Error<value=BadInput>`
+bang_payload_joins_declared_error.cz:46:16: error: incompatible error payloads: `Error<value=BadInput>` and `Error<value=string>`: this `return` raises `Error<value=string>`

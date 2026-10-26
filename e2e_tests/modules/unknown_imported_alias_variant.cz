@@ -1,0 +1,3 @@
+// A renamed sum alias retains variant validation at the call site.
+import alias_variant_lib.{ Sh as Renamed }
+let value = Renamed.Bogus { r: 1 }

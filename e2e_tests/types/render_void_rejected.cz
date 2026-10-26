@@ -1,0 +1,12 @@
+// A `void` (a call of a function that returns nothing) has no text
+// rendering: printing it, interpolating it and `string.from` on it are
+// rejected by the checker at the operand, not refused later by a back end.
+fun nothing() {
+    let a = 1
+}
+
+fun main() {
+    println(nothing())
+    let s = "[{nothing()}]"
+    let t = string.from(nothing())
+}

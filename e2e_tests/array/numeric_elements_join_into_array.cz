@@ -1,0 +1,35 @@
+// @backends: all
+// Without an expected type, bracket-literal elements that are all numbers
+// form an array of their value join -- the rule `if`/`match` branches join
+// by: a literal adapts to the typed elements and typed elements meet at the
+// smallest type they all widen to; a `null` element makes the element type
+// nullable. Numbers without a common type (`int64` with `uint64`) and other
+// differing elements form a tuple. The rule holds per instance of a generic
+// body too.
+fun sum(xs, i) {
+    if i >= xs.len() {
+        return 0
+    }
+    return xs[i] + sum(xs, i + 1)
+}
+
+fun pair(a, b) {
+    return [a, b]
+}
+
+fun main() {
+    let big: int64 = 5000000000
+    println(sum([big, 1], 0))
+    let x: int32 = 3
+    let mixed = [x, big]
+    println(typeof(mixed))
+    println(mixed[0] + mixed[1])
+    let small: uint8 = 200
+    println(typeof([small, 55]))
+    println(typeof([1, 2.5]))
+    println(typeof([x, null, big]))
+    println(typeof(pair(x, big)))
+    println(typeof(pair("s", 1)))
+    let u: uint64 = 7
+    println(typeof([big, u]))
+}

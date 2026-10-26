@@ -1,6 +1,6 @@
-// Pins: a spawn nested inside an if block must guard the spawner's accesses in
-// the enclosing scope (the old per-list live set lost the cown when the block
-// ended, racing the task against the loop after the if).
+// Pins: a spawn nested inside an `if` block also guards the spawner's
+// accesses in the enclosing scope: the loop after the `if` runs under the
+// counter's lock, so no update is lost and the total is exact.
 type Counter = {
     value: int64
 }

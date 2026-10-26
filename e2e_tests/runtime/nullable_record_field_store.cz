@@ -1,0 +1,16 @@
+// A nullable record local that starts as null and is then reassigned a record
+// can be stored into a record field (`B { a: a }`): the field holds that
+// record, and reading it back through `b.a` yields its value intact.
+
+type A = { x: int32 }
+type B = { a: A? }
+
+fun main() {
+    let a: A? = null
+    a = A { x: 1 }
+    let b = B { a: a }
+
+    let stored = b.a
+    if stored { assert(stored.x == 1, "the record survives the store") }
+    println("ok")
+}

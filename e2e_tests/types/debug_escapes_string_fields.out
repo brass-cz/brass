@@ -1,0 +1,41 @@
+P {
+    x: 1,
+    s: "q\"t\n",
+    n: "a\\b",
+    missing: null,
+    arr: [a", b],
+}
+P {
+    x: 1,
+    s: "q\"t\n",
+    n: "a\\b",
+    missing: null,
+    arr: [a", b],
+}
+P {
+    x: 1,
+    s: "q\"t\n",
+    n: "a\\b",
+    missing: null,
+    arr: [a", b],
+}
+P {
+    x: 1,
+    s: "q\"t\n",
+    n: "a\\b",
+    missing: null,
+    arr: [a", b],
+}
+S.A {
+    v: "x\"y\ttab",
+}
+"a\"b"
+{
+    "k\"1": "v\n1"
+}
+anonymous {
+    a: anonymous {
+        b: [c"d],
+    },
+    s: "e\rf",
+}

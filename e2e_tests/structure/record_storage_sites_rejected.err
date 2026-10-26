@@ -1,0 +1,9 @@
+15:12: error: cannot store a `Dog` in a slot of type `Animal`: record values do not convert implicitly; use `Animal.from(value)`
+24:21: error: cannot store a `Dog` in a slot of type `Animal`
+25:27: error: cannot store a `Dog` in a slot of type `Animal`
+26:13: error: cannot store a `Dog` in a slot of type `Animal`
+27:26: error: cannot store a `Dog` in a slot of type `Animal`
+28:14: error: cannot store a `Dog` in a slot of type `Animal`
+29:30: error: cannot store a `Dog` in a slot of type `Animal`
+30:22: error: cannot store a `Dog` in a slot of type `Animal?`
+31:22: error: cannot store a `Result<Dog, _>` in a slot of type `Result<Animal, _>`

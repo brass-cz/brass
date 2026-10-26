@@ -1,0 +1,9 @@
+// @backends: all
+fun forward(v) { return v }
+fun main() {
+ let wide: int64 = 5000000000
+ let x = forward(0)
+ x = wide
+ println(typeof(x))
+ println(x)
+}

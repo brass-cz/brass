@@ -1,12 +1,10 @@
-// @lazy: fail
-// @eager: pass
+// @backends: all
 //
-// An unannotated-return chain of int64 functions deeper than the deferred
-// runtime's adaptation window: call sites past it are compiled against the
-// default int32 return and cannot adapt when the deferred instance resolves
-// as int64, so the lazy pipeline stops resolution with a defined error
-// (never a miscompile) while the whole-program pipelines accept any depth.
-// An int32 chain of the same shape runs lazily at any depth.
+// An unannotated-return chain of int64 functions deeper than the checker's
+// elaboration depth: the calls past it are typed from the precomputed returns,
+// which carry each `cN(x) + 1` at int64 like the full check does, so the lazy
+// run compiles every deferred call site at the instance's real return and runs
+// the chain like the whole-program pipelines.
 fun c0(x: int64) { return c1(x) + 1 }
 fun c1(x: int64) { return c2(x) + 1 }
 fun c2(x: int64) { return c3(x) + 1 }

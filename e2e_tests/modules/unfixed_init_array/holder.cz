@@ -1,0 +1,8 @@
+// A module whose top-level code binds an empty array literal nothing ever
+// types is rejected by the checker at the literal (judged once every body
+// is checked, since a function could still push into a global), before any
+// of the module's top-level code runs.
+let X = 5
+println("holder init running")
+let e = []
+println(e.len())

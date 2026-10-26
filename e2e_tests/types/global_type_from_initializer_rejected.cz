@@ -1,0 +1,15 @@
+// A global's type is what its initializer's full check gives it, everywhere it
+// is read: an `int64` global (a sum of an int64 literal, or of an annotated
+// int64 global) cannot silently narrow into an `int32` local or flow into a
+// `string` one inside a function, exactly as a local of the same type could
+// not.
+let big = 5000000000 + 1
+let base: int64 = 10
+let next = base + 1
+
+fun main() {
+    let s: int32 = big
+    let t: string = next
+    println(s)
+    println(t)
+}

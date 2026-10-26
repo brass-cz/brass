@@ -1,0 +1,3 @@
+cannot implicitly convert `uint64` to `int32`
+cannot implicitly convert `int64` to `int32`
+numeric inference has no self-consistent type; annotate the binding

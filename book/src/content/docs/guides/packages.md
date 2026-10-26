@@ -112,6 +112,41 @@ A `tarball` dependency requires a 64-character lowercase hexadecimal SHA-256
 caches a completed extraction under `~/.brass/packages/tarball/<hash>`. A
 dependency entry cannot mix `tarball`/`hash` with the Git or path fields.
 
+## Managing cached packages
+
+```bash
+czpm cache info
+czpm cache clean
+czpm cache clean geometry utils
+```
+
+These commands manage `$HOME/.brass/packages` without network access. They
+leave the JIT object cache alone; use `brass cache` for that store.
+
+`info` lists Git checkouts and tarball extractions with their sizes and totals.
+It reports stale staging directories separately. Inside a package, entries
+known to the local dependency graph also show their dependency names and
+sources. Other entries show their digest. Sizes count regular-file bytes;
+links are not followed. A missing store is empty.
+
+`clean` removes all digest-named package directories and stale staging trees.
+Unknown names, symbolic links, and fresh staging trees stay intact. A staging
+tree is stale only after 24 hours without a modification anywhere inside it.
+The store root and its `git` and `tarball` directories are preserved.
+
+`clean NAME...` requires `package.toml` in the current directory. Direct names
+come from that manifest. Transitive names come from manifests already present
+in cached packages or local path dependencies. Paths are relative to the
+manifest that declares them. Missing or unreadable child manifests end that
+branch; no clone, download, or revision lookup occurs. Cycles are visited once.
+Path dependencies have nothing cached and are reported without removal.
+
+Every requested name must resolve before deletion starts. An unknown, missing,
+or ambiguous dependency is an error that names it; nothing is deleted. Repeated
+names and shared entries are removed once. Named cleanup removes published
+entries only. A filesystem error during removal can leave a partial cleanup.
+Concurrent fetches may repopulate the store.
+
 ## Importing from a dependency
 
 Once a dependency is declared, its modules are available via `import`:

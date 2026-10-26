@@ -1,0 +1,20 @@
+// @backends: all
+// A `ref(mut(T?))` parameter is a nullable like any `T?`: it accepts a `T?`
+// argument (also an element of a `T?[]`), the body may store `null` into it
+// (rebinding the name, which does not write through), and `if x` narrows it.
+fun clear(x: ref(mut(string?))) {
+    if x {
+        println("had {x.len()}")
+    }
+    x = null
+    println(x)
+}
+fun main() {
+    let s: string? = "abc"
+    clear(s)
+    println(s)
+    let xs: string?[] = ["a", null]
+    clear(xs[0])
+    clear(xs[1])
+    println(xs.len())
+}

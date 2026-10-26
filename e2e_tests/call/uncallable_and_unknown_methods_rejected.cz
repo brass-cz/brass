@@ -1,0 +1,13 @@
+// @backends: all
+// Known receiver types reject unknown methods, and non-function values reject calls.
+let xs = [1, 2]
+xs.missing_array_method()
+
+let f = (x: int32) -> x
+f.missing_function_method()
+
+fun g(x) { return x.missing_generic_method() }
+g([1, 2])
+
+let x = 1
+let y = x(2)

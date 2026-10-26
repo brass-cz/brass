@@ -5,10 +5,7 @@
 const INT32_MAX = 2147483647
 const INT32_MIN = -2147483648
 const INT64_MAX = 9223372036854775807
-// The literal -9223372036854775808 cannot be written directly (the magnitude
-// alone overflows int64 before the minus applies), so the minimum is built
-// arithmetically.
-const INT64_MIN = -9223372036854775807 - 1
+const INT64_MIN = -9223372036854775808
 
 // The conversions that can fail return `T!` (a `Result`): the `!` propagates the
 // underlying conversion's error, and the success value is wrapped as `Ok`.

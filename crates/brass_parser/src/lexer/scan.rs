@@ -206,10 +206,10 @@ impl<'a> Lexer<'a> {
                 if digits.is_empty() {
                     return Err(self.err(start, "missing digits after radix prefix"));
                 }
-                let value = i64::from_str_radix(&digits, radix)
+                let value = u64::from_str_radix(&digits, radix)
                     .map_err(|_| self.err(start, "integer literal out of range"))?;
                 self.tokens.push(Token::new(
-                    TokenKind::Int(value),
+                    TokenKind::Int(i128::from(value)),
                     Span::new(start, self.pos),
                 ));
                 return Ok(());
@@ -271,10 +271,12 @@ impl<'a> Lexer<'a> {
             }
             TokenKind::Float(value)
         } else {
-            TokenKind::Int(
-                text.parse()
+            // The whole `uint64` range is writable; which type the value
+            // takes is the checker's concern.
+            TokenKind::Int(i128::from(
+                text.parse::<u64>()
                     .map_err(|_| self.err(start, "integer literal out of range"))?,
-            )
+            ))
         };
         self.tokens
             .push(Token::new(kind, Span::new(start, self.pos)));

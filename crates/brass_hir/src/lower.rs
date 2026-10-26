@@ -37,19 +37,20 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
     // are collected (an alias may refine a type declared anywhere).
     let mut alias_decls: Vec<(String, Vec<String>, TypeDecl)> = Vec::new();
 
-    // How many modules define each top-level function/type name. A name defined
-    // in a single module keeps its bare symbol (so all existing bare-name lookups
-    // and codegen symbols are unchanged); a name defined in several modules is
-    // qualified per module so the definitions coexist.
+    // Which modules define each top-level function/type name. A name defined
+    // in a single module keeps its bare symbol; a name defined in several
+    // modules is qualified per module so the definitions coexist, except that
+    // a prelude function keeps the bare symbol (see
+    // `NameOwners::prelude_first_symbol`).
     // Only free functions compete for a bare storage symbol. A method
     // implementation `fun T.m(...)` is keyed by its receiver type, not by `m`, so
     // it neither inflates the free-function name count nor clashes with a free
     // function of the same name.
-    let fn_name_modules = name_module_counts(modules, |item| match item {
+    let fn_name_modules = NameOwners::collect(modules, |item| match item {
         TopLevel::Fun(f) if f.recv.is_none() => Some(&f.name),
         _ => None,
     });
-    let type_name_modules = name_module_counts(modules, |item| match item {
+    let type_name_modules = NameOwners::collect(modules, |item| match item {
         TopLevel::Type(t) => Some(&t.name),
         _ => None,
     });
@@ -114,7 +115,7 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
                     let symbol = if td.name == "Result" {
                         crate::hir::qualify(&td.name, &m.path)
                     } else {
-                        qualified_symbol(&td.name, &m.path, &type_name_modules)
+                        type_name_modules.symbol(&td.name, &m.path)
                     };
                     // Same symbol => same name twice in one module (a genuine
                     // duplicate). A different module yields a different symbol,
@@ -144,7 +145,7 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
                     method_impls.push((Rc::new(f.clone()), m.path.clone()));
                 }
                 TopLevel::Fun(f) => {
-                    let symbol = qualified_symbol(&f.name, &m.path, &fn_name_modules);
+                    let symbol = fn_name_modules.prelude_first_symbol(&f.name, m);
                     // Same symbol => same name defined twice in the same module:
                     // a genuine duplicate. A different module yields a different
                     // symbol, so cross-module same names coexist.
@@ -222,18 +223,11 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
         }
     }
 
-    let types_by_id = types
-        .iter()
-        .map(|(symbol, info)| (info.id, symbol.clone()))
-        .collect();
-    let type_names = types
-        .iter()
-        .flat_map(|(symbol, info)| [symbol.clone(), info.name.clone()])
-        .collect();
     let mut program = Program {
         types,
-        types_by_id,
-        type_names,
+        types_by_id: HashMap::default(),
+        type_names: HashSet::default(),
+        pattern_index: Default::default(),
         functions,
         inits,
         prelude_modules: modules
@@ -250,7 +244,9 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
         type_aliases: HashMap::default(),
         next_infer_var: 0,
     };
+    program.rebuild_resolution_indexes();
     resolve_program_annotations(&mut program, &alias_decls, &mut errors);
+    program.rebuild_resolution_indexes();
 
     (program, errors)
 }
@@ -258,7 +254,9 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
 /// Append concrete reflective-method specializations to an already lowered
 /// program. Existing declarations and module metadata are left untouched; the
 /// generated signature inherits the template's resolved parameters and fixes
-/// only its keyed result.
+/// only its keyed result. A parameter the specialization adds beyond the
+/// template's (its implicit trailing `Location`) is annotated with a
+/// compiler-internal nominal name and resolves to that nominal directly.
 pub fn lower_generated_into(
     program: &mut Program,
     generated: &[GeneratedDecl],
@@ -293,12 +291,27 @@ pub fn lower_generated_into(
         let next_error = Type::Unknown(program.next_infer_var);
         program.next_infer_var += 1;
         let keyed_ret = Type::result(generated.key.clone(), next_error);
+        let added_param_types: Vec<Option<Type>> = method_decl
+            .params
+            .iter()
+            .map(|param| match &param.ty {
+                Some(brass_parser::ast::TypeExpr::Named(name, _)) => {
+                    crate::hir::generated_type_id(name)
+                        .and_then(|id| program.type_by_id(id))
+                        .map(TypeInfo::type_ref)
+                }
+                _ => None,
+            })
+            .collect();
         let info = program
             .types
             .get_mut(&type_symbol)
             .expect("generated receiver was resolved above");
         let make_method = |template: &MethodInfo| {
             let mut signature = CallableSignature::from_method(&method_decl);
+            for (param, added) in signature.params.iter_mut().zip(&added_param_types) {
+                param.resolved_ty = added.clone();
+            }
             for (param, source) in signature.params.iter_mut().zip(&template.signature.params) {
                 param.resolved_ty = source.resolved_ty.clone();
             }
@@ -534,38 +547,80 @@ fn inject_nominal_method(
     }
 }
 
-/// Count, per top-level name (selected by `extract`), how many distinct modules
-/// define it. A name defined in a single module stays bare; one defined in
-/// several is qualified per module so the definitions coexist.
-fn name_module_counts(
-    modules: &[LoadedModule],
-    extract: impl Fn(&TopLevel) -> Option<&String>,
-) -> HashMap<String, usize> {
-    let mut per_name: HashMap<String, HashSet<Vec<String>>> = HashMap::default();
-    for m in modules {
-        for item in &m.ast.items {
-            if let Some(name) = extract(item) {
-                per_name
-                    .entry(name.clone())
-                    .or_default()
-                    .insert(m.path.clone());
-            }
-        }
-    }
-    per_name
-        .into_iter()
-        .map(|(name, mods)| (name, mods.len()))
-        .collect()
+/// The modules defining each top-level name (selected by an extractor), split
+/// into implicit-prelude modules and all others. It decides each definition's
+/// storage symbol: bare when the name is unambiguous program-wide, else the
+/// module-qualified `Name@a/b` form (see [`crate::hir::qualify`]).
+#[derive(Default)]
+struct NameOwners {
+    per_name: HashMap<String, OwnerCount>,
 }
 
-/// The unique storage/codegen symbol for a top-level name: its bare form when
-/// only one module defines that name, or the qualified `Name@a/b` form when
-/// several do (see [`crate::hir::qualify`]).
-fn qualified_symbol(name: &str, module: &[String], counts: &HashMap<String, usize>) -> String {
-    if counts.get(name).copied().unwrap_or(0) > 1 {
-        crate::hir::qualify(name, module)
-    } else {
-        name.to_string()
+#[derive(Clone, Copy, Default)]
+struct OwnerCount {
+    prelude: usize,
+    other: usize,
+}
+
+impl NameOwners {
+    fn collect(modules: &[LoadedModule], extract: impl Fn(&TopLevel) -> Option<&String>) -> Self {
+        let mut per_module: HashMap<&String, HashSet<(&[String], bool)>> = HashMap::default();
+        for m in modules {
+            for name in m.ast.items.iter().filter_map(&extract) {
+                per_module
+                    .entry(name)
+                    .or_default()
+                    .insert((m.path.as_slice(), m.is_prelude));
+            }
+        }
+        let per_name = per_module
+            .into_iter()
+            .map(|(name, owners)| {
+                let prelude = owners.iter().filter(|(_, prelude)| *prelude).count();
+                let count = OwnerCount {
+                    prelude,
+                    other: owners.len() - prelude,
+                };
+                (name.clone(), count)
+            })
+            .collect();
+        Self { per_name }
+    }
+
+    fn count(&self, name: &str) -> OwnerCount {
+        self.per_name.get(name).copied().unwrap_or_default()
+    }
+
+    /// The storage symbol for `name` defined in `module`: bare when only one
+    /// module defines it, qualified when several do.
+    fn symbol(&self, name: &str, module: &[String]) -> String {
+        let count = self.count(name);
+        if count.prelude + count.other > 1 {
+            crate::hir::qualify(name, module)
+        } else {
+            name.to_string()
+        }
+    }
+
+    /// The storage symbol for `name` defined in `module`, keeping the bare
+    /// key for the implicit prelude's definition: a module that declares a
+    /// prelude name shadows it in that module only (its own qualified entry
+    /// wins there), while every other module still resolves the bare name to
+    /// the prelude's definition. The back ends recognise prelude functions
+    /// such as `print`/`println` by that bare symbol, so it must not depend on
+    /// what user modules happen to declare.
+    fn prelude_first_symbol(&self, name: &str, module: &LoadedModule) -> String {
+        let count = self.count(name);
+        let bare = if module.is_prelude {
+            count.prelude == 1
+        } else {
+            count.prelude == 0 && count.other == 1
+        };
+        if bare {
+            name.to_string()
+        } else {
+            crate::hir::qualify(name, &module.path)
+        }
     }
 }
 
@@ -822,11 +877,21 @@ fn resolve_program_annotations(
     let import_origins = program.import_origins.clone();
     let import_renames_snap = program.import_renames.clone();
     let prelude_modules = program.prelude_modules.clone();
-    // Resolve a bare type name to its nominal info from a given module: its own
-    // bare/unique symbol, this module's qualified definition, or the imported
-    // one. Captures only the snapshots above, so it does not borrow
-    // `program` and can run while the type/function tables are mutated.
+    let module_aliases = program.module_aliases.clone();
+    let symbol_aliases = program.symbol_aliases.clone();
+    // The table key a module-qualified marker (`alias.Name`) denotes.
+    let marker_key = |table: &dyn Fn(&str) -> bool, module: &[String], name: &str| {
+        crate::hir::resolve_marker_key(&module_aliases, &symbol_aliases, module, name, table)
+    };
+    // Resolve a type name to its nominal info from a given module: a
+    // module-qualified marker, its own bare/unique symbol, this module's
+    // qualified definition, or the imported one. Captures only the snapshots
+    // above, so it does not borrow `program` and can run while the
+    // type/function tables are mutated.
     let resolve_nominal = |module: &[String], name: &str| -> Option<NominalInfo> {
+        if let Some(key) = marker_key(&|k| nominal_by_symbol.contains_key(k), module, name) {
+            return nominal_by_symbol.get(&key).copied();
+        }
         crate::hir::resolve_qualified(
             &nominal_by_symbol,
             &import_origins,
@@ -866,28 +931,35 @@ fn resolve_program_annotations(
     // the back ends -- a bare sum crossing a function boundary has no
     // construction substitution to fall back on.
     let alias_types = program.type_aliases.clone();
+    // Resolve a `type Alias = ..` name from a given module by the same rule as
+    // a nominal name.
+    let resolve_alias = |module: &[String], name: &str| -> Option<Type> {
+        if let Some(key) = marker_key(&|k| alias_types.contains_key(k), module, name) {
+            return alias_types.get(&key).map(|alias| alias.ty.clone());
+        }
+        crate::hir::resolve_qualified(
+            &alias_types,
+            &import_origins,
+            &import_renames_snap,
+            module,
+            name,
+            |alias| {
+                crate::hir::definition_is_visible(
+                    &import_origins,
+                    &prelude_modules,
+                    module,
+                    name,
+                    &alias.module,
+                )
+            },
+        )
+        .map(|alias| alias.ty.clone())
+    };
     for info in program.types.values_mut() {
         let module = info.module.clone();
+        let owner = info.type_ref();
         let nominal = |name: &str| resolve_nominal(&module, name);
-        let alias = |name: &str| -> Option<Type> {
-            crate::hir::resolve_qualified(
-                &alias_types,
-                &import_origins,
-                &import_renames_snap,
-                &module,
-                name,
-                |alias| {
-                    crate::hir::definition_is_visible(
-                        &import_origins,
-                        &prelude_modules,
-                        &module,
-                        name,
-                        &alias.module,
-                    )
-                },
-            )
-            .map(|alias| alias.ty.clone())
-        };
+        let alias = |name: &str| resolve_alias(&module, name);
         match &mut info.kind {
             // Record fields are resolved by `resolve_type_decls` above; only the
             // method signatures remain.
@@ -902,13 +974,26 @@ fn resolve_program_annotations(
                         true,
                         assign_ret_unknown,
                         errors,
-                    )
+                    );
+                    if method.decl.body.is_some() {
+                        bind_signature_self(&mut method.signature, &owner);
+                    }
                 });
             }
             TypeKind::Sum { variants } => {
                 for variant in variants {
                     variant.fields.iter_mut().for_each(|field| {
-                        resolve_variant_field_annotation(field, &nominal, &alias, &mut next_unknown)
+                        resolve_variant_field_annotation(
+                            field,
+                            &nominal,
+                            &alias,
+                            &mut next_unknown,
+                        );
+                        // `left: Self` in a variant is the sum itself.
+                        field.resolved_ty = field
+                            .resolved_ty
+                            .as_ref()
+                            .map(|t| crate::types::bind_data_self(t, &owner));
                     });
                     variant.methods.values_mut().for_each(|method| {
                         let assign_ret_unknown = method.decl.body.is_none();
@@ -920,7 +1005,10 @@ fn resolve_program_annotations(
                             true,
                             assign_ret_unknown,
                             errors,
-                        )
+                        );
+                        if method.decl.body.is_some() {
+                            bind_signature_self(&mut method.signature, &owner);
+                        }
                     });
                 }
             }
@@ -930,25 +1018,7 @@ fn resolve_program_annotations(
     program.functions.values_mut().for_each(|fun| {
         let module = fun.module.clone();
         let nominal = |name: &str| resolve_nominal(&module, name);
-        let alias = |name: &str| -> Option<Type> {
-            crate::hir::resolve_qualified(
-                &alias_types,
-                &import_origins,
-                &import_renames_snap,
-                &module,
-                name,
-                |alias| {
-                    crate::hir::definition_is_visible(
-                        &import_origins,
-                        &prelude_modules,
-                        &module,
-                        name,
-                        &alias.module,
-                    )
-                },
-            )
-            .map(|alias| alias.ty.clone())
-        };
+        let alias = |name: &str| resolve_alias(&module, name);
         resolve_signature_annotations(
             &mut fun.signature,
             &nominal,
@@ -957,7 +1027,18 @@ fn resolve_program_annotations(
             false,
             false,
             errors,
-        )
+        );
+        // A primitive-receiver method (`fun string.m(self) -> Self`) names its
+        // receiver's type with `Self`, exactly like a declared type's method.
+        let receiver = fun
+            .signature
+            .params
+            .first()
+            .filter(|p| p.name == "self")
+            .and_then(|p| p.resolved_ty.clone());
+        if let Some(receiver) = receiver {
+            bind_signature_self(&mut fun.signature, &receiver);
+        }
     });
 
     propagate_interface_field_constraints(program);
@@ -1036,6 +1117,23 @@ fn resolve_signature_annotations(
         None if assign_ret_unknown => Some(fresh_unknown(next_unknown)),
         None => None,
     };
+}
+
+/// Resolve `Self` in an implemented method's signature to the type the method
+/// belongs to (`owner`), so `fun B.make(x: int32) -> Self` declares exactly
+/// what `-> B` does for every pass that reads the signature. Only method
+/// IMPLEMENTATIONS are bound: a body-less member declared in a type body (a
+/// protocol's `default() -> Self`) keeps the abstract `Self`, which names
+/// whichever concrete type is later checked against the protocol.
+fn bind_signature_self(signature: &mut CallableSignature, owner: &Type) {
+    for param in &mut signature.params {
+        if let Some(ty) = &param.resolved_ty {
+            param.resolved_ty = Some(crate::substitute_self(ty, owner));
+        }
+    }
+    if let Some(ty) = &signature.ret_ty {
+        signature.ret_ty = Some(crate::substitute_self(ty, owner));
+    }
 }
 
 fn fresh_unknown(next_unknown: &mut u32) -> Type {
@@ -1355,6 +1453,39 @@ mod tests {
                 .resolve_function(&["main".into()], "builtin_value")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn a_module_shadows_a_prelude_function_in_that_module_only() {
+        // The prelude's definition keeps the bare symbol even when a user
+        // module declares the same name: the declaring module resolves its
+        // own (qualified) definition, every other module the prelude's.
+        let loaded = vec![
+            LoadedModule {
+                is_prelude: true,
+                path: vec!["core".into(), "io".into()],
+                ast: parse("fun show(v) { return 1 }\n").expect("parse"),
+            },
+            LoadedModule {
+                is_prelude: false,
+                path: vec!["other".into()],
+                ast: parse("fun show(v) { return 2 }\n").expect("parse"),
+            },
+            LoadedModule {
+                is_prelude: false,
+                path: vec!["main".into()],
+                ast: parse("import other\nfun run() { return show(0) }\n").expect("parse"),
+            },
+        ];
+        let (program, errors) = lower(&loaded);
+        assert!(errors.is_empty(), "{errors:?}");
+        let symbol = |module: &str| {
+            program
+                .resolve_fn_symbol(&[module.to_string()], "show")
+                .expect("resolves")
+        };
+        assert_eq!(symbol("main"), "show");
+        assert_eq!(symbol("other"), "show@other");
     }
 
     #[test]

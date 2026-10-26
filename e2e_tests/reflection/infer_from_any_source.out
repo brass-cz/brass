@@ -1,0 +1,9 @@
+42
+4.0
+hi!
+10
+err integer value 300 is out of range for int8 (-128..=127)
+err cannot decode this value as `int64`
+7
+neg
+err cannot decode this value as `string`

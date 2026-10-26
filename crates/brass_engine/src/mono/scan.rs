@@ -89,6 +89,81 @@ pub(super) fn seed_returned_aggregate(
     }
 }
 
+/// Seed the bracket literals a body returns with the declared tuple return
+/// `tuple`, following `Use` copies back from the returned local (`let t =
+/// [a, b]; return t`). A literal whose elements share one type is otherwise
+/// built as an array; only untyped locals of a literal with the tuple's arity
+/// are seeded.
+pub(super) fn seed_returned_tuple(body: &MirBody, tuple: &Type, local_types: &mut [Option<Type>]) {
+    let Type::Tuple(elems) = tuple else {
+        return;
+    };
+    let mut assigned: HashMap<LocalId, &Rvalue> = HashMap::default();
+    for block in &body.blocks {
+        for stmt in &block.stmts {
+            if let MirStmt::Assign(dest, rv) = stmt {
+                assigned.insert(*dest, rv);
+            }
+        }
+    }
+    for block in &body.blocks {
+        let Terminator::Return(Operand::Local(returned)) = &block.term else {
+            continue;
+        };
+        let mut chain = vec![*returned];
+        let mut cur = *returned;
+        while let Some(Rvalue::Use(Operand::Local(src))) = assigned.get(&cur) {
+            if chain.contains(src) {
+                break;
+            }
+            cur = *src;
+            chain.push(cur);
+        }
+        if matches!(assigned.get(&cur), Some(Rvalue::Array(es)) if es.len() == elems.len()) {
+            for local in chain {
+                if local_types[local.index()].is_none() {
+                    local_types[local.index()] = Some(tuple.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Seed the closure values a body returns with the function type `fun` it is
+/// known to return, following `Use` copies back from the returned local (`let
+/// f = (x) -> ..; return f`). Only untyped locals are seeded.
+pub(super) fn seed_returned_closure(body: &MirBody, fun: &Type, local_types: &mut [Option<Type>]) {
+    let mut assigned: HashMap<LocalId, &Rvalue> = HashMap::default();
+    for block in &body.blocks {
+        for stmt in &block.stmts {
+            if let MirStmt::Assign(dest, rv) = stmt {
+                assigned.insert(*dest, rv);
+            }
+        }
+    }
+    for block in &body.blocks {
+        let Terminator::Return(Operand::Local(returned)) = &block.term else {
+            continue;
+        };
+        let mut chain = vec![*returned];
+        let mut cur = *returned;
+        while let Some(Rvalue::Use(Operand::Local(src))) = assigned.get(&cur) {
+            if chain.contains(src) {
+                break;
+            }
+            cur = *src;
+            chain.push(cur);
+        }
+        if matches!(assigned.get(&cur), Some(Rvalue::Closure { .. })) {
+            for local in chain {
+                if local_types[local.index()].is_none() {
+                    local_types[local.index()] = Some(fun.clone());
+                }
+            }
+        }
+    }
+}
+
 /// A field's resolved type from an aggregate's instance substitution (the
 /// checker-resolved record/variant carries each field's concrete type there).
 fn aggregate_field_type(
@@ -160,10 +235,12 @@ pub fn operand_type_of(op: &Operand, local_types: &[Type]) -> Type {
 }
 
 /// The concrete (supported) Ok payload of a `Result` return type fixed by a `T!`
-/// annotation, or `None` if `t` is not such a `Result` or its Ok payload is not
-/// yet concrete. Authoritative for the fallible return's Ok payload.
+/// (or `T!?`) annotation, or `None` if `t` is not such a `Result` or its Ok
+/// payload is not yet concrete. Authoritative for the fallible return's Ok
+/// payload.
 pub(super) fn result_concrete_ok(t: &Type) -> Option<Type> {
     match t {
+        Type::Nullable(inner) => result_concrete_ok(inner),
         Type::Sum(n) if n.id == RESULT_TYPE_ID => n
             .result_payloads()
             .map(|(ok, _)| ok.clone())
@@ -321,21 +398,6 @@ pub(super) fn err_construction_locals(body: &MirBody) -> HashSet<LocalId> {
     err_only
 }
 
-/// Whether a fallible body actually raises an error: an `error(...)` (an `Err`
-/// construction) or an `expr!` propagation (a `result_is_ok` test). A body with
-/// neither never produces an `Err`, so its `Result` error payload is free.
-pub(super) fn body_has_error_source(body: &MirBody) -> bool {
-    body.blocks.iter().any(|b| {
-        b.stmts.iter().any(|s| match s {
-            MirStmt::Assign(_, Rvalue::Variant { ty, variant, .. }) => {
-                ty == "Result" && variant == "Err"
-            }
-            MirStmt::Assign(_, Rvalue::Call(Callee::Builtin(n), _)) => n == "result_is_ok",
-            _ => false,
-        })
-    })
-}
-
 /// Scan a body for indirect (closure) calls, mapping each *defining* closure
 /// local to the argument operands of *every* call site. Used to type direct-call
 /// closures, whose parameter types come from the calls rather than the
@@ -434,31 +496,35 @@ pub(super) fn collect_record_field_closures(
     out
 }
 
+/// One call a local is passed to: `(callee, all call args, its argument
+/// index)`.
+pub(super) type ClosurePass = (String, Vec<Operand>, usize);
+
 /// Scan a body for locals passed as arguments to free-function calls, mapping
-/// each to `(callee, all call args, its argument index)`. Used to type a closure
-/// that is *passed* to a higher-order function (rather than called in place): its
-/// parameter types are recovered from how the callee uses that parameter.
-#[allow(clippy::type_complexity)]
-pub(super) fn collect_closure_passes(
-    body: &MirBody,
-) -> HashMap<LocalId, (String, Vec<Operand>, usize)> {
+/// each to every call it is passed to. Used to type a closure that is
+/// *passed* to a higher-order function (rather than called in place): its
+/// parameter types are recovered from how the callees use that parameter,
+/// and every pass must agree.
+pub(super) fn collect_closure_passes(body: &MirBody) -> HashMap<LocalId, Vec<ClosurePass>> {
     let alias = use_aliases(body);
-    let mut out: HashMap<LocalId, (String, Vec<Operand>, usize)> = HashMap::default();
+    let mut out: HashMap<LocalId, Vec<ClosurePass>> = HashMap::default();
     for block in &body.blocks {
         for stmt in &block.stmts {
             let (MirStmt::Assign(_, rv) | MirStmt::Eval(rv)) = stmt else {
                 continue;
             };
-            // A closure passed to a free function, or to a UFCS method call
-            // (`arr.map(closure)` resolves to the free function `map`); both recover
+            // A closure passed to a free function or a method call; both recover
             // the closure's parameter types from the callee's use of it.
             if let Rvalue::Call(Callee::Free(base) | Callee::Method(base), args) = rv {
                 for (i, a) in args.iter().enumerate() {
                     if let Operand::Local(g) = a {
                         // Resolve back through `Use` copies to the local that
                         // actually holds the `Closure` (`let g = <closure>`).
-                        out.entry(resolve_alias(&alias, *g))
-                            .or_insert_with(|| (base.clone(), args.clone(), i));
+                        out.entry(resolve_alias(&alias, *g)).or_default().push((
+                            base.clone(),
+                            args.clone(),
+                            i,
+                        ));
                     }
                 }
             }
@@ -467,6 +533,9 @@ pub(super) fn collect_closure_passes(
     out
 }
 
+/// Scan a body for the elements pushed or inserted into each array local
+/// (`arr.push(v)`, `arr.insert(i, v)`), keyed by the local that holds the
+/// array once `Use` copies are followed: the evidence that types the element
 /// type of an empty array literal `[]` from how it is later filled.
 pub(super) fn collect_array_pushes(body: &MirBody) -> HashMap<LocalId, Vec<Operand>> {
     let alias = use_aliases(body);
@@ -520,54 +589,6 @@ pub(super) fn resolve_alias(alias: &HashMap<LocalId, LocalId>, mut l: LocalId) -
     l
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use brass_mir::{BasicBlock, BlockId, LocalDecl, TypeRef};
-
-    #[test]
-    fn returned_field_seed_stops_at_a_copy_cycle() {
-        // Reassignments can make the backward Use graph cyclic. Seeding the
-        // returned field must visit each local once rather than loop forever.
-        let body = MirBody {
-            locals: (0..3)
-                .map(|id| LocalDecl {
-                    ty: TypeRef::var(id),
-                    name: None,
-                })
-                .collect(),
-            blocks: vec![BasicBlock {
-                stmts: vec![
-                    MirStmt::Assign(LocalId(1), Rvalue::Use(Operand::Local(LocalId(2)))),
-                    MirStmt::Assign(LocalId(2), Rvalue::Use(Operand::Local(LocalId(1)))),
-                    MirStmt::Assign(
-                        LocalId(0),
-                        Rvalue::Record {
-                            ty: "Box".into(),
-                            fields: vec![("value".into(), Operand::Local(LocalId(1)))],
-                        },
-                    ),
-                ],
-                term: Terminator::Return(Operand::Local(LocalId(0))),
-            }],
-            entry: BlockId(0),
-            params: vec![],
-            declared_fallible: false,
-        };
-        let mut substitution = brass_hir::Substitution::empty();
-        substitution.insert("value", Type::Int(brass_hir::IntKind::I32));
-        let ret = Type::Record(brass_hir::NominalType::with_substitution(
-            99,
-            "Box",
-            substitution,
-        ));
-        let mut locals = vec![None; 3];
-        seed_returned_aggregate(&body, &ret, &Program::empty(), &mut locals);
-        assert_eq!(locals[1], Some(Type::Int(brass_hir::IntKind::I32)));
-        assert_eq!(locals[2], Some(Type::Int(brass_hir::IntKind::I32)));
-    }
-}
-
 /// The source name `local`'s value is bound to, for diagnostics. A value
 /// expression lowers to an unnamed temporary that a bare `Use` copy (or a
 /// top-level `SetGlobal`) then binds to what the programmer wrote (`let xs =
@@ -596,4 +617,54 @@ pub(super) fn binding_name_of(body: &MirBody, local: LocalId) -> Option<String> 
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brass_mir::{BasicBlock, BlockId, LocalDecl, TypeRef};
+
+    #[test]
+    fn returned_field_seed_stops_at_a_copy_cycle() {
+        // Reassignments can make the backward Use graph cyclic. Seeding the
+        // returned field must visit each local once rather than loop forever.
+        let body = MirBody {
+            locals: (0..3)
+                .map(|id| LocalDecl {
+                    ty: TypeRef::var(id),
+                    name: None,
+                    seed_site: None,
+                })
+                .collect(),
+            blocks: vec![BasicBlock {
+                stmts: vec![
+                    MirStmt::Assign(LocalId(1), Rvalue::Use(Operand::Local(LocalId(2)))),
+                    MirStmt::Assign(LocalId(2), Rvalue::Use(Operand::Local(LocalId(1)))),
+                    MirStmt::Assign(
+                        LocalId(0),
+                        Rvalue::Record {
+                            ty: "Box".into(),
+                            fields: vec![("value".into(), Operand::Local(LocalId(1)))],
+                        },
+                    ),
+                ],
+                term: Terminator::Return(Operand::Local(LocalId(0))),
+            }],
+            entry: BlockId(0),
+            params: vec![],
+            declared_fallible: false,
+            declared_nullable_result: false,
+        };
+        let mut substitution = brass_hir::Substitution::empty();
+        substitution.insert("value", Type::Int(brass_hir::IntKind::I32));
+        let ret = Type::Record(brass_hir::NominalType::with_substitution(
+            99,
+            "Box",
+            substitution,
+        ));
+        let mut locals = vec![None; 3];
+        seed_returned_aggregate(&body, &ret, &Program::empty(), &mut locals);
+        assert_eq!(locals[1], Some(Type::Int(brass_hir::IntKind::I32)));
+        assert_eq!(locals[2], Some(Type::Int(brass_hir::IntKind::I32)));
+    }
 }

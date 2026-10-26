@@ -1,0 +1,4 @@
+has no method `missing_array_method`
+has no method `missing_function_method`
+has no method `missing_generic_method`
+cannot call a value of type `int32`

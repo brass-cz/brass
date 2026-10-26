@@ -1,0 +1,17 @@
+// @backends: all
+// A closure that pushes into a global list gives the list the element type it
+// was applied at.
+let store = []
+
+fun add(x) {
+    store.push(x)
+}
+
+fun main() {
+    let f = (y) -> add(y)
+    f(5)
+    f(6)
+    let n: int32 = store[1]
+    println(n)
+    println(store)
+}

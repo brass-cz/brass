@@ -1,0 +1,22 @@
+// Library for the qualified_types cases: a sum and a record with an alias of
+// each (`Speed`, `Spot`), a refinement alias (`Box64`) and two non-nominal
+// aliases (`Num`, `Pts`), named from the importers qualified (`kinds.Pt`) or
+// imported by name.
+type Mode = fast | slow
+type Pt = { x: int32, y: int32 }
+type Num = int64
+type Pts = Pt[]
+
+fun pick() -> Mode {
+    return Mode.fast
+}
+
+type Speed = Mode
+
+type Box = { item }
+type Box64 = Box { item: int64 }
+type Spot = Pt
+
+fun Pt.sum(self) -> int32 {
+    return self.x + self.y
+}

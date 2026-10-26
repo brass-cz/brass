@@ -1,0 +1,64 @@
+// @backends: all
+// Assigning a possibly-null value to a narrowed variable is allowed -- it
+// stores into the declared `T?` -- and ends the narrowing from that point on:
+// on the straight-line path, after a branch that may have assigned it, and,
+// for a narrowing made before a loop, on every iteration of a loop that
+// assigns it on a path reaching the next iteration (falling off the end of
+// the body or `continue`). Each unchecked read below is rejected.
+type Node = {
+    v: int32
+    next: Node?
+}
+fun pick(b: bool) -> string? {
+    if b { return "hello" }
+    return null
+}
+fun straight() {
+    let x = pick(true)
+    if !x { return }
+    x = pick(false)
+    println(x.len())
+}
+fun after_branch(c: bool) {
+    let x = pick(true)
+    if !x { return }
+    if c { x = null }
+    println(x.len())
+}
+fun across_iterations() {
+    let x = pick(true)
+    if !x { return }
+    let i = 0
+    while i < 3 {
+        println(x.len())
+        x = pick(false)
+        i = i + 1
+    }
+}
+fun before_continue() {
+    let x = pick(true)
+    if !x { return }
+    let i = 0
+    while i < 3 {
+        i = i + 1
+        println(x.len())
+        if i == 1 {
+            x = null
+            continue
+        }
+    }
+}
+fun linked() {
+    let cur: Node? = Node { v: 1, next: null }
+    if cur {
+        cur = cur.next
+        println(cur.v)
+    }
+}
+fun main() {
+    straight()
+    after_branch(true)
+    across_iterations()
+    before_continue()
+    linked()
+}

@@ -41,13 +41,24 @@ println(inc(41))        // 42
 println(shout("hey"))   // HEY!
 ```
 
+A closure literal bound by `let` or `const` with an unannotated parameter is
+generic, like an unannotated function: each use instantiates it afresh. Any
+other closure, such as one passed directly as an argument, is fixed by its
+first call (see [Closures](/references/types/#closures)):
+
+```brass
+let show = (x) -> "<{x}>"
+println(show(1))     // <1>
+println(show("a"))   // <a>
+```
+
 Closures capture their environment **by reference**, so captured variables stay
 shared and mutable across calls:
 
 ```brass
 fun make_accumulator(initial) {
     let total = initial
-    return (amount: int32) -> {
+    return (amount: int64) -> {
         total += amount
         return total
     }

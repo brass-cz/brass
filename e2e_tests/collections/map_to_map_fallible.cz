@@ -1,13 +1,8 @@
-// An UNANNOTATED, FALLIBLE function that reads one map and builds a DIFFERENT one:
-// the input's value type (a record) is not the output's (a string).
-//
-// A propagating body's return is assembled by the light pass -- only it builds the
-// `Result` wrapping -- but its Ok PAYLOAD is the full check's, and the two are tied
-// together so the map the body fills does not reach the back end with its element
-// types unset. Reconciling the body's returns for that payload has to DROP the
-// `error(..)` ones: their payload is a variable no path produces, and left in they
-// win, the payload stays open, and the caller's `out.pairs()` monomorphizes at a
-// map whose value type is not the one the body stores (a segfault, not a refusal).
+// An UNANNOTATED, FALLIBLE function that reads one map and builds a DIFFERENT
+// one: the input's value type (a record) is not the output's (a string). The
+// `return error(..)` path produces no Ok value, so the Ok payload is the map
+// the body fills, at the `string` values it stores, and the caller reads
+// them back through `!` and `pairs()`.
 
 type Dep = {
     name: string

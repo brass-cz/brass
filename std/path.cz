@@ -36,6 +36,7 @@ import libpath.{
     path_is_dir,
     path_is_file,
     path_is_symlink,
+    path_modified_age,
     path_read_dir,
     path_read_link,
     path_temp_dir,
@@ -405,4 +406,12 @@ fun Path.entries(self) -> Path[]! {
 /** The size of the file at this path, in bytes. */
 fun Path.file_size(self) -> int64! {
     return path_file_size(self.to_string())!
+}
+
+/**
+ * Whole seconds since this entry was modified. Does not follow a final symlink.
+ * Future timestamps have age zero; missing entries and metadata errors fail.
+ */
+fun Path.modified_age(self) -> int64! {
+    return path_modified_age(self.to_string())!
 }

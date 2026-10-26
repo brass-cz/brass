@@ -1,0 +1,47 @@
+// @backends: all
+// `error(..)` is one generic prelude function, instantiated per payload type.
+// The lazy JIT checks a body it is asked for at the first instance it needs;
+// its constructions (the `Error` record `error` builds) must still be typed
+// per instance, so an `int32` payload raised in one function and a `string`
+// payload raised in another (or in `main`) each get their own `Error`, on
+// the lazy run exactly as on `--eager` and the REPL.
+fun checked(n: int32) -> int32! {
+    if n < 0 {
+        return error(n)
+    }
+    return n
+}
+
+fun named(s: string) -> int32! {
+    if s == "" {
+        return error("empty")
+    }
+    return 1
+}
+
+fun inferred(n: int32) {
+    if n < 0 {
+        return error(n * 10)
+    }
+    return n * 2
+}
+
+fun main() {
+    let message = error("unused")
+    match checked(-3) {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.value + 1}"),
+    }
+    match named("") {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.value}"),
+    }
+    match inferred(-4) {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.value}"),
+    }
+    match checked(5) {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.value}"),
+    }
+}

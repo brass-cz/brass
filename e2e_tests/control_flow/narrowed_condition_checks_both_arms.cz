@@ -1,0 +1,19 @@
+// @backends: all
+// Testing a variable that is already narrowed is an ordinary null test of its
+// declared `T?`, not a test its type alone decides, so it is not folded
+// statically: both arms are kept and checked, and the unchecked nullable use
+// in the `else` arm is rejected.
+fun pick(b: bool) -> string? {
+    if b { return "hello" }
+    return null
+}
+fun main() {
+    let x = pick(true)
+    if !x { return }
+    if x {
+        println("a")
+    } else {
+        let y = pick(false)
+        println(y.len())
+    }
+}

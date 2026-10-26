@@ -63,6 +63,14 @@ pub struct BasicBlock {
 pub struct LocalDecl {
     pub ty: TypeRef,
     pub name: Option<String>,
+    /// For the result local of an expression the checker records an
+    /// aggregate seed for (a call, a record or array literal), that
+    /// expression's source span. `ty` carries the seed every instance of the
+    /// body shares (when there is one); a span whose instances disagree has
+    /// per-instance seeds instead ([`crate::MirProgram::instance_seeds`]),
+    /// which monomorphization looks up by this span for the instance it is
+    /// typing.
+    pub seed_site: Option<brass_parser::Span>,
 }
 
 /// A lowered callable body: a CFG over a flat local table.
@@ -79,6 +87,11 @@ pub struct MirBody {
     /// per-instance fallibility fold must never narrow it away (a `-> infer!`
     /// body may only FORWARD another callable's Result).
     pub declared_fallible: bool,
+    /// Whether the source return annotation was `T!?`: the declared
+    /// `Result` carries an outer nullable layer, so every instance returns
+    /// `Result<T, E>?` and a bare `return null` is that outer null, never an
+    /// Ok payload.
+    pub declared_nullable_result: bool,
 }
 
 impl MirBody {

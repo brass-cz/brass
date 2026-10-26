@@ -1,0 +1,34 @@
+// @backends: all
+// A type's own declared static `from` wins over the builtin structural
+// conversion of the same name: `Celsius.from(21.5)` calls the declared method
+// (a plain `Celsius`, not the structural `Celsius?`), while a record that
+// declares no `from` keeps the structural `T.from(v)`. A reflective decoder's
+// `infer.from(x)` at such a key converts through the declared `from` too.
+type Celsius = { deg: float64 }
+
+fun Celsius.from(v: float64) -> Celsius {
+    return Celsius { deg: v }
+}
+
+type Point = { x: int64, y: int64 }
+
+type Json =
+    | JNum { value: float64 }
+    | JText { value: string }
+
+fun Json.into(self) -> infer! {
+    match self {
+        Json.JNum { value } => { return infer.from(value) }
+        Json.JText { value } => { return error("not a number: {value}") }
+    }
+}
+
+fun main() {
+    let c = Celsius.from(21.5)
+    println(c.deg)
+    if let p = Point.from({ x: 1, y: 2 }) {
+        println(p.x + p.y)
+    }
+    let decoded: Celsius = Json.JNum { value: 36.6 }.into()!
+    println(decoded.deg)
+}

@@ -1,0 +1,45 @@
+// @backends: all
+// A record or array pattern on a nullable subject matches only a present
+// value: an absent subject takes the else / fallback arm, and a nested
+// pattern on a nullable field tests that field's presence the same way.
+
+type P = { x: int32, next: P? }
+
+fun find(n: int32) -> P? {
+    if n > 0 {
+        return P { x: n, next: P { x: n + 1, next: null } }
+    }
+    return null
+}
+
+fun nums(n: int32) -> int32[]? {
+    if n > 0 {
+        return [n, n * 2]
+    }
+    return null
+}
+
+fun describe(p: P?) -> string {
+    return match p {
+        P { x, next: P { x: y } } => "pair {x} {y}",
+        P { x } => "single {x}",
+        _ => "none",
+    }
+}
+
+fun main() {
+    for n in [0, 3] {
+        if let P { x } = find(n) {
+            println("record {x}")
+        } else {
+            println("record absent")
+        }
+        if let [a, b] = nums(n) {
+            println("array {a} {b}")
+        } else {
+            println("array absent")
+        }
+        println(describe(find(n)))
+    }
+    println(describe(P { x: 9, next: null }))
+}

@@ -1,11 +1,8 @@
-// A branch that LEAVES -- `return`, `break`, `continue` -- produces no value, so
-// its type is `Never`, which a branch join absorbs. It must not constrain the
-// other branch.
-//
-// The `infer` checker typed such a block `void` (only the HM checker gave it
-// `Never`), so an arm that bailed out clashed with the arm that produced the
-// value: "`match` branches have incompatible types `int32` and `void`". Every
-// form below was rejected for that reason alone.
+// A branch that LEAVES -- `return`, `break`, `continue` -- produces no value:
+// its type is `never`, which a branch join absorbs, so it does not constrain
+// the other branch. Typing such an arm `void` would make it clash with the
+// arm that produces the value ("`match` branches have incompatible types
+// `int32` and `void`"). The functions below exercise each form.
 
 fun mk(bad: bool) -> int32! {
     if bad {

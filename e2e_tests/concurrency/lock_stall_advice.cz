@@ -1,0 +1,12 @@
+// Waiting for a task under a lock it needs reports suspected deadlock and actionable advice.
+type Cell = { n: int32 }
+fun start(a: ref(mut(Cell))) {
+    spawn(() -> { with(a, (y) -> { y.n = 1 }) })
+}
+fun main() {
+    let a = Cell { n: 0 }
+    with(a, (held) -> {
+        start(a)
+        sync()
+    })
+}

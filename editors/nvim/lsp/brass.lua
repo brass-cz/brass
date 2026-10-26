@@ -5,7 +5,7 @@
 --
 -- Override any field from your own config without editing this file, e.g. to
 -- point `cmd` at a locally built binary:
---   vim.lsp.config("Brass", { cmd = { "/path/to/target/debug/czls" } })
+--   vim.lsp.config("brass", { cmd = { "/path/to/target/debug/czls" } })
 
 return {
   cmd = { "czpm", "lsp" },

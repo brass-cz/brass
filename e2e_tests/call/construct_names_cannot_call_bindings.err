@@ -1,0 +1,11 @@
+construct_names_cannot_call_bindings.cz:6:5: error: `error(..)` means the language construct; rename the function binding `error` to call it
+construct_names_cannot_call_bindings.cz:10:5: error: `error(..)` means the language construct; rename the function binding `error` to call it
+construct_names_cannot_call_bindings.cz:15:14: error: `fields(..)` means the language construct; rename the function binding `fields` to call it
+construct_names_cannot_call_bindings.cz:19:14: error: `fields(..)` means the language construct; rename the function binding `fields` to call it
+construct_names_cannot_call_bindings.cz:24:5: error: `spawn(..)` means the language construct; rename the function binding `spawn` to call it
+construct_names_cannot_call_bindings.cz:28:5: error: `spawn(..)` means the language construct; rename the function binding `spawn` to call it
+construct_names_cannot_call_bindings.cz:33:5: error: `typeof(..)` means the language construct; rename the function binding `typeof` to call it
+construct_names_cannot_call_bindings.cz:37:5: error: `typeof(..)` means the language construct; rename the function binding `typeof` to call it
+construct_names_cannot_call_bindings.cz:42:5: error: `with(..)` means the language construct; rename the function binding `with` to call it
+construct_names_cannot_call_bindings.cz:46:5: error: `with(..)` means the language construct; rename the function binding `with` to call it
+construct_names_cannot_call_bindings.cz:51:13: error: `typeof(..)` means the language construct; rename the function binding `typeof` to call it

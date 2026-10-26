@@ -1,1 +1,0 @@
-error: function `f` may finish without returning a value of type `int32`

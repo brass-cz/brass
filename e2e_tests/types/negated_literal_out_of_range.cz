@@ -1,0 +1,6 @@
+// A negated literal whose value no integer type holds is rejected at the
+// literal: -18446744073709551615 is below INT64_MIN and not unsigned.
+fun main() {
+    let x = -18446744073709551615
+    println(x)
+}

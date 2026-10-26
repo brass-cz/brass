@@ -4,6 +4,7 @@
 
 use crate::alloc::{pp_str_const, pp_typed_alloc, typed_result, typed_result_err, typed_str};
 use crate::rt::*;
+use brass_utils::builtin_errors;
 
 // ----- small helpers -----
 
@@ -76,21 +77,16 @@ fn int_tag_name(t: i64) -> &'static str {
 /// `tag` and rejecting non-finite inputs.
 fn float_to_integral(f: f64, tag: i64) -> Result<i128, String> {
     if !f.is_finite() {
-        return Err(format!(
-            "cannot convert non-finite float `{}` to {}",
-            brass_utils::float_str(f),
-            int_tag_name(tag)
-        ));
+        return Err(builtin_errors::non_finite_to_int(f, int_tag_name(tag)));
     }
     let truncated = f.trunc();
     let (min, max) = int_range(tag).ok_or_else(|| format!("unknown integer tag `{tag}`"))?;
     if truncated < min as f64 || truncated > max as f64 {
-        return Err(format!(
-            "float value {} is out of range for {} ({}..={})",
-            brass_utils::float_str(f),
+        return Err(builtin_errors::float_out_of_range(
+            f,
             int_tag_name(tag),
             min,
-            max
+            max,
         ));
     }
     Ok(truncated as i128)
@@ -103,11 +99,11 @@ fn checked_int_i64(n: i128, tag: i64) -> Result<i64, String> {
     if (min..=max).contains(&n) {
         Ok(mask_int(n as i64, tag))
     } else {
-        Err(format!(
-            "integer value {n} is out of range for {} ({}..={})",
+        Err(builtin_errors::int_out_of_range(
+            n,
             int_tag_name(tag),
             min,
-            max
+            max,
         ))
     }
 }
@@ -129,17 +125,22 @@ unsafe fn write_int_at(p: *mut u8, val: i64, tag: i64) {
 
 /// Typed `Type.from(x)` for an integer target: convert an int (`is_float == 0`,
 /// value in `xi`) or float (`xf`) to `tag` with a range check, returning a typed
-/// `Result<intN, string>` (no boxed Value).
+/// `Result<intN, string>`. `source_signed` describes the integer carrier: an
+/// unsigned source is read zero-extended, so a `uint64` above `INT64_MAX` keeps
+/// its value instead of reading as negative.
 pub extern "C-unwind" fn pp_conv_int_from(
     xi: i64,
     is_float: i64,
     xf: f64,
+    source_signed: i64,
     tag: i64,
 ) -> *mut Header {
     let n: Result<i128, String> = if is_float != 0 {
         float_to_integral(xf, tag)
-    } else {
+    } else if source_signed != 0 {
         Ok(xi as i128)
+    } else {
+        Ok((xi as u64) as i128)
     };
     unsafe {
         match n.and_then(|n| checked_int_i64(n, tag)) {
@@ -161,7 +162,7 @@ pub unsafe extern "C-unwind" fn pp_conv_int_parse(s: *mut Header, tag: i64) -> *
                 Ok(masked) => typed_result(true, |p| write_int_at(p, masked, tag)),
                 Err(e) => typed_result_err(&e),
             },
-            Err(_) => typed_result_err(&format!("cannot parse `{text}` as integer")),
+            Err(_) => typed_result_err(&builtin_errors::cannot_parse(text, "integer")),
         }
     }
 }
@@ -239,7 +240,7 @@ pub unsafe extern "C-unwind" fn pp_conv_float_parse(s: *mut Header, tag: i64) ->
             // whose low half would be read as a garbage f32.
             Ok(f) if tag == TAG_F32 => typed_result(true, |p| *(p as *mut f32) = f as f32),
             Ok(f) => typed_result(true, |p| *(p as *mut f64) = f),
-            Err(_) => typed_result_err(&format!("cannot parse `{text}` as float")),
+            Err(_) => typed_result_err(&builtin_errors::cannot_parse(text, "float")),
         }
     }
 }
@@ -295,7 +296,7 @@ pub unsafe extern "C-unwind" fn pp_str_from_bytes(arr: *mut Header) -> *mut Head
                 let sp = pp_str_const(s.as_ptr(), s.len() as i64);
                 typed_result(true, |p| *(p as *mut *mut Header) = sp)
             }
-            Err(_) => typed_result_err("invalid UTF-8"),
+            Err(_) => typed_result_err(builtin_errors::INVALID_UTF8),
         }
     }
 }

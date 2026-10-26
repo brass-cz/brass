@@ -1,7 +1,7 @@
 // A pinned payload slot of a sum instance is storage: same-id flow inserts no
-// rebuild, so `P<Pa.v=IC>` must not pass where `P<Pa.v=IP>` is required even
-// though IC declares IP as its parent (reading the child's layout through the
-// parent's would corrupt the unboxed representation).
+// rebuild, so `P<Pa.v=IC>` is rejected where `P<Pa.v=IP>` is required even
+// though IC declares IP as its parent -- the payload would keep the child's
+// layout, not the parent's.
 type IP =
     | Ia {
         n: int32

@@ -1,0 +1,25 @@
+// @backends: all
+// An instance method named from coexists with structural T.from conversion,
+// including alias and typeof receivers; only a static from replaces it.
+type Point = { x: int32 }
+fun Point.from(self, n: int32) -> int32 { return self.x + n }
+type P = Point
+
+type Static = { x: int32 }
+fun Static.from(n: int32) -> string { return "static {n}" }
+
+fun main() {
+    let value = Point.from({ x: 3 })
+    println(typeof(value))
+    if let p = value {
+        println(p.x)
+        println(p.from(4))
+        if let q = typeof(p).from({ x: 5 }) {
+            println(q.from(1))
+        }
+    }
+    if let p = P.from({ x: 8 }) { println(p.from(1)) }
+    println(Point.from({ y: 1 }) == null)
+    println(Static.from(2))
+    println(typeof(Static.from(2)))
+}

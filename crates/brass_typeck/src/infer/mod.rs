@@ -1,12 +1,33 @@
-//! Local static type checks.
+//! The authoritative type checker: call-site re-elaborating inference.
 //!
-//! This pass intentionally remains conservative around genuinely polymorphic or
-//! structurally inferred code, but every type that is explicit in source is
-//! enforced before execution. It checks annotations, constructor fields,
-//! annotated function/method calls, nullable use-before-check, and operators.
-//! Unknown values are represented with unification variables so uncertain code
-//! can still be deferred to the runtime without accepting contradictions against
-//! explicit types.
+//! Every function, method, closure and module initializer body is checked
+//! with unification variables standing for what the source leaves open. A
+//! call re-elaborates the callee's body at the call's argument types
+//! (memoized per instantiation), so a generic body is checked once per
+//! distinct instantiation -- the same instances monomorphization later
+//! builds -- and the call's result is the return that instantiation
+//! produces. (Under the lazy profile a call to a fully annotated free function
+//! is typed from its signature instead.) Before the bodies, the pre-pass
+//! (`precompute` and the error-free light pass) discovers unannotated
+//! returns, record schemes and global bindings the bodies start from.
+//!
+//! Besides the diagnostics, the pass records what MIR lowering and
+//! monomorphization need and cannot re-derive from types alone: the typed
+//! expression sidecar and the channels of `crate::Analysis` (aggregate seeds,
+//! views, keyed reflective calls, type tests, ...), keyed by span and, where
+//! the instances of a generic body need different answers, by instance. Under
+//! [`crate::analyze_streaming`] the bodies are checked in execution-first
+//! order and those channels are flushed per body (see `crate::stream`).
+//!
+//! Map of the submodules: `driver` runs the pass (body order, streaming, the
+//! per-body drivers); `precompute` (with its return-table fixpoint) and the
+//! `light` walk are the pre-pass; `instantiate` re-elaborates a callee at a
+//! call site, `journal` memoizes and replays those elaborations, and
+//! `instances` attributes their observations to callable instances; `returns`
+//! joins the values that leave a body; `context` loads a context seed and
+//! `delta` builds the per-body stream deltas. The other modules type the
+//! language's constructs (expressions, statements, calls, patterns, literals,
+//! narrowing, closures, conversions, ...).
 
 use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::ops::{Deref, DerefMut};
@@ -15,11 +36,11 @@ use std::rc::Rc;
 use brass_hir::{
     CallableSignature, Constness, FloatKind, FunInfo, IntKind, ModuleInit, NominalType, ParamInfo,
     Program, SchemeMethod, Substitution, Type, TypeInfo, TypeKind, TypeScheme, TypedProgram,
-    int_literal_kind, peel_modes,
+    peel_modes,
 };
 use brass_parser::Span;
 use brass_parser::ast::*;
-use brass_typesys::{common_numeric_type, numeric_flows_into};
+use brass_typesys::numeric_flows_into;
 
 use crate::TypeError;
 use crate::constraint::ShapeConstraint;
@@ -29,55 +50,114 @@ use crate::stream::{self, StreamCtl};
 use crate::unify::Subst;
 
 mod assign;
+mod binding_joins;
 mod builtins;
 mod call;
+mod channel_changes;
+mod cleanup;
+mod closure_applications;
+mod closure_check;
+mod closure_light;
+mod closure_memo;
+mod closure_schemes;
+mod co_replay;
+mod completion_order;
+mod const_calls;
+mod context;
+mod conversion;
+mod delta;
+mod driver;
 mod expr;
-pub(crate) mod helpers;
+mod function_values;
+mod helpers;
+mod instances;
 mod instantiate;
 mod journal;
 mod light;
 mod literals;
 mod lookup;
+mod narrowing;
+mod numeric_calls;
 mod patterns;
 mod precompute;
+pub(crate) mod publication;
 mod resolve;
+mod returns;
+mod stats;
+mod stmt;
+mod storage;
+
+pub(crate) use cleanup::InferenceCleanup;
 
 use journal::{
-    CanonVar, ElaborationJournalEntry, ElaborationJournalFrame, ElaborationMemoContext,
-    ElaborationMemoEntry, ElaborationMemoKey,
+    ElaborationJournalEntry, ElaborationJournalFrame, ElaborationMemoContext, ElaborationMemoEntry,
+    ElaborationMemoKey,
 };
+use narrowing::{ArmExit, is_null_test};
 
 use assign::{common_nullable_type, integer_literal_fits};
 use builtins::primitive_static_return;
 use helpers::{
     Pipe, apply_method_substitution, apply_nominal_substitution, assign_binop,
-    block_always_returns, closure_write_targets_block, collect_closure_writes_stmt, const_index,
-    contains_typeof, expr_always_returns, expr_may_branch, field_substitution_key, int_fits_kind,
-    is_concrete_primitive, is_concrete_type, is_maybe_indexable, is_null_comparison,
-    is_result_return_type, is_runtime_builtin_value, is_self_expr, literal_pattern_matches,
-    literal_pattern_type, method_param_substitution_key, method_return_substitution_key,
-    next_unknown_after_program, numeric_literal_repr, param_expected_type, param_is_location,
-    peel_ref_mut, peel_value_wrappers, required_arg_count, same_nominal_instance, stmt_may_branch,
-    substitute_self,
+    block_always_returns, block_literal, const_index, contains_typeof, expr_always_returns,
+    expr_may_branch, field_substitution_key, int_literal_type, is_concrete_primitive,
+    is_concrete_type, is_maybe_indexable, is_null_comparison, is_result_return_type,
+    is_runtime_builtin_value, is_self_expr, literal_pattern_matches, literal_pattern_type,
+    method_param_substitution_key, method_return_substitution_key, next_unknown_after_program,
+    numeric_literal_repr, overlay_nominal_substitution, param_expected_type, param_is_location,
+    peel_ref_mut, peel_value_wrappers, presence_binding_truth, required_arg_count,
+    same_nominal_instance, stmt_may_branch, substitute_self, value_literal,
 };
+use storage::FlowSite;
 
+pub use context::ContextTables;
+use delta::flush_delta;
+pub(crate) use driver::analyze_inner;
+pub use driver::{analyze, analyze_generated, analyze_with, check};
+
+/// One lexical frame: its value bindings (shared copy-on-write, so cloning a
+/// scope stack for a branch is cheap), plus the nullable bindings proven
+/// non-null for the region the frame covers (see [`narrowing`]).
 #[derive(Clone, Default)]
-struct Scope(Rc<HashMap<String, Type>>);
+struct Scope {
+    numeric: binding_joins::numeric::Origins,
+    values: Rc<HashMap<String, Type>>,
+    narrowings: Vec<narrowing::Narrowing>,
+    /// Field paths (`p.n`) a condition of this frame's region tested for
+    /// presence. A field is never narrowed; these only explain an unchecked
+    /// read of a tested field (see `Checker::report_nullable_use`).
+    tested_fields: Vec<String>,
+}
 
 impl Scope {
     fn new(values: HashMap<String, Type>) -> Self {
-        Self(Rc::new(values))
+        Self::shared(Rc::new(values))
     }
 
     fn shared(values: Rc<HashMap<String, Type>>) -> Self {
-        Self(values)
+        Self {
+            values,
+            numeric: Default::default(),
+            narrowings: Vec::new(),
+            tested_fields: Vec::new(),
+        }
     }
 
     fn into_map(self) -> HashMap<String, Type> {
-        match Rc::try_unwrap(self.0) {
+        match Rc::try_unwrap(self.values) {
             Ok(values) => values,
             Err(values) => values.as_ref().clone(),
         }
+    }
+
+    /// Bind `name` in this frame. The new binding is not narrowed, so a
+    /// narrowing this frame recorded for an earlier same-named binding ends.
+    fn insert(&mut self, name: String, ty: Type) -> Option<Type> {
+        self.numeric.remove(&name);
+        self.narrowings.retain(|n| n.name() != name);
+        self.tested_fields
+            .retain(|path| path.split('.').next() != Some(name.as_str()));
+        Rc::make_mut(&mut self.values).insert(name, ty)
     }
 }
 
@@ -85,28 +165,22 @@ impl Deref for Scope {
     type Target = HashMap<String, Type>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.values
     }
 }
 
 impl DerefMut for Scope {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        Rc::make_mut(&mut self.0)
+        Rc::make_mut(&mut self.values)
     }
 }
 
 type ScopeStack = Vec<Scope>;
 
-/// One exact lexical binding whose nullable type was narrowed for control flow.
-/// The frame index keeps invalidation aimed at that binding when an inner scope
-/// shadows the same source name before a call.
-#[derive(Clone)]
-struct NarrowedBinding {
-    name: String,
-    frame: usize,
-    original: Type,
-}
-
+/// A method call the call checker resolved, with everything
+/// `Checker::instantiate_method_call` needs to elaborate the method's body
+/// at it: the method, its receiver and argument types, and the returns to
+/// fall back on.
 struct MethodCall<'a> {
     owner: &'a str,
     self_type: &'a str,
@@ -129,6 +203,9 @@ struct MethodCall<'a> {
     scheme_params: &'a [Option<Type>],
 }
 
+/// A method a lookup resolved (see `Checker::method_for_qualifier`): the
+/// qualifier whose table holds it (a record's storage symbol, or
+/// `Sum.Variant`), the receiver type's symbol, its signature and declaration.
 #[derive(Clone)]
 struct ResolvedMethod {
     qualifier: String,
@@ -138,24 +215,38 @@ struct ResolvedMethod {
 }
 
 /// Propagation signals the light pass collects while walking a body: the
-/// `Err` payload types of `error(...)` / Result-operand `expr!` sites, and
-/// the spans of nullable-operand `expr!` sites (whose null case returns null,
-/// making the enclosing callable's return type nullable).
-#[derive(Default)]
+/// `Err` payload types of its error sites (`error(...)`, a Result-operand
+/// `expr!`, a returned `Result` with no Ok value), and the spans of
+/// nullable-operand `expr!` sites (whose null case returns null, making the
+/// enclosing callable's return type nullable).
+#[derive(Clone, Default)]
 pub(super) struct LightProps {
     pub(super) errors: Vec<(Type, Span)>,
     pub(super) nulls: Vec<Span>,
+    /// Whether a `!` propagates an operand whose type the walk left open:
+    /// such a body may be fallible in its instances even though no error site
+    /// was typed here.
+    pub(super) open_errors: bool,
+    /// Whether a member-presence test's subject is a binding whose type the
+    /// walk left open: each instance decides the test (and so which arm's
+    /// returns and error sites count), so the open walk must not judge the
+    /// arms' disagreement.
+    pub(super) open_static_test: bool,
 }
 
+/// What the `return`s of the body being checked are checked against: an
+/// inferred return, or the declared type.
 #[derive(Clone)]
 enum ReturnContext {
     Inferred,
     Explicit(Type),
 }
 
-/// The pieces of a callable whose first parameter is filled by a receiver,
-/// cloned out of a `FunInfo` so the call can be checked while the checker is
-/// mutably borrowed. Shared by UFCS and primitive-method dispatch.
+/// A stdlib method on a primitive or array receiver
+/// (`fun string.m(self, ..)`, lowered as a free function whose first
+/// parameter is the receiver; see `Program::primitive_methods`), cloned out
+/// of its `FunInfo` so the call can be checked while the checker is mutably
+/// borrowed (see `Checker::check_receiver_call`).
 struct ReceiverCall {
     symbol: String,
     module: Vec<String>,
@@ -176,226 +267,27 @@ impl ReceiverCall {
     }
 }
 
-pub fn check(program: &Program) -> Vec<TypeError> {
-    analyze(program).errors
-}
-
-/// The cross-module tables a CONTEXT-ONLY analysis (every module except the
-/// entry) leaves behind, fully resolved against its own solver. Applied to a
-/// later run as a seed, they let that run check ONLY the entry module: the
-/// context's schemes, inferred returns, and globals are read from here instead
-/// of being re-derived, which is where a library-heavy program spends almost
-/// all of its inference time.
-///
-/// The tables are span-free by construction (keyed by symbol or
-/// module path), so they survive the entry file changing size. Inference
-/// VARIABLE ids are not portable -- a consuming run mints its own -- so
-/// [`ContextTables::remapped`] renumbers every open variable into the consumer's
-/// namespace first, one map across all tables so linked entries stay linked.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ContextTables {
-    pub schemes: HashMap<String, TypeScheme>,
-    pub function_returns: HashMap<String, Type>,
-    pub method_returns: HashMap<(String, String), Type>,
-    pub method_return_props: HashSet<(String, String)>,
-    pub co_method_returns: HashMap<(String, String), Type>,
-    pub global_defs: HashMap<Vec<String>, HashMap<String, Type>>,
-    /// One past the highest variable id the tables mention.
-    pub next_var: u32,
-    /// Every bare top-level name the context defines. An entry defining one of
-    /// these would QUALIFY the context's symbols in the combined program,
-    /// detaching every table key -- the consumer must bail to an unseeded run.
-    pub bare_names: HashSet<String>,
-    /// The module paths these tables cover. `None` means the whole context
-    /// (every module but the entry) -- the full-seed case. `Some` marks a
-    /// PARTIAL seed (see [`ContextTables::retain_modules`]): only the listed
-    /// modules skip their passes; the rest re-analyze against the seed.
-    pub covered: Option<HashSet<Vec<String>>>,
-    /// The program-wide storage symbols and nominal IDs these tables were
-    /// built against. Both can change when an otherwise unrelated module
-    /// adds a declaration, so partial reuse requires an exact match.
-    program_identity: ContextProgramIdentity,
-}
-
-/// The parts of HIR identity embedded in context table keys and values.
-#[derive(Clone, Debug, Default, PartialEq)]
-struct ContextProgramIdentity {
-    functions: std::collections::BTreeMap<String, Vec<String>>,
-    types: std::collections::BTreeMap<String, (Vec<String>, i32)>,
-}
-
-impl ContextProgramIdentity {
-    fn of(program: &Program) -> Self {
-        Self {
-            functions: program
-                .functions
-                .iter()
-                .map(|(symbol, info)| (symbol.clone(), info.module.clone()))
-                .collect(),
-            types: program
-                .types
-                .iter()
-                .map(|(symbol, info)| (symbol.clone(), (info.module.clone(), info.id)))
-                .collect(),
-        }
-    }
-}
-
-impl ContextTables {
-    pub(crate) fn covers_module(&self, module: &[String]) -> bool {
-        match &self.covered {
-            Some(covered) => covered.contains(module),
-            None => !matches!(module, [name] if name == "main"),
-        }
-    }
-
-    /// The tables with every inference variable renumbered densely from `base`,
-    /// and the first id past them. One mapping is applied across all tables, so
-    /// a variable shared between entries (a scheme parameter appearing in a
-    /// method return) stays shared.
-    pub fn remapped(&self, base: u32) -> (ContextTables, u32) {
-        use std::collections::BTreeMap;
-        let mut vars: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-        for scheme in self.schemes.values() {
-            vars.extend(scheme.params.iter().copied());
-            for (_, t) in &scheme.fields {
-                vars.extend(brass_hir::type_vars(t));
-            }
-            for m in scheme.methods.values() {
-                for (_, t) in &m.params {
-                    vars.extend(brass_hir::type_vars(t));
-                }
-                vars.extend(brass_hir::type_vars(&m.ret));
-            }
-        }
-        for t in self
-            .function_returns
-            .values()
-            .chain(self.method_returns.values())
-            .chain(self.co_method_returns.values())
-            .chain(self.global_defs.values().flat_map(|defs| defs.values()))
-        {
-            vars.extend(brass_hir::type_vars(t));
-        }
-        let map_id: HashMap<u32, u32> = vars
-            .iter()
-            .enumerate()
-            .map(|(i, v)| (*v, base + i as u32))
-            .collect();
-        let subst: BTreeMap<u32, Type> = map_id
-            .iter()
-            .map(|(old, new)| (*old, Type::Unknown(*new)))
-            .collect();
-        let re = |t: &Type| brass_hir::substitute_vars(t, &subst);
-        let out = ContextTables {
-            schemes: self
-                .schemes
-                .iter()
-                .map(|(name, scheme)| {
-                    let mut s = scheme.clone();
-                    s.params = s.params.iter().map(|v| map_id[v]).collect();
-                    s.fields = s.fields.iter().map(|(n, t)| (n.clone(), re(t))).collect();
-                    for m in s.methods.values_mut() {
-                        m.params = m.params.iter().map(|(n, t)| (n.clone(), re(t))).collect();
-                        m.ret = re(&m.ret);
-                    }
-                    (name.clone(), s)
-                })
-                .collect(),
-            function_returns: self
-                .function_returns
-                .iter()
-                .map(|(k, t)| (k.clone(), re(t)))
-                .collect(),
-            method_returns: self
-                .method_returns
-                .iter()
-                .map(|(k, t)| (k.clone(), re(t)))
-                .collect(),
-            method_return_props: self.method_return_props.clone(),
-            co_method_returns: self
-                .co_method_returns
-                .iter()
-                .map(|(k, t)| (k.clone(), re(t)))
-                .collect(),
-            global_defs: self
-                .global_defs
-                .iter()
-                .map(|(m, defs)| {
-                    (
-                        m.clone(),
-                        defs.iter().map(|(n, t)| (n.clone(), re(t))).collect(),
-                    )
-                })
-                .collect(),
-            next_var: base + map_id.len() as u32,
-            bare_names: self.bare_names.clone(),
-            covered: self.covered.clone(),
-            program_identity: self.program_identity.clone(),
-        };
-        let next = out.next_var;
-        (out, next)
-    }
-
-    /// Restrict these tables to the entries owned by `keep` modules,
-    /// attributing each entry through `program` (a context program over the
-    /// same modules): a function return by its symbol's defining module, a
-    /// scheme and the method tables by the type's, `global_defs` by its own
-    /// key. The identity guard below rejects a program whose storage symbols
-    /// or nominal IDs changed, so every retained key still names the same HIR
-    /// item. `bare_names` is kept WHOLE: the declaration set is unchanged,
-    /// and shrinking it would weaken the consumer's collision bail.
-    /// `next_var` is kept too -- the retained entries keep
-    /// their one coherent variable space, and the re-analysis of the dropped
-    /// modules allocates past it. Sound because a retained (clean) module
-    /// cannot reference a dropped (dirty) one: references follow imports,
-    /// and the dirty closure includes every transitive importer.
-    ///
-    /// Returns `false` without changing the tables when the current program's
-    /// storage symbols or nominal IDs differ. Those identities are global to
-    /// lowering rather than module-local, so even an unchanged module cannot
-    /// safely retain tables across such a change.
-    pub fn retain_modules(&mut self, program: &Program, keep: &HashSet<Vec<String>>) -> bool {
-        if self.program_identity != ContextProgramIdentity::of(program) {
-            return false;
-        }
-        // Retention can only narrow an existing partial seed. In particular, a
-        // cache sidecar produced while one module was broken must not claim that
-        // module merely because a later source-hash comparison calls it clean.
-        let keep: HashSet<Vec<String>> = match &self.covered {
-            Some(covered) => keep.intersection(covered).cloned().collect(),
-            None => keep.clone(),
-        };
-        let fn_kept = |sym: &String| {
-            program
-                .functions
-                .get(sym)
-                .is_some_and(|f| keep.contains(&f.module))
-        };
-        let ty_kept = |name: &String| {
-            program
-                .types
-                .get(
-                    name.split_once('.')
-                        .map_or(name.as_str(), |(symbol, _)| symbol),
-                )
-                .is_some_and(|t| keep.contains(&t.module))
-        };
-        self.function_returns.retain(|sym, _| fn_kept(sym));
-        self.schemes.retain(|name, _| ty_kept(name));
-        self.method_returns.retain(|(ty, _), _| ty_kept(ty));
-        self.co_method_returns.retain(|(ty, _), _| ty_kept(ty));
-        self.method_return_props.retain(|(ty, _)| ty_kept(ty));
-        self.global_defs.retain(|module, _| keep.contains(module));
-        self.covered = Some(keep);
-        true
-    }
-}
-
+/// The result of the infer pass: its diagnostics, the typed sidecar and the
+/// channels it recorded. [`crate::analyze`] merges it with the
+/// declaration-level passes' diagnostics into the same-named fields of
+/// [`crate::Analysis`].
 pub struct Inference {
     pub errors: Vec<TypeError>,
     pub warnings: Vec<TypeError>,
     pub typed: TypedProgram,
+    /// The aggregate-seed observations of `typed` made inside an instance
+    /// elaboration, attributed to that instance (see
+    /// [`stream::InstanceObservations`]).
+    pub instance_typed: stream::InstanceObservations,
+    /// The `recv.name(..)` calls the checker resolved to calling the
+    /// function value a record field holds: `None` when every instantiation
+    /// does, else the type-test patterns of the receivers that do (the
+    /// others call a method). MIR lowering emits a field load and an indirect
+    /// call for them, a method of the same name elsewhere notwithstanding.
+    pub field_calls: HashMap<Span, Option<Vec<Type>>>,
+    /// The per-instance targets of the reflective calls whose instances key
+    /// them differently (see `Checker::settled_keyed_calls`).
+    pub instance_keyed_calls: brass_hir::InstanceChannel<(String, String, Type)>,
     /// Per record-type generalized scheme (its inferred type parameters and the
     /// field/method signatures over them), keyed by the type's storage symbol. Read
     /// by the language server to render a method generically; see `build_schemes`.
@@ -405,8 +297,9 @@ pub struct Inference {
     /// converts exactly these arguments into the parameter's view.
     pub view_args: HashSet<Span>,
     /// Expressions accepted as a declared sum subtype at a flow site, keyed by
-    /// the value expression's span, mapped to the PARENT sum's table symbol.
-    /// MIR lowering rebuilds exactly these values as the parent (SumView).
+    /// the value expression's span, mapped to the PARENT sum instance the site
+    /// requires. MIR lowering rebuilds exactly these values as the parent
+    /// (SumView).
     pub sum_views: HashMap<Span, Type>,
     /// `expr!` sites whose propagated Err payload is re-raised wrapped into
     /// the prelude `Error` (gaining the site's location); MIR's propagation
@@ -416,17 +309,23 @@ pub struct Inference {
     /// span. The checker resolved `x`'s record type and checked one expanded
     /// copy per field; MIR lowering unrolls the same copies from this list.
     pub fields_loops: HashMap<Span, Vec<String>>,
-    /// Resolved type names of `typeof(x)` calls, keyed by the call span. MIR
-    /// lowering replaces each such call with this string constant.
+    /// Type symbols resolved for expressions, keyed by span: the type a
+    /// `typeof(v).method(..)` static call names (keyed by the inner
+    /// `typeof(v)`), and the declared record an anonymous record literal or a
+    /// literal written through a record alias is built as. MIR lowering
+    /// routes the call and builds the literal by these.
     pub type_names: HashMap<Span, String>,
     /// Reflective (`-> infer!`) method calls keyed by the caller's expectation:
     /// call span -> (canonical receiver type symbol, method, target key). The driver
     /// generates a concrete specialization per (receiver, method, key) and
     /// rewrites the call to it.
     pub keyed_calls: HashMap<Span, (String, String, Type)>,
+    /// Concrete return-origin contracts, keyed by call and enclosing instance.
+    pub numeric_calls: brass_hir::NumericCalls,
     /// Resolved binding types of local annotations that contain a `typeof(v)`,
     /// keyed by the annotation's span; MIR seeds the slot from this (the type
-    /// is not recoverable from a `null`/inferred initializer alone).
+    /// is not recoverable from a `null`/inferred initializer alone). Disagreeing
+    /// instances use the typed annotation observations in `instance_seeds`.
     pub typeof_types: HashMap<Span, Type>,
     /// Resolved type-test patterns (`if v: T`), keyed by the test's span; MIR
     /// lowering embeds each into the test's rvalue so monomorphization can
@@ -449,1162 +348,43 @@ pub struct Inference {
     /// server substitutes these into the typed sidecar before rendering; the
     /// compile pipeline ignores them.
     pub closure_bindings: HashMap<u32, Type>,
-    /// This run's cross-module tables, extracted for reuse as a context seed
-    /// (see [`ContextTables`]); meaningful to reapply only when this was a
-    /// context-only, error-free run.
+    /// The fully-known return of each unannotated function instance a clean
+    /// call-site elaboration settled, keyed by (function symbol, resolved
+    /// argument types). Monomorphization types against it what an instance's
+    /// body alone cannot give: a call into an instance it is still typing (an
+    /// unannotated mutual recursion), a returned closure, and in the lazy JIT
+    /// a call compiled as a runtime-deferred site without lowering the callee.
+    pub instance_returns: HashMap<(String, Vec<Type>), Type>,
+    /// This run's cross-module tables (see [`ContextTables`]): a context seed
+    /// for later runs when this was a context-only run (whole, or restricted
+    /// to its modules without diagnostics), and what [`analyze_generated`]
+    /// continues a completed run from.
     pub context_tables: ContextTables,
-}
-
-/// Check every type's method bodies in the shared per-type environment. Binding
-/// `self` to the bare type makes a type's methods share one field variable, so
-/// the bodies' stores and reads link each field's element to the methods'
-/// parameter and return variables -- the linkage [`Checker::build_schemes`] then
-/// generalizes.
-impl Checker<'_> {
-    /// Load remapped context tables into this checker and confine the per-item
-    /// passes to the entry module. The caller has already renumbered the
-    /// tables' variables past this checker's counter.
-    fn apply_seed(&mut self, seed: ContextTables, next_var: u32) -> AppliedSeedMetadata {
-        let ContextTables {
-            schemes,
-            function_returns,
-            method_returns,
-            method_return_props,
-            co_method_returns,
-            global_defs,
-            next_var: table_next_var,
-            bare_names,
-            covered,
-            program_identity,
-        } = seed;
-        let scheme_keys = schemes.keys().cloned().collect();
-        let function_return_keys = function_returns.keys().cloned().collect();
-        let method_return_keys = method_returns.keys().cloned().collect();
-        let method_return_prop_keys = method_return_props.clone();
-        let co_method_return_keys = co_method_returns.keys().cloned().collect();
-        let global_def_keys = global_defs.keys().cloned().collect();
-        self.schemes = schemes;
-        self.function_returns = function_returns;
-        self.method_returns = method_returns;
-        self.method_return_props = method_return_props;
-        self.co_method_returns = co_method_returns;
-        self.global_defs = global_defs;
-        self.seeded_set = covered;
-        self.next_unknown = self.next_unknown.max(next_var);
-        self.entry_only = true;
-        AppliedSeedMetadata {
-            next_var: table_next_var,
-            bare_names,
-            program_identity,
-            scheme_keys,
-            function_return_keys,
-            method_return_keys,
-            method_return_prop_keys,
-            co_method_return_keys,
-            global_def_keys,
-        }
-    }
-
-    /// Recover the applied seed after a preliminary checker has read it. Any
-    /// entries inferred for uncovered modules are removed before the tables are
-    /// transferred to the real checker.
-    fn take_applied_seed(&mut self, metadata: AppliedSeedMetadata) -> ContextTables {
-        let covered = self.seeded_set.take();
-        self.schemes
-            .retain(|name, _| metadata.scheme_keys.contains(name));
-        self.function_returns
-            .retain(|symbol, _| metadata.function_return_keys.contains(symbol));
-        self.method_returns
-            .retain(|key, _| metadata.method_return_keys.contains(key));
-        self.method_return_props
-            .retain(|key| metadata.method_return_prop_keys.contains(key));
-        self.co_method_returns
-            .retain(|key, _| metadata.co_method_return_keys.contains(key));
-        self.global_defs
-            .retain(|module, _| metadata.global_def_keys.contains(module));
-
-        ContextTables {
-            schemes: std::mem::take(&mut self.schemes),
-            function_returns: std::mem::take(&mut self.function_returns),
-            method_returns: std::mem::take(&mut self.method_returns),
-            method_return_props: std::mem::take(&mut self.method_return_props),
-            co_method_returns: std::mem::take(&mut self.co_method_returns),
-            global_defs: std::mem::take(&mut self.global_defs),
-            next_var: metadata.next_var,
-            bare_names: metadata.bare_names,
-            covered,
-            program_identity: metadata.program_identity,
-        }
-    }
-
-    /// Whether `module` was covered by the applied seed: anything but the
-    /// entry (whose module path is always `main`) for a full seed, or the
-    /// seed's own module list for a partial one (an incremental context
-    /// rebuild -- the uncovered modules get real passes here).
-    fn seeded_module(&self, module: &[String]) -> bool {
-        if !self.entry_only {
-            return false;
-        }
-        match &self.seeded_set {
-            Some(set) => set.contains(module),
-            None => !matches!(module, [m] if m == "main"),
-        }
-    }
-}
-
-struct AppliedSeedMetadata {
-    next_var: u32,
-    bare_names: HashSet<String>,
-    program_identity: ContextProgramIdentity,
-    scheme_keys: HashSet<String>,
-    function_return_keys: HashSet<String>,
-    method_return_keys: HashSet<(String, String)>,
-    method_return_prop_keys: HashSet<(String, String)>,
-    co_method_return_keys: HashSet<(String, String)>,
-    global_def_keys: HashSet<Vec<String>>,
-}
-
-/// Whether the scheme pre-pass can skip co-checking `info`'s method bodies:
-/// the pre-pass exists only to build [`TypeScheme`]s, so any body whose check
-/// cannot influence a scheme is wasted work there. Sums never contribute (a
-/// scheme is record-only). A record whose fields and bodied method signatures
-/// (parameters and annotated returns) all resolve to fully-known types
-/// generalizes to a parameterless scheme the declarations already spell out
-/// -- the co-check would only link inference variables that do not exist.
-/// An unannotated return keeps the co-check: its full-pass reconciliation can
-/// differ in shape from the precomputed light-pass type the scheme would
-/// otherwise fall back to.
-fn scheme_pass_skips(info: &TypeInfo) -> bool {
-    match &info.kind {
-        TypeKind::Sum { .. } => true,
-        TypeKind::Record { fields, methods } => {
-            fields.iter().all(|f| {
-                f.resolved_ty
-                    .as_ref()
-                    .is_some_and(brass_hir::is_fully_known)
-            }) && methods.values().all(|m| {
-                m.decl.body.is_none()
-                    || (m.signature.params.iter().all(|p| {
-                        p.name == "self"
-                            || p.resolved_ty
-                                .as_ref()
-                                .is_some_and(brass_hir::is_fully_known)
-                    }) && m
-                        .signature
-                        .ret_ty
-                        .as_ref()
-                        .is_some_and(brass_hir::is_fully_known))
-            })
-        }
-    }
-}
-
-fn check_method_bodies(checker: &mut Checker, program: &Program, schemes_only: bool) {
-    let mut perf = brass_utils::PerfLog::start("typeck/method-body");
-    checker.co_checking = true;
-    for t in program.types.values() {
-        // A seeded run reads the context's schemes and co-checked returns from
-        // the seed; only the entry's own types are co-checked here.
-        if checker.seeded_module(&t.module) {
-            continue;
-        }
-        if schemes_only && scheme_pass_skips(t) {
-            continue;
-        }
-        checker.current_module = t.module.clone();
-        match &t.kind {
-            TypeKind::Record { methods, .. } => {
-                for m in methods.values() {
-                    // A reflective `-> infer!` template has no fixed body type;
-                    // it is specialized per key by the driver, so skip it here.
-                    if brass_hir::keyed_return(m.decl.ret.as_ref()) {
-                        continue;
-                    }
-                    if let Some(body) = &m.decl.body {
-                        let m_started = std::time::Instant::now();
-                        let mut scopes = checker.signature_scopes(&m.signature.params);
-                        let ret = m.signature.ret_ty.clone();
-                        checker.current_co_method =
-                            Some((t.symbol.clone(), m.signature.name.clone()));
-                        let full = checker.check_block_with_self(
-                            body,
-                            &mut scopes,
-                            ret.as_ref(),
-                            &t.symbol,
-                        );
-                        checker.current_co_method = None;
-                        perf.item(
-                            format!("{}.{}", t.symbol, m.signature.name),
-                            m_started.elapsed(),
-                        );
-                        // Keep the return the full check reconciled here, in the
-                        // shared per-type environment, for scheme generalization
-                        // (see `co_method_returns`). A propagating body's shape
-                        // (`Result`/`?`) only the light assembly builds, so it
-                        // keeps its precomputed type.
-                        let key = (t.symbol.clone(), m.signature.name.clone());
-                        if let Some(inferred) = checker.method_returns.get(&key).cloned() {
-                            checker.warn_implicit_nullable_result(&m.signature, body, &inferred);
-                        }
-                        if let Some(full) = full
-                            && !checker.method_return_props.contains(&key)
-                        {
-                            checker.co_method_returns.insert(key, full);
-                        }
-                    }
-                }
-            }
-            TypeKind::Sum { variants } => {
-                for v in variants {
-                    for m in v.methods.values() {
-                        if brass_hir::keyed_return(m.decl.ret.as_ref()) {
-                            continue;
-                        }
-                        if let Some(body) = &m.decl.body {
-                            let mut scopes = checker.signature_scopes(&m.signature.params);
-                            let ret = m.signature.ret_ty.clone();
-                            checker.check_block_with_self_variant(
-                                body,
-                                &mut scopes,
-                                ret.as_ref(),
-                                &t.symbol,
-                                &v.name,
-                            );
-                            let key =
-                                (format!("{}.{}", t.symbol, v.name), m.signature.name.clone());
-                            if let Some(inferred) = checker.method_returns.get(&key).cloned() {
-                                checker.warn_implicit_nullable_result(
-                                    &m.signature,
-                                    body,
-                                    &inferred,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    checker.co_checking = false;
-    perf.report();
-}
-
-/// Generalize every record into a [`TypeScheme`] on a throwaway checker, so the
-/// real pass has the schemes in hand *while* it checks method bodies.
-///
-/// A scheme can only be built after the method bodies have been checked (that is
-/// what links a field's element type to its methods' parameter variables), so the
-/// real pass cannot build them any earlier than it already does. But a method
-/// body that calls ANOTHER type's method needs that type's scheme to pin the
-/// call's parameters from the receiver -- `map.set(k, 100)` on a width-pinned
-/// `HashMap` types the bare literal as the map's `int64`, not the literal's
-/// default `int32`. Until the schemes existed only from the function-body phase
-/// onward, so the same call inside a method body typed the literal from the
-/// argument and clashed with the receiver's slot.
-///
-/// The preliminary run's diagnostics and solver are discarded; only the schemes
-/// are kept, and the real pass rebuilds them once its own method bodies are done.
-/// It therefore does only the work a scheme needs: declaration validation is
-/// pure diagnostics, while method-return precomputation converges internally.
-fn seed_schemes(
-    program: &Program,
-    seed: Option<(ContextTables, u32)>,
-    rows: Rc<brass_typesys::RowInfo>,
-) -> (HashMap<String, TypeScheme>, Option<(ContextTables, u32)>) {
-    let mut pre = Checker::new(program, rows);
-    let applied = seed.map(|(tables, next)| (pre.apply_seed(tables, next), next));
-    pre.precompute_global_bindings();
-    pre.precompute_function_returns();
-    pre.precompute_method_returns();
-    check_method_bodies(&mut pre, program, true);
-    let schemes = pre.build_schemes();
-    let seed = applied.map(|(metadata, next)| (pre.take_applied_seed(metadata), next));
-    (schemes, seed)
-}
-
-pub fn analyze(program: &Program) -> Inference {
-    analyze_with(program, None)
-}
-
-/// [`analyze`], optionally seeded with the tables of a prior CONTEXT-ONLY run
-/// (see [`ContextTables`]): the seeded modules' per-item passes are skipped and
-/// their schemes, inferred returns, and globals are read from the seed, so the
-/// run costs roughly what checking the entry module alone costs.
-pub fn analyze_with(program: &Program, seed: Option<&ContextTables>) -> Inference {
-    analyze_inner(program, seed, None).0
-}
-
-/// Check only append-only methods synthesized from keyed templates, reusing
-/// the completed first pass's cross-module tables. Generated methods may call
-/// one another, so all declarations must already be present in `program`.
-pub fn analyze_generated(
-    program: &Program,
-    seed: &ContextTables,
-    generated: &[brass_hir::GeneratedDecl],
-) -> Inference {
-    let rows = Rc::new(brass_typesys::RowInfo::analyze(program));
-    let mut checker = Checker::new(program, rows);
-    let (tables, next) = seed.remapped(next_unknown_after_program(program));
-    checker.apply_seed(tables, next);
-    checker.co_checking = true;
-
-    for generated in generated {
-        let Some(info) = program
-            .types
-            .values()
-            .find(|info| info.name == generated.receiver && info.module == generated.module)
-        else {
-            continue;
-        };
-        checker.current_module = info.module.clone();
-        match &info.kind {
-            TypeKind::Record { methods, .. } => {
-                let Some(method) = methods.get(&generated.decl.name) else {
-                    continue;
-                };
-                let Some(body) = method.decl.body.as_ref() else {
-                    continue;
-                };
-                let mut scopes = checker.signature_scopes(&method.signature.params);
-                checker.current_co_method =
-                    Some((info.symbol.clone(), method.signature.name.clone()));
-                checker.check_block_with_self(
-                    body,
-                    &mut scopes,
-                    method.signature.ret_ty.as_ref(),
-                    &info.symbol,
-                );
-                checker.current_co_method = None;
-                let key = (info.symbol.clone(), method.signature.name.clone());
-                if let Some(inferred) = checker.method_returns.get(&key).cloned() {
-                    checker.warn_implicit_nullable_result(&method.signature, body, &inferred);
-                }
-                checker.errors.extend(crate::exhaustive::check_block(
-                    program,
-                    &checker.typed,
-                    body,
-                ));
-            }
-            TypeKind::Sum { variants } => {
-                for variant in variants {
-                    let Some(method) = variant.methods.get(&generated.decl.name) else {
-                        continue;
-                    };
-                    let Some(body) = method.decl.body.as_ref() else {
-                        continue;
-                    };
-                    let mut scopes = checker.signature_scopes(&method.signature.params);
-                    checker.check_block_with_self_variant(
-                        body,
-                        &mut scopes,
-                        method.signature.ret_ty.as_ref(),
-                        &info.symbol,
-                        &variant.name,
-                    );
-                    let key = (
-                        format!("{}.{}", info.symbol, variant.name),
-                        method.signature.name.clone(),
-                    );
-                    if let Some(inferred) = checker.method_returns.get(&key).cloned() {
-                        checker.warn_implicit_nullable_result(&method.signature, body, &inferred);
-                    }
-                    checker.errors.extend(crate::exhaustive::check_block(
-                        program,
-                        &checker.typed,
-                        body,
-                    ));
-                }
-            }
-        }
-    }
-    checker.co_checking = false;
-    checker.report_uninferable_error_types();
-    checker.finalize_typed();
-
-    let function_returns = checker
-        .function_returns
-        .iter()
-        .map(|(key, ty)| (key.clone(), checker.resolve(ty)))
-        .collect();
-    let method_returns = checker
-        .method_returns
-        .iter()
-        .map(|(key, ty)| (key.clone(), checker.resolve(ty)))
-        .collect();
-    let sum_views = checker
-        .sum_views
-        .iter()
-        .map(|(span, ty)| (*span, checker.resolve(ty)))
-        .collect();
-    let closure_bindings = checker.finalized_closure_bindings();
-    Inference {
-        errors: checker.errors,
-        warnings: checker.warnings,
-        typed: checker.typed,
-        schemes: checker.schemes,
-        view_args: checker.view_args,
-        lift_errs: checker.lift_errs,
-        sum_views,
-        fields_loops: checker.fields_loops,
-        type_names: checker.type_names,
-        keyed_calls: checker.keyed_calls,
-        typeof_types: checker.typeof_types,
-        type_tests: checker.type_tests,
-        null_props: checker.null_props,
-        function_returns,
-        method_returns,
-        closure_bindings,
-        context_tables: seed.clone(),
-    }
-}
-
-/// Publish settlement immediately for every demanded symbol, but defer the
-/// cumulative table scan until the last queued member of that demand batch.
-/// The driver waits for the whole set, so no retry can observe the empty
-/// intermediate deltas.
-fn emit_function_checked(
-    checker: &Checker,
-    ctl: &mut StreamCtl,
-    queue: &std::collections::VecDeque<(String, Option<u64>)>,
-    batch: Option<u64>,
-    symbol: String,
-) {
-    let batch_continues = batch.is_some_and(|batch| {
-        queue
-            .iter()
-            .any(|(_, queued_batch)| *queued_batch == Some(batch))
-    });
-    let delta = if batch_continues {
-        stream::ChannelDelta::default()
-    } else {
-        flush_delta(checker, &mut ctl.state, false)
-    };
-    ctl.sched.emit(stream::CheckEvent::BodyChecked(
-        stream::BodyId::Function(symbol),
-        delta,
-    ));
-}
-
-/// [`analyze_with`] with optional streaming control (the lazy-check
-/// pipeline): with a [`StreamCtl`], bodies are checked in an execution-first
-/// order -- module initializers, then `main`, then the remaining functions,
-/// reprioritized between bodies by the scheduler's requests -- and a channel
-/// event is emitted after each body; a priority batch carries its cumulative
-/// delta on the final event. Without one, the body order is the eager
-/// pipeline's. The second return value is the terminal delta (flushed after
-/// the finalize re-resolution), for the caller to emit once the remaining
-/// whole-program passes are done.
-pub(crate) fn analyze_inner(
-    program: &Program,
-    seed: Option<&ContextTables>,
-    mut ctl: Option<&mut StreamCtl>,
-) -> (Inference, Option<stream::ChannelDelta>) {
-    let phase = |name: &'static str, at: std::time::Instant| {
-        brass_utils::perf_phase(name, at.elapsed());
-    };
-    // One remapping serves both checkers below, so the preliminary scheme pass
-    // and the real pass agree on every seeded variable id.
-    let remapped = seed.map(|s| s.remapped(next_unknown_after_program(program)));
-    let rows = Rc::new(brass_typesys::RowInfo::analyze(program));
-    let t = std::time::Instant::now();
-    let (seeded, remapped) = seed_schemes(program, remapped, Rc::clone(&rows));
-    phase("typeck/seed-schemes", t);
-    let mut checker = Checker::new(program, rows);
-    checker.lazy_profile = ctl.is_some();
-    // A resumed run may skip every body that produced an earlier warning.
-    // Seed the final Analysis as well as the flush bookkeeping so completing
-    // the run can persist the full warning set into the ordinary cache.
-    if let Some(ctl) = ctl.as_deref() {
-        checker
-            .warnings
-            .extend(ctl.state.warnings_flushed.iter().cloned());
-    }
-    if checker.lazy_profile {
-        checker.keyed_tainted = crate::taint::keyed_reachable(program);
-    }
-    if let Some((tables, next)) = remapped {
-        checker.apply_seed(tables, next);
-    }
-    checker.schemes = seeded;
-    let t = std::time::Instant::now();
-    checker.validate_param_declarations();
-    checker.precompute_global_bindings();
-    checker.precompute_function_returns();
-    // A method's inferred return may depend on another type's method
-    // (`Tcp.close` propagating `File.close`), so this pass closes the table to a
-    // fixpoint.
-    checker.precompute_method_returns();
-    // The free functions were inferred before any method return existed (the
-    // method pass needs theirs, so it cannot go first), which leaves a function
-    // whose value flows OUT of a method call with nothing to read: `http`'s
-    // `fetch` returns `client.fetch(path)`. Re-infer them now that the methods
-    // have converged -- and re-run the methods once more over the result, so a
-    // method reading a function that only just resolved (`QueryPair.parse_all`
-    // propagating `_decode_form`, which propagates `percent.decode`) sees it.
-    checker.refresh_function_returns();
-    checker.precompute_method_returns();
-    phase("typeck/precompute", t);
-    // Check each type's method bodies, then generalize each record type into a
-    // scheme. Generalizing before the function bodies are checked makes the
-    // schemes available at call sites (a function instantiates a method's scheme
-    // to type the call's result) and keeps the generic field variable read here
-    // free of any concrete use. The bodies below are checked against the seeded
-    // schemes; this rebuild replaces them with the ones this pass linked.
-    let t = std::time::Instant::now();
-    check_method_bodies(&mut checker, program, false);
-    checker.schemes = checker.build_schemes();
-    phase("typeck/method-bodies", t);
-    if let Some(ctl) = ctl.as_deref_mut() {
-        checker.report_uninferable_method_error_types();
-        let delta = flush_delta(&checker, &mut ctl.state, false);
-        ctl.sched.emit(stream::CheckEvent::ContextReady(delta));
-    }
-
-    match ctl.as_deref_mut() {
-        // The eager order: every function body, then the module initializers.
-        None => {
-            let mut perf = brass_utils::PerfLog::start("typeck/fn-bodies");
-            for (symbol, f) in &program.functions {
-                // Context bodies were checked by the run that produced the seed;
-                // their call-site behavior is still exact, because a call from the
-                // entry re-elaborates the callee body at the call's own types.
-                if checker.seeded_module(&f.module) {
-                    continue;
-                }
-                let fn_started = std::time::Instant::now();
-                check_function_body(&mut checker, symbol, f);
-                perf.item(symbol.clone(), fn_started.elapsed());
-            }
-            perf.report();
-            checker.in_entry_main = false;
-
-            let t = std::time::Instant::now();
-            checker.const_scopes = vec![HashSet::default()];
-            for init in &program.inits {
-                check_init_body(&mut checker, init);
-            }
-            checker.const_scopes.clear();
-            phase("typeck/inits", t);
-        }
-        // The streaming (execution-first) order: initializers, then `main`,
-        // then the remaining functions, with the scheduler's priority
-        // requests jumping the queue between bodies. Body results are
-        // order-tolerant by construction (the eager order is a HashMap's),
-        // so the reorder changes when a body's entries become available,
-        // not what they end up being.
-        Some(ctl) => {
-            // Method bodies were checked in the shared phase above; their
-            // matches get the same early exhaustiveness verdict bodies get
-            // below, so a broken method on the execution path reports
-            // deterministically (the terminal whole-program pass may never
-            // run under a stopped lazy run).
-            for info in program.types.values() {
-                let mut method_bodies: Vec<&Block> = Vec::new();
-                match &info.kind {
-                    TypeKind::Record { methods, .. } => {
-                        method_bodies.extend(methods.values().filter_map(|m| m.decl.body.as_ref()));
-                    }
-                    TypeKind::Sum { variants } => {
-                        for v in variants {
-                            method_bodies
-                                .extend(v.methods.values().filter_map(|m| m.decl.body.as_ref()));
-                        }
-                    }
-                }
-                for body in method_bodies {
-                    let errs = crate::exhaustive::check_block(program, &checker.typed, body);
-                    checker.errors.extend(errs);
-                }
-            }
-            // Execution runs every module initializer before `main`, so the
-            // inits are the entry code the lazy driver needs first, in
-            // execution (module-load) order.
-            let t = std::time::Instant::now();
-            checker.const_scopes = vec![HashSet::default()];
-            for (i, init) in program.inits.iter().enumerate() {
-                check_init_body(&mut checker, init);
-                let errs = crate::exhaustive::check_stmts(program, &checker.typed, &init.stmts);
-                checker.errors.extend(errs);
-                let delta = flush_delta(&checker, &mut ctl.state, false);
-                ctl.sched.emit(stream::CheckEvent::BodyChecked(
-                    stream::BodyId::Init(i),
-                    delta,
-                ));
-            }
-            checker.const_scopes.clear();
-            phase("typeck/inits", t);
-
-            // `main` first, the rest sorted so the static order is
-            // deterministic. Seeded (context) bodies skip the check like in
-            // the eager order but still emit their event immediately: the
-            // event means "this body is settled", and a seeded body is --
-            // its entries stream in through the re-elaboration a caller's
-            // own check performs. Without the event, a consumer waiting on
-            // a context function would wait forever.
-            let mut queue: std::collections::VecDeque<(String, Option<u64>)> = {
-                let mut symbols: Vec<String> = program.functions.keys().cloned().collect();
-                symbols.sort();
-                if let Some(pos) = symbols.iter().position(|s| s == "main") {
-                    let main = symbols.remove(pos);
-                    symbols.insert(0, main);
-                }
-                symbols.into_iter().map(|symbol| (symbol, None)).collect()
-            };
-            let mut done: HashSet<String> = HashSet::default();
-            // The concrete argument types each priority request carried: the
-            // demanded body is checked at ITS INSTANCE (see
-            // `check_function_body_at`) rather than the open signature frame.
-            // A queue body without a request keeps the definitional pass.
-            let mut demanded_at: HashMap<String, Vec<Type>> = HashMap::default();
-            // Bodies the consumer explicitly asked for. These are the only
-            // ones checked while the scheduler is paused; `main` counts as
-            // requested (the gate waits on it without sending a request).
-            let mut priority: HashSet<String> = HashSet::default();
-            priority.insert("main".to_string());
-            let mut perf = brass_utils::PerfLog::start("typeck/fn-bodies");
-            loop {
-                // The consumer no longer needs anything (its program ended):
-                // stop at the body boundary. What was checked stays reported;
-                // the complete verdict is the eager pipeline's job.
-                if ctl.sched.stopped() {
-                    break;
-                }
-                // While the consumer is settling its entry, hold the
-                // background queue and park until its next request. Waking the
-                // scheduler also releases this wait when execution begins.
-                let parked = ctl.sched.paused()
-                    && queue
-                        .front()
-                        .is_some_and(|(symbol, _)| !priority.contains(symbol));
-                let requests = if parked {
-                    ctl.sched.wait_for_requests()
-                } else {
-                    ctl.sched.drain_requests()
-                };
-                // Priority requests land at the front in request order; a
-                // request for an unknown or already-checked symbol is spent.
-                for request in requests.into_iter().rev() {
-                    let fresh = !done.contains(&request.symbol)
-                        && program.functions.contains_key(&request.symbol);
-                    if fresh {
-                        demanded_at.insert(request.symbol.clone(), request.type_args);
-                        priority.insert(request.symbol.clone());
-                        queue.push_front((request.symbol, Some(request.batch)));
-                    }
-                }
-                // A wake may leave the queue paused when it accompanied only
-                // stale requests. Park again instead of starting background
-                // work before the entry gate opens.
-                if ctl.sched.paused()
-                    && queue
-                        .front()
-                        .is_some_and(|(symbol, _)| !priority.contains(symbol))
-                {
-                    continue;
-                }
-                let Some((symbol, batch)) = queue.pop_front() else {
-                    break;
-                };
-                if !done.insert(symbol.clone()) {
-                    continue;
-                }
-                let f = &program.functions[&symbol];
-                // A demanded body checks at the instance the demand named
-                // when its types align with the signature; anything else
-                // (stale request, mismatched arity, an open type) falls back
-                // to the definitional pass. So does a STRUCTURAL argument:
-                // an anonymous record that does not fit the body degrades to
-                // the call's fallback by design -- the row check at the
-                // value's span is its error source -- and a dedicated pass
-                // at such an instance would hard-error where the call site
-                // deliberately does not.
-                let instance_args = demanded_at.remove(&symbol).filter(|args| {
-                    args.len() == f.signature.params.len()
-                        && args.iter().all(brass_hir::is_fully_known)
-                        && !args.iter().any(contains_structural_record)
-                });
-                if instance_args.is_none() && checker.seeded_module(&f.module) {
-                    // A seeded (context) body is settled without a check of
-                    // its own -- callers re-elaborate it at their call sites
-                    // -- but the event must still go out: a consumer waiting
-                    // on a context function would otherwise wait forever.
-                    emit_function_checked(&checker, ctl, &queue, batch, symbol);
-                    continue;
-                }
-                let fn_started = std::time::Instant::now();
-                let instance_ret = match &instance_args {
-                    Some(args) => check_function_body_at(&mut checker, &symbol, f, args),
-                    None => {
-                        check_function_body(&mut checker, &symbol, f);
-                        None
-                    }
-                };
-                let errs = crate::exhaustive::check_block(program, &checker.typed, &f.decl.body);
-                checker.errors.extend(errs);
-                checker.report_uninferable_function_error_type(f);
-                perf.item(symbol.clone(), fn_started.elapsed());
-                if let (Some(args), Some(ret)) = (instance_args, instance_ret) {
-                    checker.record_instance_return(symbol.clone(), args, ret);
-                }
-                emit_function_checked(&checker, ctl, &queue, batch, symbol);
-            }
-            perf.report();
-            checker.in_entry_main = false;
-        }
-    }
-    let t = std::time::Instant::now();
-    // Each expression's type was resolved against the substitution as it was
-    // recorded, but a variable can be pinned *after* an expression that mentions
-    // it was checked (e.g. an array element fixed by a later `push`). Re-resolve
-    // every recorded type against the final substitution so the typed program
-    // reflects the fully solved types -- which hover and the other LSP features
-    // read directly.
-    checker.report_uninferable_error_types();
-    checker.finalize_typed();
-    phase("typeck/finalize", t);
-    // The terminal flush: finalize re-resolved the recorded types in place,
-    // so this delta settles every entry the earlier flushes withheld or
-    // emitted provisionally. Emitted by the caller (as `Finished`) once the
-    // remaining whole-program passes contribute their errors.
-    let final_delta = ctl.map(|ctl| flush_delta(&checker, &mut ctl.state, true));
-    let function_returns: HashMap<String, Type> = checker
-        .function_returns
-        .clone()
-        .into_iter()
-        .map(|(name, ty)| {
-            let ty = checker.resolve(&ty);
-            (name, ty)
-        })
-        .collect();
-    let method_returns: HashMap<(String, String), Type> = checker
-        .method_returns
-        .clone()
-        .into_iter()
-        .map(|(key, ty)| {
-            let ty = checker.resolve(&ty);
-            (key, ty)
-        })
-        .collect();
-    // The cross-module tables, deep-resolved so a consumer without this run's
-    // solver sees exactly what this run's `resolve` would have shown; whatever
-    // stays open is genuinely generic.
-    let context_tables = ContextTables {
-        schemes: checker
-            .schemes
-            .iter()
-            .map(|(name, scheme)| {
-                let mut s = scheme.clone();
-                s.fields = s
-                    .fields
-                    .iter()
-                    .map(|(n, t)| (n.clone(), checker.resolve(t)))
-                    .collect();
-                for m in s.methods.values_mut() {
-                    m.params = m
-                        .params
-                        .iter()
-                        .map(|(n, t)| (n.clone(), checker.resolve(t)))
-                        .collect();
-                    m.ret = checker.resolve(&m.ret);
-                }
-                (name.clone(), s)
-            })
-            .collect(),
-        function_returns: function_returns.clone(),
-        method_returns: method_returns.clone(),
-        method_return_props: checker.method_return_props.clone(),
-        co_method_returns: checker
-            .co_method_returns
-            .iter()
-            .map(|(k, t)| (k.clone(), checker.resolve(t)))
-            .collect(),
-        global_defs: checker
-            .global_defs
-            .iter()
-            .map(|(m, defs)| {
-                (
-                    m.clone(),
-                    defs.iter()
-                        .map(|(n, t)| (n.clone(), checker.resolve(t)))
-                        .collect(),
-                )
-            })
-            .collect(),
-        next_var: checker.next_unknown,
-        bare_names: program
-            .functions
-            .values()
-            .map(|f| f.signature.name.clone())
-            .chain(program.types.values().map(|t| t.name.clone()))
-            .collect(),
-        covered: None,
-        program_identity: ContextProgramIdentity::of(program),
-    };
-    // Re-resolve the coercion targets against the final substitution: a
-    // variable pinned after the site was recorded (an err payload bound by a
-    // later return) must reach MIR fully known so the rebuilt value's locals
-    // can be seeded. A Result payload slot still open here was pinned by
-    // NOTHING anywhere -- the value never carries data in it (an Err-only
-    // flow's Ok side) -- so it defaults to void IN THE CHANNEL COPY only; no
-    // solver binding can leak to other callers.
-    let sum_views = checker
-        .sum_views
-        .iter()
-        .map(|(s, t)| {
-            let mut t = checker.resolve(t);
-            if let Type::Sum(n) = &mut t
-                && n.is_result_type()
-            {
-                for key in [
-                    brass_hir::types::RESULT_OK_VALUE,
-                    brass_hir::types::RESULT_ERR_ERROR,
-                ] {
-                    if n.substitution.get(key).is_none_or(|t| t.is_unknown()) {
-                        n.substitution.insert(key, Type::Void);
-                    }
-                }
-            }
-            (*s, t)
-        })
-        .collect();
-    let closure_bindings = checker.finalized_closure_bindings();
-    (
-        Inference {
-            errors: checker.errors,
-            warnings: checker.warnings,
-            typed: checker.typed,
-            schemes: checker.schemes,
-            view_args: checker.view_args,
-            lift_errs: checker.lift_errs,
-            sum_views,
-            fields_loops: checker.fields_loops,
-            type_names: checker.type_names,
-            keyed_calls: checker.keyed_calls,
-            typeof_types: checker.typeof_types,
-            type_tests: checker.type_tests,
-            null_props: checker.null_props,
-            function_returns,
-            method_returns,
-            closure_bindings,
-            context_tables,
-        },
-        final_delta,
-    )
-}
-
-/// One free function's dedicated body pass -- the per-body core both body
-/// orders share. The caller decides ordering and skips seeded modules.
-fn check_function_body(checker: &mut Checker, symbol: &str, f: &FunInfo) {
-    tracing::debug!(function = %f.signature.name, "inferring function body");
-    // The module comes first: the body's bottom scope is the globals visible
-    // from IT, so building the scope before setting it would hand the function
-    // some other module's globals.
-    checker.current_module = f.module.clone();
-    let mut scopes = checker.signature_scopes(&f.signature.params);
-    let ret = f.signature.ret_ty.clone();
-    // The root module's bare `main` symbol is the program entry; its `!`
-    // propagations abort at runtime, waiving the fallible-return-context
-    // requirement for its own body.
-    checker.in_entry_main = symbol == "main";
-    checker.check_block_root(&f.decl.body, &mut scopes, ret.as_ref());
-    if let Some(inferred) = checker.function_returns.get(symbol).cloned() {
-        checker.warn_implicit_nullable_result(&f.signature, &f.decl.body, &inferred);
-    }
-}
-
-/// A demanded body's dedicated pass, run at the concrete argument types the
-/// demand carried -- the instance the program is about to execute -- instead
-/// of the open signature frame. Checking at the instance's types is what the
-/// lazy run needs (its verdict is per executed instance, and the recorded
-/// channel entries are the instance's), and it makes the pass cheap: the
-/// call tree was already elaborated at these same types by the caller's own
-/// pass, so the nested calls hit the elaboration memo instead of re-checking
-/// an open frame, where nothing memoizes and a call chain re-expands
-/// exponentially. Annotated parameters keep their annotations (the frame
-/// instantiates them against the arguments, annotation winning), so a fully
-/// annotated body checks exactly as its definitional pass would.
-/// Whether a type mentions an anonymous structural record anywhere: such an
-/// argument is served by the call-site row machinery (fit-or-degrade), so a
-/// demanded instance carrying one keeps the definitional pass instead of
-/// `check_function_body_at`.
-fn contains_structural_record(ty: &Type) -> bool {
-    match ty {
-        Type::Record(n) if n.id == brass_hir::STRUCTURAL_RECORD_ID => true,
-        Type::Record(n) | Type::Sum(n) => n
-            .substitution
-            .iter()
-            .any(|(_, t)| contains_structural_record(t)),
-        Type::Array(inner, _)
-        | Type::Slice(inner)
-        | Type::Nullable(inner)
-        | Type::ConstOf(inner)
-        | Type::Mut(inner)
-        | Type::Ref(inner) => contains_structural_record(inner),
-        Type::Fun(params, ret) => {
-            params.iter().any(contains_structural_record) || contains_structural_record(ret)
-        }
-        Type::Tuple(elems) => elems.iter().any(contains_structural_record),
-        _ => false,
-    }
-}
-
-/// Check a demanded body at its concrete instance. Returns the instance's
-/// resolved return type when it can serve as a runtime-deferral contract:
-/// the body is UNANNOTATED (an annotation is already a contract), the pass
-/// reported no new errors, and the reconciled return resolved fully known.
-/// The caller streams it to the consumer, whose monomorphizer may then
-/// compile call sites to this instance as runtime-resolved calls without
-/// lowering the body at all -- the fallibility guard (`!`/`error()` bodies
-/// change the ABI away from this plain return) lives on the consumer side,
-/// next to the annotated deferral's identical rule.
-fn check_function_body_at(
-    checker: &mut Checker,
-    symbol: &str,
-    f: &FunInfo,
-    arg_types: &[Type],
-) -> Option<Type> {
-    tracing::debug!(function = %f.signature.name, "inferring function body at demanded types");
-    checker.current_module = f.module.clone();
-    let mut scopes = checker.signature_call_frame(&f.signature.params, arg_types, &[], None);
-    checker.in_entry_main = symbol == "main";
-    let errors_before = checker.errors.len();
-    let full = checker.check_block_root(&f.decl.body, &mut scopes, f.signature.ret_ty.as_ref());
-    if let Some(inferred) = checker.function_returns.get(symbol).cloned() {
-        checker.warn_implicit_nullable_result(&f.signature, &f.decl.body, &inferred);
-    }
-    if f.signature.ret_ty.is_some() || checker.errors.len() != errors_before {
-        return None;
-    }
-    // Only a reconciled full return serves as a contract. `None` covers more
-    // than one shape (no returns at all, a propagating body whose shape only
-    // the light assembly builds), so no contract is claimed for it.
-    let ret = checker.resolve(&full?);
-    brass_hir::is_fully_known(&ret).then_some(ret)
-}
-
-/// One module initializer's dedicated pass -- the per-init core both body
-/// orders share. The caller brackets the whole init sequence with the shared
-/// `const_scopes` frame.
-fn check_init_body(checker: &mut Checker, init: &ModuleInit) {
-    checker.current_module = init.path.clone();
-    // The globals of OTHER modules this one can see. Its own are left out so
-    // they still accumulate as its statements are checked -- a later global is
-    // not visible to an earlier initializer.
-    let global_scope = checker.global_scope();
-    let mut scopes = vec![Scope::shared(global_scope)];
-    if let Some(own) = checker.global_defs.get(&init.path) {
-        for name in own.keys() {
-            scopes[0].remove(name);
-        }
-    }
-    checker.narrowed_bindings.clear();
-    checker.closure_write_targets = init
-        .stmts
-        .iter()
-        .flat_map(|s| {
-            let mut acc = HashSet::default();
-            collect_closure_writes_stmt(s, false, &mut acc);
-            acc
-        })
-        .collect();
-    for s in &init.stmts {
-        checker.check_stmt(s, &mut scopes);
-    }
-}
-
-/// Flush the channel entries recorded since the previous flush into a
-/// [`stream::ChannelDelta`] (see the field notes there). `terminal` is the
-/// flush after `finalize_typed`: the recorded types were re-resolved in
-/// place -- which a prefix cursor cannot see -- so the aggregate scan
-/// restarts from scratch, and a still-open `Result` payload in `sum_views`
-/// defaults to `void` exactly like the channel copy the eager tail builds.
-fn flush_delta(
-    checker: &Checker,
-    state: &mut stream::FlushState,
-    terminal: bool,
-) -> stream::ChannelDelta {
-    let mut delta = stream::ChannelDelta::default();
-    // Aggregate result types: fold the newly recorded typed expressions into
-    // the running per-span agreement, then diff the seedable view against
-    // what was already delivered. A span can gain a seed (it resolved, or
-    // was first seen), change it (superseded value), or lose it (a later
-    // instantiation disagreed).
-    if terminal {
-        state.typed_seen = 0;
-        state.agg = Default::default();
-        state.receivers = Default::default();
-    }
-    for e in &checker.typed.expressions[state.typed_seen..] {
-        // An entry was resolved when it was RECORDED, which can be mid-body:
-        // a constructor's open slots are pinned by the statements after it
-        // (`HashMap.new()` then `set`). Resolve against the substitution as
-        // it stands NOW -- at a body boundary, with the whole body's pins
-        // committed -- or the entry would stay invisible to the aggregate
-        // until the terminal flush, far too late for a consumer that lowers
-        // the body's MIR from this delta.
-        let mut e = e.clone();
-        e.ty = checker.resolve(&e.ty);
-        state.agg.observe(&e, checker.program);
-        state.receivers.observe(&e, checker.program);
-    }
-    state.typed_seen = checker.typed.expressions.len();
-    let want = state.agg.seedable_map();
-    for (span, ty) in &want {
-        if state.expr_flushed.get(span) != Some(ty) {
-            delta.expr_types.push((*span, ty.clone()));
-        }
-    }
-    for span in state.expr_flushed.keys() {
-        if !want.contains_key(span) {
-            delta.expr_types_removed.push(*span);
-        }
-    }
-    state.expr_flushed = want;
-    let want = state.receivers.agreed_map();
-    for (span, ty) in &want {
-        if state.receivers_flushed.get(span) != Some(ty) {
-            delta.receiver_types.push((*span, ty.clone()));
-        }
-    }
-    for span in state.receivers_flushed.keys() {
-        if !want.contains_key(span) {
-            delta.receiver_types_removed.push(*span);
-        }
-    }
-    state.receivers_flushed = want;
-    // Append-only span sets.
-    for s in checker.view_args.difference(&state.view_args) {
-        delta.view_args.push(*s);
-    }
-    state.view_args.extend(delta.view_args.iter().copied());
-    for s in checker.lift_errs.difference(&state.lift_errs) {
-        delta.lift_errs.push(*s);
-    }
-    state.lift_errs.extend(delta.lift_errs.iter().copied());
-    for s in checker.null_props.difference(&state.null_props) {
-        delta.null_props.push(*s);
-    }
-    state.null_props.extend(delta.null_props.iter().copied());
-    for (span, fields) in &checker.fields_loops {
-        if state.fields_loops.insert(*span) {
-            delta.fields_loops.push((*span, fields.clone()));
-        }
-    }
-    // Last-write-wins maps. `sum_views` values mirror the eager channel
-    // copy: resolved against the current substitution, with a still-open
-    // `Result` payload defaulted to `void` -- an Err-only flow may leave the
-    // Ok slot pinned by nothing, ever, so waiting for it to close would
-    // withhold the entry forever. The default is provisional: a later body
-    // that does pin the slot changes the resolved value, and the revision is
-    // re-emitted for the consumer to re-lower against.
-    for (span, t) in &checker.sum_views {
-        let mut t = checker.resolve(t);
-        if let Type::Sum(n) = &mut t
-            && n.is_result_type()
-        {
-            for key in [
-                brass_hir::types::RESULT_OK_VALUE,
-                brass_hir::types::RESULT_ERR_ERROR,
-            ] {
-                if n.substitution.get(key).is_none_or(|t| t.is_unknown()) {
-                    n.substitution.insert(key, Type::Void);
-                }
-            }
-        }
-        if state.sum_views.get(span) != Some(&t) {
-            delta.sum_views.push((*span, t.clone()));
-            state.sum_views.insert(*span, t);
-        }
-    }
-    for (span, name) in &checker.type_names {
-        if state.type_names.get(span) != Some(name) {
-            delta.type_names.push((*span, name.clone()));
-            state.type_names.insert(*span, name.clone());
-        }
-    }
-    for (span, t) in &checker.typeof_types {
-        if state.typeof_types.get(span) != Some(t) {
-            delta.typeof_types.push((*span, t.clone()));
-            state.typeof_types.insert(*span, t.clone());
-        }
-    }
-    // A typeof entry disappears when disagreeing instantiations poison it.
-    let poisoned: Vec<Span> = state
-        .typeof_types
-        .keys()
-        .filter(|s| !checker.typeof_types.contains_key(*s))
-        .copied()
-        .collect();
-    for span in poisoned {
-        state.typeof_types.remove(&span);
-        delta.typeof_types_removed.push(span);
-    }
-    // Type-test patterns follow the typeof discipline: last-write-wins values
-    // (a wildcard hole is a legitimate final value, so entries are emitted
-    // as-is, never withheld for openness), removals on poisoning.
-    for (span, t) in &checker.type_tests {
-        if state.type_tests.get(span) != Some(t) {
-            delta.type_tests.push((*span, t.clone()));
-            state.type_tests.insert(*span, t.clone());
-        }
-    }
-    let poisoned: Vec<Span> = state
-        .type_tests
-        .keys()
-        .filter(|s| !checker.type_tests.contains_key(*s))
-        .copied()
-        .collect();
-    for span in poisoned {
-        state.type_tests.remove(&span);
-        delta.type_tests_removed.push(span);
-    }
-    // Clean call-site elaborations can discover contracts for nested
-    // unannotated callees before their dedicated body pass. Stream each new
-    // instance so runtime resolution can keep the whole call chain deferred.
-    for (key, ret) in &checker.instance_returns {
-        if state.instance_returns.get(key) != Some(ret) {
-            delta
-                .instance_returns
-                .push((key.0.clone(), key.1.clone(), ret.clone()));
-            state.instance_returns.insert(key.clone(), ret.clone());
-        }
-    }
-    for (span, (receiver, method, key)) in &checker.keyed_calls {
-        if state.keyed_calls.insert(*span) {
-            delta
-                .keyed_calls
-                .push((*span, receiver.clone(), method.clone(), key.clone()));
-        }
-    }
-    // The errors reported in this window (raw report order; the final
-    // analysis sorts and dedups the full set).
-    delta.errors = checker.errors[state.errors_seen..].to_vec();
-    state.errors_seen = checker.errors.len();
-    // Warnings can be rediscovered by call-site and dedicated-body checks, so
-    // flush by value instead of by prefix.
-    delta.warnings = checker
-        .warnings
-        .iter()
-        .filter(|warning| !state.warnings_flushed.contains(warning))
-        .cloned()
-        .collect();
-    state
-        .warnings_flushed
-        .extend(delta.warnings.iter().cloned());
-    delta
 }
 
 /// A closure's source and lexical environment for concrete body checking.
 struct ClosureBody {
     expr: Expr,
+    /// Whether the syntax has only local primitive arithmetic dependencies.
+    numeric_replay: bool,
+    /// Whether the body has a contextual return contract.
+    explicit_return: bool,
     scopes: ScopeStack,
+    /// The narrowing facts of the callable the literal belongs to.
+    narrowing_facts: Rc<narrowing::NarrowingFacts>,
     const_scopes: Vec<HashSet<String>>,
     module: Vec<String>,
     self_type: Option<String>,
     self_variant: Option<(String, String)>,
 }
 
+/// The state of one run of the infer pass (see `driver`): the diagnostics and
+/// channels being recorded, the pre-pass tables the bodies start from
+/// (returns, schemes, globals), the solver, and the bookkeeping of the body
+/// checks and call-site elaborations in progress.
+#[derive(Clone)]
 struct Checker<'a> {
+    channel_changes: std::cell::RefCell<channel_changes::ChannelChanges>,
     program: &'a Program,
     errors: Vec<TypeError>,
     warnings: Vec<TypeError>,
@@ -1626,6 +406,76 @@ struct Checker<'a> {
     /// The `return` types the last [`Self::check_block_root`] collected, so a
     /// caller can reconcile them itself (see `prefer_full_return`).
     last_returns: Vec<(Type, brass_parser::Span)>,
+    /// Expressions checked as `never` in the current callable body. Return
+    /// completeness reads these facts without changing branch value inference.
+    diverging_exprs: HashSet<Span>,
+    /// The statically decided `if`/`if let` tests of each body being checked
+    /// (innermost last), by the expression's span: the arm the full check
+    /// selected when the condition's type alone decides it. Type tests use
+    /// their condition span.
+    static_fold_frames: Vec<HashMap<Span, bool>>,
+    /// The decisions the last [`Self::check_block_root`] made (see
+    /// `static_fold_frames`), for the light walk of the same elaboration.
+    last_static_folds: HashMap<Span, bool>,
+    /// The full check's decisions the current light walk follows (see
+    /// `prefer_full_return`), so a per-instance walk prunes exactly the arms
+    /// the full check -- and the back end -- never run: their returns and
+    /// error sites belong to no path of the instance.
+    light_folds: HashMap<Span, bool>,
+    /// The numeric-literal value of each collected `return` written as a
+    /// literal, keyed by the span the return was collected under, so the
+    /// return join can let the literal adapt (see `returns.rs`).
+    return_literals: HashMap<brass_parser::Span, brass_typesys::NumericLiteral>,
+    /// The span of each `return` statement's value expression, keyed by the
+    /// statement span its type is collected under: where a joined return
+    /// that must be rebuilt as a parent sum records the rebuild.
+    return_value_spans: HashMap<brass_parser::Span, brass_parser::Span>,
+    /// While an instantiation that called itself is re-elaborated (see
+    /// `returns::settle_recursive_return`), keyed like `instantiating`: the
+    /// argument types and the return its recursive calls read.
+    recursion_assumptions: HashMap<String, (Vec<Type>, Type)>,
+    /// What the most recent check of a closure body against an expected
+    /// function type returned (its expression value or joined `return`s,
+    /// with the propagation layers), read back by `check_callable_body` for
+    /// the application's result.
+    last_closure_result: Option<Type>,
+    /// The instantiation whose body's returns and error payloads are being
+    /// reconciled, while a re-elaboration reports its conflicts; `None`
+    /// outside one (a conflict is then the definition's own).
+    conflict_site: Option<returns::InstanceSite>,
+    /// Instantiations (callable + resolved inputs) whose return or
+    /// error-payload conflict was already reported, so a later call site or
+    /// re-elaboration of the same instantiation stays quiet.
+    reported_instances: HashSet<(String, Vec<Type>)>,
+    /// The span of the trailing expression statement of the block being
+    /// checked in expression position (its value is the block's value, not
+    /// discarded); `None` in a statement block.
+    block_value_tail: Option<Span>,
+    /// The requirement the value of the `if`/`match`/block expression about
+    /// to be checked flows into (set by `check_expr_against_at`, taken by that
+    /// expression): each branch value is checked against it, so a construction
+    /// in a branch adapts to the slot exactly as a direct initializer does.
+    branch_expectation: Option<(Type, storage::FlowSite)>,
+    /// The requirement the trailing value of the block being checked in
+    /// expression position flows into, when its enclosing branching
+    /// expression had one (see `branch_expectation`).
+    tail_expectation: Option<(Type, storage::FlowSite)>,
+    /// Whether the branching expression `check_expr_against_at` handed
+    /// `branch_expectation` to passed it on to its branch values (a type-test
+    /// `if` drops it instead).
+    branch_expectation_taken: bool,
+    /// Spans of the expressions whose value the enclosing statement discards
+    /// (see `walk::discarded_value_spans`): a `!` there only propagates.
+    discarded_values: HashSet<Span>,
+    /// Spans of the expressions in statement position and, through their
+    /// arms, of each arm's trailing expression (see
+    /// `walk::discarded_value_spans`): an `if`/`if let`/`match` there yields
+    /// no value, so its arms' values are not joined -- `if c { f() }` with an
+    /// `int32`-returning `f` is fine as a statement.
+    statement_values: HashSet<Span>,
+    /// Set while checking the operand of `typeof(..)`, which reads only the
+    /// operand's type.
+    type_only_read: bool,
     /// Top-level bindings keyed by their DEFINING module. Globals are per-module
     /// (the back end keys their storage that way too), so two modules' same-named
     /// `const`s are two different globals with two different types -- a single
@@ -1651,10 +501,11 @@ struct Checker<'a> {
     co_method_returns: HashMap<(String, String), Type>,
     /// Whether the co-check pass (every record type's method bodies, checked in
     /// one shared environment before scheme generalization) is running. Return
-    /// reconciliation COMMITS unifications only then: the scheme must record two
-    /// unifiable returns as one parameter (`get_or`'s `dflt` IS the map's value
-    /// type), while a free function's returns stay loose -- its signature keeps
-    /// its own variables, bound per call site.
+    /// reconciliation RECORDS unifiable return paths as links (see
+    /// `co_return_links`) only then: the scheme must record two unifiable
+    /// returns as one parameter (`get_or`'s `dflt` IS the map's value type),
+    /// while a free function's returns stay loose -- its signature keeps its
+    /// own variables, bound per call site.
     co_checking: bool,
     /// The `(type symbol, method name)` whose body the co-check pass is
     /// currently checking, so return reconciliation can attribute the links it
@@ -1669,37 +520,74 @@ struct Checker<'a> {
     /// Callables whose body is currently being re-elaborated at a call site,
     /// keyed by `fn:<symbol>` / `method:<self type>.<name>`. Re-entering one is a
     /// recursive call: re-checking the body again would not terminate, so the
-    /// call falls back to the declared (or precomputed) return type.
+    /// call is typed against the return the elaboration in progress assumes
+    /// (see `recursion_assumptions`, `recursion_provisional`), else the
+    /// declared or precomputed one.
     ///
     /// A method is keyed by its RECEIVER TYPE, not by the `Sum.Variant` qualifier
     /// the call resolved through. A sum's methods are lowered into every variant's
     /// table, so one `v.render()` resolves to one candidate per variant, all
-    /// sharing the same body. Keyed per qualifier, a recursive call re-entered
-    /// through a *different* variant's key and the guard never fired: each level
-    /// re-elaborated the body once per not-yet-entered variant, so the work grew
-    /// factorially in the variant count and a wide sum's self-recursive method
-    /// effectively hung the compiler.
+    /// sharing the same body. Keyed per qualifier, a recursive call could
+    /// re-enter through another variant's key, and each level would
+    /// re-elaborate the body once per variant not yet entered: work factorial
+    /// in the variant count.
     instantiating: HashSet<String>,
     /// Set when a context seed was applied: every module except the entry
     /// (`main`) was checked by the run that produced the seed, so the per-item
     /// passes skip it and read the seeded tables instead.
     entry_only: bool,
-    /// Symbols whose RECURSIVE call fell back to the precomputed return during an
-    /// elaboration in progress. Only those need their shared table entry tied back
-    /// to what the body really returns (see `link_inferred_return`); doing it for
-    /// every function would pin a GENERIC one's shared entry to whichever call site
-    /// ran first, and every other call would then conflict with it.
+    /// Elaborations in progress (keyed like `instantiating`) that a recursive
+    /// call re-entered. Only those need what their recursive calls were typed
+    /// against -- the instance's provisional return (see
+    /// `recursion_provisional`) -- tied to what the body really returns (see
+    /// `link_inferred_return`), and an unsettled recursive return reported.
     recursed: HashSet<String>,
-    /// Callables whose body has at least one error site (an `error(..)`, an `expr!`
-    /// propagation, or a forwarded `Result`). A `T!` with NO site is fine -- nothing
-    /// ever reads its Err -- but one whose sites all came back with an unknown error
-    /// type has nothing to infer it from, and is reported.
+    /// Names the method co-check read from the global scope. The co-check runs
+    /// before the module initializers settle the globals' types, so a method
+    /// that read one was checked against its provisional type (see
+    /// `settle_global`).
+    co_global_reads: HashSet<String>,
+    /// The callables whose call-site elaborations are in progress, innermost
+    /// last (the order `instantiating` does not keep).
+    elaboration_stack: Vec<String>,
+    /// Elaborations in progress (keyed like `instantiating`) that a recursive
+    /// call re-entered through ANOTHER callable's elaboration.
+    mutually_recursed: HashSet<String>,
+    /// The return-table entries the light pass read while inferring the
+    /// precompute entry in progress, `None` outside that pass. The precompute
+    /// fixpoint re-infers an entry only when one of these changed (see
+    /// `precompute_return_entries`). A cell because the read in
+    /// `instantiate_annotated_type` happens behind a shared borrow.
+    light_reads: std::cell::RefCell<Option<HashSet<precompute::ReturnKey>>>,
+    /// The provisional return of each call-site elaboration in progress of an
+    /// unannotated function, keyed like `instantiating`, with the resolved
+    /// argument types it is for: what a recursive call at those arguments is
+    /// typed against until the body's own return is known. Instance-specific
+    /// (see `instance_provisional_return`), and tied to the real return when
+    /// the elaboration finishes (see `link_inferred_return`).
+    recursion_provisional: HashMap<String, (Vec<Type>, Type)>,
+    /// Callables (keyed like `generic_error_returns`) whose body has at least one
+    /// error site (an `error(..)`, an `expr!` propagation, or a forwarded
+    /// `Result`). A `T!` with NO site is fine -- nothing ever reads its Err --
+    /// but one whose sites all came back with an unknown error type has nothing
+    /// to infer it from, and is reported.
     error_sites: HashSet<String>,
     /// How many callable bodies have been re-elaborated at call sites so far, and
     /// whether the budget below has already been reported. Inference that fails to
     /// converge must not hang the compiler: it stops re-elaborating and says so.
     elaborations: u64,
+    /// Observations owned by this checker; speculative clones keep their own counts.
+    stats: stats::ElaborationStats,
     elaboration_budget_reported: bool,
+    /// How many calls were typed from their fallback return because the
+    /// elaboration nesting was too deep (see `elaboration_allowed`). A
+    /// fallback is only an approximation of the instance's return (the
+    /// definitional return, not one checked at these argument types), so an
+    /// elaboration that saw the count grow is neither memoized nor reported
+    /// as an instance's return.
+    depth_capped: u64,
+    /// Dependency observations made only by committed priority passes.
+    completion: completion_order::CompletionGraph,
     /// Deferred structural constraints on inference variables, keyed by the
     /// variable's `Unknown` id. Recorded while checking a body that uses an
     /// unknown-typed value (a closure parameter) and verified when the variable
@@ -1709,30 +597,36 @@ struct Checker<'a> {
     /// values retain their parameter variables, so applications can check the
     /// body again with concrete arguments just like a named generic function.
     closure_bodies: HashMap<Vec<Type>, Rc<ClosureBody>>,
+    /// Bodies identified by an open result, including closures with no open
+    /// parameters whose bracket shape depends on captured values.
+    closure_result_bodies: HashMap<u32, Rc<ClosureBody>>,
     /// The inference solver: a persistent substitution for variables pinned
     /// across expressions (such as an empty array's element type once a `push`
     /// fixes it) plus variable classification. `resolve` follows the
     /// substitution so all later uses of the same binding see the solved type,
-    /// and `kind_of` distinguishes a bare empty-array element (which cannot
-    /// satisfy a required position while unconstrained) from other unknowns
-    /// used by the local inference and monomorphization passes.
+    /// and `kind_of` tells the variables that cannot satisfy a required
+    /// position while unconstrained (an empty array's element, the Ok payload
+    /// of a body that only fails; see `InferenceVarKind`) from source-level
+    /// unknowns.
     solver: Solver,
     /// The module whose body is currently being checked, used to enforce
-    /// per-module name visibility. Set per function,
-    /// method, and module-init, and swapped while a called body is re-checked.
+    /// per-module name visibility. Set per function, method, and module-init,
+    /// and swapped while a called body is re-checked.
     current_module: Vec<String>,
     /// Nominal ids of shadowing `type Result` declarations whose shape problem
     /// was already reported, so every `T!`/`error(..)` in the module does not
     /// repeat the same diagnostic (`i32::MIN` marks the alias-shadow report).
     reported_result_shadow: HashSet<i32>,
-    /// The lazy (run) profile: calls to FULLY-ANNOTATED free functions --
-    /// concrete declared return, every parameter's type declared and fully
-    /// known -- are typed from the signature alone, skipping the callee-body
-    /// re-elaboration. That is exactly the class the JIT compiles as
-    /// runtime-deferred sites: such a body is instantiation-independent (its
-    /// own dedicated pass records its channels), so per-call re-checking
-    /// only re-derives what the signature already states. The complete
-    /// diagnostic verdict stays `check`'s (eager's) job, where this is off.
+    /// The lazy (streaming) profile: a call to a FULLY-ANNOTATED free function
+    /// -- concrete declared return, every parameter's type declared and fully
+    /// known -- is typed from the signature alone, skipping the callee-body
+    /// re-elaboration (`check_call` lists the remaining conditions). Such a
+    /// body is instantiation-independent and its own dedicated pass records
+    /// its channels, so per-call re-checking would only re-derive what the
+    /// signature already states; the lazy JIT can likewise compile a call to
+    /// it as a runtime-deferred site from the signature. The complete
+    /// diagnostic verdict stays with the eager (non-streaming) run, where this
+    /// is off.
     lazy_profile: bool,
     /// Memoized call-site body elaborations. Open input variables are numbered by
     /// first occurrence and tagged with their solver kind, preserving aliases
@@ -1746,6 +640,43 @@ struct Checker<'a> {
     /// helper. This keeps nested windows and poison rules equivalent to a body
     /// walk while collapsing repeated subtrees of inferred call chains.
     elaboration_memo: HashMap<ElaborationMemoKey, Rc<ElaborationMemoEntry>>,
+    /// Keep co-check reuse disabled when a numeric probe temporarily adopts
+    /// an ordinary frame for a structurally zero-growth annotated body.
+    co_memo_suspended: bool,
+    /// Nested co-effect observers, empty unless memo differential checks run.
+    co_validation: Vec<co_replay::CoEffects>,
+    /// Opt-in nested dependency windows used only for inventory reporting.
+    method_inventory: Option<Box<co_replay::MethodInventory>>,
+    /// Version of the shared scheme table, local to this checker.
+    method_scheme_revision: u64,
+    /// Canonical method co keys already missed in this checker. Only repeated
+    /// misses may open their own storage window; enclosing journals stay active.
+    method_co_seen: HashSet<ElaborationMemoKey>,
+    /// Completed checks of lexically closed numeric closures. Entries retain
+    /// exact concrete observations in their original enclosing instance.
+    closure_memo: HashMap<closure_memo::ClosureMemoKey, Rc<ElaborationMemoEntry>>,
+    /// Differential checking can force every concrete closure body walk.
+    closure_memo_disabled: bool,
+    #[cfg(test)]
+    closure_memo_hits: usize,
+    /// How many speculative walks -- checks whose solver bindings are rolled
+    /// back afterwards (a type-test probe, a closure body checked at one
+    /// application's types) -- enclose the current point. An elaboration
+    /// finished inside one is not memoized: its entry would describe bindings
+    /// the rollback undoes, and a later real call would replay them as if they
+    /// had happened.
+    speculation_depth: u32,
+    /// The imported context was checked without widening any numeric origin.
+    numeric_seed_ordinary: bool,
+    /// Whether this attempt solves unsatisfied numeric-origin demands.
+    numeric_enabled: bool,
+    /// A completed private walk certified this entire subtree at its ordinary types.
+    numeric_zero_growth: bool,
+    numeric: binding_joins::numeric::NumericState,
+    numeric_pure_bodies: Rc<HashSet<String>>,
+    numeric_pure_spans: Rc<std::cell::OnceCell<HashSet<Span>>>,
+    numeric_eligibility: Rc<std::cell::OnceCell<binding_joins::numeric::eligibility::Eligibility>>,
+    numeric_closed_bodies: Rc<HashSet<String>>,
     /// Nested elaboration windows isolate their own observations while still
     /// composing complete child subtrees into an enclosing memo entry.
     elaboration_journals: Vec<ElaborationJournalFrame>,
@@ -1756,8 +687,9 @@ struct Checker<'a> {
     /// Free functions that can transitively reach a reflective keyed
     /// (`-> infer!`) method call (see `taint::keyed_reachable`). The lazy
     /// profile never types a call to one from its signature alone: the keyed
-    /// call must be SEEN by this pass, or its discovery would restart the
-    /// analysis after execution began. Empty outside the lazy profile.
+    /// call must be SEEN while its caller is checked, or it could first be
+    /// reported after execution began, too late to specialize (see `taint`).
+    /// Empty outside the lazy profile.
     keyed_tainted: HashSet<String>,
     /// The module paths a PARTIAL seed covers (see `ContextTables::covered`);
     /// `None` under a full seed or no seed.
@@ -1767,8 +699,10 @@ struct Checker<'a> {
     /// named per call site, exempt from the uninferable-error report.
     generic_error_returns: HashSet<String>,
     /// Per record-type generalized scheme, keyed by storage symbol. Built after the
-    /// method bodies are co-checked and consulted at call sites to type a method
-    /// call's result by instantiating the method's scheme against the receiver.
+    /// method bodies are co-checked (the co-check itself runs against a
+    /// preliminary set, see `seed_schemes`) and consulted at call sites to type a
+    /// method call's result by instantiating the method's scheme against the
+    /// receiver.
     schemes: HashMap<String, TypeScheme>,
     /// One-shot marker set while checking the direct array-literal initializer
     /// of an unannotated `const` binding: the binding is immutable, so the
@@ -1782,37 +716,74 @@ struct Checker<'a> {
     call_expected: Option<Type>,
     /// Reflective method calls discovered so far (see [`Inference::keyed_calls`]).
     keyed_calls: HashMap<Span, (String, String, Type)>,
+    numeric_observations: Vec<numeric_calls::Observation>,
+    numeric_observed: HashSet<numeric_calls::Observation>,
+    /// How each `recv.name(..)` call resolved across its elaborations (see
+    /// `Checker::record_call_kind`).
+    call_sites: HashMap<Span, instances::CallSite>,
+    /// Every reflective call observation, attributed to its instance (see
+    /// `Checker::settled_keyed_calls`); `keyed_calls` only tracks which
+    /// spans are reflective.
+    keyed_observations: Vec<instances::KeyedObservation>,
+    /// The callable instances being elaborated, innermost last (see
+    /// [`instances`]): channel observations are attributed to the top one.
+    instance_stack: Vec<instances::TagRef>,
+    /// The interned instance tags by hash (see `instances::TagRef`).
+    instance_tags: HashMap<u64, Vec<Rc<instances::InstanceTag>>>,
+    /// Recursive-call spans already reported as polymorphic recursion
+    /// (see `Checker::check_polymorphic_recursion`).
+    polymorphic_recursion_reported: HashSet<Span>,
+    /// Aggregate-seed observations made inside an instance elaboration, in
+    /// record order, deduplicated (see `Checker::record_instance_typed`).
+    instance_typed: Vec<instances::InstanceTyped>,
+    /// The members of `instance_typed`, for deduplication.
+    instance_typed_seen: HashSet<instances::InstanceTyped>,
     /// Resolved binding types of `typeof`-bearing local annotations, keyed by
     /// the annotation span (see [`Inference::typeof_types`]).
     typeof_types: HashMap<Span, Type>,
     /// `typeof`-bearing annotation spans whose resolved type DIFFERED between
     /// two checks -- a generic body's instantiations disagreeing. One MIR body
     /// is shared by every instantiation, so no single slot type is right;
-    /// the entry is dropped (and stays dropped) and the binding's slot is left
-    /// to per-instance inference from its assignments.
+    /// the shared entry is dropped and the binding's slot reads its
+    /// per-instance seed from the typed annotation observations.
     typeof_poisoned: HashSet<Span>,
-    /// Bindings narrowed non-null in the current callable, with their original
-    /// nullable types. A call can re-null a narrowed GLOBAL (any callee may
-    /// write it) or a narrowed local ASSIGNED INSIDE A CLOSURE of this body (a
-    /// closure value may run during the call), so those narrowings are undone
-    /// after every call (`invalidate_narrowed_after_call`). Plain locals are
-    /// unaffected: no callee can rebind them.
-    narrowed_bindings: Vec<NarrowedBinding>,
-    /// Names assigned anywhere inside a closure literal of the callable body
-    /// currently being checked; see `narrowed_bindings`.
-    closure_write_targets: HashSet<String>,
+    /// The narrowings ended on the path being checked in the current callable
+    /// (see [`narrowing`]): a branch arm's entries are taken out and put back
+    /// at the join, a loop's stay to end them at its head.
+    narrowing_kills: Vec<narrowing::NarrowId>,
+    /// Nullable field reads inside a region whose condition tested the same
+    /// field path, by the read's span, with that path: their nullable-use
+    /// diagnostic explains that testing a field does not narrow it.
+    tested_field_reads: HashMap<Span, String>,
+    /// The next fresh [`narrowing::NarrowId`].
+    next_narrowing: narrowing::NarrowId,
+    /// Syntactic facts of the callable body being checked that bound how long
+    /// a narrowing survives calls and closure capture.
+    narrowing_facts: Rc<narrowing::NarrowingFacts>,
+    /// The loops of the current path being checked, innermost last, with the
+    /// narrowings in force at each loop head (see `Checker::check_loop`).
+    loop_frames: Vec<narrowing::LoopFrame>,
+    /// Set while typing the operand of a null test (`if x`, `!x`,
+    /// `x == null`), which is not a value use of a narrowing.
+    null_test_operand: bool,
+    /// Depth of walks whose diagnostics are discarded (statically dead arms,
+    /// speculative probes); their uses are not judged by loop verification.
+    discarded_walks: u32,
     /// Per-parameter rows (field presence/type requirements) of every free
     /// function and method, derived once per program. An anonymous structural
     /// argument to a row-covered parameter is checked against the row at the
     /// argument's own span (the value is where the mismatch lives).
     rows: Rc<brass_typesys::RowInfo>,
+    /// The method calls const checking found touching a const value; each is
+    /// judged against its resolved receiver (see `check_const_method_call`).
+    const_calls: Rc<crate::constck::ConstCalls>,
     /// Spans of anonymous structural arguments that passed their callee row
     /// check for a view-ELIGIBLE parameter: exactly the call sites where MIR
     /// lowering may convert the argument into the parameter's view.
     view_args: HashSet<Span>,
     /// Value expressions accepted as a declared sum subtype at a flow site,
-    /// keyed by the expression's span, mapped to the PARENT sum's table
-    /// symbol; MIR lowering rebuilds exactly these values as the parent.
+    /// keyed by the expression's span, mapped to the PARENT sum instance the
+    /// site requires (see [`Inference::sum_views`]).
     sum_views: HashMap<Span, Type>,
     /// `expr!` sites whose propagated Err payload is re-raised wrapped into
     /// the prelude `Error` (see [`Inference::lift_errs`]).
@@ -1820,7 +791,9 @@ struct Checker<'a> {
     /// Field lists of checked fields-loops, keyed by loop-statement span; the
     /// channel MIR lowering unrolls from (see [`Inference::fields_loops`]).
     fields_loops: HashMap<Span, Vec<String>>,
-    /// Resolved type names of checked `typeof(x)` calls, keyed by call span.
+    /// Type symbols resolved for `typeof(v).method(..)` static calls and for
+    /// record literals built as a declared record (see
+    /// [`Inference::type_names`]).
     type_names: HashMap<Span, String>,
     /// Display-only observations of what each application of a Fun-typed value
     /// instantiated its open parameter variables to, var id -> observed type.
@@ -1828,11 +801,32 @@ struct Checker<'a> {
     /// `Checker::record_closure_binding`); `None` poisons a variable observed
     /// at two different types (a genuinely polymorphic closure).
     closure_bindings: HashMap<u32, Option<Type>>,
-    /// Nesting depth of closure-argument re-checks (see
-    /// `Checker::recheck_closure_args`). While positive, body elaborations are
-    /// not memoized: the re-check's unifications are rolled back, so its
-    /// context is speculative the same way a co-check or type-test probe is.
-    closure_recheck_depth: u32,
+    /// The binding spans of the generalized closure bindings of the program
+    /// (`brass_hir::generalized_closure_bindings`): the rule MIR lowering
+    /// applies too, so both agree on which bindings are let-polymorphic.
+    generalizable: Rc<HashSet<Span>>,
+    /// Quantified variable -> every variable of the closure scheme it belongs
+    /// to (see `closure_schemes`). A type mentioning one is a use of a
+    /// generalized closure binding and is instantiated at each lookup.
+    closure_schemes: HashMap<u32, Rc<[u32]>>,
+    /// The light walk collecting a monomorphic closure binding's direct
+    /// applications, while one runs (see
+    /// `Checker::pin_closure_parameters`).
+    application_probe: Option<closure_applications::ApplicationProbe>,
+    /// (scheme variable, the fresh variable one use instantiated it to), for
+    /// the display-only `closure_bindings` observations made at the end.
+    closure_instantiations: Vec<(u32, u32)>,
+    /// Functions named as values with optional trailing parameters, by the
+    /// inference variable standing for each occurrence (see
+    /// `function_values`).
+    function_values: HashMap<u32, function_values::FunctionValue>,
+    /// Closure literals a concrete instance returned with parameters its body
+    /// did not determine (see `settle_escaping_closures`).
+    undetermined_closures: Vec<Span>,
+    /// The inference variables minted for unannotated closure parameters: an
+    /// arithmetic operation on one next to a literal is typed by the
+    /// parameter (see `check_binary_expr`).
+    closure_param_vars: HashSet<u32>,
     /// Spans of `expr!` operators whose operand is a NULLABLE (not a `Result`):
     /// the null case propagates as `Result.Null`. MIR lowering emits the
     /// presence-test shape for exactly these spans (see [`Inference::null_props`]).
@@ -1844,6 +838,22 @@ struct Checker<'a> {
     /// the kinds are tracked here and a disagreement is a checker error
     /// (`None` marks a span already reported, so re-elaborations stay quiet).
     prop_kinds: HashMap<Span, Option<PropKind>>,
+    /// The error payload (lifted into the prelude `Error`) the latest full
+    /// check of each `!` site found it propagating from a `Result` operand.
+    /// The light return walk of a per-instance elaboration runs right after
+    /// the full check of the same body and reads it for an operand it cannot
+    /// type itself -- a callee that is fallible only at this instance (a
+    /// method on an open parameter, a closure parameter) -- so the instance
+    /// is fallible exactly when one of its live `!` sites propagates an error.
+    full_err_props: HashMap<Span, Type>,
+    /// The element type of every empty array literal (`[]`) checked outside
+    /// a speculative walk, by the literal's span. A body checked at concrete
+    /// inputs judges its own literals once it is done (see
+    /// [`Checker::report_unfixed_empty_arrays`]).
+    empty_array_elems: Vec<(Span, Type)>,
+    /// The empty array literals of module top-level code, judged after every
+    /// body is checked (see [`Checker::report_unfixed_init_arrays`]).
+    init_empty_arrays: Vec<(Span, Type)>,
     /// Per-span evidence of how each sum flow site lowered in this
     /// elaboration: `Some(parent)` = coerced (rebuilt) to that declared-parent
     /// instance, `None` = same-nominal flow needing no rebuild. `sum_views` is
@@ -1851,7 +861,8 @@ struct Checker<'a> {
     /// instantiations and the baked rebuild has no per-instance escape hatch,
     /// so instantiations that disagree -- different parent instances, or
     /// view in one and identity in another -- are rejected like `prop_kinds`.
-    sum_view_seen: HashMap<Span, Option<NominalType>>,
+    /// Unresolved observations stay here until their payloads settle.
+    sum_view_seen: HashMap<Span, Vec<Option<Type>>>,
     /// Sum-view spans whose cross-instantiation conflict is already reported.
     sum_view_poisoned: HashSet<Span>,
     /// Whether each `!`/forwarded-return span re-wraps a raw error payload
@@ -1871,23 +882,18 @@ struct Checker<'a> {
     /// enclosing block is then unreachable. `check_block` reads it to stop
     /// reporting there, exactly as it already stops reporting inside the dead
     /// ARM of such an `if` -- the back end folds the branch to a direct jump and
-    /// never emits the fall-through either.
+    /// never emits the fall-through either. The unreachable statements'
+    /// `return`s do not join the instance's return type.
     static_divergence: bool,
-    /// Set alongside `static_divergence` by a TYPE-TEST `if`: the unreachable
-    /// fall-through additionally contributes no `return`s to the instance's
-    /// reconciled return type (the back end joins no return from a
-    /// type-test-dead block, so collecting them here would disagree with the
-    /// compiled ABI). A presence-dispatch fold leaves this false and keeps
-    /// its historical behavior.
-    static_divergence_prunes_returns: bool,
     /// Resolved patterns of checked type tests (`if v: T`), keyed by the test's
     /// span: the annotation with each `infer` hole either pinned by the tested
     /// arm's own requirements or left a wildcard. MIR lowering embeds the
     /// pattern into the test's rvalue and monomorphization re-decides the match
-    /// per instance through the same `brass_hir::type_test_matches` the checker
-    /// folded with. Recorded only by a pass whose subject type is fully known
-    /// (an open definitional sighting is less information, not a decision), and
-    /// shared-body instantiations that resolve a hole differently are rejected.
+    /// per instance through the same `brass_typesys::type_test_accepts` the
+    /// checker folded with. Recorded only by a pass whose subject type is fully
+    /// known (an open definitional sighting is less information, not a
+    /// decision), and shared-body instantiations that resolve a hole
+    /// differently are rejected.
     type_tests: HashMap<Span, Type>,
     /// Type-test spans whose cross-instantiation pattern conflict is already
     /// reported; the entry is dropped and stays dropped.
@@ -1909,10 +915,12 @@ enum PropKind {
     Err,
 }
 
-/// Find one direct nullable propagation and one direct error propagation in a
-/// callable body. Closure spans are excluded because a closure owns its return
-/// flow even when the light return-inference walk visits it while checking the
-/// surrounding callable.
+/// Find one direct nullable propagation and one direct error source in a
+/// callable body: the first `expr!` that propagates a null, and the first
+/// `expr!` that propagates an `Err` or `error(..)` call (returned or not --
+/// every evaluated `error(..)` makes the body fallible). Closure spans are
+/// excluded because a closure owns its return flow even when the light
+/// return-inference walk visits it while checking the surrounding callable.
 fn mixed_propagation_sites(
     body: &Block,
     kinds: &HashMap<Span, Option<PropKind>>,
@@ -1920,6 +928,7 @@ fn mixed_propagation_sites(
     #[derive(Default)]
     struct Sites {
         props: Vec<Span>,
+        raises: Vec<Span>,
         closures: Vec<Span>,
     }
 
@@ -1927,6 +936,9 @@ fn mixed_propagation_sites(
         fn visit(&mut self, expr: &Expr) {
             match expr {
                 Expr::ErrorProp(_, span) => self.props.push(*span),
+                Expr::Call(callee, _, span) if matches!(&**callee, Expr::Ident(name, _) if name == "error") => {
+                    self.raises.push(*span)
+                }
                 Expr::Closure(_, _, span) => self.closures.push(*span),
                 _ => {}
             }
@@ -1935,32 +947,54 @@ fn mixed_propagation_sites(
 
     let mut sites = Sites::default();
     crate::walk::walk_block(body, &mut sites);
-    sites.props.sort_by_key(|span| span.lo);
-    let direct = sites.props.into_iter().filter(|span| {
+    let direct = |span: &Span| {
         !sites
             .closures
             .iter()
             .any(|closure| closure.lo <= span.lo && span.hi <= closure.hi)
-    });
-    let mut null = None;
-    let mut error = None;
-    for span in direct {
-        match kinds.get(&span) {
-            Some(Some(PropKind::Null)) => null.get_or_insert(span),
-            Some(Some(PropKind::Err)) => error.get_or_insert(span),
-            _ => continue,
-        };
-        if null.is_some() && error.is_some() {
-            break;
-        }
-    }
-    Some((null?, error?))
+    };
+    let first_prop = |kind: PropKind| {
+        sites
+            .props
+            .iter()
+            .filter(|span| direct(span) && kinds.get(*span) == Some(&Some(kind)))
+            .min_by_key(|span| span.lo)
+            .copied()
+    };
+    let null = first_prop(PropKind::Null)?;
+    let raise = sites
+        .raises
+        .iter()
+        .filter(|span| direct(span))
+        .min_by_key(|span| span.lo)
+        .copied();
+    let error = [first_prop(PropKind::Err), raise]
+        .into_iter()
+        .flatten()
+        .min_by_key(|span| span.lo)?;
+    Some((null, error))
 }
 
 impl<'a> Checker<'a> {
-    /// Emit the warning only for an unannotated callable whose own direct `!`
-    /// sites inferred both layers. A nullable Result merely forwarded from an
-    /// annotated callee has no mixed pair here and remains deliberate plumbing.
+    /// Settle an unannotated method's precomputed return against the body the
+    /// co-check just walked (see `settle_definitional_return`).
+    fn settle_method_return(&mut self, key: &(String, String), body: &Block, unannotated: bool) {
+        let collected = std::mem::take(&mut self.last_returns);
+        if !unannotated {
+            return;
+        }
+        if let Some(entry) = self.method_returns.get(key).cloned()
+            && let Some(settled) = self.settle_definitional_return(&entry, body, collected)
+        {
+            self.method_returns.insert(key.clone(), settled);
+        }
+    }
+
+    /// Warn that an unannotated callable's inferred return `inferred` is a
+    /// nullable `Result` (callers must unwrap two layers) -- only when its own
+    /// direct `!` sites inferred both layers. A nullable Result merely
+    /// forwarded from an annotated callee has no mixed pair here and remains
+    /// deliberate plumbing.
     fn warn_implicit_nullable_result(
         &mut self,
         signature: &CallableSignature,
@@ -2014,11 +1048,31 @@ impl<'a> Checker<'a> {
         });
     }
 
+    #[cfg(test)]
     fn new(program: &'a Program, rows: Rc<brass_typesys::RowInfo>) -> Self {
+        Self::new_with_numeric(program, rows, true)
+    }
+
+    fn new_with_numeric(
+        program: &'a Program,
+        rows: Rc<brass_typesys::RowInfo>,
+        numeric_enabled: bool,
+    ) -> Self {
+        let numeric_pure_bodies = if numeric_enabled {
+            binding_joins::numeric::pure::bodies(program)
+        } else {
+            HashSet::default()
+        };
+        let numeric_closed_bodies = if numeric_enabled {
+            binding_joins::numeric::pure::closed_bodies(program)
+        } else {
+            HashSet::default()
+        };
         Self {
             program,
             errors: Vec::new(),
             warnings: Vec::new(),
+            channel_changes: Default::default(),
             typed: TypedProgram::default(),
             typed_seen: HashMap::default(),
             const_scopes: Vec::new(),
@@ -2028,6 +1082,23 @@ impl<'a> Checker<'a> {
             return_contexts: Vec::new(),
             return_values: Vec::new(),
             last_returns: Vec::new(),
+            diverging_exprs: HashSet::default(),
+            static_fold_frames: Vec::new(),
+            last_static_folds: HashMap::default(),
+            light_folds: HashMap::default(),
+            return_literals: HashMap::default(),
+            return_value_spans: HashMap::default(),
+            recursion_assumptions: HashMap::default(),
+            last_closure_result: None,
+            conflict_site: None,
+            reported_instances: HashSet::default(),
+            block_value_tail: None,
+            branch_expectation: None,
+            tail_expectation: None,
+            branch_expectation_taken: false,
+            discarded_values: HashSet::default(),
+            statement_values: HashSet::default(),
+            type_only_read: false,
             global_defs: HashMap::default(),
             global_scopes: HashMap::default(),
             function_returns: HashMap::default(),
@@ -2040,17 +1111,25 @@ impl<'a> Checker<'a> {
             instantiating: HashSet::default(),
             entry_only: false,
             recursed: HashSet::default(),
+            recursion_provisional: HashMap::default(),
+            light_reads: std::cell::RefCell::new(None),
+            elaboration_stack: Vec::new(),
+            mutually_recursed: HashSet::default(),
+            co_global_reads: HashSet::default(),
             error_sites: HashSet::default(),
             elaborations: 0,
+            stats: stats::ElaborationStats::default(),
             elaboration_budget_reported: false,
+            depth_capped: 0,
+            completion: completion_order::CompletionGraph::default(),
             shape_constraints: HashMap::default(),
             closure_bodies: HashMap::default(),
+            closure_result_bodies: HashMap::default(),
             solver: {
                 // Fresh variables must not collide with the ids lowering
                 // embedded in the program's resolved types (see
-                // `Program::next_infer_var`); a collision aliases an
-                // unrelated type and surfaced as order-dependent phantom
-                // type errors.
+                // `Program::next_infer_var`): a collision would alias a fresh
+                // variable with an unrelated declaration's type.
                 let mut s = Solver::new();
                 s.seed_var_counter(program.next_infer_var);
                 s
@@ -2059,7 +1138,42 @@ impl<'a> Checker<'a> {
             reported_result_shadow: HashSet::default(),
             lazy_profile: false,
             elaboration_memo: HashMap::default(),
+            co_memo_suspended: false,
+            co_validation: Vec::new(),
+            method_scheme_revision: 0,
+            method_co_seen: HashSet::default(),
+            method_inventory:
+                tracing::enabled!(target: "brass::method_inventory", tracing::Level::TRACE)
+                    .then(|| Box::new(co_replay::MethodInventory::default())),
+            closure_memo: HashMap::default(),
+            closure_memo_disabled: std::env::var("BRASS_CLOSURE_MEMO").as_deref() == Ok("off")
+                || std::env::var("BRASS_MEMO_CHECK").as_deref() == Ok("1"),
+            #[cfg(test)]
+            closure_memo_hits: 0,
             elaboration_journals: Vec::new(),
+            speculation_depth: 0,
+            numeric_seed_ordinary: true,
+            numeric_enabled,
+            numeric: Default::default(),
+            numeric_pure_spans: Rc::new(if numeric_enabled {
+                std::cell::OnceCell::from(
+                    program
+                        .functions
+                        .values()
+                        .filter(|info| {
+                            numeric_pure_bodies.contains(&info.symbol)
+                                || numeric_closed_bodies.contains(&info.symbol)
+                        })
+                        .map(|info| info.decl.body.span)
+                        .collect::<HashSet<_>>(),
+                )
+            } else {
+                std::cell::OnceCell::new()
+            }),
+            numeric_zero_growth: false,
+            numeric_eligibility: Default::default(),
+            numeric_pure_bodies: Rc::new(numeric_pure_bodies),
+            numeric_closed_bodies: Rc::new(numeric_closed_bodies),
             instance_returns: HashMap::default(),
             keyed_tainted: HashSet::default(),
             seeded_set: None,
@@ -2068,27 +1182,50 @@ impl<'a> Checker<'a> {
             fixed_array_binding: false,
             call_expected: None,
             keyed_calls: HashMap::default(),
+            numeric_observations: Vec::new(),
+            numeric_observed: HashSet::default(),
+            keyed_observations: Vec::new(),
+            call_sites: HashMap::default(),
+            instance_stack: Vec::new(),
+            instance_tags: HashMap::default(),
+            polymorphic_recursion_reported: HashSet::default(),
+            instance_typed: Vec::new(),
+            instance_typed_seen: HashSet::default(),
             typeof_types: HashMap::default(),
             typeof_poisoned: HashSet::default(),
             prop_kinds: HashMap::default(),
+            full_err_props: HashMap::default(),
+            empty_array_elems: Vec::new(),
+            init_empty_arrays: Vec::new(),
             sum_view_seen: HashMap::default(),
             sum_view_poisoned: HashSet::default(),
             lift_kinds: HashMap::default(),
             lift_poisoned: HashSet::default(),
-            narrowed_bindings: Vec::new(),
-            closure_write_targets: HashSet::default(),
+            narrowing_kills: Vec::new(),
+            tested_field_reads: HashMap::default(),
+            next_narrowing: 0,
+            narrowing_facts: Rc::default(),
+            loop_frames: Vec::new(),
+            null_test_operand: false,
+            discarded_walks: 0,
             rows,
+            const_calls: Rc::default(),
             view_args: HashSet::default(),
             lift_errs: HashSet::default(),
             sum_views: HashMap::default(),
             fields_loops: HashMap::default(),
             type_names: HashMap::default(),
             closure_bindings: HashMap::default(),
-            closure_recheck_depth: 0,
+            generalizable: Rc::new(brass_hir::generalized_closure_bindings(program)),
+            closure_schemes: HashMap::default(),
+            application_probe: None,
+            closure_instantiations: Vec::new(),
+            closure_param_vars: HashSet::default(),
+            undetermined_closures: Vec::new(),
+            function_values: HashMap::default(),
             null_props: HashSet::default(),
             in_entry_main: false,
             static_divergence: false,
-            static_divergence_prunes_returns: false,
             type_tests: HashMap::default(),
             type_test_poisoned: HashSet::default(),
             type_test_holes: HashSet::default(),
@@ -2119,8 +1256,47 @@ impl<'a> Checker<'a> {
         brass_hir::freshen_unknowns(ty, &mut fresh)
     }
 
+    /// Judge the empty array literals recorded since `from` (see
+    /// `empty_array_elems`), then forget them. With `body` -- the span of a
+    /// body checked at concrete inputs -- a literal inside it whose element
+    /// type nothing fixed (no annotation, no push, no use that pins it) is an
+    /// error: the array has no element type to be built with. Literals of
+    /// other bodies elaborated meanwhile are judged by their own pass.
+    fn report_unfixed_empty_arrays(&mut self, from: usize, body: Option<Span>) {
+        let recorded: Vec<(Span, Type)> = self.empty_array_elems.drain(from..).collect();
+        let Some(body) = body else {
+            return;
+        };
+        for (span, elem) in recorded {
+            if span.lo >= body.lo && span.hi <= body.hi {
+                self.report_unfixed_empty_array(span, &elem);
+            }
+        }
+    }
+
+    /// Judge the empty array literals of module top-level code (see
+    /// `check_init_body`) once every body is checked: a global's element type
+    /// may be fixed by a function that pushes into it.
+    fn report_unfixed_init_arrays(&mut self) {
+        for (span, elem) in std::mem::take(&mut self.init_empty_arrays) {
+            self.report_unfixed_empty_array(span, &elem);
+        }
+    }
+
+    fn report_unfixed_empty_array(&mut self, span: Span, elem: &Type) {
+        if self.resolve(elem).is_unknown() {
+            self.errors.push(TypeError {
+                message: "the element type of this empty array literal is never fixed: \
+                          annotate the binding (e.g. `let xs: int32[] = []`) or push a value \
+                          into it"
+                    .to_string(),
+                span,
+            });
+        }
+    }
+
     /// A fresh inference variable for the element type of a bare `[]` literal,
-    /// remembered so that an unconstrained empty array escaping into a required
+    /// classified so that an unconstrained empty array escaping into a required
     /// position is reported instead of silently unifying with the required type.
     fn fresh_empty_array_elem(&mut self) -> Type {
         let id = self.next_unknown;
@@ -2139,670 +1315,21 @@ impl<'a> Checker<'a> {
         Type::Unknown(id)
     }
 
-    /// Check a method body with `self` bound to the bare type. For an
-    /// inferred-return body, returns the reconciled return type like
-    /// [`Self::check_block_root`].
-    fn check_block_with_self(
-        &mut self,
-        b: &Block,
-        scopes: &mut ScopeStack,
-        ret: Option<&Type>,
-        self_type: &str,
-    ) -> Option<Type> {
-        self.check_block_with_self_context(b, scopes, ret, self_type, None)
-    }
-
-    fn check_block_with_self_variant(
-        &mut self,
-        b: &Block,
-        scopes: &mut ScopeStack,
-        ret: Option<&Type>,
-        self_type: &str,
-        variant: &str,
-    ) {
-        self.check_block_with_self_context(b, scopes, ret, self_type, Some(variant));
-    }
-
-    fn check_block_with_self_context(
-        &mut self,
-        b: &Block,
-        scopes: &mut ScopeStack,
-        ret: Option<&Type>,
-        self_type: &str,
-        variant: Option<&str>,
-    ) -> Option<Type> {
-        let saved = self.self_type.replace(self_type.to_string());
-        let saved_variant = self.self_variant.clone();
-        self.self_variant = variant.map(|v| (self_type.to_string(), v.to_string()));
-        if let Some(scope) = scopes.last_mut() {
-            scope.insert("self".to_string(), self.type_by_name(self_type));
-        }
-        let full = self.check_block_root(b, scopes, ret);
-        self.self_type = saved;
-        self.self_variant = saved_variant;
-        full
-    }
-
-    /// Check a function/method body. For an inferred-return body (`ret` is `None`)
-    /// returns the reconciled type of its `return` values as observed by the full
-    /// check (so a constructor whose slot array is filled with `null` returns the
-    /// nullable element type), or `None` for an explicit-return body.
-    fn check_block_root(
-        &mut self,
-        b: &Block,
-        scopes: &mut ScopeStack,
-        ret: Option<&Type>,
-    ) -> Option<Type> {
-        let saved = std::mem::replace(&mut self.const_scopes, vec![HashSet::default()]);
-        let saved_narrowed = std::mem::take(&mut self.narrowed_bindings);
-        let saved_closure_writes = std::mem::replace(
-            &mut self.closure_write_targets,
-            closure_write_targets_block(b),
-        );
-        self.return_contexts.push(match ret {
-            Some(ty) => ReturnContext::Explicit(ty.clone()),
-            None => ReturnContext::Inferred,
-        });
-        self.return_values.push(Vec::new());
-        self.check_block(b, scopes);
-        let collected = self.return_values.pop().unwrap_or_default();
-        self.last_returns = collected.clone();
-        self.return_contexts.pop();
-        self.closure_write_targets = saved_closure_writes;
-        self.narrowed_bindings = saved_narrowed;
-        self.const_scopes = saved;
-        if ret.is_none() {
-            // The co-check RECORDS the unifiable-return links (see
-            // `reconcile_return_types_with`): this is what ties a method's
-            // open-parameter return to the value it joins with, so the scheme
-            // records them as one parameter (`get_or`'s `dflt` IS the map's
-            // value type).
-            let common = self.reconcile_return_types_with(&collected, false, self.co_checking);
-            // The join helper leaves an open variable bare when joined with a
-            // literal `return null` (eager wrapping could nest once the
-            // variable resolves to a nullable type), which understates a
-            // generic body's return (`get`'s value-or-null is `V?`, not `V`).
-            // Re-wrap here: a body with a null return is nullable. Consumers
-            // collapse a nested `T??` to `T?` after instantiation (see
-            // `brass_hir::collapse_nullable`).
-            match common {
-                Some(t) if collected.iter().any(|(r, _)| r.is_null()) => {
-                    Some(match self.resolve(&t) {
-                        resolved @ Type::Nullable(_) => resolved,
-                        other => Type::Nullable(Box::new(other)),
-                    })
-                }
-                other => other,
-            }
-        } else {
-            None
-        }
-    }
-
-    /// Check every statement of a block.
-    ///
-    /// Statements after a statically-folded `if` whose taken arm always returns
-    /// are UNREACHABLE (see [`Checker::static_divergence`]). They are still
-    /// walked -- so the calls they make still reach monomorphization -- but their
-    /// type errors are dropped, the same treatment the dead arm of such an `if`
-    /// already gets. This is what lets a generic body pick the arm that fits its
-    /// instantiation and fall through for the others:
-    ///
-    /// ```text
-    /// fun as_text(v) -> string {
-    ///     if v._components { return v.to_string() }   // a Path: returns here
-    ///     return v                                    // a string: unreachable above
-    /// }
-    /// ```
-    ///
-    /// A `bool` condition never folds, so ordinary control flow is unaffected:
-    /// only a condition whose truthiness the type alone decides (a present member
-    /// vs an absent one) can make a fall-through dead.
-    fn check_block(&mut self, b: &Block, scopes: &mut ScopeStack) {
-        scopes.push(Scope::default());
-        self.const_scopes.push(HashSet::default());
-        let mut unreachable = false;
-        // Whether the divergence came from a TYPE TEST: the unreachable
-        // statements then also contribute no `return`s (their values are
-        // collected into a discarded scratch frame), mirroring the back
-        // end's type-test-dead blocks. A presence fold keeps collecting.
-        let mut prune_returns = false;
-        for s in &b.stmts {
-            let mark = self.errors.len();
-            self.static_divergence = false;
-            self.static_divergence_prunes_returns = false;
-            if unreachable && prune_returns {
-                self.return_values.push(Vec::new());
-                self.check_stmt(s, scopes);
-                self.return_values.pop();
-            } else {
-                self.check_stmt(s, scopes);
-            }
-            if unreachable {
-                self.errors.truncate(mark);
-            } else {
-                unreachable = self.static_divergence;
-                prune_returns = self.static_divergence_prunes_returns;
-            }
-        }
-        self.static_divergence = false;
-        self.static_divergence_prunes_returns = false;
-        self.const_scopes.pop();
-        scopes.pop();
-    }
-
-    /// Check a `return` against the active return context. The context is the
-    /// top of `return_contexts`, pushed by `check_block_root` for a function or
-    /// method body and by the closure checker for a closure body. Consulting
-    /// the stack rather than a positionally-threaded parameter means a `return`
-    /// nested inside an `if`/bare block/`match`-arm that is evaluated as an
-    /// expression is still checked against the enclosing callable's declared
-    /// type, and a `return` inside a closure is checked against the closure's
-    /// own (inferred) context rather than the outer function.
-    fn check_return(
-        &mut self,
-        value: Option<&Expr>,
-        span: brass_parser::Span,
-        scopes: &mut ScopeStack,
-    ) {
-        let returned = match self.return_contexts.last().cloned() {
-            Some(ReturnContext::Explicit(want)) => match value {
-                Some(e) => {
-                    // A fallible return type (`-> T!`, or any `Result`) auto-wraps a
-                    // bare value as `Ok { value }`: check it against the Ok payload.
-                    // A `Result`-typed value flows whole. This mirrors the inferred
-                    // fallible path and the HM checker (`hm::Stmt::Return`).
-                    let resolved = self.resolve(&want);
-                    let result_return = match &resolved {
-                        Type::Nullable(inner) if inner.is_result_type() => inner.as_ref(),
-                        other => other,
-                    };
-                    if let Some((ok, _err)) = result_return.result_payloads() {
-                        let ok = ok.clone();
-                        // `return e!` where the enclosing return is `T!` keys a
-                        // reflective method inside `e` by the Ok payload `ok`
-                        // (or by `want` when `e` is itself a `Result`). Set the
-                        // channel narrowly for a direct call / `call!`.
-                        if matches!(e, Expr::Call(..) | Expr::ErrorProp(..)) {
-                            self.call_expected = Some(ok.clone());
-                        }
-                        let got = self.check_expr(e, scopes);
-                        self.call_expected = None;
-                        // A declared subtype of the return's Result also flows
-                        // whole (the flow site coerces it). A null or an
-                        // already-nullable Result belongs to the declared outer
-                        // nullable layer rather than to the Result's Ok payload.
-                        let got_res = self.resolve(&got);
-                        let outer_nullable = matches!(resolved, Type::Nullable(_));
-                        let nullable_result = matches!(
-                            &got_res,
-                            Type::Nullable(inner) if inner.is_result_type()
-                        );
-                        if outer_nullable && (got_res.is_null() || nullable_result) {
-                            self.expect_expr_assignable(&got, &want, e);
-                        } else {
-                            let whole = got_res.is_result_type()
-                                || matches!((&got_res, result_return), (Type::Sum(h), Type::Sum(w))
-                                    if crate::structural::declares_sum_parent(self.program, h.id, w.id, 0));
-                            if whole {
-                                let flowed =
-                                    self.link_forwarded_error(&got_res, result_return, e.span());
-                                self.expect_expr_assignable(&flowed, &want, e);
-                            } else {
-                                self.expect_expr_assignable(&got, &ok, e);
-                            }
-                        }
-                        got
-                    } else {
-                        self.check_expr_against(e, &want, scopes)
-                    }
-                }
-                None => {
-                    // A fallible return wraps a bare `return` exactly like a
-                    // bare value: no value is a void payload, so `-> void!`
-                    // accepts it as the Ok exit (and `-> int32!` reports the
-                    // payload mismatch, not a mismatch against the whole
-                    // `Result`). Mirrors the HM checker, which skips the
-                    // void-return unification in a fallible body.
-                    let resolved = self.resolve(&want);
-                    let result_return = match &resolved {
-                        Type::Nullable(inner) if inner.is_result_type() => inner.as_ref(),
-                        other => other,
-                    };
-                    if let Some((ok, _err)) = result_return.result_payloads() {
-                        let ok = ok.clone();
-                        self.expect_assignable(&Type::Void, &ok, span);
-                    } else {
-                        self.expect_assignable(&Type::Void, &want, span);
-                    }
-                    Type::Void
-                }
-            },
-            // Inferred context (closure or unannotated function) or no context
-            // (module top level): type the value but do not constrain it; the
-            // return type is reconciled separately.
-            _ => match value {
-                Some(e) => self.check_expr(e, scopes),
-                None => Type::Void,
-            },
-        };
-        // Collect the resolved return type for the enclosing callable's inferred
-        // return (see `return_values`); harmless for an explicit-return body, whose
-        // collected values `check_block_root` discards.
-        let resolved = self.resolve(&returned);
-        if let Some(frame) = self.return_values.last_mut() {
-            frame.push((resolved, span));
-        }
-    }
-
-    /// Commit the return annotation's OPEN Err payload to a forwarded
-    /// Result's. `T!` infers its Err from the body's error sources; a body
-    /// whose only source is a forwarded callee Result (`return helper()`)
-    /// names the type only at this return, and the ordinary assignability
-    /// probe is deliberately non-committing, so the binding is made here.
-    fn link_forwarded_error(&mut self, got: &Type, want: &Type, span: Span) -> Type {
-        // The Err slot alone decides: an Err-only construction has no
-        // `Ok.value` entry, so `result_payloads` (which demands both keys)
-        // would miss it.
-        let g_err = match got {
-            Type::Sum(n) if n.is_result_type() => n
-                .substitution
-                .get(brass_hir::types::RESULT_ERR_ERROR)
-                .cloned(),
-            _ => None,
-        };
-        let Some(g_err) = g_err else {
-            return got.clone();
-        };
-        let g_err = self.resolve(&g_err);
-        if g_err.is_unknown() {
-            return got.clone();
-        }
-        // A forwarded payload that is not the prelude Error is re-raised
-        // wrapped into one at this return (MIR rebuilds the Err arm), so
-        // every error a fallible body hands back has one shape. The flowed
-        // type -- what the return is checked at -- carries the lifted slot.
-        let lifted = crate::lift_err_payload(self.program, g_err.clone());
-        self.record_lift_kind(span, lifted != g_err);
-        let flowed = if lifted != g_err {
-            self.record_lift_err(span);
-            match got {
-                Type::Sum(n) => {
-                    let mut n = n.clone();
-                    n.substitution
-                        .insert(brass_hir::types::RESULT_ERR_ERROR, lifted.clone());
-                    Type::Sum(n)
-                }
-                other => other.clone(),
-            }
-        } else {
-            got.clone()
-        };
-        if let Some((_, w_err)) = want.result_payloads()
-            && self.resolve(w_err).is_unknown()
-        {
-            let w_err = w_err.clone();
-            let _ = self.solver.unify(&w_err, &lifted);
-        }
-        flowed
-    }
-
-    fn check_stmt(&mut self, s: &Stmt, scopes: &mut ScopeStack) {
-        match s {
-            Stmt::Let {
-                pat,
-                ty,
-                value,
-                is_const,
-                ..
-            } => {
-                let Some(value) = value else {
-                    // `let x: T` without an initializer: the annotation alone
-                    // types the binding; the definite-assignment pass rejects
-                    // any read before the binding is fully assigned.
-                    self.bind_uninit_let(pat, ty.as_ref(), scopes);
-                    return;
-                };
-                let binding_ty = if let Some(te) = ty {
-                    match self.resolve_annotation_scoped(te, scopes) {
-                        Ok(annotated) => {
-                            let got = self.check_expr_against(value, &annotated, scopes);
-                            // Pin an open constructor result to the annotation, so
-                            // the back end seeds the concrete instance: `let m: SI =
-                            // HashMap.new()` fixes the witness-free map's key/value
-                            // from `SI` (its inferred fields would otherwise stay
-                            // open and its slot array read as `never`). Same-nominal
-                            // only, rolled back on a genuine mismatch (already
-                            // reported by `check_expr_against`).
-                            let g = self.resolve(&got);
-                            let a = self.resolve(&annotated);
-                            if same_nominal_instance(&g, &a) {
-                                let snap = self.solver.snapshot();
-                                if self.solver.unify(&got, &annotated).is_err() {
-                                    self.solver.rollback(snap);
-                                }
-                            }
-                            self.instantiate_annotated_type(&annotated, &got)
-                        }
-                        Err(message) => {
-                            self.errors.push(TypeError {
-                                message,
-                                span: te.span(),
-                            });
-                            self.check_expr(value, scopes)
-                        }
-                    }
-                } else {
-                    // An unannotated `const` bound directly to a non-empty array
-                    // literal is immutable, so the literal types as a
-                    // fixed-length array; a `let` binding stays a growable
-                    // slice. An annotation (above) always wins.
-                    self.fixed_array_binding =
-                        *is_const && matches!(value, Expr::Array(es, _) if !es.is_empty());
-                    let t = self.check_expr(value, scopes);
-                    self.fixed_array_binding = false;
-                    t
-                };
-                // Binding a NAME to a `void` value is a mistake with no
-                // representable value behind it -- classically a block-bodied
-                // closure that forgot `return`, whose call site would otherwise
-                // fail much later with an opaque unsupported-construct error.
-                // A wildcard (`let _ = f()`) still discards a void result.
-                if let Pattern::Binding(name, None, span) = pat
-                    && matches!(self.resolve(&binding_ty), Type::Void)
-                {
-                    self.errors.push(TypeError {
-                        message: format!(
-                            "cannot bind `{name}` to a `void` value (a block-bodied \
-                             closure or function returns `void` without an explicit \
-                             `return`)"
-                        ),
-                        span: *span,
-                    });
-                }
-                self.check_let_pattern_against(
-                    &binding_ty,
-                    pat,
-                    value,
-                    if *is_const { "const" } else { "let" },
-                );
-                self.bind_pattern(pat, &binding_ty, scopes);
-                if *is_const {
-                    self.record_expr_type_with(value, &binding_ty, Constness::Const);
-                    self.bind_const_pattern(pat);
-                }
-            }
-            Stmt::Assign {
-                target,
-                op,
-                value,
-                span,
-            } => {
-                let target_ty = self.check_place(target, scopes);
-                if matches!(op, AssignOp::Eq) {
-                    // A store into an array element whose type still carries an
-                    // open inference variable commits the value into it (the way
-                    // `push` does), so `arr[i] = v` pins an as-yet-unknown element
-                    // -- including a record element with open fields (`_Entry<?,
-                    // ?>`), whose key/value the stored value refines through the
-                    // solver. A fully-concrete element keeps the ordinary
-                    // bidirectional check (typed integer literals, structural
-                    // compatibility).
-                    let target_open = matches!(target, Expr::Index(..))
-                        && !self.solver.free_vars(&self.resolve(&target_ty)).is_empty();
-                    if target_open {
-                        let value_ty = self.check_expr(value, scopes);
-                        self.expect_element_assignable(&value_ty, &target_ty, value);
-                    } else {
-                        let value_ty = self.check_expr_against(value, &target_ty, scopes);
-                        self.constrain_stored_value(&value_ty, &target_ty);
-                    }
-                } else {
-                    let value_ty = self.check_expr(value, scopes);
-                    let result = self.check_binary(assign_binop(*op), &target_ty, &value_ty, *span);
-                    // The combined result is stored back into the target, so it
-                    // must flow into the target's type: `int64 += int32` widens
-                    // the operand, but `int32 += float64` would need a silent
-                    // float -> int truncation on the write-back and is rejected.
-                    self.expect_assignable(&result, &target_ty, *span);
-                }
-            }
-            Stmt::Expr(e) => {
-                self.check_expr(e, scopes);
-            }
-            Stmt::While { cond, body, .. } => {
-                self.check_condition(cond, scopes);
-                self.check_block(body, scopes);
-            }
-            Stmt::For {
-                pat, iter, body, ..
-            } => {
-                if brass_hir::fields_loop_target(s).is_some() {
-                    self.check_fields_loop(s, scopes);
-                    return;
-                }
-                let iter_ty = self.check_expr(iter, scopes);
-                // Iterating sees through reference/mutability wrappers and binds the
-                // loop variable to the element of the same kind: over `ref(mut(T[]))`
-                // each element is a `ref(mut(T))`, so mutating it writes through.
-                let item_ty = self.for_element(&iter_ty).unwrap_or_else(|| {
-                    self.errors.push(TypeError {
-                        message: format!(
-                            "cannot iterate over `{}`",
-                            self.resolve(&iter_ty).display()
-                        ),
-                        span: iter.span(),
-                    });
-                    self.fresh_unknown()
-                });
-                scopes.push(Scope::default());
-                self.const_scopes.push(HashSet::default());
-                // Check the loop variable's pattern against the element type, so a
-                // destructuring of the wrong arity is a diagnostic here rather than
-                // an out-of-bounds tuple read in the back end.
-                self.check_pattern_against(&item_ty, pat);
-                self.check_irrefutable_pattern(&item_ty, pat, None, "for");
-                self.bind_pattern(pat, &item_ty, scopes);
-                self.check_block(body, scopes);
-                self.const_scopes.pop();
-                scopes.pop();
-            }
-            Stmt::Return(value, span) => self.check_return(value.as_ref(), *span, scopes),
-            Stmt::Break(_) | Stmt::Continue(_) => {}
-        }
-        self.apply_guard_narrowing(s, scopes);
-    }
-
-    /// Bind an uninitialized `let x: T`: the annotation is the binding's type.
-    /// Only a single-name binding makes sense (there is no value to
-    /// destructure); the definite-assignment pass enforces write-before-read.
-    /// Resolve a local-binding annotation with the value scope in hand, so a
-    /// `typeof(v)` node ties the binding to `v`'s inferred type (`let x:
-    /// typeof(v)` gives x the same type as v). Structural wrappers around a
-    /// `typeof` recurse; a `typeof`-free annotation delegates to `resolve_type`.
-    /// `v` is type-checked (needed to know its type) but never lowered.
-    fn resolve_annotation_scoped(
-        &mut self,
-        te: &TypeExpr,
-        scopes: &mut ScopeStack,
-    ) -> Result<Type, String> {
-        let resolved = self.resolve_annotation_scoped_inner(te, scopes)?;
-        // A `typeof`-bearing annotation is not recoverable by MIR's scope-free
-        // resolver, so record the resolved type for the back end to seed the
-        // binding's slot (needed when the initializer -- e.g. `null` -- does not
-        // itself carry the type). The channel is keyed by span while one MIR
-        // body is shared across a generic's instantiations, so it is kept only
-        // while every fully-known observation agrees: a disagreement poisons
-        // the span for good and the slot falls back to per-instance inference
-        // from its assignments (correct whenever the initializer carries the
-        // type). A not-yet-concrete observation -- the template elaboration of
-        // a generic, before any instantiation -- is no information, neither
-        // recorded nor a conflict.
-        if contains_typeof(te) {
-            let span = te.span();
-            self.record_typeof_type(span, &resolved);
-        }
-        Ok(resolved)
-    }
-
-    fn resolve_annotation_scoped_inner(
-        &mut self,
-        te: &TypeExpr,
-        scopes: &mut ScopeStack,
-    ) -> Result<Type, String> {
-        match te {
-            TypeExpr::TypeOf(e, _) => Ok(self.check_expr(e, scopes)),
-            TypeExpr::Nullable(inner, _) => Ok(Type::Nullable(Box::new(
-                self.resolve_annotation_scoped_inner(inner, scopes)?,
-            ))),
-            TypeExpr::Array(inner, Some(n), _) => Ok(Type::Array(
-                Box::new(self.resolve_annotation_scoped_inner(inner, scopes)?),
-                *n,
-            )),
-            TypeExpr::Array(inner, None, _) => Ok(Type::Slice(Box::new(
-                self.resolve_annotation_scoped_inner(inner, scopes)?,
-            ))),
-            TypeExpr::Fallible(inner, span) => {
-                let ok = self.resolve_annotation_scoped_inner(inner, scopes)?;
-                let err = self.fresh_unknown();
-                Ok(self.scoped_result(ok, err, *span))
-            }
-            TypeExpr::Mut(inner, _) => Ok(Type::Mut(Box::new(
-                self.resolve_annotation_scoped_inner(inner, scopes)?,
-            ))),
-            TypeExpr::Ref(inner, _) => Ok(Type::Ref(Box::new(
-                self.resolve_annotation_scoped_inner(inner, scopes)?,
-            ))),
-            TypeExpr::Tuple(elems, _) => {
-                let mut ts = Vec::with_capacity(elems.len());
-                for e in elems {
-                    ts.push(self.resolve_annotation_scoped_inner(e, scopes)?);
-                }
-                Ok(Type::Tuple(ts))
-            }
-            // Named / Anonymous / Fun carry no `typeof` in practice; resolve them
-            // with the ordinary (scope-free) resolver.
-            _ => self.resolve_type(te),
-        }
-    }
-
-    fn bind_uninit_let(&mut self, pat: &Pattern, ty: Option<&TypeExpr>, scopes: &mut ScopeStack) {
-        // The parser only omits the initializer when an annotation is present.
-        let Some(te) = ty else { return };
-        let binding_ty = match self.resolve_annotation_scoped(te, scopes) {
-            Ok(t) => t,
-            Err(message) => {
-                self.errors.push(TypeError {
-                    message,
-                    span: te.span(),
-                });
-                return;
-            }
-        };
-        if !matches!(pat, Pattern::Binding(_, None, _)) {
-            self.errors.push(TypeError {
-                message: "an uninitialized `let` must bind a single name".to_string(),
-                span: te.span(),
-            });
-            return;
-        }
-        self.check_irrefutable_pattern(&binding_ty, pat, None, "let");
-        self.bind_pattern(pat, &binding_ty, scopes);
-    }
-
-    /// Check a `for f in fields(x)` loop: `x` must be a record; the body is
-    /// expanded and checked once per field (declaration order for a nominal
-    /// record, canonical key order for an anonymous one), with the loop
-    /// variable decayed to the field name and `v[f]` to the field projection
-    /// (see `brass_hir::expand`). The field list is recorded for MIR
-    /// lowering, which unrolls the identical copies.
-    fn check_fields_loop(&mut self, s: &Stmt, scopes: &mut ScopeStack) {
-        if let Stmt::For {
-            pat: pat @ Pattern::Binding(_, Some(_), _),
-            ..
-        } = s
-        {
-            // Reflection yields field names, not variants. Validate before
-            // expansion can mistake the qualified head for a loop binding.
-            self.check_pattern_against(&Type::Str, pat);
-            return;
-        }
-        if let Stmt::For { pat, .. } = s {
-            self.check_irrefutable_pattern(&Type::Str, pat, None, "for");
-        }
-        let Some((var, arg, body)) = brass_hir::fields_loop_target(s) else {
-            return;
-        };
-        let arg_ty = self.check_expr(arg, scopes);
-        let resolved = self.resolve(&arg_ty);
-        let (type_name, field_names) = match &resolved {
-            Type::Record(n) if n.id == brass_hir::STRUCTURAL_RECORD_ID => (
-                brass_hir::STRUCTURAL_RECORD_NAME.to_string(),
-                n.substitution.iter().map(|(k, _)| k.to_string()).collect(),
-            ),
-            Type::Record(n) => {
-                let Some(info) = self.program.type_by_id(n.id) else {
-                    self.errors.push(TypeError {
-                        message: format!(
-                            "`fields(..)` requires a record value, got `{}`",
-                            resolved.display()
-                        ),
-                        span: arg.span(),
-                    });
-                    return;
-                };
-                let TypeKind::Record { fields, .. } = &info.kind else {
-                    self.errors.push(TypeError {
-                        message: format!(
-                            "`fields(..)` requires a record value, got `{}`",
-                            resolved.display()
-                        ),
-                        span: arg.span(),
-                    });
-                    return;
-                };
-                (
-                    info.name.clone(),
-                    fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
-                )
-            }
-            other => {
-                self.errors.push(TypeError {
-                    message: format!(
-                        "`fields(..)` requires a record value, got `{}`",
-                        other.display()
-                    ),
-                    span: arg.span(),
-                });
-                return;
-            }
-        };
-        // Defensive: the channel is span-keyed and consumed by one shared MIR
-        // lowering. A generic `fields(..)` operand is rejected before reaching
-        // here today, but a disagreement must never be baked silently.
-        if !self.record_fields_loop(s.span(), field_names.clone()) {
-            return;
-        }
-        for (i, field) in field_names.iter().enumerate() {
-            let expanded = brass_hir::expand_fields_body(body, var, field, i);
-            let err_start = self.errors.len();
-            self.check_block(&expanded, scopes);
-            // Copies carry shifted spans (so span-keyed sidecars stay distinct
-            // per copy); surface diagnostics at the source position, naming
-            // the field whose copy failed.
-            for e in &mut self.errors[err_start..] {
-                e.span = brass_hir::unshift_span(e.span);
-                e.message = format!(
-                    "{} (while expanding field `{field}` of `{type_name}`)",
-                    e.message
-                );
-            }
-        }
+    /// A fresh inference variable for the `Ok` payload of an instantiation
+    /// that can only fail (see `InferenceVarKind::UninhabitedOk`).
+    fn fresh_uninhabited_ok(&mut self) -> Type {
+        let id = self.next_unknown;
+        self.next_unknown += 1;
+        self.solver.record_var(id, InferenceVarKind::UninhabitedOk);
+        Type::Unknown(id)
     }
 
     fn check_expr(&mut self, e: &Expr, scopes: &mut ScopeStack) -> Type {
         let ty = self.check_expr_inner(e, scopes);
-        self.record_expr_type(e, &ty);
+        if self.numeric.probing {
+            self.note_numeric_expression(e, scopes);
+        }
+        self.record_inferred_expr_type(e, &ty);
         ty
     }
 
@@ -2830,6 +1357,11 @@ impl<'a> Checker<'a> {
 
     fn record_expr_type_with(&mut self, expr: &Expr, ty: &Type, constness: Constness) {
         let ty = self.resolve(ty);
+        if matches!(ty, Type::Never) {
+            self.diverging_exprs.insert(expr.span());
+        } else {
+            self.diverging_exprs.remove(&expr.span());
+        }
         let ty = if constness == Constness::Const {
             Type::ConstOf(Box::new(ty))
         } else {
@@ -2843,13 +1375,6 @@ impl<'a> Checker<'a> {
         );
     }
 
-    /// Re-resolve every recorded expression type against the final substitution.
-    /// Run once after all checking, so a type recorded before one of its
-    /// variables was pinned still reflects the solved type. `resolve` is deep --
-    /// it follows variables nested inside arrays, function types, and a nominal's
-    /// substitution (so a `HashMap`'s `_entries` element pinned by a later `push`
-    /// shows its concrete type) -- and preserves the `ConstOf` wrapper, so
-    /// constness is unchanged.
     /// The unambiguous closure-parameter observations, resolved against the
     /// final substitution (later unification may have pinned parts of an
     /// observed type). Conflict-poisoned and still-open observations are
@@ -2864,7 +1389,47 @@ impl<'a> Checker<'a> {
             .collect()
     }
 
+    /// Move the `len` typed entries recorded from `start` behind every entry
+    /// recorded after them, keeping each group's own order. The editor
+    /// features read the FIRST entry at a span as the generic view of the
+    /// body it belongs to -- the one its definitional pass records -- so the
+    /// module initializers' call-site elaborations of those bodies, checked
+    /// first because they type the globals, must not stay in front of it.
+    fn defer_typed_entries(&mut self, start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let total = self.typed.expressions.len();
+        self.typed.expressions[start..].rotate_left(len);
+        self.typed_seen.clear();
+        for (index, e) in self.typed.expressions.iter().enumerate() {
+            let hash = journal::typed_hash(&e.kind, e.span, &e.ty, e.constness);
+            self.typed_seen.entry(hash).or_default().push(index);
+        }
+        // The instance observations name typed entries by index: follow the
+        // rotation.
+        let moved = |index: usize| match index {
+            i if i < start => i,
+            i if i < start + len => i + (total - start - len),
+            i => i - len,
+        };
+        for entry in &mut self.instance_typed {
+            entry.index = moved(entry.index as usize) as u32;
+        }
+        self.instance_typed_seen = self.instance_typed.iter().cloned().collect();
+    }
+
+    /// Re-resolve every recorded expression type against the final substitution.
+    /// Run once after all checking, so a type recorded before one of its
+    /// variables was pinned (an array element fixed by a later `push`) still
+    /// reflects the solved type; hover and the other editor features read the
+    /// typed program directly. `resolve` is deep --
+    /// it follows variables nested inside arrays, function types, and a nominal's
+    /// substitution (so a `HashMap`'s `_entries` element pinned by a later `push`
+    /// shows its concrete type) -- and preserves the `ConstOf` wrapper, so
+    /// constness is unchanged.
     fn finalize_typed(&mut self) {
+        self.settle_sum_views();
         let resolved: Vec<Type> = self
             .typed
             .expressions
@@ -2928,17 +1493,18 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Whether `a` and `b` unify on their own, or one is structurally
+    /// compatible with the other (either direction). A probe: nothing is
+    /// committed to the solver.
     fn can_unify(&self, a: &Type, b: &Type) -> bool {
         Subst::new().unify(a, b).is_ok()
             || crate::structural::types_compatible(self.program, a, b)
             || crate::structural::types_compatible(self.program, b, a)
     }
 
-    /// Resolve a type through the persistent substitution, following solved
-    /// inference variables (including nested ones). The substitution is only
-    /// populated where the checker pins a variable across uses (e.g. an empty
-    /// array's element type after the first `push`), so an unconstrained type is
-    /// returned structurally unchanged.
+    /// Resolve a type through the solver's substitution, following solved
+    /// inference variables (including nested ones); a variable nothing has
+    /// bound is returned as it is.
     fn resolve(&self, ty: &Type) -> Type {
         self.solver.resolve(ty)
     }
@@ -2949,3 +1515,5 @@ impl<'a> Checker<'a> {
         self.solver.resolve_head(ty)
     }
 }
+
+mod closure_instances;

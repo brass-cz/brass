@@ -1,0 +1,20 @@
+// A recursion none of whose paths returns a value of its own has no return
+// type to infer, for a cycle of functions and for one function alike; the
+// call is rejected with a request to annotate rather than refused by the back
+// end.
+fun a(n) {
+    return b(n)
+}
+
+fun b(n) {
+    return a(n)
+}
+
+fun spin(n) {
+    return spin(n)
+}
+
+fun main() {
+    println(a(1))
+    println(spin(1))
+}

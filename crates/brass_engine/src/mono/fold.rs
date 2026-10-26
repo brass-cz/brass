@@ -9,9 +9,10 @@ use super::*;
 /// and a non-nullable / non-bool condition (always truthy) as true, so the dead
 /// arm is never visited. The typed back end uses this to skip emitting an arm
 /// that cannot run -- and the unwrapped `never` values it would otherwise
-/// contain (e.g. `a * 2` where `a` is a bare `null`) -- while monomorphization
-/// still types both arms so a fallible callable's `Result` payloads infer from
-/// whichever arm supplies each.
+/// contain (e.g. `a * 2` where `a` is a bare `null`) -- and monomorphization
+/// joins an instance's returns and infers its `Result` payloads over the
+/// reachable blocks only, so a dead arm's returns and `error(..)` sites do not
+/// shape the instance.
 pub fn reachable_blocks(program: &Program, body: &MirBody, local_types: &[Type]) -> Vec<bool> {
     let mut reached = vec![false; body.blocks.len()];
     let mut stack = vec![body.entry];
@@ -56,15 +57,11 @@ pub fn locals_only_in_dead_blocks(body: &MirBody, reachable: &[bool]) -> Vec<boo
 
 /// The effective static truthiness of an `if` condition, used to fold a branch.
 ///
-/// Folding decides ONLY on the condition, never on the arm's content. An
-/// earlier version also folded a then-arm whose reachable return conflicted
-/// with the function's return type, to let a structural `if` degrade for a
-/// non-fitting instance -- but every sound degrade is already decided by the
-/// condition itself (an absent member reads `never?` -> false, a present
-/// non-nullable one -> true), while a runtime-decided branch with a
-/// conflicting return is a type error, and deleting the arm turned it into a
-/// miscompilation (`HashMap.get_or` silently returned the default on the hit
-/// path). The front end now rejects such programs; nothing here may prune a
+/// Folding decides ONLY on the condition, never on the arm's content: every
+/// sound fold is decided by the condition itself (an absent member reads
+/// `never?` -> false, a present non-nullable one -> true), while a
+/// runtime-decided branch whose return conflicts with the function's return
+/// type is a type error the checker rejects. Nothing here may prune a
 /// runtime-reachable arm.
 pub fn cond_static_truthiness(
     program: &Program,
@@ -96,7 +93,104 @@ pub fn cond_static_truthiness(
             ty => Some(brass_typesys::type_test_accepts(program, pattern, &ty)),
         };
     }
+    // A variant test (`match` arm, `if let` of a variant) of a variant no
+    // value of the subject's type can hold.
+    if uninhabited_variant_test(program, body, local_types, cond) {
+        return Some(false);
+    }
     operand_type_of(cond, local_types).static_truthiness()
+}
+
+/// Whether `cond` is certainly false because it is a variant test of a
+/// variant no value of the subject's type can hold (see
+/// [`variant_uninhabited`]). Pattern lowering guards the tag test behind
+/// the subject's presence test and joins both outcomes into one condition
+/// local (`c = false` when absent, `c = value_matches(..)` when present), so
+/// a local is certainly false when every value assigned to it is: a `false`
+/// constant, such a variant test, or a copy of a local that is -- at least
+/// one of them a variant test.
+fn uninhabited_variant_test(
+    program: &Program,
+    body: &MirBody,
+    local_types: &[Type],
+    cond: &Operand,
+) -> bool {
+    /// The answer for one operand: `None` when it may be true, else whether
+    /// a variant test was among its sources.
+    fn certainly_false(
+        program: &Program,
+        body: &MirBody,
+        local_types: &[Type],
+        op: &Operand,
+        depth: u8,
+    ) -> Option<bool> {
+        let id = match op {
+            Operand::Const(Literal::Bool(false)) => return Some(false),
+            Operand::Local(id) if depth > 0 => id,
+            _ => return None,
+        };
+        let mut assigned = false;
+        let mut saw_test = false;
+        for block in &body.blocks {
+            for stmt in &block.stmts {
+                let MirStmt::Assign(dest, rv) = stmt else {
+                    continue;
+                };
+                if dest != id {
+                    continue;
+                }
+                assigned = true;
+                match rv {
+                    Rvalue::Use(inner) => {
+                        saw_test |= certainly_false(program, body, local_types, inner, depth - 1)?;
+                    }
+                    Rvalue::Call(Callee::Builtin(name), args) if name == "value_matches" => {
+                        let [subj, Operand::Const(Literal::Str(variant))] = args.as_slice() else {
+                            return None;
+                        };
+                        let ty = operand_type_of(subj, local_types);
+                        if !variant_uninhabited(program, unwrap_nullable(&ty), variant) {
+                            return None;
+                        }
+                        saw_test = true;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        assigned.then_some(saw_test)
+    }
+    certainly_false(program, body, local_types, cond, 4) == Some(true)
+}
+
+/// Whether no value of the sum type `ty` can be the variant `variant`: the
+/// variant has a member its declaration leaves open (unannotated), and `ty`
+/// does not pin it. A construction of the variant records its open members
+/// in the instance type it produces, and joining instances keeps them, so
+/// a type that leaves one unpinned was never built as that variant -- an
+/// `Opt.Nothing` handed to `show(o: Opt)` makes an instance whose `Some { v }`
+/// arm would read a `v` of no type. That arm is dead for the instance (the
+/// JIT's variant layout already answers such a test `false`). The generic
+/// `Result` is not judged here: an unpinned payload of it is spelled `void`.
+fn variant_uninhabited(program: &Program, ty: &Type, variant: &str) -> bool {
+    let Type::Sum(n) = ty else {
+        return false;
+    };
+    if n.is_result_type() {
+        return false;
+    }
+    let Some(TypeKind::Sum { variants }) = program.type_by_id(n.id).map(|info| &info.kind) else {
+        return false;
+    };
+    let Some(v) = variants.iter().find(|v| v.name == variant) else {
+        return false;
+    };
+    v.fields.iter().any(|field| {
+        field.resolved_ty.as_ref().is_none_or(Type::is_unknown)
+            && n.substitution
+                .get(&format!("{variant}.{}", field.name))
+                .is_none_or(Type::is_unknown)
+    })
 }
 
 /// The blocks an instance reaches once its TYPE TESTS are folded against the

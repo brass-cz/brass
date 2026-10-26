@@ -1,4 +1,4 @@
 ok: 1 2
 err: [e2e_tests/reflection/into_decode_errors.cz:13:20] unhandled error: missing field 'y'
-err: [<unknown>:0:0] unhandled error: cannot decode this value as `Point`
-err: [<unknown>:0:0] unhandled error: cannot decode this value as `int64`
+err: [e2e_tests/reflection/into_decode_errors.cz:38:29] unhandled error: cannot decode this value as `Point`
+err: [e2e_tests/reflection/into_decode_errors.cz:28:30] unhandled error: cannot decode this value as `int64`

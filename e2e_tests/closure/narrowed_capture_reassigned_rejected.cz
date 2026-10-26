@@ -1,0 +1,56 @@
+// @backends: all
+// A closure may run at any later point, so it sees a narrowed variable as
+// non-null only when nothing can reassign it while the closure exists. A
+// variable assigned after the closure literal (or anywhere in a loop around
+// it), one that some closure assigns, and a module global are all seen with
+// their declared `T?` inside the closure, so each unchecked read is rejected.
+let g: string? = "global"
+fun pick(b: bool) -> string? {
+    if b { return "hello" }
+    return null
+}
+fun assigned_later() {
+    let x = pick(true)
+    let f = () -> 0
+    if x {
+        f = () -> x.len()
+    }
+    x = null
+    println(f())
+}
+fun assigned_by_closure() {
+    let x = pick(true)
+    let clear = () -> {
+        x = null
+        return 0
+    }
+    if !x { return }
+    let reader = () -> x.len()
+    clear()
+    println(reader())
+}
+fun assigned_in_loop() {
+    let x = pick(true)
+    let f = () -> 0
+    let i = 0
+    while i < 2 {
+        x = pick(i == 0)
+        if x {
+            f = () -> x.len()
+        }
+        i = i + 1
+    }
+    println(f())
+}
+fun global_capture() {
+    if g {
+        let f = () -> g.len()
+        println(f())
+    }
+}
+fun main() {
+    assigned_later()
+    assigned_by_closure()
+    assigned_in_loop()
+    global_capture()
+}

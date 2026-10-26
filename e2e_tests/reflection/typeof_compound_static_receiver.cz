@@ -1,0 +1,23 @@
+// @backends: all
+// `typeof(e).method(..)` calls the static method of e's type for any operand,
+// not only a name: a literal, a call or an element read is typed (and a
+// compound operand runs once, for its effects) and its static type is the
+// receiver, also per instance inside a generic function.
+fun noisy() -> float32 {
+    println("evaluated")
+    return 1.5
+}
+
+const from_literal = typeof(3.9).from(3)
+println(from_literal)
+let from_call = typeof(noisy()).from(3)
+println(from_call)
+println(typeof(from_call))
+let xs = [1, 2]
+println(typeof(xs[0]).from(7.9)!)
+println(typeof("s").from(5))
+
+fun first_as(v) {
+    return typeof(v[0]).from(2)
+}
+println(first_as([1.5]))

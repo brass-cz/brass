@@ -1,0 +1,1 @@
+error: this record literal is built as `A` in one instantiation of this generic function and as `B` in another

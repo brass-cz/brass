@@ -1,10 +1,17 @@
 //! Resolution of source type annotations to checker types: named
-//! types and aliases, composite type expressions, and refinement
-//! annotations over a base nominal type.
+//! types and aliases, composite type expressions, refinement
+//! annotations over a base nominal type, and the `Result` the
+//! fallibility sugar builds in the current scope.
 
 use super::*;
 
 impl<'a> Checker<'a> {
+    /// Resolve the annotation `te` as seen from the current module, with no
+    /// value scope (a local `let`'s annotation goes through
+    /// `resolve_annotation_scoped`, which ties a `typeof(v)` to `v`). `infer`
+    /// and the error payload of a `T!` become fresh inference variables;
+    /// `Err` carries the message for a name or form that denotes no value
+    /// type.
     pub(super) fn resolve_type(&mut self, te: &TypeExpr) -> Result<Type, String> {
         match te {
             TypeExpr::Named(name, _) => self.resolve_named(name),
@@ -19,7 +26,7 @@ impl<'a> Checker<'a> {
                 }
                 Ok(Type::Fun(ps, Box::new(self.resolve_type(ret)?)))
             }
-            TypeExpr::Nullable(inner, _) => Ok(Type::Nullable(Box::new(self.resolve_type(inner)?))),
+            TypeExpr::Nullable(inner, _) => Ok(Type::nullable(self.resolve_type(inner)?)),
             // `T!` is the fallible `Result` in scope (a shadowing declaration
             // included); the error payload is a fresh unknown so it is inferred
             // from the body's error sites (like `infer`), unless the scope's
@@ -83,9 +90,7 @@ impl<'a> Checker<'a> {
             .resolve_type(&self.current_module, bname)
             .ok_or_else(|| format!("unknown type `{bname}` in refinement"))?;
         let TypeKind::Record { fields, .. } = &info.kind else {
-            return Err(format!(
-                "`{bname}` is not a record type and cannot be refined"
-            ));
+            return Err(brass_hir::typedecl::sum_refinement_error(bname));
         };
         let (id, name) = (info.id, info.name.clone());
         let slots = info.slots.clone();
@@ -195,26 +200,17 @@ impl<'a> Checker<'a> {
     /// from the current module, with any `infer` slot freshened so distinct uses
     /// do not share a variable.
     pub(super) fn resolve_alias(&mut self, name: &str) -> Option<Type> {
-        let alias = brass_hir::resolve_qualified(
-            &self.program.type_aliases,
-            &self.program.import_origins,
-            &self.program.import_renames,
-            &self.current_module,
-            name,
-            |alias| {
-                brass_hir::definition_is_visible(
-                    &self.program.import_origins,
-                    &self.program.prelude_modules,
-                    &self.current_module,
-                    name,
-                    &alias.module,
-                )
-            },
-        )?;
-        let ty = alias.ty.clone();
+        let ty = self
+            .program
+            .resolve_type_alias(&self.current_module, name)?
+            .ty
+            .clone();
         Some(brass_hir::freshen_infer(ty, &mut || self.fresh_unknown()))
     }
 
+    /// The nominal type named by the storage symbol or the source name `name`
+    /// (resolved from the current module); a name that resolves to no type
+    /// yields a placeholder nominal (id `-1`).
     pub(super) fn type_by_name(&self, name: &str) -> Type {
         self.program
             .types

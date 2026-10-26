@@ -1,0 +1,17 @@
+// @backends: all
+// A global initialized from a `match` arm binding takes the binding's type,
+// even when another global has the same name as the binding: `g` is the
+// variant's string, not the int32 global `n`.
+type W = | Only { n: string }
+
+let n = 5
+let w = W.Only { n: "hello" }
+let g = match w {
+    Only { n } => n,
+}
+
+fun main() {
+    println(typeof(g))
+    println(g)
+    println(n + 1)
+}

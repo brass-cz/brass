@@ -108,6 +108,37 @@ pub fn prim_method_instance(
     (program.lookup(&sym).is_some() || program.deferred.contains_key(&sym)).then_some(sym)
 }
 
+/// The USER `display` instance that `"{v}"` interpolation and
+/// `print`/`println` route a (non-nullable) value of type `ty` to, when the
+/// monomorphizer created one: a record/sum declaring `display` renders
+/// through it. A nullable value is never looked up here -- [`method_symbol`]'s
+/// receiver keying would find the inner type's instance and hand it the cell;
+/// see [`nullable_display_instance`].
+pub fn display_instance<'p, 'm>(
+    program: &'p MonoProgram<'m>,
+    ty: &Type,
+) -> Option<&'p MonoFunction<'m>> {
+    if matches!(ty, Type::Nullable(_)) {
+        return None;
+    }
+    program.lookup(&method_symbol("display", std::slice::from_ref(ty)))
+}
+
+/// For a nullable `ty` (`T?`) whose inner `T` renders through a USER
+/// `display` ([`display_instance`]), that instance. Rendering such a value
+/// (`"{v}"`, `print`/`println`) yields `null` when it is absent and calls the
+/// instance on the unwrapped value when it is present, so a present value
+/// renders exactly as the non-null value would. `None` for any other type.
+pub fn nullable_display_instance<'p, 'm>(
+    program: &'p MonoProgram<'m>,
+    ty: &Type,
+) -> Option<&'p MonoFunction<'m>> {
+    match ty {
+        Type::Nullable(inner) => display_instance(program, inner),
+        _ => None,
+    }
+}
+
 /// Instance symbol of a closure: distinct per closure id, captured types, and
 /// parameter types. Derivable from types alone so the monomorphizer and back end
 /// agree.

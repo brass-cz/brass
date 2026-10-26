@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -18,18 +18,194 @@ const MAGIC: &[u8; 8] = b"CZOBJ\0\0\0";
 const FORMAT_VERSION: u32 = 1;
 const HEADER_LEN: usize = 8 + 4 + 8 + 32;
 const DEFAULT_MAX_MB: u64 = 256;
-static STORE: OnceLock<Option<Arc<ObjectStore>>> = OnceLock::new();
+static STORE: OnceLock<ProcessStore> = OnceLock::new();
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Disable the process object store before any session is constructed. Integration
-/// test binaries call this before creating backends, protecting the user's cache.
-/// Repeated calls are allowed only when storage was already pinned off.
-#[doc(hidden)]
-pub fn disable_jit_cache_for_tests() {
+/// Process-wide cache initialization and explicit opt-out authority.
+enum ProcessStore {
+    /// Explicit opt-out: `from_env` returns no store and repeated disabling is harmless.
+    Disabled,
+    /// Sampled configuration: `from_env` reuses this store or absence.
+    /// Disabling is allowed for `None` and panics for an initialized store.
+    Configured(Option<Arc<ObjectStore>>),
+}
+
+/// Cache configuration resolved from XDG_CACHE_HOME / HOME, BRASS_JIT_CACHE,
+/// and BRASS_JIT_CACHE_MAX_MB, independently of compiler identity.
+#[derive(Clone, Debug)]
+pub struct JitCacheLocation {
+    /// Directory containing the process's native object cache.
+    pub directory: PathBuf,
+    /// Configured size limit in bytes; invalid values use the default 256 MiB.
+    pub max_bytes: u64,
+    /// Whether configuration permits storage, including the process opt-out.
+    /// An unavailable compiler identity can still prevent a session from caching.
+    pub enabled: bool,
+}
+
+/// Owned published objects and stale publication files in a cache directory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JitCacheUsage {
+    /// Number of published object files, excluding temporary files.
+    pub entries: u64,
+    /// Total bytes in published object files, including their headers.
+    pub bytes: u64,
+    /// Number of stale temporary files; their bytes are excluded from `bytes`.
+    pub temp_files: u64,
+}
+
+/// Resolves cache configuration without initializing storage or compiler identity.
+/// Returns `None` when neither a nonempty XDG_CACHE_HOME nor HOME is available.
+/// Disabled caches still have a location and can be inspected or cleaned.
+pub fn jit_cache_location() -> Option<JitCacheLocation> {
+    let mut location = configured_location(|name| std::env::var_os(name))?;
+    if matches!(STORE.get(), Some(ProcessStore::Disabled)) {
+        location.enabled = false;
+    }
+    Some(location)
+}
+
+/// Counts owned published objects and stale temporary files without changing them.
+/// A missing directory is empty; other I/O errors are returned to the caller.
+/// Concurrent publication and removal can change the directory during the scan.
+pub fn jit_cache_usage(location: &JitCacheLocation) -> io::Result<JitCacheUsage> {
+    scan_cache(location, false)
+}
+
+/// Removes all owned published objects and stale temporary files, returning the
+/// counts actually removed. Missing directories are empty; other I/O errors are
+/// returned, possibly after partial removal. Fresh temporary files, directories,
+/// symlinks, and unknown names are untouched. Concurrent readers see a cache miss;
+/// concurrent writers may publish objects after the scan.
+pub fn clean_jit_cache(location: &JitCacheLocation) -> io::Result<JitCacheUsage> {
+    scan_cache(location, true)
+}
+
+/// Disables cache reads and writes for this process before any session exists.
+/// Repeated calls are harmless when storage is already disabled. Panics if the
+/// process has initialized an enabled store; call before constructing sessions.
+pub fn disable_jit_cache() {
     assert!(
-        STORE.get_or_init(|| None).is_none(),
+        matches!(
+            STORE.get_or_init(|| ProcessStore::Disabled),
+            ProcessStore::Disabled | ProcessStore::Configured(None)
+        ),
         "JIT store already enabled"
     );
+}
+
+fn configured_location(get: impl Fn(&str) -> Option<OsString>) -> Option<JitCacheLocation> {
+    let directory = get("XDG_CACHE_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            get("HOME")
+                .filter(|path| !path.is_empty())
+                .map(|home| PathBuf::from(home).join(".cache"))
+        })?
+        .join("brass/jit");
+    let max_mb = get("BRASS_JIT_CACHE_MAX_MB")
+        .and_then(|value| value.to_str()?.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_MB);
+    Some(JitCacheLocation {
+        directory,
+        max_bytes: max_mb.saturating_mul(1024 * 1024),
+        enabled: !matches!(
+            get("BRASS_JIT_CACHE").as_deref().and_then(|s| s.to_str()),
+            Some("off" | "0")
+        ),
+    })
+}
+
+const OBJECT_SUFFIX: &str = ".czobj";
+const TEMP_SUFFIX: &str = ".tmp";
+// Publishing only writes and renames an object. A 24-hour grace period leaves
+// ample room for slow I/O and temporarily suspended writers. Longer suspension
+// can lose a publication, which remains a best-effort cache miss.
+const STALE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CacheFile {
+    Object,
+    Temporary,
+}
+
+fn object_name(key: &str) -> String {
+    format!("{key}{OBJECT_SUFFIX}")
+}
+
+fn temporary_name(key: &str, pid: u32, nonce: u128, sequence: u64) -> String {
+    format!(".{key}-{pid}-{nonce}-{sequence}{TEMP_SUFFIX}")
+}
+
+fn cache_file(name: &str) -> Option<CacheFile> {
+    let is_key = |key: &str| {
+        key.len() == 64
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    if name.strip_suffix(OBJECT_SUFFIX).is_some_and(is_key) {
+        return Some(CacheFile::Object);
+    }
+    let stem = name.strip_prefix('.')?.strip_suffix(TEMP_SUFFIX)?;
+    let mut parts = stem.split('-');
+    let key = parts.next()?;
+    if !is_key(key) {
+        return None;
+    }
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    let nonce = parts.next()?.parse::<u128>().ok()?;
+    let sequence = parts.next()?.parse::<u64>().ok()?;
+    // Round-tripping rejects numeric spellings the publisher never creates.
+    (parts.next().is_none() && name == temporary_name(key, pid, nonce, sequence))
+        .then_some(CacheFile::Temporary)
+}
+
+fn scan_cache(location: &JitCacheLocation, clean: bool) -> io::Result<JitCacheUsage> {
+    let entries = match fs::read_dir(&location.directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(JitCacheUsage::default());
+        }
+        Err(error) => return Err(error),
+    };
+    let now = SystemTime::now();
+    let mut usage = JitCacheUsage::default();
+    for entry in entries {
+        let entry = entry?;
+        let Some(kind) = entry.file_name().to_str().and_then(cache_file) else {
+            continue;
+        };
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        if kind == CacheFile::Temporary
+            && now.duration_since(metadata.modified()?).unwrap_or_default() <= STALE_TEMP_AGE
+        {
+            continue;
+        }
+        if clean {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        match kind {
+            CacheFile::Object => {
+                usage.entries += 1;
+                usage.bytes = usage.bytes.saturating_add(metadata.len());
+            }
+            CacheFile::Temporary => usage.temp_files += 1,
+        }
+    }
+    Ok(usage)
 }
 
 /// The target settings passed to LLJIT, retained with the session so a key
@@ -59,36 +235,25 @@ impl ObjectStore {
         if cfg!(test) {
             return None;
         }
-        STORE
-            .get_or_init(|| {
-                Self::configured(|name| std::env::var_os(name), compiler_identity()).map(Arc::new)
-            })
-            .clone()
+        match STORE.get_or_init(|| {
+            ProcessStore::Configured(
+                Self::configured(|name| std::env::var_os(name), compiler_identity()).map(Arc::new),
+            )
+        }) {
+            ProcessStore::Disabled => None,
+            ProcessStore::Configured(store) => store.clone(),
+        }
     }
 
     fn configured(get: impl Fn(&str) -> Option<OsString>, tag: Option<String>) -> Option<Self> {
-        if matches!(
-            get("BRASS_JIT_CACHE").as_deref().and_then(|s| s.to_str()),
-            Some("off" | "0")
-        ) {
+        let location = configured_location(get)?;
+        if !location.enabled {
             return None;
         }
-        let directory = get("XDG_CACHE_HOME")
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                get("HOME")
-                    .filter(|path| !path.is_empty())
-                    .map(|home| PathBuf::from(home).join(".cache"))
-            })?
-            .join("brass/jit");
-        let max_mb = get("BRASS_JIT_CACHE_MAX_MB")
-            .and_then(|value| value.to_str()?.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_MAX_MB);
         Some(Self {
-            directory,
+            directory: location.directory,
             tag: tag?,
-            max_bytes: max_mb.saturating_mul(1024 * 1024),
+            max_bytes: location.max_bytes,
             evicted: AtomicBool::new(false),
         })
     }
@@ -123,7 +288,7 @@ impl ObjectStore {
     /// must come from `key`; rejected files are removed so the next compilation
     /// can repair them. I/O failure always behaves like an ordinary miss.
     pub(super) fn load(&self, key: &str, symbol: &str) -> Option<Vec<u8>> {
-        let path = self.directory.join(format!("{key}.czobj"));
+        let path = self.directory.join(object_name(key));
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -150,7 +315,7 @@ impl ObjectStore {
     /// process. A same-directory rename makes every visible object complete;
     /// concurrent writers for the same content key are interchangeable.
     pub(super) fn publish(&self, key: &str, symbol: &str, payload: &[u8]) {
-        let path = self.directory.join(format!("{key}.czobj"));
+        let path = self.directory.join(object_name(key));
         if let Err(error) = fs::create_dir_all(&self.directory) {
             log_io("mkdir", &self.directory, &error);
             return;
@@ -160,10 +325,9 @@ impl ObjectStore {
             .unwrap_or_default()
             .as_nanos();
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temp = self.directory.join(format!(
-            ".{key}-{}-{nonce}-{sequence}.tmp",
-            std::process::id()
-        ));
+        let temp = self
+            .directory
+            .join(temporary_name(key, std::process::id(), nonce, sequence));
         let result = (|| -> io::Result<()> {
             let mut file = OpenOptions::new()
                 .write(true)
@@ -207,11 +371,10 @@ impl ObjectStore {
                 }
             };
             let path = entry.path();
-            if path.extension().is_none_or(|ext| ext != "czobj") {
+            if entry.file_name().to_str().and_then(cache_file) != Some(CacheFile::Object) {
                 continue;
             }
-            match entry
-                .metadata()
+            match fs::symlink_metadata(&path)
                 .and_then(|metadata| Ok((metadata.len(), metadata.modified()?, metadata.is_file())))
             {
                 Ok((size, modified, true)) => {
@@ -331,6 +494,127 @@ impl Drop for TestDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Management counts only owned regular files and never removes a fresh
+    /// publication, an unknown name, or a directory, even when caching is off.
+    #[test]
+    fn usage_and_clean_preserve_unowned_entries() {
+        let directory = TestDirectory::new();
+        let location = JitCacheLocation {
+            directory: directory.0.clone(),
+            max_bytes: 1024,
+            enabled: false,
+        };
+        assert_eq!(
+            jit_cache_usage(&location).unwrap(),
+            JitCacheUsage::default()
+        );
+        assert_eq!(
+            clean_jit_cache(&location).unwrap(),
+            JitCacheUsage::default()
+        );
+        assert!(!directory.0.exists());
+        fs::create_dir_all(&directory.0).unwrap();
+        let key = "a".repeat(64);
+        let object = directory.0.join(object_name(&key));
+        fs::write(&object, b"object").unwrap();
+        let fresh = directory.0.join(temporary_name(&key, 123, 456, 0));
+        let stale = directory.0.join(temporary_name(&key, 123, 456, 1));
+        fs::write(&fresh, b"fresh").unwrap();
+        fs::write(&stale, b"stale").unwrap();
+        File::open(&stale)
+            .unwrap()
+            .set_modified(SystemTime::now() - STALE_TEMP_AGE - Duration::from_secs(60))
+            .unwrap();
+        let foreign = [
+            "notes.czobj".to_string(),
+            format!("{}.czobj", "g".repeat(64)),
+            format!("{}.czobj", "a".repeat(63)),
+            format!(".{key}-123-456.tmp"),
+            format!(".{key}-123-456-1-extra.tmp"),
+            format!(".{key}-+123-456-1.tmp"),
+            format!(".{key}-123-456-01.tmp"),
+            "unrelated.tmp".to_string(),
+        ];
+        for name in &foreign {
+            let path = directory.0.join(name);
+            fs::write(&path, b"foreign").unwrap();
+            File::open(path).unwrap().set_modified(UNIX_EPOCH).unwrap();
+        }
+        let nested = directory.0.join(object_name(&"b".repeat(64)));
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("keep"), b"nested").unwrap();
+        #[cfg(unix)]
+        let link = {
+            let link = directory.0.join(object_name(&"c".repeat(64)));
+            std::os::unix::fs::symlink(&object, &link).unwrap();
+            link
+        };
+        let expected = JitCacheUsage {
+            entries: 1,
+            bytes: 6,
+            temp_files: 1,
+        };
+        assert_eq!(jit_cache_usage(&location).unwrap(), expected);
+        assert_eq!(clean_jit_cache(&location).unwrap(), expected);
+        assert!(!object.exists());
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+        assert!(nested.join("keep").exists());
+        for name in foreign {
+            assert!(directory.0.join(name).exists());
+        }
+        #[cfg(unix)]
+        assert!(fs::symlink_metadata(link).unwrap().is_symlink());
+        assert_eq!(
+            jit_cache_usage(&location).unwrap(),
+            JitCacheUsage::default()
+        );
+        assert_eq!(
+            clean_jit_cache(&location).unwrap(),
+            JitCacheUsage::default()
+        );
+    }
+
+    /// A file where the directory belongs is an I/O error, not an empty store.
+    #[test]
+    fn management_reports_io_errors() {
+        let directory = TestDirectory::new();
+        fs::create_dir_all(&directory.0).unwrap();
+        let path = directory.0.join("file");
+        fs::write(&path, b"not a directory").unwrap();
+        let location = JitCacheLocation {
+            directory: path,
+            max_bytes: 0,
+            enabled: true,
+        };
+        assert!(jit_cache_usage(&location).is_err());
+        assert!(clean_jit_cache(&location).is_err());
+    }
+
+    /// Location resolution remains available when caching is disabled and
+    /// validates caps without consulting compiler identity or creating files.
+    #[test]
+    fn location_is_independent_of_store_initialization() {
+        for (cap, expected) in [
+            ("invalid", 256 * 1024 * 1024),
+            ("0", 0),
+            ("18446744073709551615", u64::MAX),
+        ] {
+            let location = configured_location(|name| match name {
+                "HOME" => Some("home".into()),
+                "XDG_CACHE_HOME" => Some("".into()),
+                "BRASS_JIT_CACHE" => Some("off".into()),
+                "BRASS_JIT_CACHE_MAX_MB" => Some(cap.into()),
+                _ => None,
+            })
+            .unwrap();
+            assert_eq!(location.directory, PathBuf::from("home/.cache/brass/jit"));
+            assert_eq!(location.max_bytes, expected);
+            assert!(!location.enabled);
+        }
+        assert!(configured_location(|_| None).is_none());
+    }
 
     fn target() -> TargetIdentity {
         TargetIdentity {
@@ -475,6 +759,12 @@ mod tests {
                 .unwrap();
         }
         fs::write(directory.0.join("unrelated.tmp"), [0; 1000]).unwrap();
+        let foreign = directory.0.join("foreign.czobj");
+        fs::write(&foreign, [0; 1000]).unwrap();
+        File::open(&foreign)
+            .unwrap()
+            .set_modified(UNIX_EPOCH)
+            .unwrap();
         assert!(seed.load(&keys[0], "test").is_some());
         assert!(
             fs::metadata(path(0)).unwrap().modified().unwrap()
@@ -487,6 +777,7 @@ mod tests {
         assert!(!path(2).exists());
         assert!(path(3).exists());
         assert!(directory.0.join("unrelated.tmp").exists());
+        assert!(foreign.exists());
         bounded.publish(&keys[4], "test", &[0; 600]);
         assert!(path(0).exists(), "only the first publish evicts");
     }

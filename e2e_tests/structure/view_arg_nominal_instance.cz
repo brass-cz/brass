@@ -1,8 +1,7 @@
-// view_args is a span SET united across a generic's instantiations, so the
-// nominal instance's argument is wrapped in a RecordView too and takes the
-// identity pass-through. That alias must be retained like the fresh view the
-// binding otherwise owns -- without it the nominal record was over-released
-// and the program crashed AFTER printing the right answers.
+// A generic forwarder (`mid`) hands its parameter to a function that reads one
+// field. Called with anonymous records of different shapes and with a nominal
+// `N`, every call reads its own `a`, and the program exits cleanly after the
+// last line.
 type N = { a: int64, c: string }
 
 fun takes(p) -> int64 {

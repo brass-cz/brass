@@ -1,0 +1,18 @@
+// A method call on a nullable record local narrowed by `if a` (`a.show()`)
+// dispatches on the narrowed `A`, exactly as a field read does, so the call
+// the checker accepts also runs.
+
+type A = { x: int32 }
+type Box = { a: A? }
+
+fun A.show(self) -> string {
+    return "x={self.x}"
+}
+
+fun main() {
+    let box = Box { a: A { x: 5 } }
+
+    let a = box.a
+    if a { assert(a.show() == "x=5", "method call on a narrowed nullable record") }
+    println("ok")
+}

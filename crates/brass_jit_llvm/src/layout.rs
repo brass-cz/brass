@@ -10,20 +10,25 @@ use inkwell::values::FunctionValue;
 
 use brass_hir::Type;
 
-/// ABI helpers bound to a module/context for the lifetime of code generation.
+/// ABI helpers bound to an LLVM context for the lifetime of code generation.
 pub struct Abi<'ctx> {
+    /// The context every type and declaration is created in.
     pub ctx: &'ctx Context,
 }
 
 impl<'ctx> Abi<'ctx> {
+    /// ABI helpers for `ctx`.
     pub fn new(ctx: &'ctx Context) -> Self {
         Abi { ctx }
     }
 
+    /// LLVM `i64`: lengths, indices and the integer arguments of runtime
+    /// primitives.
     pub fn i64t(&self) -> inkwell::types::IntType<'ctx> {
         self.ctx.i64_type()
     }
 
+    /// The opaque pointer type every heap handle (and nullable cell) uses.
     pub fn ptr(&self) -> inkwell::types::PointerType<'ctx> {
         self.ctx.ptr_type(AddressSpace::default())
     }

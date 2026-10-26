@@ -325,7 +325,7 @@ fn promote_in_body(
             }
             let known = match &body.locals[local.index()].ty {
                 TypeRef::Known(t) => Some(t.clone()),
-                TypeRef::Var(_) => None,
+                TypeRef::Var(_) | TypeRef::Join(_) => None,
             };
             let name = globals.global_for(&consts, known.as_ref());
             promotions.push((bi, si, *local, name));

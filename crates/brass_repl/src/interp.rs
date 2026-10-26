@@ -1,4 +1,4 @@
-//! A tree-walking interpreter over monomorphized MIR.
+//! An interpreter over monomorphized MIR.
 //!
 //! The interpreter is the REPL's execution back end. It does not implement
 //! `brass_engine::Codegen` -- that trait is a *compiler* seam (it walks each MIR
@@ -21,16 +21,18 @@ use std::io::Write;
 use std::rc::Rc;
 
 use brass_engine::{
-    MonoFunction, MonoProgram, binary_operand_type, closure_symbol, element_type, float_kind_name,
-    instance_symbol, is_comparison, method_symbol, numeric_conv_ret, operand_type_of,
-    prim_method_instance, record_field_names, record_field_type, record_from_succeeds,
-    result_ok_type, static_symbol, str_const, unwrap_nullable,
+    EqualityKind, MonoFunction, MonoProgram, aggregate_field_type, binary_operand_type,
+    closure_symbol, display_instance, element_type, equality_kind, float_kind_name,
+    instance_symbol, is_comparison, method_symbol, nullable_display_instance, numeric_conv_ret,
+    operand_type_of, prim_method_instance, record_field_names, record_field_type,
+    record_from_succeeds, result_ok_type, static_symbol, str_const, unwrap_nullable,
 };
 use brass_hir::{FloatKind, IntKind, Program, RESULT_TYPE_ID, Type};
 use brass_mir::{Callee, Literal, MirStmt, Operand, Place, Projection, Rvalue, Terminator};
 use brass_parser::ast::{BinOp, UnaryOp};
+use brass_utils::builtin_errors;
 
-use crate::format::{float_str, format_value};
+use crate::format::format_value;
 use crate::value::{ClosureObj, MAX_VALUE_DEPTH, Value, VariantObj};
 
 /// Guard against unbounded native recursion: a runaway recursive Brass program
@@ -214,7 +216,7 @@ impl<'p, 'm> Interp<'p, 'm> {
         match place.proj.as_slice() {
             [Projection::Field(field)] => {
                 let base_ty = f.local_type(place.local).clone();
-                let fty = record_field_type(&base_ty, field);
+                let fty = aggregate_field_type(self.hir, &base_ty, field);
                 let v = self.eval_operand(f, frame, op, &fty)?;
                 let base = frame.locals[place.local.index()].clone();
                 let key = field_key(field).to_string();
@@ -240,7 +242,7 @@ impl<'p, 'm> Interp<'p, 'm> {
                     let mut b = arr.borrow_mut();
                     let i = i as usize;
                     if i >= b.len() {
-                        return Err("array index out of bounds (store)".into());
+                        return Err(brass_utils::builtin_errors::ARRAY_INDEX_OUT_OF_BOUNDS.into());
                     }
                     b[i] = v;
                 }
@@ -279,7 +281,7 @@ impl<'p, 'm> Interp<'p, 'm> {
                 };
                 let va = self.eval_operand(f, frame, a, &operand_ty)?;
                 let vb = self.eval_operand(f, frame, b, &operand_ty)?;
-                eval_bin(*op, &va, &vb, &operand_ty)
+                eval_bin(self.hir, *op, &va, &vb, &operand_ty)
             }
             Rvalue::Un(UnaryOp::Not, a) => {
                 let aty = operand_type_of(a, &f.local_types);
@@ -301,9 +303,10 @@ impl<'p, 'm> Interp<'p, 'm> {
                 Ok(Value::Record(Rc::new(RefCell::new(map))))
             }
             // `T.from(v)`: the same per-instance decision as the JIT. `dest_ty` is
-            // `T?`; using the source's static (per-instance) type, if it has every
-            // field `T` declares with a matching type, build the record by copying
-            // those fields (shared, like the JIT's retain), else yield null.
+            // `T?`; when the source's static (per-instance) type carries every
+            // field `T` declares, each with a value that flows into it, build the
+            // record from those fields (converted, shared like the JIT's retain),
+            // else yield null.
             Rvalue::RecordFrom { source, .. } => {
                 let target = match dest_ty {
                     Type::Nullable(inner) => inner.as_ref().clone(),
@@ -317,21 +320,30 @@ impl<'p, 'm> Interp<'p, 'm> {
                 let Value::Record(src_map) = src else {
                     return Ok(Value::Null);
                 };
+                // Each field converts to the target field's type (a numeric
+                // widening, possibly inside the target's nullable).
                 let mut map = HashMap::default();
                 for name in record_field_names(&target) {
                     if let Some(v) = src_map.borrow().get(&name) {
-                        map.insert(name, v.clone());
+                        let sty = record_field_type(&src_ty, &name);
+                        let fty = record_field_type(&target, &name);
+                        let v = if v.is_null() {
+                            v.clone()
+                        } else {
+                            coerce(v.clone(), unwrap_nullable(&sty), unwrap_nullable(&fty))?
+                        };
+                        map.insert(name, v);
                     }
                 }
                 Ok(Value::Record(Rc::new(RefCell::new(map))))
             }
             // The view of a callee parameter's row: a filtered clone of the
             // source record holding exactly the view type's fields, with a
-            // guarded field the source lacks (or carries at a non-flowing
-            // type) materialized as null. The per-field decision is the shared
-            // engine plan over the static types, so the interpreter and the
-            // typed back end degrade identically. A non-structural destination
-            // is mono's defensive identity pass-through.
+            // guarded field the source lacks (or cannot supply) materialized
+            // as null. The per-field decision is the shared engine plan over
+            // the static types, so the interpreter and the typed back end
+            // degrade identically. A non-structural destination is mono's
+            // defensive identity pass-through.
             Rvalue::RecordView { source, .. } => {
                 let src_ty = operand_type_of(source, &f.local_types);
                 if !matches!(dest_ty, Type::Record(n) if n.id == brass_hir::STRUCTURAL_RECORD_ID) {
@@ -348,9 +360,9 @@ impl<'p, 'm> Interp<'p, 'm> {
                         (brass_engine::ViewFieldPlan::Copy, Some(m)) => {
                             let ft = record_field_type(&src_ty, &name);
                             let v = m.borrow().get(&name).cloned().unwrap_or(Value::Null);
-                            // Value nullability is implicit (a value or Null),
-                            // so only the numeric widening of `coerce` applies.
-                            coerce(v, &ft, &fty)
+                            // A view slot carries the source field's own
+                            // type, so this coercion is the identity.
+                            coerce(v, &ft, &fty)?
                         }
                         _ => Value::Null,
                     };
@@ -386,6 +398,7 @@ impl<'p, 'm> Interp<'p, 'm> {
                     cap_vals.push(v);
                 }
                 Ok(Value::Closure(Rc::new(ClosureObj {
+                    target: f.closure_targets.get(id).cloned(),
                     id: *id,
                     capture_types,
                     captures: cap_vals,
@@ -393,10 +406,9 @@ impl<'p, 'm> Interp<'p, 'm> {
                 })))
             }
             Rvalue::Array(es) => {
-                // A heterogeneous bracket literal is a tuple: each element is
-                // built at its own positional type (an int64 element must not be
-                // materialized at a uniform int32). A homogeneous one shares the
-                // single element type.
+                // A tuple-typed bracket literal builds each element at its own
+                // positional type; an array literal builds every element at the
+                // shared element type.
                 let mut vals = Vec::with_capacity(es.len());
                 if let Type::Tuple(elem_types) = dest_ty {
                     for (op, ety) in es.iter().zip(elem_types) {
@@ -444,11 +456,9 @@ impl<'p, 'm> Interp<'p, 'm> {
                 let it = operand_type_of(idx, &f.local_types);
                 let i = self.eval_operand(f, frame, idx, &it)?.as_int();
                 match base {
-                    Value::Array(a) => a
-                        .borrow()
-                        .get(i as usize)
-                        .cloned()
-                        .ok_or_else(|| "array index out of bounds (load)".to_string()),
+                    Value::Array(a) => a.borrow().get(i as usize).cloned().ok_or_else(|| {
+                        brass_utils::builtin_errors::ARRAY_INDEX_OUT_OF_BOUNDS.to_string()
+                    }),
                     _ => Ok(Value::Void),
                 }
             }
@@ -519,7 +529,7 @@ impl<'p, 'm> Interp<'p, 'm> {
             Operand::Local(id) => {
                 let v = frame.locals[id.index()].clone();
                 let from = f.local_type(*id);
-                Ok(coerce(v, from, expected_ty))
+                coerce(v, from, expected_ty)
             }
             Operand::Const(lit) => Ok(eval_const(lit, expected_ty)),
         }
@@ -538,6 +548,9 @@ impl<'p, 'm> Interp<'p, 'm> {
             .iter()
             .map(|a| operand_type_of(a, &f.local_types))
             .collect();
+        // A reflective call site dispatches to this instance's specialization.
+        let dispatched = f.dispatch(callee);
+        let callee: &Callee = &dispatched;
         let target: String = match callee {
             // Growable-array methods are runtime operations on the slice, not user
             // methods.
@@ -635,8 +648,24 @@ impl<'p, 'm> Interp<'p, 'm> {
                 return self.eval_io(f, frame, base, args);
             }
             Callee::Free(base) => instance_symbol(base, &arg_types),
+            Callee::Numeric { site, .. } => f
+                .keyed
+                .get(site)
+                .cloned()
+                .ok_or("internal error: missing numeric call target")?,
+            Callee::NumericFree { base, site } => f
+                .keyed
+                .get(site)
+                .cloned()
+                .unwrap_or_else(|| instance_symbol(base, &arg_types)),
             Callee::Builtin(name) => return self.eval_builtin(f, frame, name, args),
             Callee::Indirect(callee_op) => return self.eval_indirect(f, frame, callee_op, args),
+            Callee::Keyed { method, .. } => {
+                return Err(format!(
+                    "internal error: the reflective call `{method}` was not resolved for this \
+                     instance"
+                ));
+            }
         };
         let program = self.program;
         let Some(inst) = program.lookup(&target) else {
@@ -673,10 +702,15 @@ impl<'p, 'm> Interp<'p, 'm> {
             let pty = params.get(i).cloned().unwrap_or(Type::Void);
             vals.push(self.eval_operand(f, frame, a, &pty)?);
         }
-        let sym = closure_symbol(clo.id, &clo.capture_types, &clo.param_types);
+        let sym = clo
+            .target
+            .clone()
+            .unwrap_or_else(|| closure_symbol(clo.id, &clo.capture_types, &clo.param_types));
         let program = self.program;
         let Some(inst) = program.lookup(&sym) else {
-            return Err(format!("call to unresolved closure instance `{sym}`"));
+            return Err(format!(
+                "internal error: call of a closure that has no compiled instance (`{sym}`)"
+            ));
         };
         let captures = clo.captures.clone();
         self.run_instance(inst, vals, &captures)
@@ -746,9 +780,15 @@ impl<'p, 'm> Interp<'p, 'm> {
                 // A `"{v}"` segment routes to the USER `display` instance the
                 // monomorphizer created when the value's type declares one.
                 let program = self.program;
-                if let Some(inst) =
-                    program.lookup(&method_symbol("display", std::slice::from_ref(&ty)))
-                {
+                if let Some(inst) = display_instance(program, &ty) {
+                    return self.run_instance(inst, vec![v], &[]);
+                }
+                // A nullable of such a type renders `null` when absent and
+                // through the inner type's `display` when present.
+                if let Some(inst) = nullable_display_instance(program, &ty) {
+                    if v.is_null() {
+                        return Ok(Value::str("null"));
+                    }
                     return self.run_instance(inst, vec![v], &[]);
                 }
                 let hir = self.hir;
@@ -762,9 +802,6 @@ impl<'p, 'm> Interp<'p, 'm> {
             // interpreter is single-threaded, so freezing/cowning a value is a
             // no-op; a program that actually spawns still errors at `spawn` above.
             "_cown" | "_freeze" => Ok(Value::Void),
-            "__rt_dispatch" => {
-                Err("runtime type dispatch is not supported by the REPL runtime".into())
-            }
             // Standalone stdio primitives: the prelude's `print`/`println`
             // bodies and `input()`. Reading takes the process's real stdin,
             // so interactive `input()` works on the interpreter.
@@ -884,7 +921,7 @@ impl<'p, 'm> Interp<'p, 'm> {
                 };
                 match String::from_utf8(bytes) {
                     Ok(s) => Ok(result_ok(Value::str(s))),
-                    Err(_) => Ok(result_err("invalid UTF-8 byte sequence")),
+                    Err(_) => Ok(result_err(builtin_errors::INVALID_UTF8)),
                 }
             }
             "_int_to_string" | "_float_to_string" => {
@@ -984,12 +1021,16 @@ impl<'p, 'm> Interp<'p, 'm> {
                 let program = self.program;
                 if matches!(ty, Type::Str) {
                     v.as_str().to_string()
-                } else if let Some(inst) =
-                    program.lookup(&method_symbol("display", std::slice::from_ref(&ty)))
-                {
+                } else if let Some(inst) = display_instance(program, &ty) {
                     // Like a `"{v}"` segment, `print`/`println` prefer the USER
                     // `display` method when the value's type declares one.
                     self.run_instance(inst, vec![v], &[])?.as_str().to_string()
+                } else if let Some(inst) = nullable_display_instance(program, &ty) {
+                    if v.is_null() {
+                        "null".to_string()
+                    } else {
+                        self.run_instance(inst, vec![v], &[])?.as_str().to_string()
+                    }
                 } else {
                     let hir = self.hir;
                     format_value(hir, &v, &ty)?
@@ -1015,8 +1056,6 @@ fn truthy(v: &Value, ty: &Type) -> bool {
     }
 }
 
-/// Whether a value is the named sum variant. A record (single-shape) always
-/// matches; a non-aggregate never does.
 /// A fresh, independent deep copy of `v`. Aggregates (array, record, sum) are
 /// rebuilt with new mutable cells and recursively-copied children, so the copy
 /// shares no mutable storage with the original. Scalars and immutable/shared
@@ -1058,6 +1097,8 @@ fn deep_copy_value_at(v: &Value, depth: usize) -> Result<Value, String> {
     })
 }
 
+/// Whether a value is the named sum variant. A record (single-shape) always
+/// matches; a non-aggregate never does.
 fn matches_variant(v: &Value, variant: &str) -> bool {
     match v {
         Value::Variant(var) => var.variant == variant,
@@ -1090,27 +1131,42 @@ fn load_field(base: &Value, field: &str) -> Value {
 
 /// A binary operator over two values typed `ty`. Integer arithmetic wraps and is
 /// re-normalized to the operand width/sign; comparisons respect signedness.
-fn eval_bin(op: BinOp, a: &Value, b: &Value, ty: &Type) -> Result<Value, String> {
-    // Equality against the null literal (or between nullables) is an identity test.
-    if matches!(op, BinOp::Eq | BinOp::Ne) && (a.is_null() || b.is_null()) {
-        let eq = a.is_null() && b.is_null();
-        return Ok(Value::Bool(if matches!(op, BinOp::Eq) { eq } else { !eq }));
+/// `==` / `!=` follow the shared structural definition ([`values_equal`]).
+fn eval_bin(
+    program: &Program,
+    op: BinOp,
+    a: &Value,
+    b: &Value,
+    ty: &Type,
+) -> Result<Value, String> {
+    if matches!(op, BinOp::Eq | BinOp::Ne) {
+        // Against the null literal (or on a value typed at its narrowed
+        // aggregate type) a null side decides alone: equal only to null.
+        let equal = if a.is_null() || b.is_null() {
+            a.is_null() && b.is_null()
+        } else {
+            match ty {
+                // Numeric operands already converted to their common type.
+                Type::Int(k) => return int_bin(op, a.as_int(), b.as_int(), *k),
+                Type::Float(fk) => return Ok(float_bin(op, a.as_float(), b.as_float(), *fk)),
+                // A nullable operand narrows to its element type.
+                Type::Nullable(inner) => values_equal(program, a, b, inner, &mut HashSet::new()),
+                _ => values_equal(program, a, b, ty, &mut HashSet::new()),
+            }
+        };
+        return Ok(Value::Bool(if matches!(op, BinOp::Eq) {
+            equal
+        } else {
+            !equal
+        }));
     }
     match ty {
         Type::Int(k) => int_bin(op, a.as_int(), b.as_int(), *k),
         Type::Float(fk) => Ok(float_bin(op, a.as_float(), b.as_float(), *fk)),
         Type::Bool => Ok(bool_bin(op, a.as_bool(), b.as_bool())),
         Type::Str => Ok(str_bin(op, a.as_str(), b.as_str())),
-        Type::Record(_) if matches!(op, BinOp::Eq | BinOp::Ne) => {
-            let equal = values_equal(a, b, &mut HashSet::new());
-            Ok(Value::Bool(if matches!(op, BinOp::Eq) {
-                equal
-            } else {
-                !equal
-            }))
-        }
         // A nullable operand narrows to its element type for arithmetic/ordering.
-        Type::Nullable(inner) => eval_bin(op, a, b, inner),
+        Type::Nullable(inner) => eval_bin(program, op, a, b, inner),
         _ => Err(format!(
             "unsupported binary operand type `{}`",
             ty.display()
@@ -1118,37 +1174,108 @@ fn eval_bin(op: BinOp, a: &Value, b: &Value, ty: &Type) -> Result<Value, String>
     }
 }
 
-/// Equality used recursively by record comparison. Record fields are compared
-/// by value; other managed aggregates keep their existing identity semantics.
-/// Already-seen record pairs terminate cycles after their fields agreed on the
-/// path leading back to them.
-fn values_equal(a: &Value, b: &Value, seen: &mut HashSet<(usize, usize)>) -> bool {
-    match (a, b) {
-        (Value::Int(a), Value::Int(b)) => a == b,
-        (Value::Float(a), Value::Float(b)) => a == b,
-        (Value::Bool(a), Value::Bool(b)) => a == b,
-        (Value::Str(a), Value::Str(b)) => a == b,
-        (Value::Null, Value::Null) | (Value::Void, Value::Void) => true,
-        (Value::Record(a), Value::Record(b)) => {
-            if Rc::ptr_eq(a, b) {
+/// `==` over two values of the concrete type `ty`, by the definition shared
+/// with the compiled back end ([`brass_engine::equality_kind`]): scalars and
+/// strings by value, nullables null-safely, records field by field, sums by
+/// variant then payload, arrays by length then element, tuples by position,
+/// function values by identity. The field lists come from the same render
+/// authority the JIT lays values out by. Two handles to one object are equal
+/// at once; a pair of objects already being compared on the current path is
+/// assumed equal, which ends the walk of two cyclic values.
+fn values_equal(
+    program: &Program,
+    a: &Value,
+    b: &Value,
+    ty: &Type,
+    seen: &mut HashSet<(usize, usize)>,
+) -> bool {
+    match equality_kind(ty) {
+        EqualityKind::Scalar => match (a, b) {
+            (Value::Bool(x), Value::Bool(y)) => x == y,
+            _ => a.as_int() == b.as_int(),
+        },
+        EqualityKind::Float => a.as_float() == b.as_float(),
+        EqualityKind::Str => a.as_str() == b.as_str(),
+        EqualityKind::Unit => true,
+        EqualityKind::Nullable => match (a.is_null(), b.is_null(), ty) {
+            (true, true, _) => true,
+            (false, false, Type::Nullable(inner)) => values_equal(program, a, b, inner, seen),
+            _ => false,
+        },
+        EqualityKind::Identity => match (a, b) {
+            (Value::Closure(x), Value::Closure(y)) => Rc::ptr_eq(x, y),
+            _ => false,
+        },
+        EqualityKind::Record => {
+            let (Value::Record(x), Value::Record(y), Type::Record(n)) = (a, b, ty) else {
+                return false;
+            };
+            if Rc::ptr_eq(x, y) || !seen.insert((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize)) {
                 return true;
             }
-            let pair = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
-            if !seen.insert(pair) {
-                return true;
-            }
-            let a = a.borrow();
-            let b = b.borrow();
-            a.len() == b.len()
-                && a.iter().all(|(name, value)| {
-                    b.get(name)
-                        .is_some_and(|other| values_equal(value, other, seen))
+            let fields = brass_engine::render_record_fields(program, n).unwrap_or_default();
+            let (x, y) = (x.borrow(), y.borrow());
+            fields
+                .iter()
+                .all(|(name, fty)| match (x.get(name), y.get(name)) {
+                    (Some(u), Some(v)) => values_equal(program, u, v, fty, seen),
+                    (None, None) => true,
+                    _ => false,
                 })
         }
-        (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
-        (Value::Variant(a), Value::Variant(b)) => Rc::ptr_eq(a, b),
-        (Value::Closure(a), Value::Closure(b)) => Rc::ptr_eq(a, b),
-        _ => false,
+        EqualityKind::Sum => {
+            let (Value::Variant(x), Value::Variant(y), Type::Sum(n)) = (a, b, ty) else {
+                return false;
+            };
+            if Rc::ptr_eq(x, y) {
+                return true;
+            }
+            if x.variant != y.variant {
+                return false;
+            }
+            if !seen.insert((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize)) {
+                return true;
+            }
+            let fields = brass_engine::render_variant_fields(program, n, &x.variant)
+                .map(|(_, fields)| fields)
+                .unwrap_or_default();
+            let (xf, yf) = (x.fields.borrow(), y.fields.borrow());
+            fields
+                .iter()
+                .all(|(name, fty)| match (xf.get(name), yf.get(name)) {
+                    (Some(u), Some(v)) => values_equal(program, u, v, fty, seen),
+                    (None, None) => true,
+                    _ => false,
+                })
+        }
+        EqualityKind::Sequence | EqualityKind::Tuple => {
+            let (Value::Array(x), Value::Array(y)) = (a, b) else {
+                return false;
+            };
+            if Rc::ptr_eq(x, y) {
+                return true;
+            }
+            if !seen.insert((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize)) {
+                return true;
+            }
+            let (x, y) = (x.borrow(), y.borrow());
+            if x.len() != y.len() {
+                return false;
+            }
+            match ty {
+                Type::Tuple(elem_types) => x
+                    .iter()
+                    .zip(y.iter())
+                    .zip(elem_types)
+                    .all(|((u, v), ety)| values_equal(program, u, v, ety, seen)),
+                _ => {
+                    let elem_ty = element_type(ty);
+                    x.iter()
+                        .zip(y.iter())
+                        .all(|(u, v)| values_equal(program, u, v, &elem_ty, seen))
+                }
+            }
+        }
     }
 }
 
@@ -1269,9 +1396,24 @@ fn eval_unary(op: UnaryOp, v: &Value, ty: &Type) -> Value {
 
 /// Coerce a value to the expected type: only integer width changes and float
 /// narrowing are observable; everything else is the identity (a present nullable
-/// is already its inner value).
-fn coerce(v: Value, from: &Type, to: &Type) -> Value {
-    match (&v, to) {
+/// is already its inner value). Implicit integer conversions only widen (the
+/// checker and monomorphization type every operator, join and flow by
+/// value-preserving rules), so an integer reaching a narrower slot is an
+/// internal error, as on the JIT, rather than a dropped high part.
+fn coerce(v: Value, from: &Type, to: &Type) -> Result<Value, String> {
+    let from_int = match from {
+        Type::Nullable(inner) => inner.as_ref(),
+        other => other,
+    };
+    Ok(match (&v, to) {
+        (Value::Int(_), Type::Int(k)) if matches!(from_int, Type::Int(kf) if kf.bits() > k.bits()) =>
+        {
+            return Err(format!(
+                "internal error: a `{}` value reached a narrower `{}` slot",
+                from_int.display(),
+                to.display()
+            ));
+        }
         (Value::Int(x), Type::Int(k)) if !matches!(from, Type::Int(kf) if kf == k) => {
             Value::Int(norm_int(*x, *k))
         }
@@ -1286,7 +1428,7 @@ fn coerce(v: Value, from: &Type, to: &Type) -> Value {
         }
         (Value::Float(x), Type::Float(FloatKind::F32)) => Value::Float((*x as f32) as f64),
         _ => v,
-    }
+    })
 }
 
 /// Materialize a constant operand at its expected type (a literal flowing into a
@@ -1298,9 +1440,13 @@ fn eval_const(lit: &Literal, expected_ty: &Type) -> Value {
         return eval_const(lit, inner);
     }
     match lit {
+        // An integer value is held as its low 64 bits (a `uint64` above
+        // `INT64_MAX` keeps its bit pattern); an integer literal in a float
+        // position is that float.
         Literal::Int(v) => match expected_ty {
-            Type::Int(k) => Value::Int(norm_int(*v, *k)),
-            _ => Value::Int(norm_int(*v, IntKind::I32)),
+            Type::Int(k) => Value::Int(norm_int(*v as i64, *k)),
+            Type::Float(fk) => Value::Float(round_f32_if(*fk, *v as f64)),
+            _ => Value::Int(norm_int(*v as i64, IntKind::I32)),
         },
         Literal::Float(v) => match expected_ty {
             Type::Float(FloatKind::F32) => Value::Float((*v as f32) as f64),
@@ -1321,14 +1467,19 @@ fn convert(target: &Type, method: &str, arg_ty: &Type, v: &Value) -> Value {
         Type::Int(k) => match method {
             "from" => match arg_ty {
                 Type::Float(_) => float_to_int(v.as_float(), *k),
-                _ => int_in_range(v.as_int() as i128, *k),
+                // An unsigned source is read zero-extended from its `i64`
+                // carrier, so a `uint64` above `INT64_MAX` keeps its value.
+                Type::Int(source) if !source.is_signed() => {
+                    int_in_range(i128::from(v.as_int() as u64), *k)
+                }
+                _ => int_in_range(i128::from(v.as_int()), *k),
             },
             // The runtime parses as a wide integer first, so an in-range overflow
             // is reported as out-of-range, not as a parse failure (matching `text`
             // untrimmed in the message).
             "parse" => match v.as_str().trim().parse::<i128>() {
                 Ok(n) => int_in_range(n, *k),
-                Err(_) => result_err(&format!("cannot parse `{}` as integer", v.as_str())),
+                Err(_) => result_err(&builtin_errors::cannot_parse(v.as_str(), "integer")),
             },
             _ => result_err("unsupported integer conversion"),
         },
@@ -1343,7 +1494,7 @@ fn convert(target: &Type, method: &str, arg_ty: &Type, v: &Value) -> Value {
             }
             "parse" => match v.as_str().trim().parse::<f64>() {
                 Ok(x) => result_ok(Value::Float(round_f32_if(*k, x))),
-                Err(_) => result_err(&format!("cannot parse `{}` as float", v.as_str())),
+                Err(_) => result_err(&builtin_errors::cannot_parse(v.as_str(), "float")),
             },
             _ => result_err("unsupported float conversion"),
         },
@@ -1352,38 +1503,27 @@ fn convert(target: &Type, method: &str, arg_ty: &Type, v: &Value) -> Value {
 }
 
 /// Truncate a float toward zero and range-check it into integer kind `k`. The
-/// out-of-range / non-finite messages match the runtime (`brass_runtime`) so the
-/// REPL's `Result.Err` text is identical to the JIT's.
+/// out-of-range / non-finite messages come from `brass_utils::builtin_errors`,
+/// shared with the runtime, so the REPL's `Result.Err` text is the JIT's.
 fn float_to_int(fx: f64, k: IntKind) -> Value {
     if !fx.is_finite() {
-        return result_err(&format!(
-            "cannot convert non-finite float `{}` to {}",
-            float_str(fx),
-            k.name()
-        ));
+        return result_err(&builtin_errors::non_finite_to_int(fx, k.name()));
     }
     let truncated = fx.trunc();
     let (min, max) = int_range(k.bits(), k.is_signed());
     let integral = truncated as i128;
     if integral < min || integral > max {
-        return result_err(&format!(
-            "float value {} is out of range for {} ({min}..={max})",
-            float_str(fx),
-            k.name()
-        ));
+        return result_err(&builtin_errors::float_out_of_range(fx, k.name(), min, max));
     }
     result_ok(Value::Int(norm_int(integral as i64, k)))
 }
 
 /// `Result.Ok { value }` when `x` fits integer kind `k`, else `Result.Err`, with
-/// the runtime's exact out-of-range message.
+/// the out-of-range message shared with the runtime.
 fn int_in_range(x: i128, k: IntKind) -> Value {
     let (min, max) = int_range(k.bits(), k.is_signed());
     if x < min || x > max {
-        result_err(&format!(
-            "integer value {x} is out of range for {} ({min}..={max})",
-            k.name()
-        ))
+        result_err(&builtin_errors::int_out_of_range(x, k.name(), min, max))
     } else {
         result_ok(Value::Int(norm_int(x as i64, k)))
     }

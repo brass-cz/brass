@@ -1,0 +1,29 @@
+// @backends: all
+// A value the callee may only read -- an immutable `ref(T)` parameter or a
+// `const` -- cannot be handed to a function value that takes it by
+// `ref(mut(T))`, just as it cannot be passed to such a named function: the
+// callee would write through to it. A higher-order function's function-valued
+// parameter is judged by the function value each call passes (a named
+// function, a closure literal), and the error is reported at the argument
+// the higher-order function forwards to it.
+type P = { x: int32 }
+
+fun mutate(p: ref(mut(P))) {
+    p.x = 42
+}
+
+fun apply(f, v: ref(P)) {
+    f(v)
+}
+
+fun with_local(f) {
+    const c = P { x: 1 }
+    f(c)
+    return c.x
+}
+
+fun main() {
+    let w = P { x: 2 }
+    apply(mutate, w)
+    println(with_local((p: ref(mut(P))) -> { p.x = 9 }))
+}

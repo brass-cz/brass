@@ -1,0 +1,31 @@
+// @backends: all
+// A `!` on a fallible closure's result makes the enclosing instantiation
+// fallible even when the unwrapped value is discarded -- in the checker and
+// the back ends alike -- so the caller unwraps the instance's Result.
+fun run(f, s) {
+    f(s)!
+    return 5
+}
+
+const parse = (s: string) -> int32.parse(s)!
+
+println(run(parse, "12")!)
+println(typeof(run(parse, "12")))
+match run(parse, "x") {
+    Ok { value } => println(value),
+    Err { error } => println("failed"),
+}
+
+fun collect(f, xs) {
+    let out = []
+    for x in xs {
+        out.push(f(x)!)
+    }
+    return out
+}
+
+println(collect(parse, ["1", "2"])!)
+match collect(parse, ["1", "z"]) {
+    Ok { value } => println(value),
+    Err { error } => println("collect failed"),
+}

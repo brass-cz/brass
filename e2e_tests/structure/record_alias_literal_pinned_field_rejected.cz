@@ -1,0 +1,10 @@
+// A record literal written through a refinement alias is checked against the
+// alias's pinned field types: a value that does not flow into the pinned
+// type is rejected at the value.
+type Box = { item }
+type IntBox = Box { item: int32 }
+
+fun main() {
+    let b = IntBox { item: "s" }
+    println(b.item)
+}

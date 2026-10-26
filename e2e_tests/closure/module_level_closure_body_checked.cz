@@ -1,0 +1,7 @@
+// A module-level closure applied from a function is checked at the
+// argument's type: `x + 1` on a `string` is rejected.
+const add = (x) -> x + 1
+
+fun main() {
+    println(add("s"))
+}

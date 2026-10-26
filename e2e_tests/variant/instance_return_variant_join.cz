@@ -1,0 +1,46 @@
+// @backends: all
+// Returns that construct different variants of one sum join to one value
+// type carrying every variant's payload slots, so each returned variant is
+// read back at its own payload type, also when one variant has no payload.
+type T =
+    | A { x }
+    | B { y }
+
+type Opt =
+    | Nothing
+    | Some { v }
+
+fun pick(c) {
+    if c {
+        return T.A { x: 1 }
+    }
+    return T.B { y: "s" }
+}
+
+fun maybe(c, v) {
+    if c {
+        return Opt.Some { v }
+    }
+    return Opt.Nothing
+}
+
+fun show(o) {
+    match o {
+        T.A { x } => println("a {x}"),
+        T.B { y } => println("b {y}"),
+    }
+}
+
+fun describe(o) {
+    match o {
+        Opt.Nothing => println("nothing"),
+        Opt.Some { v } => println("some {v}"),
+    }
+}
+
+fun main() {
+    show(pick(true))
+    show(pick(false))
+    describe(maybe(true, "s"))
+    describe(maybe(false, "s"))
+}

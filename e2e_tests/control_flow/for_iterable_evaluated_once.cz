@@ -1,0 +1,43 @@
+// @backends: all
+// A `for` loop evaluates its iterable once: rebinding the variable the
+// iterable named (an array or a range bound) inside the body neither changes
+// the elements visited nor the loop's end, and the loop variable's write-back
+// goes to the array that was iterated. A range expression copies its bounds,
+// so counting never advances a variable used as the lower bound.
+
+fun main() {
+    let lo = 0
+    let r = [lo..3]
+    println(r)
+    println(lo)
+
+    let start = 1
+    for v in [start..4] {
+        print("{v} ")
+    }
+    println(start)
+
+    let n = 3
+    for v in [0..n] {
+        n = 1
+        print("{v} ")
+    }
+    println(n)
+
+    let arr = [1, 2, 3]
+    for e in arr {
+        arr = [7]
+        print("{e} ")
+    }
+    println(arr)
+
+    // The element write-back targets the array that was iterated.
+    let ys = [1, 2]
+    let orig = ys
+    for e in ys {
+        ys = [0]
+        e = e * 10
+    }
+    println(orig)
+    println(ys)
+}

@@ -1,0 +1,11 @@
+// A closure's concrete returns must have a join even when its body is
+// re-elaborated independently for each polymorphic application.
+fun main() {
+    let pick = (flag, value) -> {
+        if flag { return 0 }
+        return value
+    }
+    let big: int64 = 5000000000
+    println(pick(false, big))
+    println(pick(false, "s"))
+}

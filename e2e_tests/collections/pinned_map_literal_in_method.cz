@@ -1,19 +1,7 @@
-// A bare integer literal stored into a width-pinned container must take the
-// receiver's width, and that must hold inside a METHOD body just as it does
-// inside a function body.
-//
-// Pinning a call's parameters from the receiver needs the receiver type's scheme,
-// and a scheme can only be generalized once the method bodies have been checked
-// (that is what links a field's element type to its methods' parameter
-// variables). So the schemes only existed from the function-body phase onward,
-// and the same `set` inside a method body typed the literal from the ARGUMENT --
-// `int32` -- clashing with the map's `int64` slot:
-//
-//     cannot use `_Entry<key=string, value=int32>` where
-//     `_Entry<key=string, value=int64>?` is required
-//
-// The checker now seeds the schemes from a preliminary pass, so a method body
-// sees them too.
+// A bare integer literal stored into a width-pinned container takes the
+// receiver's width (`int64` for a `Counts` map) inside a METHOD body just as
+// inside a function body, also through a parameter annotated with the
+// refinement alias.
 
 type Counts = HashMap {
     key: string

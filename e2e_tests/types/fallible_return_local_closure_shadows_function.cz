@@ -1,0 +1,16 @@
+// @backends: all
+// In a fallible body, a local closure named like a top-level function shadows
+// it for the return inference as well: `f` returns the closure's `string`,
+// not the shadowed `helper`'s `int32`.
+fun helper() { return 1 }
+fun f(fail: bool) {
+  let helper = (x) -> "item {x}"
+  if fail { error("boom")! }
+  return helper(3)
+}
+fun main() {
+  println(helper())
+  let v = f(false)!
+  println(typeof(v))
+  println(v)
+}

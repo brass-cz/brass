@@ -1,0 +1,1 @@
+error: operator `+` is not defined for `int32` and `bool` (no applicable conversion)

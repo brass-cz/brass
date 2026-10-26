@@ -1,0 +1,7 @@
+// A payload variant typo through a sum alias is rejected before execution.
+type Shape = Circle { r: int32 } | Empty
+type Sh = Shape
+fun main() {
+    let value = Sh.Bogus { r: 1 }
+    println("unreachable")
+}

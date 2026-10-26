@@ -345,8 +345,9 @@ fn index_by_defines(items: &[Item]) -> HashMap<String, usize> {
 //
 // These walk the AST gathering every name an item mentions. The set is an
 // over-approximation: identifiers, type names, and field/method names all go in
-// undistinguished, because a name shared between a field and a free function
-// (UFCS) must still force a re-check of users when either changes.
+// undistinguished, because a method item is keyed by its bare name (`fun T.m`
+// defines `m`), so a member access `x.m` must force a re-check of its users when
+// an item named `m` changes.
 
 fn refs_type_decl(t: &TypeDecl, out: &mut HashSet<String>) {
     for i in &t.interfaces {
@@ -499,8 +500,8 @@ fn refs_expr(e: &Expr, out: &mut HashSet<String>) {
         }
         Expr::Field(recv, name, _) => {
             refs_expr(recv, out);
-            // Method/field names participate in UFCS dispatch, so a free
-            // function of the same name is a possible target: record it.
+            // A method item is keyed by its bare name, so the item named
+            // `name` is a possible target: record it.
             out.insert(name.clone());
         }
         Expr::Closure(params, body, _) => {
@@ -599,7 +600,7 @@ mod tests {
 
     /// Editing a function that references a module-level global must pull the
     /// `<init>` item (which declares the global) into the reduced re-check set, so
-    /// the function is not re-checked with the global out of scope -- which used to
+    /// the function is not re-checked with the global out of scope -- which would
     /// produce a spurious "unknown name" the full compiler never reports.
     #[test]
     fn editing_a_function_pulls_in_the_globals_it_uses() {

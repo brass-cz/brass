@@ -1,8 +1,7 @@
-// Pins: `spawn(task)` where `task` is a VARIABLE bound to a closure literal must
-// be analyzed exactly like a literal spawn -- the capture is promoted to a cown
-// (atomic reference count) and both the task body and the spawner's own accesses
-// are lock-guarded. Before the fix this shape got no promotion at all: two
-// threads raced the non-atomic reference count (double free) and lost updates.
+// Pins: `spawn(task)` where `task` is a VARIABLE bound to a closure literal is
+// analyzed exactly like a literal spawn -- the capture is promoted to a cown
+// (atomic reference count) and both the task body and the spawner's own
+// accesses are lock-guarded, so no update is lost and the total is exact.
 type Counter = {
     value: int64
 }

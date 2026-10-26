@@ -1,0 +1,6 @@
+cannot call mutating method `bump` on const value `w`
+cannot call mutating method `bump` on const value `alias`
+cannot call mutating method `bump` on const value `d`
+cannot call mutating method `set` on const value `m`
+cannot call mutating method `bump` on const value `handle`
+cannot pass const value `o` to method `absorb`, which requires a mutable parameter

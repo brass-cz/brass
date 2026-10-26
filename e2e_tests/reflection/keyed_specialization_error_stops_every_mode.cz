@@ -1,0 +1,22 @@
+// @backends: all
+// A diagnostic inside a reflective decoder is reported for the specialization
+// a call requested, at the template's source position. The lazy run must
+// treat it like the eager check and refuse to run: the template itself never
+// runs, so its body range must not hide the specialization's error.
+type Src = | Num { v: int64 } | Big
+
+fun Src.conv(self) -> infer! {
+    match self {
+        Src.Num { v } => {
+            const missing: int32? = null
+            return missing + v
+        }
+        Src.Big => { return error("big") }
+    }
+}
+
+fun main() {
+    println("start")
+    let n: int64 = Src.Num { v: 10 }.conv()!
+    println(n)
+}

@@ -1,0 +1,35 @@
+// @backends: all
+// A `let`/`const` bound closure literal that is never reassigned is
+// let-polymorphic: every use instantiates its type afresh and is compiled at
+// its own instantiation -- called directly, passed to a generic or builtin
+// higher-order function, or used inside another closure.
+fun apply(f, v) {
+    return f(v)
+}
+
+fun main() {
+    let id = (x) -> x
+    println(id(1))
+    println(id("s"))
+    println(id(2.5))
+    let big: int64 = 5000000000
+    println(id(big))
+
+    let show = (x) -> "<{x}>"
+    println([1, 2].map(show))
+    println(["p", "q"].map(show))
+
+    let g = (x) -> x + x
+    println(apply(g, 2))
+    println(apply(g, "ab"))
+
+    // A generalized closure captures its environment like any closure; the
+    // use inside another closure is instantiated there.
+    const suffix = "!"
+    let shout = (x) -> "{x}{suffix}"
+    let both = () -> {
+        println(shout(1))
+        println(shout("hi"))
+    }
+    both()
+}

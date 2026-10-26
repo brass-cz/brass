@@ -1,0 +1,22 @@
+// @backends: all
+// A generic constructor body first instantiated at `int32` by `main`, then at
+// `string` by a function only compiled when execution reaches it (the lazy
+// default): the late instance builds its record at its own type rather than
+// reusing the seed the first instance published.
+
+type Box = { item }
+
+fun wrap(x) {
+    let b = Box { item: x }
+    return b
+}
+
+fun later(n: int32) -> string {
+    let b = wrap("s{n}")
+    return b.item
+}
+
+fun main() {
+    println(wrap(1).item)
+    println(later(4))
+}

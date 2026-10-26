@@ -1,0 +1,40 @@
+// @backends: all
+// An `if`/`match` value flowing into a numeric position adapts its branches
+// written as literals to that position's type when every one of them fits
+// it, as a literal flowing there directly would: in an annotated binding, a
+// return, an argument, a float slot, a nullable slot, and through a nested
+// `if`. The value is built at that type, so arithmetic on it stays there.
+fun pick(c: bool) -> uint8 {
+    return if c { 250 } else { 7 }
+}
+
+fun take(b: uint8) -> uint8 {
+    return b
+}
+
+fun main() {
+    let c = true
+    let small: uint8 = if c { 200 } else { 7 }
+    println(small + 50)
+    let m: int8 = match 3 {
+        1 => -100,
+        2 => 5,
+        _ => 100,
+    }
+    println(m)
+    println(pick(true) + 5)
+    println(take(if c { 255 } else { 0 }))
+    let f: float32 = if c { 3 } else { 2.5 }
+    println(f)
+    let x: uint8 = 9
+    let mixed: uint8 = if c { x } else { 200 }
+    println(mixed)
+    let nested: uint16 = if c {
+        if c { 60000 } else { 1 }
+    } else {
+        2
+    }
+    println(nested)
+    let opt: uint8? = if c { 3 } else { null }
+    println(opt)
+}

@@ -1,0 +1,1 @@
+render_function_value_generic_rejected.cz:5:13: error: cannot print `(int32) -> int32`: a function value has no text rendering

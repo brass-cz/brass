@@ -1,0 +1,4 @@
+// @backends: all
+// Export a sum alias for module-aware construction lookup.
+type Shape = Circle { r: int32 } | Empty
+type Sh = Shape

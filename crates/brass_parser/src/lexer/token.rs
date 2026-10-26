@@ -116,7 +116,10 @@ pub enum StrPart {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TokenKind {
     // Literals
-    Int(i64),
+    /// An integer literal's magnitude, up to `u64::MAX`. The value type is
+    /// wider than any Brass integer so the whole unsigned range is writable;
+    /// a leading `-` is a separate token.
+    Int(i128),
     Float(f64),
     Str(Vec<StrPart>),
     True,

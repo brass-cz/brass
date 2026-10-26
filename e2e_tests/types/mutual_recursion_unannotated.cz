@@ -1,0 +1,77 @@
+// @backends: all
+// Unannotated mutual recursion runs in every mode: the return type each
+// instantiation of the cycle settles on (a bool, a string, a record, a
+// fallible bool) is what the back end compiles the cycle at.
+type Node = { label: string }
+
+fun is_even(n) {
+    if n == 0 {
+        return true
+    }
+    return is_odd(n - 1)
+}
+
+fun is_odd(n) {
+    if n == 0 {
+        return false
+    }
+    return is_even(n - 1)
+}
+
+fun ping(n, acc) {
+    if n == 0 {
+        return acc
+    }
+    return pong(n - 1, "{acc}i")
+}
+
+fun pong(n, acc) {
+    if n == 0 {
+        return acc
+    }
+    return ping(n - 1, "{acc}o")
+}
+
+fun even_f(n) {
+    if n < 0 {
+        error("negative")!
+    }
+    if n == 0 {
+        return true
+    }
+    return odd_f(n - 1)!
+}
+
+fun odd_f(n) {
+    if n == 0 {
+        return false
+    }
+    return even_f(n - 1)!
+}
+
+fun make_a(n) {
+    if n == 0 {
+        return Node { label: "a" }
+    }
+    return make_b(n - 1)
+}
+
+fun make_b(n) {
+    if n == 0 {
+        return Node { label: "b" }
+    }
+    return make_a(n - 1)
+}
+
+fun main() {
+    println("before")
+    println(is_even(10))
+    println(is_odd(7))
+    println(ping(4, ""))
+    println(even_f(4)!)
+    match even_f(-1) {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.value}"),
+    }
+    println(make_a(3).label)
+}

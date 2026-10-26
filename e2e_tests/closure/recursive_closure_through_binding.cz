@@ -1,0 +1,32 @@
+// @backends: all
+// A closure calls itself through a binding declared before the closure is
+// assigned to it: the binding is a shared cell the closure captures, and
+// each call reads the current closure out of it. The assigned closure's
+// unannotated parameter takes the binding's parameter type: from the
+// application (`f(5)`) or from the initializer's annotation (`rev`).
+fun main() {
+    let f = (n) -> 0
+    f = (n) -> {
+        if n == 0 {
+            return 1
+        }
+        return n * f(n - 1)
+    }
+    println(f(5))
+    let fib = (n: int64) -> n
+    fib = (n: int64) -> {
+        if n < 2 {
+            return n
+        }
+        return fib(n - 1) + fib(n - 2)
+    }
+    println(fib(20))
+    let rev = (xs: string[]) -> ""
+    rev = (xs) -> {
+        if let last = xs.pop() {
+            return last + rev(xs)
+        }
+        return "."
+    }
+    println(rev("abc".chars()))
+}

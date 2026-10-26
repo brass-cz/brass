@@ -1,0 +1,24 @@
+// @backends: all
+// A recursive call whose result meets a float literal (`f(n - 1) + 0.5`)
+// widens the instance's return from the literal `return 0` to `float64`; the
+// recursive call itself then reads `float64`, on every back end.
+fun halves(n: int32) {
+    if n == 0 {
+        return 0
+    }
+    return halves(n - 1) + 0.5
+}
+
+fun halves_open(n) {
+    if n == 0 {
+        return 0
+    }
+    const r = halves_open(n - 1)
+    return r + 0.5
+}
+
+fun main() {
+    println(halves(3))
+    println(typeof(halves(3)))
+    println(halves_open(2))
+}

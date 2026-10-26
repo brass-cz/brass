@@ -1,0 +1,16 @@
+// @backends: all
+// Another module declaring its own `println` must not change how this module's
+// prelude `println` treats an anonymous argument's view: rendering the
+// parameter still shows exactly the fields the callee uses, and the library's
+// own `println` stays the library's.
+import printlib.{ shout }
+
+fun show(p) {
+    println(p)
+    println("a = {p.a}")
+}
+
+fun main() {
+    show({ a: 1, b: "x" })
+    shout("hi")
+}

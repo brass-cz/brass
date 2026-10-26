@@ -1,8 +1,8 @@
-// A `!` on a USER TYPE'S STATIC method must make an unannotated caller fallible,
-// exactly as a `!` on a free function does. The light pass has no receiver to
-// infer for `Conn.open(..)` (the base names a type, not a value), so it looks the
-// return up under the type's own name; without that the call's type stayed
-// unknown, `use_it` inferred non-fallible, and `use_it(..)!` failed to compile.
+// A `!` on a USER TYPE'S STATIC method makes an unannotated caller fallible,
+// exactly as a `!` on a free function does: `Conn.open(..)` names a type, not
+// a value, and its declared `Conn!` return is found under the type's own
+// name, so `use_it` infers a `Result` its callers unwrap with `!` and
+// `match`. The Err keeps the location of the `error(..)` in `Conn.open`.
 type Conn = { _id: int64 }
 
 fun Conn.open(id: int64) -> Conn! {

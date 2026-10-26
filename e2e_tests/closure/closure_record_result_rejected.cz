@@ -1,0 +1,10 @@
+// A closure checked against `() -> Animal` returns into an `Animal` result
+// slot; a `Dog` result is a representation change there.
+type Animal = { name: string }
+type Dog = { age: int32, name: string }
+
+fun call(f: () -> Animal) -> string {
+    return f().name
+}
+
+println(call(() -> Dog { age: 7, name: "rex" }))

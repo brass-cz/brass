@@ -1,0 +1,11 @@
+// Two record declarations with the same fields (in another order) still
+// have different layouts: an array of one cannot be stored as an array of
+// the other, and a record cannot be stored as the other.
+type A = { x: int64, y: float64 }
+type B = { y: float64, x: int64 }
+
+fun main() {
+    let as_: A[] = [A { x: 1, y: 0.5 }]
+    let bs: B[] = as_
+    let b: B = A { x: 2, y: 0.25 }
+}

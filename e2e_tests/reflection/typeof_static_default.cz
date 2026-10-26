@@ -1,0 +1,29 @@
+// @backends: all
+// `typeof(v).default()` is the static `default` of v's type: a primitive's
+// folds to its zero value at any width, and inside a generic function the
+// call is resolved at the instance's type (the open definition names no type
+// yet, so it is not a method call on the type-name string).
+type Cfg = { level: int32, name: string }
+
+fun Cfg.default() -> Cfg {
+    return Cfg { level: 1, name: "def" }
+}
+
+fun fresh(v) {
+    return typeof(v).default()
+}
+
+fun zero(x) {
+    return typeof(x).default() + x
+}
+
+fun main() {
+    let u: uint8 = 9
+    let w: int64 = 5000000000
+    let f: float32 = 1.5
+    println(typeof(u).default())
+    println(typeof(w).default())
+    println(typeof(f).default())
+    println(fresh(Cfg { level: 5, name: "x" }).name)
+    println(zero(w))
+}

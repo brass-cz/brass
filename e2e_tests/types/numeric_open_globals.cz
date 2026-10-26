@@ -1,0 +1,8 @@
+// @backends: all
+let x = 0
+let wide: int64 = 5000000000
+println(typeof(x))
+x = wide
+fun set() { x = wide }
+set()
+println(x)

@@ -40,16 +40,30 @@ follows ordinary lexical scoping: a binding of the same name in the body
 shadows it from that point on, and only the uses before the binding decay to
 the field name.
 
+In an unannotated (generic) function, `x`'s record type is the one each call
+instantiates the function with, so the loop is checked per instantiation; a
+call with a non-record argument is rejected. The function's body is lowered
+once for all its instantiations, so they must all expand the same field names
+in the same order; the fields' types may differ.
+
 ## `typeof(x)`
 
 `typeof(x)` names the static type of the value `x`. It is a compile-time
 construct with three uses that mirror the way `Self` names the enclosing type:
 
 **As a string** (value position). A record or sum reports its own name (the
-substitution is dropped, so the name is stable across instantiations);
-primitives and structural forms (`int32[]`, `T?`, ...) report their written
-form. The name is resolved per monomorphic instance, so a generic function
-reports each caller's own argument type:
+substitution is dropped, so the name is stable across instantiations and
+does not depend on whether the value was constructed or reached an annotated
+slot); primitives and structural forms (`int32[]`, `T?`, ...) report their
+written form, with the same rule for the records and sums inside them (`R?`,
+`[R, int32]`). An anonymous record reports `anonymous { field: T, ... }`.
+The string names the same type `typeof(x)` denotes in type position, so a
+`const` array literal, which is fixed-length, reports its length. A function
+type under a suffix is parenthesized, since a suffix written after it would
+belong to its return type: an array of closures reports
+`((int64) -> int64)[]`, a closure returning an array `(int64) -> int64[]`.
+The name is resolved per monomorphic instance, so a generic function reports
+each caller's own argument type:
 
 ```brass
 type Shape = Circle { r: float64 } | Square
@@ -57,6 +71,8 @@ println(typeof(Shape.Circle { r: 1.0 }))      // Shape
 
 let xs = [1, 2, 3]
 println(typeof(xs))                            // int32[]
+const pair = [1, 2]
+println(typeof(pair))                          // int32[2]
 
 fun name(x) -> string { return typeof(x) }
 println(name(1))                               // int32
@@ -77,6 +93,11 @@ associated function of that type is reachable through a value:
 const o = typeof(v).origin()    // calls the static `origin` of v's type
 const n = typeof(x).from(3.9)!  // the `from` of x's numeric type
 ```
+
+Inside a generic function the static call is resolved per instance, but the
+body is lowered once for all instances, so every instantiation must name the
+same type there: `fun zero(x) { return typeof(x).default() }` may be called
+at `int64` or at `Cfg`, not at both (the second instantiation is rejected).
 
 In every value context `typeof(v)` decays to the type's name string, exactly as
 a `fields()` descriptor decays to the field name outside `v[field]`. Only the
@@ -100,8 +121,9 @@ answer is fixed at compile time:
 
 Because a bare `null` is statically false and any other value statically true,
 an `if` over a member access is decided while checking. The arm that cannot run
-is neither type-checked nor emitted, so a single generic body may hold arms that
-only type for _some_ of its instantiations:
+is neither type-checked nor emitted, and its `return`s and `error(..)` calls do
+not count toward the function's result, so a single generic body may hold arms
+that only type for _some_ of its instantiations:
 
 ```brass
 type Segments = { parts: string[] }
@@ -216,8 +238,12 @@ result type is not fixed by the definition but by each call site's expectation.
 j.into()!` decodes the same method as an `int64`. Inside the body, `infer` is
 the target type (`let ret: infer` becomes `let ret: User`), and
 `infer.from(x)` converts `x` to the target when a value conversion exists
-(numbers between numeric types, a value of the target's own type), producing a
-runtime decode error otherwise.
+(numbers between numeric types, a value of the target's own type, or, for a
+record or sum target that declares its own static `from`, a call of that
+method), producing a runtime decode error otherwise. `x` may be any
+expression -- a pattern binding, a local, a field, a literal, a call -- whose
+type each specialization decides; outside such a method `infer.from` is a
+compile error.
 
 This turns a whole recursive JSON-to-struct decoder into one method. This is
 exactly how the `data.json` library implements `JsonValue.into` (abridged):
@@ -243,10 +269,21 @@ let user: User = obj.into()!                     // decodes a nested User tree
 
 The compiler generates one concrete method per target type actually requested
 (and, transitively, per field type a record decode needs), so there is no
-runtime type dispatch: a `Json.JNum` reaching a `User` target, or a missing
-field, is a normal `Result` error. The target type must be known at the call
-(from an annotation or the enclosing return), not only inside a later `match`
-arm.
+runtime type dispatch: a `JsonValue.Number` reaching a `User` target, or a
+missing field, is a normal `Result` error. The target type must be known at
+the call (from an annotation or the enclosing return), not only inside a later
+`match` arm.
+
+The record walk is the `fields(x)` loop over a binding declared `let x: infer`
+(any name). At a nullable target `T?`, that binding is a `T` and the walk visits
+`T`'s fields, so a present value decodes as `T` and promotes into the result,
+while `return null` yields `null`; `infer.from(x)` converts to `T` and
+propagates a failed (range-checked) conversion. When a target cannot be
+produced -- `infer.from` has no conversion, `return null` at a non-nullable
+target, a record walk at a non-record target -- the decode error is located at
+the decoder call that requested that target. `data.json` decodes an absent
+object member into a nullable field as `null`; for any other field it is a
+`missing field` error.
 
 ## Compile-time cost
 

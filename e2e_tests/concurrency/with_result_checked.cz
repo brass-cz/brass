@@ -1,0 +1,27 @@
+// The result of `with(obj, f)` is the closure's result, checked like any
+// value: an `int32` field read cannot initialize a `string`, and the spawn
+// auto-guard's `with` keeps the guarded access's `int64`, so accumulating it
+// into an `int32` binding is the usual lossy-narrowing error.
+type Node = {
+    value: int32
+}
+
+type Big = {
+    value: int64
+}
+
+fun touch(b) {
+    return b.value
+}
+
+fun main() {
+    let n = Node { value: 3 }
+    let p: string = with(n, (m) -> m.value)
+    let b = Big { value: 5000000000 }
+    spawn(() -> {
+        let t = touch(b)
+    })
+    let s = 0
+    s = s + touch(b)
+    sync()
+}

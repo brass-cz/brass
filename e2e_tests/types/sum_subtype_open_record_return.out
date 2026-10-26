@@ -1,0 +1,14 @@
+Result
+Result.Ok {
+    value: Box {
+        item: 4,
+    },
+}
+Result.Ok {
+    value: Box {
+        item: 4,
+    },
+}
+Result.Ok {
+    value: 4,
+}

@@ -71,10 +71,12 @@ fun error(value, loc: Location) -> infer! {
     return Result.Err { error: Error { value, location: loc, frames } }
 }
 
-// Attach a context message to a failed Result, keeping a success untouched.
+// Attach a context message to a failed Result, keeping a success's value.
 // An `Error` payload gains a trace frame at the caller's position; any other
 // payload is wrapped into an `Error` first (its base position is the
-// `context` call, the nearest position known).
+// `context` call, the nearest position known). A success is rebuilt around
+// its value rather than returned as is: the result's error type may be the
+// wrapping `Error` while the receiver's is the raw payload.
 fun Result.context(self, ctx: string, loc: Location) {
     return match self {
         Err { error } => {
@@ -91,7 +93,7 @@ fun Result.context(self, ctx: string, loc: Location) {
                 }
             }
         },
-        Ok { value } => self,
+        Ok { value } => Result.Ok { value },
     }
 }
 

@@ -1,0 +1,56 @@
+// @backends: all
+// `infer.from(x)` converts any source expression, not only a variable a
+// variant pattern binds: a local, a field, a literal or an operator result.
+// The source type is decided per specialization, and the conversion follows
+// the from/parse partition exactly as for a pattern binding: the target's own
+// type is the identity, numbers convert between numeric types (range-checked),
+// and any other pair is a runtime decode error.
+type Src = | Num { v: int32 } | Text { s: string } | Big
+
+fun Src.conv(self) -> infer! {
+    match self {
+        Src.Num { v } => {
+            const local = v * 2
+            return infer.from(local)
+        }
+        Src.Text { s } => { return infer.from(s + "!") }
+        Src.Big => { return infer.from(300) }
+    }
+}
+
+type Box = { n: int32, label: string }
+
+fun Box.conv(self) -> infer! {
+    if self.n < 0 {
+        return infer.from(self.label)
+    }
+    return infer.from(self.n)
+}
+
+fun show(r) {
+    match r {
+        Ok { value } => println("ok {value}")
+        Err { error } => println("err {error.value}")
+    }
+}
+
+fun main() {
+    let a: int64 = Src.Num { v: 21 }.conv()!
+    println(a)
+    let b: float64 = Src.Num { v: 2 }.conv()!
+    println(b)
+    let c: string = Src.Text { s: "hi" }.conv()!
+    println(c)
+    let d: int64? = Src.Num { v: 5 }.conv()!
+    println(d)
+    const e: int8! = Src.Big.conv()
+    show(e)
+    const f: int64! = Src.Text { s: "x" }.conv()
+    show(f)
+    let g: int64 = Box { n: 7, label: "l" }.conv()!
+    println(g)
+    let h: string = Box { n: -1, label: "neg" }.conv()!
+    println(h)
+    const i: string! = Box { n: 3, label: "l" }.conv()
+    show(i)
+}

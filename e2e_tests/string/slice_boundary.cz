@@ -1,11 +1,11 @@
-// Pins _string_slice's UTF-8 handling: a byte range that lands mid-character is
-// snapped back to the nearest character boundary (matching the interpreter),
-// never materializing invalid UTF-8. "héllo" is h(1 byte) é(2 bytes) llo:
+// `_string_slice` on UTF-8 text: a byte range that lands mid-character snaps
+// back to the nearest character boundary, on the JIT as in the interpreter,
+// so a slice is always valid UTF-8. "héllo" is h(1 byte) é(2 bytes) llo:
 //  - [0,2) ends mid-é, snaps to [0,1) = "h";
 //  - [2,3) starts mid-é, snaps to [1,3) = "é";
 //  - [1,2) both mid-é endpoints collapse to [1,1) = "".
-// Also pins that a multibyte slice stays searchable/parseable (defined
-// behavior, not UB through from_utf8_unchecked).
+// A multibyte slice is an ordinary string that `_string_find` searches, and
+// a start beyond the end yields an empty slice.
 fun main() {
     let s = "héllo"
     let a = _string_slice(s, 0, 2)

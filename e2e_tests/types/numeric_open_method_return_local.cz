@@ -1,0 +1,26 @@
+// @backends: all
+type Box = { tag: int32 }
+fun Box.seed(self) {
+ let x = 0
+ println(typeof(x))
+ return x
+}
+fun Box.zero() {
+ let x = 0
+ println(typeof(x))
+ return x
+}
+fun main() {
+ let box = Box { tag: 1 }
+ let wide: int64 = 5000000000
+ let a = box.seed()
+ a = wide
+ let b = box.seed()
+ let c = Box.zero()
+ c = wide
+ let d = Box.zero()
+ println(typeof(a))
+ println(typeof(b))
+ println(typeof(c))
+ println(typeof(d))
+}

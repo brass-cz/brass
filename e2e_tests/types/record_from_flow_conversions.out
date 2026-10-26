@@ -1,0 +1,16 @@
+6
+Mixed {
+    x: 5.0,
+    label: "s",
+}
+Optional {
+    tag: "t",
+    n: 5,
+}
+Optional {
+    tag: null,
+    n: null,
+}
+int64 into int32: null
+float into int64: null
+missing field: null

@@ -1,0 +1,15 @@
+// @backends: all
+// The growable-array operations are methods (`xs.push(v)`, `xs.pop()`,
+// `xs.insert(i, v)`, `xs.remove(i)`). No back end implements free functions
+// named `_array_push`, `_array_pop`, `_array_insert` or `_array_remove`, so the
+// checker must reject such calls instead of accepting a program that cannot
+// run.
+fun main() {
+  let xs: int32[] = [1, 2]
+  _array_push(xs, 3)
+  let y = _array_pop(xs)
+  println(y)
+  _array_insert(xs, 0, 9)
+  _array_remove(xs, 0)
+  println(xs)
+}

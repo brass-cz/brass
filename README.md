@@ -44,7 +44,8 @@ czpm run
 ## Features
 
 - **Type inference everywhere.** Flexible inference means most code needs
-  no annotations; types are resolved per function, just before it runs.
+  no annotations; an unannotated function is checked at each call's argument
+  types, just before it runs.
 - **Records and sum types** under one `type` keyword. Methods are implemented
   with `fun T.m(...)`: a first `self` parameter makes an instance method,
   otherwise it is static; `Self` refers to the type.
@@ -60,9 +61,11 @@ czpm run
 - **Structural conversion.** `T.from(v)` for a record type `T` yields `T?`: the
   record when `v` structurally has all of `T`'s fields, null otherwise. So
   `if let p = T.from(v)` branches on the actual value.
-- **References with inferred mutability.** An unannotated parameter is passed by
-  reference and its mutability is inferred; `infer` deep-copies instead; `ref(T)`
-  and `ref(mut(T))` are explicit. Closures capture by mutable reference.
+- **Inferred parameter passing.** An unannotated parameter is a shared
+  reference when the body only reads it and a private deep copy when the body
+  mutates it. `ref(T)` (read-only reference), `ref(mut(T))` (writes through to
+  the caller), `mut(T)` (mutable copy), and `infer` (read-only copy) are
+  explicit. Closures capture by mutable reference.
 - **Tuples** `[T, U]`, anonymous structural records, string interpolation, and
   both explicit and automatic numeric conversion.
 - **A file-based module system** where each file is a module and a leading `_`
@@ -109,12 +112,14 @@ brass repl                      # interactive interpreter session
 brass                           # no arguments: same interactive session
 ```
 
-A bare file argument is type-checked and then run on the JIT when it is built in,
-otherwise on the interpreter. Each module's top-level statements run in dependency
-order, then `main` is called if defined. The standard library is an implicit
-prelude. Everything after the program file is passed through verbatim and is
-available from `env.args()`; driver flags such as `--eager` must come before the
-file:
+A bare file argument runs on the JIT when it is built in, otherwise on the
+interpreter. The JIT run checks each function before it executes but does not
+wait for code the run never needs; `--eager` checks the whole program first, as
+`brass check` does. Each module's top-level statements run in dependency order,
+then `main` is called if defined. The embedded `core` library is an implicit
+prelude; the shipped `std` library is imported as `std.*`. Everything after the
+program file is passed through verbatim and is available from `env.args()`;
+driver flags such as `--eager` must come before the file:
 
 ```sh
 brass --eager path/to/file.cz input.txt --verbose
@@ -127,12 +132,11 @@ knowing:
 
 - **Concurrency is experimental.** Scheduling is unstructured, so code that must
   observe a spawned task's results calls `sync()` first. Treat it as a preview.
-- **The JIT and interpreter agree across the language's tested surface,** but a
-  few features are native-only: concurrency (`spawn`/`sync`/`with`) and runtime
-  type specialization are refused by the interpreter, so they need the JIT.
-  File I/O and the other native `std` modules run on both back ends
-  (`brass repl` included); only the browser playground, which cannot load
-  plugins, lacks them.
+- **The JIT and interpreter agree across the language's tested surface,** but
+  concurrency (`spawn`/`sync`/`with`) is native-only: the interpreter refuses
+  it, so it needs the JIT. File I/O and the other native `std` modules run on
+  both back ends (`brass repl` included); only the browser playground, which
+  cannot load plugins, lacks them.
 
 ## License
 

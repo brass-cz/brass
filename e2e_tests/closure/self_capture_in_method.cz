@@ -1,7 +1,6 @@
-// A closure inside a METHOD body that reads `self`. The free-variable walk
-// collected `Ident` reads only, and `self` is its own expression form -- so the
-// closure never CAPTURED it: the body's `self` resolved to nothing, and both back
-// ends refused the value ("cannot infer the type of an expression temporary").
+// A closure inside a METHOD body that reads `self` captures it like any other
+// binding, so calling the closure runs a method on the receiver it was
+// created with.
 type Req = {
     path: string
 }

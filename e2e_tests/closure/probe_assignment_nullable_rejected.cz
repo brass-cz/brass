@@ -1,0 +1,33 @@
+// Provisional assignments must not hide errors at earlier uses of a callable.
+fun main() {
+    {
+        let f = (x) -> x.foo
+        println(f(1))
+        f = (x) -> x
+        println(f(2147483648))
+    }
+    {
+        let f = (x) -> x.foo
+        println(f(1))
+        f = (x) -> x + 1
+        println(f(2147483648))
+    }
+    {
+        let f = (x) -> x.foo
+        println(f(1))
+        f = (x) -> { return x }
+        println(f(2147483648))
+    }
+    {
+        let f = (x) -> x.foo
+        println(f(1))
+        f = (x) -> [x]
+        println(f(2147483648))
+    }
+    {
+        let f = (x) -> x.foo
+        println(f(1))
+        f = (x) -> { return 1 }
+        println(f(2147483648))
+    }
+}

@@ -1,0 +1,48 @@
+// @backends: all
+// `.context(..)!` inside a function whose own Ok type differs from the
+// context's operand: the Ok wrap of a present nullable keeps the operand's
+// type (an `Item`), not the enclosing `string!` return's payload, and an
+// error forwarded from a generic helper keeps the lifted `Error` payload.
+// Neither value is typed by the enclosing function's return.
+
+type Item = {
+    name: string
+}
+
+fun find(items: Item[], name: string) -> Item? {
+    for it in items {
+        if it.name == name {
+            return it
+        }
+    }
+    return null
+}
+
+fun label(items: Item[], name: string) -> string! {
+    return find(items, name).context("missing {name}")!.name
+}
+
+fun fail_with(value) -> infer! {
+    return Result.Err { error: value }
+}
+
+fun checked(flag: bool) -> infer! {
+    if flag {
+        return 7
+    }
+    return fail_with("bad flag")
+}
+
+fun main() {
+    const items = [Item { name: "a" }, Item { name: "b" }]
+    println(label(items, "b")!)
+    match label(items, "z") {
+        Ok { value } => println(value),
+        Err { error } => println(error.value),
+    }
+    println(checked(true)!)
+    match checked(false) {
+        Ok { value } => println(value),
+        Err { error } => println(error.value),
+    }
+}

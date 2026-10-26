@@ -1,7 +1,7 @@
-// `string.from(s)` of a string is the identity -- its result aliases the argument.
-// A bound alias must be retained so its later drop balances, otherwise the borrowed
-// argument is over-released. Using one string value through several `string.from`
-// conversions (directly and across calls) must not double-free it.
+// `string.from(s)` of a string is the identity: its result is the argument
+// itself, not a copy. One string value used through several `string.from`
+// conversions, bound directly and across calls, stays intact and prints
+// unchanged afterwards.
 
 fun hash_len(key) {
     // `string.from(key)` aliases `key`; bound here and consumed by `_string_bytes`.

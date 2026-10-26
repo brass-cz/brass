@@ -1,10 +1,25 @@
-//! Typing of builtin runtime functions and primitive methods:
-//! the `_`-prefixed runtime helpers, concurrency builtins, and the
-//! array/string method surface that has no user-level signature.
+//! Typing of the callables that have no user-level signature to elaborate:
+//! the runtime builtins (`len`, the concurrency primitives, the `_`-prefixed
+//! runtime helpers), the prelude's `print`/`println`, the builtin methods
+//! (array `push`/`pop`/`insert`/`remove`/`len`, string `len`, nullable
+//! `context`, the built-in `debug`) and the static methods of the primitive
+//! type words (`T.from`, `T.parse`, `T.default()`). It also owns the
+//! renderability rule every rendering site shares (`expect_renderable`).
+//!
+//! `spawn` and `with` are language constructs in call position. Any other
+//! builtin or prelude name is typed here only where the call reaches it: a
+//! local binding, or a function the current module declares or imports under
+//! that name, shadows it in that scope or module only.
 
 use super::*;
 
 impl<'a> Checker<'a> {
+    /// The type of a call of the builtin function `name` -- a runtime
+    /// primitive, or a prelude function typed without elaborating its body
+    /// (`print`, `println`, the `input` stand-in) -- with its arguments
+    /// checked. `spawn` and `with` always denote constructs. For other names,
+    /// `None` when the name is not a builtin or a visible binding or function
+    /// shadows it, matching MIR's ordinary call resolution.
     pub(super) fn builtin_function_type(
         &mut self,
         name: &str,
@@ -12,6 +27,11 @@ impl<'a> Checker<'a> {
         span: brass_parser::Span,
         scopes: &mut ScopeStack,
     ) -> Option<Type> {
+        if !matches!(name, "spawn" | "with")
+            && !self.calls_prelude_function(name, self.lookup(scopes, name).is_some())
+        {
+            return None;
+        }
         // `len` is a runtime primitive usable as a free
         // function. Its result is always `int64`, and its single argument must
         // be a collection or string; a concrete non-collection argument is a
@@ -26,8 +46,9 @@ impl<'a> Checker<'a> {
                 self.check_expr(&a.expr, scopes);
             }
             if let Some(arg) = args.first() {
+                // A `ref`/`mut`/`const` view has the length of what it views.
                 let resolved = self.resolve(&arg_ty);
-                if !is_maybe_indexable(&resolved) {
+                if !is_maybe_indexable(brass_hir::peel_modes(&resolved)) {
                     self.errors.push(TypeError {
                         message: format!(
                             "`len` expects an array or string, found `{}`",
@@ -39,25 +60,27 @@ impl<'a> Checker<'a> {
             }
             return Some(Type::Int(IntKind::I64));
         }
+        // The prelude's `print`/`println` only render their argument; they are
+        // typed here rather than by elaborating their bodies.
         if matches!(name, "print" | "println") {
-            args.iter().for_each(|a| {
-                self.check_expr(&a.expr, scopes);
-            });
+            for a in args {
+                let ty = self.check_expr(&a.expr, scopes);
+                self.expect_renderable(&ty, a.expr.span(), "cannot print");
+                self.invalidate_after_rendering(&ty, scopes);
+            }
             return Some(Type::Void);
         }
         if name == "input" && self.lookup_function("input").is_none() {
-            // The stdlib defines the real `input` (an inferred-fallible
-            // `string!`); resolution above prefers it. This fallback keeps the
-            // same static type when no stdlib is loaded, so the checker never
-            // hands out an unconstrained unknown for the name.
+            // The prelude defines the real `input` (an inferred-fallible
+            // `string!`), and a call of it is elaborated like any function's.
+            // This stand-in keeps a static type for the name in a program
+            // without the prelude, so the checker never hands out an
+            // unconstrained unknown for it.
             self.check_arg_count("input", 0, args.len(), span);
             args.iter().for_each(|a| {
                 self.check_expr(&a.expr, scopes);
             });
             return Some(Type::result(Type::Str, Type::Str));
-        }
-        if let Some(ret) = self.array_builtin_type(name, args, span, scopes) {
-            return Some(ret);
         }
         if let Some(ret) = self.string_builtin_type(name, args, span, scopes) {
             return Some(ret);
@@ -84,6 +107,12 @@ impl<'a> Checker<'a> {
                 Type::Str,
             ));
         }
+        if name == "_panic" {
+            // `_panic(msg)`: abort the program with `msg` (the primitive
+            // behind `assert`). It yields no value, as on the back ends.
+            self.check_builtin_args_against(name, args, &[Type::Str], span, scopes);
+            return Some(Type::Void);
+        }
         if name == "_flush" {
             // `_flush()`: push buffered output to the operating system.
             self.check_arg_count(name, 0, args.len(), span);
@@ -107,6 +136,29 @@ impl<'a> Checker<'a> {
             return Some(ret);
         }
         None
+    }
+
+    /// Reject rendering a value of type `ty` (the operand at `span`) as text
+    /// when some part of it has no rendering (see
+    /// [`brass_hir::unrenderable_part`]): a `void` -- the expression produces
+    /// no value -- or a function value. Every rendering site (`print`,
+    /// `println`, a `"{v}"` segment, `string.from`, the built-in `debug`)
+    /// shares this rule, so the back ends never meet such an operand. `what`
+    /// leads the message (`"cannot print"`). A still-open type is decided by
+    /// the per-instantiation checks of its generic body.
+    pub(super) fn expect_renderable(&mut self, ty: &Type, span: brass_parser::Span, what: &str) {
+        let resolved = self.resolve(ty);
+        let Some(part) = brass_hir::unrenderable_part(&resolved) else {
+            return;
+        };
+        let reason = match part {
+            Type::Void => "the expression produces no value",
+            _ => "a function value has no text rendering",
+        };
+        self.errors.push(TypeError {
+            message: format!("{what} `{}`: {reason}", resolved.display()),
+            span,
+        });
     }
 
     /// `_plugin_[f]call_<t>(logical_id, name, sig, payload...)`: the loader
@@ -178,8 +230,8 @@ impl<'a> Checker<'a> {
     /// map onto LLVM/runtime primitives, so the value class of each argument
     /// must be correct before the runtime reads its payload bits: passing a
     /// float to `_int_to_string`, for example, would reinterpret a bit pattern
-    /// as an integer. Concrete wrong classes are static errors; unknown
-    /// arguments stay deferred to the runtime tag checks.
+    /// as an integer. Concrete wrong classes are static errors; a still-open
+    /// argument is judged by the check of each instantiation.
     fn numeric_helper_type(
         &mut self,
         name: &str,
@@ -250,11 +302,10 @@ impl<'a> Checker<'a> {
         Some(ret)
     }
 
-    /// Minimal static contracts for the concurrency primitives.
-    /// `spawn(f: () -> void) -> void` and `with(c, f) -> U` are the only
-    /// programmer-facing concurrency API. Until cown typing is real the first
-    /// `with` argument stays untyped (the closure parameter is deferred), but
-    /// the callable shape and `spawn`'s zero-arity are enforced now.
+    /// Static contracts for the concurrency primitives: the programmer-facing
+    /// `spawn(f: () -> void)`, `sync()` and `with(c, f) -> U`, and the
+    /// `_cown`/`_freeze`/`_with_all` forms the spawn auto-acquire pass
+    /// inserts.
     fn concurrency_builtin_type(
         &mut self,
         name: &str,
@@ -305,14 +356,33 @@ impl<'a> Checker<'a> {
                 }
                 Some(Type::Void)
             }
+            // `with(obj, f)` acquires `obj` and yields `f(obj)`: `f` is
+            // checked against `(typeof obj) -> R` like a closure argument of
+            // any call, so an unannotated parameter takes `obj`'s type, the
+            // body is checked at it, and the call's type is the closure's
+            // result `R` -- the type the guarded expression had before the
+            // spawn auto-guard wrapped it in a `with`.
             "with" => {
                 self.check_arg_count("with", 2, args.len(), span);
-                if let Some(arg) = args.first() {
-                    self.check_expr(&arg.expr, scopes);
-                }
+                let obj = match args.first() {
+                    Some(arg) => self.check_expr(&arg.expr, scopes),
+                    None => self.fresh_unknown(),
+                };
                 let ret = match args.get(1) {
                     Some(arg) => {
-                        let got = self.check_expr(&arg.expr, scopes);
+                        let result = self.fresh_unknown();
+                        let expected = Type::Fun(vec![obj], Box::new(result.clone()));
+                        self.last_closure_result = None;
+                        let got = self.check_expr_against(&arg.expr, &expected, scopes);
+                        // Checking a literal against the expected type only
+                        // probes its result; this call applies it, so what the
+                        // body returns at `obj`'s type is the result, as an
+                        // application of any closure value commits it.
+                        if let Some(observed) = self.last_closure_result.take()
+                            && !brass_hir::is_fully_known(&self.resolve(&result))
+                        {
+                            let _ = self.solver.unify(&result, &observed);
+                        }
                         match self.resolve(&got) {
                             Type::Fun(params, ret) => {
                                 if params.len() != 1 {
@@ -348,8 +418,8 @@ impl<'a> Checker<'a> {
                 Some(ret)
             }
             // `sync()` joins every thread spawned so far, so values mutated by a
-            // `spawn` become observable before the program continues (R6
-            // value-observability / structured-concurrency barrier).
+            // `spawn` become observable before the program continues (the
+            // structured-concurrency barrier).
             "sync" => {
                 self.check_arg_count("sync", 0, args.len(), span);
                 for arg in args {
@@ -390,6 +460,10 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The light pass's return types for builtin callees, and for the prelude
+    /// functions typed as builtins (`print`, `assert`, ...). Each applies only
+    /// when the call reaches it rather than a shadowing local binding or
+    /// function (see the module doc); the caller checks that.
     pub(super) fn builtin_function_type_light(&self, name: &str) -> Option<Type> {
         if let Some(ret) = brass_hir::plugin_builtin_return(name) {
             return Some(ret);
@@ -401,11 +475,21 @@ impl<'a> Checker<'a> {
                 Type::Str,
             )),
             "_argv" => Some(Type::Slice(Box::new(Type::Str))),
-            "_flush" => Some(Type::Void),
-            "input" => Some(Type::result(Type::Str, Type::Str)),
+            "_flush" | "_panic" => Some(Type::Void),
+            // The prelude declares the real `input` (an inferred-fallible
+            // `string!` whose Err is the prelude `Error`); its return comes
+            // from the precompute table like any function's. This type only
+            // stands in for a program without the prelude, as in the full
+            // check (`builtin_function_type`).
+            "input" if self.lookup_function("input").is_none() => {
+                Some(Type::result(Type::Str, Type::Str))
+            }
             "len" => Some(Type::Int(IntKind::I64)),
             "print" | "println" | "assert" => Some(Type::Void),
-            "_string_concat" | "_string_slice" | "_string_char_at" => Some(Type::Str),
+            "_string_concat" | "_string_slice" => Some(Type::Str),
+            // The character at a byte offset, or null past the end or inside a
+            // multibyte character.
+            "_string_char_at" => Some(Type::Nullable(Box::new(Type::Str))),
             "_string_bytes" => Some(Type::Slice(Box::new(Type::Int(IntKind::U8)))),
             "_string_from_bytes" => Some(Type::result(Type::Str, Type::Str)),
             "_string_find" => Some(Type::Nullable(Box::new(Type::Int(IntKind::I64)))),
@@ -425,148 +509,6 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn array_builtin_type(
-        &mut self,
-        name: &str,
-        args: &[Arg],
-        span: brass_parser::Span,
-        scopes: &mut ScopeStack,
-    ) -> Option<Type> {
-        match name {
-            "_array_push" => {
-                self.check_arg_count(name, 2, args.len(), span);
-                let arr_ty = args
-                    .first()
-                    .map(|arg| self.check_expr(&arg.expr, scopes))
-                    .unwrap_or(Type::Void);
-                let elem_ty = match self.resolve(&arr_ty) {
-                    Type::Slice(inner) => *inner,
-                    Type::Array(_, _) => {
-                        if let Some(arg) = args.first() {
-                            self.errors.push(TypeError {
-                                message: "`_array_push` expects a slice, found fixed array"
-                                    .to_string(),
-                                span: arg.expr.span(),
-                            });
-                        }
-                        self.fresh_unknown()
-                    }
-                    Type::Unknown(_) => self.fresh_unknown(),
-                    other => {
-                        if let Some(arg) = args.first() {
-                            self.errors.push(TypeError {
-                                message: format!(
-                                    "`_array_push` expects a slice, found `{}`",
-                                    other.display()
-                                ),
-                                span: arg.expr.span(),
-                            });
-                        }
-                        self.fresh_unknown()
-                    }
-                };
-                if let Some(value) = args.get(1) {
-                    let got = self.check_expr(&value.expr, scopes);
-                    self.expect_expr_assignable(&got, &elem_ty, &value.expr);
-                    if matches!(self.resolve(&elem_ty), Type::Unknown(_)) {
-                        let _ = self.solver.unify(&elem_ty, &got);
-                    }
-                }
-                for arg in args.iter().skip(2) {
-                    self.check_expr(&arg.expr, scopes);
-                }
-                Some(Type::Void)
-            }
-            "_array_pop" => {
-                self.check_arg_count(name, 1, args.len(), span);
-                let arr_ty = args
-                    .first()
-                    .map(|arg| self.check_expr(&arg.expr, scopes))
-                    .unwrap_or(Type::Void);
-                for arg in args.iter().skip(1) {
-                    self.check_expr(&arg.expr, scopes);
-                }
-                let elem_ty = match self.resolve(&arr_ty) {
-                    Type::Slice(inner) => *inner,
-                    Type::Array(_, _) => {
-                        if let Some(arg) = args.first() {
-                            self.errors.push(TypeError {
-                                message: "`_array_pop` expects a slice, found fixed array"
-                                    .to_string(),
-                                span: arg.expr.span(),
-                            });
-                        }
-                        self.fresh_unknown()
-                    }
-                    Type::Unknown(_) => self.fresh_unknown(),
-                    other => {
-                        if let Some(arg) = args.first() {
-                            self.errors.push(TypeError {
-                                message: format!(
-                                    "`_array_pop` expects a slice, found `{}`",
-                                    other.display()
-                                ),
-                                span: arg.expr.span(),
-                            });
-                        }
-                        self.fresh_unknown()
-                    }
-                };
-                Some(Type::Nullable(Box::new(elem_ty)))
-            }
-            // `_array_insert(arr, idx, elem)` / `_array_remove(arr, idx)` primitives: the slice's element type drives the index/element
-            // checks. Insert yields void; remove yields the removed element.
-            "_array_insert" | "_array_remove" => {
-                let want_args = if name == "_array_insert" { 3 } else { 2 };
-                self.check_arg_count(name, want_args, args.len(), span);
-                let arr_ty = args
-                    .first()
-                    .map(|arg| self.check_expr(&arg.expr, scopes))
-                    .unwrap_or(Type::Void);
-                let elem_ty = match self.resolve(&arr_ty) {
-                    Type::Slice(inner) => *inner,
-                    Type::Unknown(_) => self.fresh_unknown(),
-                    other => {
-                        if let Some(arg) = args.first() {
-                            self.errors.push(TypeError {
-                                message: format!(
-                                    "`{name}` expects a slice, found `{}`",
-                                    other.display()
-                                ),
-                                span: arg.expr.span(),
-                            });
-                        }
-                        self.fresh_unknown()
-                    }
-                };
-                // The index argument is an int64 offset.
-                if let Some(idx) = args.get(1) {
-                    let got = self.check_expr(&idx.expr, scopes);
-                    self.expect_expr_assignable(&got, &Type::Int(IntKind::I64), &idx.expr);
-                }
-                if name == "_array_insert" {
-                    if let Some(value) = args.get(2) {
-                        let got = self.check_expr(&value.expr, scopes);
-                        self.expect_expr_assignable(&got, &elem_ty, &value.expr);
-                        if matches!(self.resolve(&elem_ty), Type::Unknown(_)) {
-                            let _ = self.solver.unify(&elem_ty, &got);
-                        }
-                    }
-                    for arg in args.iter().skip(3) {
-                        self.check_expr(&arg.expr, scopes);
-                    }
-                    Some(Type::Void)
-                } else {
-                    for arg in args.iter().skip(2) {
-                        self.check_expr(&arg.expr, scopes);
-                    }
-                    Some(elem_ty)
-                }
-            }
-            _ => None,
-        }
-    }
-
     fn string_builtin_type(
         &mut self,
         name: &str,
@@ -581,7 +523,7 @@ impl<'a> Checker<'a> {
             "_string_slice" => (vec![Type::Str, i64_ty.clone(), i64_ty.clone()], Type::Str),
             "_string_bytes" => (vec![Type::Str], bytes_ty),
             "_string_from_bytes" => (vec![bytes_ty], Type::result(Type::Str, Type::Str)),
-            "_string_char_at" => (vec![Type::Str, i64_ty], Type::Str),
+            "_string_char_at" => (vec![Type::Str, i64_ty], Type::Nullable(Box::new(Type::Str))),
             "_string_cmp" => (vec![Type::Str, Type::Str], Type::Int(IntKind::I32)),
             "_string_find" => (
                 vec![Type::Str, Type::Str],
@@ -610,6 +552,10 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The type of the call `recv.method(args)` when `method` is a builtin
+    /// method of the receiver (nullable `context`, the built-in `debug`, an
+    /// array or string method), with its arguments checked; `None` when it is
+    /// not one and the call resolves like any method call.
     pub(super) fn builtin_method_type(
         &mut self,
         recv_ty: &Type,
@@ -689,7 +635,8 @@ impl<'a> Checker<'a> {
     /// quoting) and a user type may declare its own, so this claims the name
     /// only for the REMAINING receivers -- records/sums without a user `debug`,
     /// arrays, tuples, and still-open generics -- whose rendering is the
-    /// runtime's traditional one (exactly what `"{v}"` interpolation emits).
+    /// built-in structural one (what `"{v}"` emits for a value whose type
+    /// declares no `display`).
     fn debug_method_type(
         &mut self,
         recv_ty: &Type,
@@ -735,16 +682,18 @@ impl<'a> Checker<'a> {
                 span,
             });
         }
+        self.expect_renderable(&base, span, "`debug` cannot render");
         Some(Type::Str)
     }
 
     /// Type the builtin collection methods so their element types are enforced:
-    /// `push(self: T[], value: T) -> void`,
-    /// `pop(self: T[]) -> T?`, and `len(self) -> int64`. Element checking turns
-    /// `[1].push("x")` into a static error.
+    /// on a `T[]`, `push(value: T) -> void`, `insert(idx: int64, value: T) ->
+    /// void`, `pop() -> T?`, `remove(idx: int64) -> T` and `len() -> int64`
+    /// (also on a `string`). Element checking turns `[1].push("x")` into a
+    /// static error.
     ///
-    /// `push`/`pop` are slice-only: a fixed array `T[n]` has a statically fixed
-    /// length (modeled as an inline `[n x T]`), so a
+    /// `push`/`pop`/`insert`/`remove` are slice-only: a fixed array `T[n]` has
+    /// a statically fixed length (modeled as an inline `[n x T]`), so a
     /// length-changing call on one is rejected. `len` and indexing remain valid
     /// for both `T[n]` and `T[]` (indexing is handled in the `Index`/place
     /// paths).
@@ -789,8 +738,7 @@ impl<'a> Checker<'a> {
             }
             ("push", Some(elem)) => {
                 if let Some(arg) = args.first() {
-                    let got = self.check_expr(&arg.expr, scopes);
-                    self.expect_element_assignable(&got, elem, &arg.expr);
+                    self.check_element_value(&arg.expr, elem, scopes);
                 }
                 self.check_method_arg_count(method, args, 1, scopes, span);
                 Some(Type::Void)
@@ -806,8 +754,7 @@ impl<'a> Checker<'a> {
                     self.expect_expr_assignable(&got, &Type::Int(IntKind::I64), &idx.expr);
                 }
                 if let Some(value) = args.get(1) {
-                    let got = self.check_expr(&value.expr, scopes);
-                    self.expect_element_assignable(&got, elem, &value.expr);
+                    self.check_element_value(&value.expr, elem, scopes);
                 }
                 self.check_method_arg_count(method, args, 2, scopes, span);
                 Some(Type::Void)
@@ -903,6 +850,10 @@ fn str_literal(expr: &Expr) -> Option<String> {
     }
 }
 
+/// The result type of the builtin static method `tname.method` of a
+/// primitive type word: `T.default()`, the fallible `intN.from`/`intN.parse`,
+/// `floatN.from`, the fallible `floatN.parse`, and `string.from`, which renders
+/// its argument exactly like `"{x}"`. `None` for anything else.
 pub(super) fn primitive_static_return(tname: &str, method: &str) -> Option<Type> {
     // `T.default()`: the zero value of every primitive class (the `Default`
     // protocol's builtin implementations; MIR folds the call to a constant).

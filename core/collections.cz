@@ -333,7 +333,9 @@ fun HashMap.display(self) -> string {
     }
     let lines = []
     for [key, value] in self.pairs() {
-        lines.push("    {key.debug()}: {value.debug()}")
+        let rendered_key = key.debug().replace("\n", "\n    ")
+        let rendered_value = value.debug().replace("\n", "\n    ")
+        lines.push("    {rendered_key}: {rendered_value}")
     }
     return "\{\n{lines.join(",\n")}\n}"
 }

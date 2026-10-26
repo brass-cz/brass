@@ -1,0 +1,2 @@
+`fast` binds a new name, but the matched `Mode` has a variant `fast` that is not in scope here
+`slow` binds a new name, but the matched `Mode` has a variant `slow` that is not in scope here

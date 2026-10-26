@@ -1,0 +1,75 @@
+// @lazy: fail
+// @eager: fail
+// The print-containing body is first lowered at the completion boundary.
+fun warm0() -> int32 { return 0 }
+fun warm1() -> int32 { return 1 }
+fun warm2() -> int32 { return 2 }
+fun warm3() -> int32 { return 3 }
+fun warm4() -> int32 { return 4 }
+fun warm5() -> int32 { return 5 }
+fun warm6() -> int32 { return 6 }
+fun warm7() -> int32 { return 7 }
+fun warm8() -> int32 { return 8 }
+fun warm9() -> int32 { return 9 }
+fun warm10() -> int32 { return 10 }
+fun warm11() -> int32 { return 11 }
+fun warm12() -> int32 { return 12 }
+fun warm13() -> int32 { return 13 }
+fun warm14() -> int32 { return 14 }
+fun warm15() -> int32 { return 15 }
+fun warm16() -> int32 { return 16 }
+fun warm17() -> int32 { return 17 }
+fun warm18() -> int32 { return 18 }
+fun warm19() -> int32 { return 19 }
+fun warm20() -> int32 { return 20 }
+fun warm21() -> int32 { return 21 }
+fun warm22() -> int32 { return 22 }
+fun warm23() -> int32 { return 23 }
+fun warm24() -> int32 { return 24 }
+fun warm25() -> int32 { return 25 }
+fun warm26() -> int32 { return 26 }
+fun warm27() -> int32 { return 27 }
+fun warm28() -> int32 { return 28 }
+fun warm29() -> int32 { return 29 }
+fun warm30() -> int32 { return 30 }
+fun E() { let wrong = 1 + true
+ return 1 }
+fun B() -> int32 { return E() }
+fun entry() -> int32 {
+    println("start")
+    return B()
+}
+fun main() {
+    warm0()
+    warm1()
+    warm2()
+    warm3()
+    warm4()
+    warm5()
+    warm6()
+    warm7()
+    warm8()
+    warm9()
+    warm10()
+    warm11()
+    warm12()
+    warm13()
+    warm14()
+    warm15()
+    warm16()
+    warm17()
+    warm18()
+    warm19()
+    warm20()
+    warm21()
+    warm22()
+    warm23()
+    warm24()
+    warm25()
+    warm26()
+    warm27()
+    warm28()
+    warm29()
+    warm30()
+    entry()
+}

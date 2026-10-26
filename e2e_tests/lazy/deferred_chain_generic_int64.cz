@@ -1,0 +1,113 @@
+// @backends: all
+//
+// A chain of generic functions deeper than the checker's elaboration depth,
+// called at int64 and at int32. The calls past that depth are typed from a
+// fallback return, which is only an approximation for a generic callee (here
+// an `int32`), so no elaboration that used one may report its return as the
+// instance's: the lazy run compiles every deferred call site at the
+// instance's real return (`int64` for the first call) and runs the chain like
+// the whole-program pipelines.
+fun d0(x) { return d1(x) + 1 }
+fun d1(x) { return d2(x) + 1 }
+fun d2(x) { return d3(x) + 1 }
+fun d3(x) { return d4(x) + 1 }
+fun d4(x) { return d5(x) + 1 }
+fun d5(x) { return d6(x) + 1 }
+fun d6(x) { return d7(x) + 1 }
+fun d7(x) { return d8(x) + 1 }
+fun d8(x) { return d9(x) + 1 }
+fun d9(x) { return d10(x) + 1 }
+fun d10(x) { return d11(x) + 1 }
+fun d11(x) { return d12(x) + 1 }
+fun d12(x) { return d13(x) + 1 }
+fun d13(x) { return d14(x) + 1 }
+fun d14(x) { return d15(x) + 1 }
+fun d15(x) { return d16(x) + 1 }
+fun d16(x) { return d17(x) + 1 }
+fun d17(x) { return d18(x) + 1 }
+fun d18(x) { return d19(x) + 1 }
+fun d19(x) { return d20(x) + 1 }
+fun d20(x) { return d21(x) + 1 }
+fun d21(x) { return d22(x) + 1 }
+fun d22(x) { return d23(x) + 1 }
+fun d23(x) { return d24(x) + 1 }
+fun d24(x) { return d25(x) + 1 }
+fun d25(x) { return d26(x) + 1 }
+fun d26(x) { return d27(x) + 1 }
+fun d27(x) { return d28(x) + 1 }
+fun d28(x) { return d29(x) + 1 }
+fun d29(x) { return d30(x) + 1 }
+fun d30(x) { return d31(x) + 1 }
+fun d31(x) { return d32(x) + 1 }
+fun d32(x) { return d33(x) + 1 }
+fun d33(x) { return d34(x) + 1 }
+fun d34(x) { return d35(x) + 1 }
+fun d35(x) { return d36(x) + 1 }
+fun d36(x) { return d37(x) + 1 }
+fun d37(x) { return d38(x) + 1 }
+fun d38(x) { return d39(x) + 1 }
+fun d39(x) { return d40(x) + 1 }
+fun d40(x) { return d41(x) + 1 }
+fun d41(x) { return d42(x) + 1 }
+fun d42(x) { return d43(x) + 1 }
+fun d43(x) { return d44(x) + 1 }
+fun d44(x) { return d45(x) + 1 }
+fun d45(x) { return d46(x) + 1 }
+fun d46(x) { return d47(x) + 1 }
+fun d47(x) { return d48(x) + 1 }
+fun d48(x) { return d49(x) + 1 }
+fun d49(x) { return d50(x) + 1 }
+fun d50(x) { return d51(x) + 1 }
+fun d51(x) { return d52(x) + 1 }
+fun d52(x) { return d53(x) + 1 }
+fun d53(x) { return d54(x) + 1 }
+fun d54(x) { return d55(x) + 1 }
+fun d55(x) { return d56(x) + 1 }
+fun d56(x) { return d57(x) + 1 }
+fun d57(x) { return d58(x) + 1 }
+fun d58(x) { return d59(x) + 1 }
+fun d59(x) { return d60(x) + 1 }
+fun d60(x) { return d61(x) + 1 }
+fun d61(x) { return d62(x) + 1 }
+fun d62(x) { return d63(x) + 1 }
+fun d63(x) { return d64(x) + 1 }
+fun d64(x) { return d65(x) + 1 }
+fun d65(x) { return d66(x) + 1 }
+fun d66(x) { return d67(x) + 1 }
+fun d67(x) { return d68(x) + 1 }
+fun d68(x) { return d69(x) + 1 }
+fun d69(x) { return d70(x) + 1 }
+fun d70(x) { return d71(x) + 1 }
+fun d71(x) { return d72(x) + 1 }
+fun d72(x) { return d73(x) + 1 }
+fun d73(x) { return d74(x) + 1 }
+fun d74(x) { return d75(x) + 1 }
+fun d75(x) { return d76(x) + 1 }
+fun d76(x) { return d77(x) + 1 }
+fun d77(x) { return d78(x) + 1 }
+fun d78(x) { return d79(x) + 1 }
+fun d79(x) { return d80(x) + 1 }
+fun d80(x) { return d81(x) + 1 }
+fun d81(x) { return d82(x) + 1 }
+fun d82(x) { return d83(x) + 1 }
+fun d83(x) { return d84(x) + 1 }
+fun d84(x) { return d85(x) + 1 }
+fun d85(x) { return d86(x) + 1 }
+fun d86(x) { return d87(x) + 1 }
+fun d87(x) { return d88(x) + 1 }
+fun d88(x) { return d89(x) + 1 }
+fun d89(x) { return d90(x) + 1 }
+fun d90(x) { return d91(x) + 1 }
+fun d91(x) { return d92(x) + 1 }
+fun d92(x) { return d93(x) + 1 }
+fun d93(x) { return d94(x) + 1 }
+fun d94(x) { return d95(x) + 1 }
+fun d95(x) { return d96(x) + 1 }
+fun d96(x) { return d97(x) + 1 }
+fun d97(x) { return d98(x) + 1 }
+fun d98(x) { return d99(x) + 1 }
+fun d99(x) { return d100(x) + 1 }
+fun d100(x) { return x }
+let b: int64 = 5000000000
+println(d0(b))
+println(d0(1))

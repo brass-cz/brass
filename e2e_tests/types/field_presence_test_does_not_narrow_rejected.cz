@@ -1,0 +1,17 @@
+// Testing a nullable FIELD (`if p.n`) does not narrow it: only bindings
+// narrow, because a field can be reassigned through any alias of its record.
+// Reading the field as non-null inside the test is rejected, and the
+// diagnostic says why and names the working form (bind the field first).
+type N = { n: int32? }
+
+fun widen(p) -> int64 {
+    if p.n {
+        let a: int64 = p.n
+        return a
+    }
+    return -1
+}
+
+fun main() {
+    println(widen(N { n: 5 }))
+}

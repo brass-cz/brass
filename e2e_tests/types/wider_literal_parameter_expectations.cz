@@ -1,0 +1,22 @@
+// @backends: all
+// Wider anonymous parameter literals adapt matching fields to the declared
+// requirements and preserve extra fields, including branch and method arguments.
+type A = { n: int64 }
+type Open = { n }
+type Open64 = Open { n: int64 }
+type Gate = { id: int32 }
+type Node = { n: int64, next: Self? }
+fun take(a: A) { println("{a.n}: {typeof(a.n)}, {typeof(a.m)}") }
+fun take_open(a: Open64) { println("{a.n}: {typeof(a.n)}, {typeof(a.m)}") }
+fun Gate.take(self, a: A) { println("{a.n}: {typeof(a.n)}, {typeof(a.m)}") }
+fun take_node(x: Node) { println("{x.n}: {typeof(x.n)}, {typeof(x.extra)}") }
+fun main() {
+    take({ n: 1, m: "extra" })
+    take(if true { { n: 2, m: 3 } } else { { n: 4, m: 5 } })
+    take({ n: 6 })
+    let big: int64 = 7
+    take({ n: big, m: false })
+    Gate { id: 0 }.take({ n: 8, m: "method" })
+    take_open({ n: 9, m: "refined" })
+    take_node({ n: 10, next: null, extra: "recursive" })
+}

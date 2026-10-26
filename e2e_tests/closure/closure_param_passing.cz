@@ -1,0 +1,72 @@
+// @backends: all
+// Closure parameters follow the same passing table as function parameters:
+// an unannotated parameter the body mutates, an annotated aggregate, and a
+// `mut(T)` parameter are private deep copies made on entry (the caller's
+// value -- including a `const` one -- is untouched); a read-only parameter
+// shares the caller's value; only `ref(mut(T))` writes through.
+
+type Box = { v: int32 }
+
+fun call(f, b) {
+    f(b)
+    println(b.v)
+}
+
+fun main() {
+    let grow = (a) -> {
+        a.push(9)
+        return a.len()
+    }
+    const fixed: int32[] = [1, 2, 3]
+    println(grow(fixed))
+    println(fixed)
+
+    const b = [1, 2, 3]
+    let dbl = (a) -> {
+        for e in a {
+            e *= 2
+        }
+        println(a)
+    }
+    dbl(b)
+    println(b)
+
+    const xs = [[1], [2]]
+    let lens = xs.map((v) -> {
+        v[0] = 7
+        return v.len()
+    })
+    println(lens)
+    println(xs)
+
+    let annotated = (a: int32[]) -> {
+        a[0] = 100
+        return a[0]
+    }
+    let arr = [1, 2, 3]
+    println(annotated(arr))
+    println(arr)
+
+    let b2 = Box { v: 2 }
+    call((x: mut(Box)) -> {
+        x.v = 20
+    }, b2)
+    println(b2.v)
+
+    let b3 = Box { v: 3 }
+    let unannotated = (x) -> {
+        x.v = 30
+    }
+    unannotated(b3)
+    println(b3.v)
+
+    let b4 = Box { v: 4 }
+    let through = (x: ref(mut(Box))) -> {
+        x.v = 40
+    }
+    through(b4)
+    println(b4.v)
+
+    let total = [Box { v: 1 }, Box { v: 2 }].map((x) -> x.v).fold(0, (acc, v) -> acc + v)
+    println(total)
+}

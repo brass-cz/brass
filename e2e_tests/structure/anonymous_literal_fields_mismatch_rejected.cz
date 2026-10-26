@@ -1,0 +1,18 @@
+// @lazy: fail
+// @eager: fail
+// An anonymous record literal is built as the slot's declared record only
+// when its fields are EXACTLY the record's; an extra or a missing field is an
+// error at a storage site. An anonymous record VALUE (not a literal) is never
+// converted implicitly.
+type Named = { name: string, id: int32 }
+
+fun mk() -> Named {
+    return { z: 2.5, id: 7, name: "made" }
+}
+
+fun main() {
+    let p: Named = { id: 3 }
+    let o = { id: 3, name: "o" }
+    let r: Named = o
+    println(mk().name)
+}

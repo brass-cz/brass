@@ -1,0 +1,24 @@
+// The instance-only fallibility of `outer` (through `via`, whose receiver
+// is an unannotated parameter) makes its result a `Result`: storing it in an
+// `int32` slot is rejected instead of reading the Result as an integer.
+type S = { k: int32 }
+
+fun S.get(self, n: int32) {
+    if n < 0 {
+        error("negative")!
+    }
+    return n
+}
+
+fun via(s, n: int32) {
+    return s.get(n)!
+}
+
+fun outer(s: S, n: int32) {
+    return via(s, n)!
+}
+
+fun main() {
+    let x: int32 = outer(S { k: 1 }, 5)
+    println(x)
+}

@@ -1,12 +1,10 @@
-//! Name resolution for Brass: module loading, imports, visibility, and a
-//! reusable lexical scope.
+//! Name resolution for Brass: module loading, imports, and visibility.
 
 pub mod frontend;
 pub mod loader;
 pub mod module;
 pub mod plugin;
 pub mod qualified;
-pub mod scope;
 pub mod visibility;
 
 pub use loader::{
@@ -16,5 +14,4 @@ pub use loader::{
 };
 pub use module::{ResolveError, check_imports};
 pub use qualified::resolve_qualified_uses;
-pub use scope::Scope;
 pub use visibility::{is_private_module, is_public};

@@ -1,7 +1,7 @@
 //! Per-document analysis: incremental diagnostics and an on-demand full
 //! analysis.
 //!
-//! Diagnostics are the per-keystroke hot path, so they run incrementally: only
+//! Type diagnostics run on every open and save, so they run incrementally: only
 //! the changed items and their users are re-checked (see [`items`]), against a
 //! module graph reduced to the affected items plus the definitions they depend
 //! on. Hover and go-to-definition need type information for the whole document,
@@ -414,7 +414,7 @@ fn render_secondary_locations(diags: &mut [Diag], sources: &SourceMap) {
     for (message, _, _) in diags {
         *message = brass_typeck::render_diagnostic_message(message, |offset| {
             let loc = sources.locate(offset)?;
-            let (line, col) = brass_parser::line_col(loc.src, loc.local);
+            let (line, col) = loc.line_col();
             Some(format!("{}:{line}:{col}", loc.label))
         });
     }

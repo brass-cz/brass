@@ -1,6 +1,6 @@
 // A parameter used as a method RECEIVER is view-ineligible: dispatch needs the
-// full value, so the argument keeps today's per-concrete-type path and the
-// structural method resolution still sees every field of the caller's value.
+// full value, so the callee is compiled at the argument's own type and the
+// structural method resolution sees every field of the caller's value.
 type Person = {
     name: string
 }

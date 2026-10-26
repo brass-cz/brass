@@ -1,0 +1,14 @@
+// @backends: all
+// A function forwarding the prelude's `input()` returns the declaration's
+// Result, whose Err is the prelude `Error` (its `value` is the message). With
+// no stdin attached the line is empty, which is still an Ok result.
+fun ask() {
+    return input()
+}
+
+fun main() {
+    match ask() {
+        Ok { value } => println("[{value}]"),
+        Err { error } => println("failed: {error.value}"),
+    }
+}

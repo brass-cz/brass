@@ -1,0 +1,56 @@
+// @backends: all
+// `ref(T?)`, `ref(mut(T?))` and `mut(T?)` parameters narrow like any other
+// nullable (types.md, Narrowing): `!x` is a null test, a guard or a test
+// narrows the parameter to `T`, and `if let` binds the unwrapped value.
+// A `mut(T?)` parameter is the callee's own copy, so a call does not
+// re-widen it, unlike a `ref` parameter or a module global.
+type P = { v: int32 }
+
+fun noop() {}
+
+fun guard_ref(x: ref(int32?)) -> int32 {
+    if !x { return 0 }
+    println("guarded")
+    return x + 1
+}
+
+fun test_ref(x: ref(string?)) -> string {
+    if x { return x }
+    return "none"
+}
+
+fun bind_ref(x: ref(P?)) -> int32 {
+    if let p = x { return p.v }
+    return 0
+}
+
+fun guard_ref_mut(x: ref(mut(int32?))) -> int32 {
+    if x == null { return 0 }
+    return x * 10
+}
+
+fun guard_mut(x: mut(int32?)) -> int32 {
+    if !x { return 0 }
+    noop()
+    return x + 1
+}
+
+fun length(x: ref(int32[]?)) -> int64 {
+    if x { return x.len() }
+    return 0
+}
+
+let some: int32? = 1
+let none: int32? = null
+println(guard_ref(some))
+println(guard_ref(none))
+let s: string? = "a"
+println(test_ref(s))
+let p: P? = P { v: 7 }
+println(bind_ref(p))
+let n: int32? = 4
+println(guard_ref_mut(n))
+println(guard_mut(1))
+println(guard_mut(null))
+let a: int32[]? = [1, 2]
+println(length(a))

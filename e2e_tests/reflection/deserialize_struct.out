@@ -2,4 +2,4 @@ decoded Config:
   width = 1920
   height = 1080
   depth = 24
-error: [<unknown>:0:0] unhandled error: Config: missing field 'depth'
+error: [e2e_tests/reflection/deserialize_struct.cz:23:20] unhandled error: Config: missing field 'depth'

@@ -1,0 +1,35 @@
+// @backends: all
+// A reflective `into()` keyed by `typeof(sample)` inside a generic function:
+// each instantiation of `conv` dispatches to the specialization of its own
+// key (`int32` for one, `string` for the other) instead of every instance
+// sharing the last one checked. A failed decode carries the location of the
+// call that decoded.
+
+type Json =
+    | JNull
+    | JNum { value: int64 }
+    | JStr { value: string }
+
+fun Json.into(self) -> infer! {
+    match self {
+        Json.JNum { value } => { return infer.from(value) }
+        Json.JStr { value } => { return infer.from(value) }
+        Json.JNull => { return null }
+        _ => {}
+    }
+    return error("no conversion")
+}
+
+fun conv(j, sample) {
+    const out: typeof(sample) = j.into()!
+    return out
+}
+
+fun main() {
+    println(conv(Json.JNum { value: 42 }, 0))
+    println(conv(Json.JStr { value: "hi" }, ""))
+    match conv(Json.JStr { value: "x" }, 0) {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.value} at line {error.location.line}"),
+    }
+}

@@ -1,0 +1,11 @@
+// @backends: all
+// Each use of a generalized global closure shadows the prelude function and
+// instantiates independently, including first-class references and identity.
+let print = (x) -> x
+fun main() {
+    println(print(3))
+    println(print("hello"))
+    let f = print
+    println(f(4))
+    println(print == print)
+}

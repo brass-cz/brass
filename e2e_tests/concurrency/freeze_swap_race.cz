@@ -1,7 +1,7 @@
 // Pins: the task reads `h.inner` while the spawner REPLACES the inner record
-// each iteration, releasing the old one. With the capture frozen the reader
-// could hold a freed record (use after free); cowning `h` serializes the swap
-// against the read.
+// each iteration, releasing the old one. A capture the spawner writes after
+// the spawn is a cown, not a frozen share, so the swap is serialized against
+// the read and the reader always sees a complete record.
 type Inner = {
     value: int64
 }
@@ -13,7 +13,7 @@ fun main() {
     let h = Holder { inner: Inner { value: 0 } }
     spawn(() -> {
         let i = 0
-        let sum = 0
+        let sum: int64 = 0
         while i < 200000 {
             sum = sum + h.inner.value
             i = i + 1

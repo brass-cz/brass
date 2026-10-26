@@ -3,12 +3,13 @@
 //! The builder keeps a "current block" cursor. Lowering pushes statements into
 //! it and, when it emits control flow, calls [`BodyBuilder::terminate`] and
 //! switches the cursor to a freshly created block. Once a block is terminated,
-//! further statement pushes are dropped: this models the fact that source code
-//! after a `return`/`break`/`continue` (or after a fully-diverging `if`) is
-//! dead, exactly as the AST-walking codegen skips it.
+//! further statement pushes are dropped: source code after a
+//! `return`/`break`/`continue` (or after a fully-diverging `if`) is dead and
+//! emits nothing.
 //!
 //! Locals are append-only and each is born with a fresh type *variable*
-//! ([`TypeRef::Var`]); the body is type-independent until monomorphization.
+//! ([`TypeRef::Var`]) unless an annotation or a checker seed fixes its type;
+//! the body is otherwise type-independent until monomorphization.
 
 use crate::cfg::{BasicBlock, LocalDecl, MirBody, MirStmt, Terminator};
 use crate::ids::{BlockId, LocalId};
@@ -48,6 +49,20 @@ impl BodyBuilder {
         self.locals.push(LocalDecl {
             ty: TypeRef::Var(id.0),
             name,
+            seed_site: None,
+        });
+        id
+    }
+
+    /// Allocate the unnamed result local of a value-producing `if`/`if let`/
+    /// `match`, typed by monomorphization as the join of the values its arms
+    /// assign ([`TypeRef::Join`]).
+    pub fn fresh_join_local(&mut self) -> LocalId {
+        let id = LocalId(self.locals.len() as u32);
+        self.locals.push(LocalDecl {
+            ty: TypeRef::Join(id.0),
+            name: None,
+            seed_site: None,
         });
         id
     }
@@ -61,6 +76,26 @@ impl BodyBuilder {
         self.locals.push(LocalDecl {
             ty: TypeRef::Known(ty),
             name,
+            seed_site: None,
+        });
+        id
+    }
+
+    /// Allocate the unnamed result local of the expression at `site`, whose
+    /// type the checker may seed: `shared` is the seed every instance of the
+    /// body agrees on (a `Known` local), and the site lets monomorphization
+    /// look up a per-instance seed when the instances disagree (see
+    /// [`LocalDecl::seed_site`]).
+    pub fn fresh_seeded_local(
+        &mut self,
+        site: brass_parser::Span,
+        shared: Option<brass_hir::Type>,
+    ) -> LocalId {
+        let id = LocalId(self.locals.len() as u32);
+        self.locals.push(LocalDecl {
+            ty: shared.map_or(TypeRef::Var(id.0), TypeRef::Known),
+            name: None,
+            seed_site: Some(site),
         });
         id
     }
@@ -95,7 +130,7 @@ impl BodyBuilder {
     }
 
     /// Terminate the current block, unless it already is. The first terminator
-    /// wins, matching codegen, where the first `return`/branch ends the block.
+    /// wins: the first `return`/branch ends the block.
     pub fn terminate(&mut self, term: Terminator) {
         let buf = &mut self.blocks[self.cur.index()];
         if buf.term.is_none() {
@@ -117,6 +152,19 @@ impl BodyBuilder {
     /// instead of inferring, which a witness-free constructor's caller needs.
     pub fn emit_known(&mut self, rv: Rvalue, ty: brass_hir::Type) -> Operand {
         let tmp = self.fresh_local_typed(None, ty);
+        self.push(MirStmt::Assign(tmp, rv));
+        Operand::Local(tmp)
+    }
+
+    /// Like [`emit`](Self::emit), into a seeded result local for the
+    /// expression at `site` (see [`Self::fresh_seeded_local`]).
+    pub fn emit_seeded(
+        &mut self,
+        rv: Rvalue,
+        site: brass_parser::Span,
+        shared: Option<brass_hir::Type>,
+    ) -> Operand {
+        let tmp = self.fresh_seeded_local(site, shared);
         self.push(MirStmt::Assign(tmp, rv));
         Operand::Local(tmp)
     }
@@ -152,6 +200,7 @@ impl BodyBuilder {
             entry,
             params,
             declared_fallible: false,
+            declared_nullable_result: false,
         }
     }
 }

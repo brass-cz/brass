@@ -1,0 +1,2 @@
+cannot implicitly convert `int64` to `int32`
+cannot use `int64` where `string` is required

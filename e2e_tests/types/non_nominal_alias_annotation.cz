@@ -1,0 +1,21 @@
+// @backends: all
+// `type Name = <type expression>` with a non-nominal right-hand side (a
+// primitive, an array) declares an alias: the name stands for that type in
+// every annotation, including parameters and returns.
+type Num = int64
+type Names = string[]
+
+fun double(n: Num) -> Num {
+    return n * 2
+}
+
+fun first(xs: Names) -> string {
+    return xs[0]
+}
+
+fun main() {
+    let n: Num = 5000000000
+    println(double(n))
+    let xs: Names = ["a", "b"]
+    println(first(xs))
+}

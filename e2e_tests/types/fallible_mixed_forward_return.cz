@@ -1,0 +1,45 @@
+// @backends: all
+// In a fallible body a `Result` value is returned whole while a bare value is
+// Ok-wrapped, so one body may do both: the forwarded `result` and the bound
+// `value` meet at the Ok payload (`int32`), even when the body's only own
+// error site is a `!` on a parameter's method.
+type Conn = { name: string }
+
+fun Conn.close(self) {
+    if self.name == "" {
+        error("no name")!
+    }
+    return 0
+}
+
+fun open(n: int32) {
+    if n < 0 {
+        error("negative")!
+    }
+    return n * 2
+}
+
+fun read(conn, n: int32) {
+    const result = open(n)
+    match result {
+        Err { error } => {
+            return result
+        },
+        Ok { value } => {
+            conn.close()!
+            return value
+        },
+    }
+}
+
+fun main() {
+    println(read(Conn { name: "a" }, 4)!)
+    match read(Conn { name: "a" }, -1) {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.value}"),
+    }
+    match read(Conn { name: "" }, 1) {
+        Ok { value } => println("ok {value}"),
+        Err { error } => println("err {error.value}"),
+    }
+}

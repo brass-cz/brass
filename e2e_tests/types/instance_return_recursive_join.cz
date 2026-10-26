@@ -1,0 +1,43 @@
+// @backends: all
+// A recursive call inside an instantiation types at that instantiation's own
+// return: the literal `return 0` / `return 1` joins with the wider value the
+// recursion produces (`float64`, `int64`), plain and fallible alike, and the
+// recursive call reads the joined type rather than the literal's default.
+fun total(n, step) {
+    if n == 0 {
+        return 0
+    }
+    return total(n - 1, step) + step
+}
+
+fun checked_total(n, step) {
+    if n < 0 {
+        return error("negative count")
+    }
+    if n == 0 {
+        return 0
+    }
+    return checked_total(n - 1, step)! + step
+}
+
+fun fact(n) {
+    if n <= 1 {
+        return 1
+    }
+    return n * fact(n - 1)
+}
+
+fun main() {
+    println(total(2, 2.5))
+    println(typeof(total(2, 2.5)))
+    println(total(3, 2))
+    println(checked_total(2, 2.5)!)
+    match checked_total(-1, 2.5) {
+        Ok { value } => println(value),
+        Err { error } => println("err {error.value}"),
+    }
+    let big: int64 = 20
+    println(fact(big))
+    println(typeof(fact(big)))
+    println(fact(5))
+}

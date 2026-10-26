@@ -1,0 +1,32 @@
+// @backends: all
+// A final return, an infinite loop, or a call returning never prevents fallthrough.
+fun spin() { while true {} }
+fun loop_end(c: bool) {
+    if c { return 1 }
+    while true {}
+}
+fun call_end(c: bool) {
+    if c { return 2 }
+    spin()
+}
+fun return_end(c: bool) {
+    if c { return 3 }
+    return 4
+}
+fun nested_end(c: bool, d: bool) {
+    if c { return 5 }
+    if d { spin() } else { while true {} }
+}
+println(loop_end(true))
+println(call_end(true))
+println(return_end(false))
+println(nested_end(true, false))
+fun selected(v) {
+    if v: string { return v }
+}
+println(selected("selected"))
+fun selected_loop(v, c: bool) {
+    if c { return 6 }
+    if v: int32 { while true {} }
+}
+println(selected_loop(1, true))

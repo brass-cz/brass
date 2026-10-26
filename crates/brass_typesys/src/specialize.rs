@@ -5,30 +5,50 @@
 //! (`infer`); each call site fixes the target from the caller's expectation
 //! (`let u: User = j.into()!` fixes `User`). Because Brass monomorphizes to
 //! fully concrete code, the generic body is turned into one CONCRETE method per
-//! requested key here, before ordinary type checking and lowering see it. The
+//! requested key here, which is then checked and lowered like source code. The
 //! specializer:
 //!
 //! - substitutes every `infer` annotation with the key (`let ret: infer` ->
 //!   `let ret: User`, the return `infer!` -> `User!`);
-//! - unrolls a `for f in fields(ret)` loop over the (now concrete) key, so each
-//!   field is assigned directly and the recursive `x.into()` inside becomes a
-//!   call to the FIELD's own specialization (`x.into__<fieldtype>()`), which is
-//!   in turn scheduled for specialization;
+//! - unrolls the record walk -- a `for f in fields(x)` loop over a binding
+//!   declared `let x: infer`, whatever its name -- over the (now concrete) key,
+//!   so each field is assigned directly and the recursive `x.into()` inside
+//!   becomes a call to the FIELD's own specialization (`x.into__<fieldtype>()`),
+//!   which is in turn scheduled for specialization. A nullable key `T?` walks
+//!   `T`'s fields (the walked binding is typed `T`, and the `T` it builds
+//!   promotes into the `T?` result);
 //! - resolves `infer.from(x)` by the from/parse partition
 //!   (`crate::convert::infer_from`): an identity, a named conversion, or -- when
 //!   no conversion exists -- a runtime error (the arm is not viable for this
-//!   key, e.g. a JSON number decoded as a record);
+//!   key, e.g. a JSON number decoded as a record). A source the template does
+//!   not type (anything but a variant-pattern binding) is resolved per instance
+//!   by a type-test dispatch over the same partition (see `conversion`). At a
+//!   nullable key a fallible conversion is unwrapped with `!`, so its value
+//!   promotes into the result;
 //! - turns `return null` into a runtime error when the key is not nullable.
 //!
-//! The result is a set of concrete methods keyed by mangled name; the driver
-//! injects them, rewrites the keyed call sites to their specializations, and
-//! runs the normal pipeline over the fully concrete program.
+//! Every runtime error the specializer itself generates is raised at the
+//! location of the decoder call that could not produce its key: the concrete
+//! method takes the caller's position through an implicit trailing `Location`
+//! parameter (filled at each call site, like `error`'s own).
+//!
+//! The result is a set of concrete methods keyed by mangled name. The driver
+//! takes the keys from the checker's keyed-call channels, lowers the
+//! generated methods into the program (`brass_hir::lower_generated_into`),
+//! checks each of them, and has MIR lowering call the specialization at every
+//! keyed call site (per instance where the enclosing body's instances key the
+//! call differently); keyed calls inside generated bodies repeat the step.
 
 use fxhash::FxHashMap as HashMap;
 
 use brass_parser::ast::*;
 
 use brass_hir::{Program, Type, TypeKind};
+
+mod conversion;
+mod walk;
+
+use walk::{fields_loop_binding, fields_walked_bindings};
 
 /// A pure span-shift of a block by `delta` (a multiple of `SPAN_SHIFT_UNIT`):
 /// reuses the fields-loop expander with a variable that matches nothing, so it
@@ -177,9 +197,15 @@ pub fn mangled_name(method: &str, key: &Type) -> String {
 /// One generated specialization, retained outside the parsed module graph.
 pub type Generated = brass_hir::GeneratedDecl;
 
+/// The name of the implicit trailing `Location` parameter every generated
+/// specialization declares. Source text cannot spell it, so it never collides
+/// with a template's own bindings.
+const LOCATION_PARAM: &str = "\u{0}location";
+
 /// Generate every concrete method reachable from `roots` (transitively: a
-/// record key pulls in a specialization per field type), or an error naming a
-/// construct the specializer cannot handle.
+/// record key pulls in a specialization per field type), or an error when a
+/// need names no method with a body on its receiver or the synthetic span
+/// space runs out.
 pub fn specialize_all(program: &Program, roots: &[KeyedNeed]) -> Result<Vec<Generated>, String> {
     let mut out = Vec::new();
     let mut done: fxhash::FxHashSet<String> = fxhash::FxHashSet::default();
@@ -254,6 +280,13 @@ fn specialize_one(
     }
     .ok_or_else(|| format!("`{}` has no method `{}`", info.name, need.method))?;
     let src = &method.decl;
+    let template_body = src.body.as_ref().ok_or("keyed method has no body")?;
+    // A program lowered without the prelude (unit tests, embedders) has no
+    // `Location`; its generated errors then fall back to `error`'s own
+    // implicit position.
+    let location = program
+        .prelude_type("Location")
+        .map(brass_hir::TypeInfo::type_ref);
     let mut cx = Specializer {
         program,
         recv: &need.recv,
@@ -261,13 +294,25 @@ fn specialize_one(
         key: &need.key,
         scrutinee: info.type_ref(),
         work,
+        walked: fields_walked_bindings(template_body),
+        walk_targets: fxhash::FxHashSet::default(),
+        located: location.is_some(),
+        dispatch_stride: walk_width(program, &need.key) + 1,
     };
-    let body = cx.block(&src.body.clone().ok_or("keyed method has no body")?);
+    let body = cx.block(template_body);
+    let mut params = src.params.clone();
+    if let Some(location) = &location {
+        params.push(Param {
+            name: LOCATION_PARAM.to_string(),
+            ty: Some(type_to_expr(location, src.span)),
+            span: src.span,
+        });
+    }
     let decl = FunDecl {
         name: mangled_name(&need.method, &need.key),
         name_span: src.name_span,
         recv: Some(TypeExpr::Named(info.name.clone(), src.span)),
-        params: src.params.clone(),
+        params,
         // The concrete result: `key!` (a fallible decode).
         ret: Some(TypeExpr::Fallible(
             Box::new(type_to_expr(&need.key, src.span)),
@@ -280,6 +325,22 @@ fn specialize_one(
     Ok((decl, info.module.clone()))
 }
 
+/// How many copies a record walk at `key` unrolls: the record key's field
+/// count (a nullable key walks its payload), zero for any other key.
+fn walk_width(program: &Program, key: &Type) -> usize {
+    let key = match key {
+        Type::Nullable(inner) => inner,
+        other => other,
+    };
+    match key {
+        Type::Record(n) => program.type_by_id(n.id).map_or(0, |info| match &info.kind {
+            TypeKind::Record { fields, .. } => fields.len(),
+            TypeKind::Sum { .. } => 0,
+        }),
+        _ => 0,
+    }
+}
+
 struct Specializer<'a> {
     program: &'a Program,
     recv: &'a str,
@@ -288,12 +349,23 @@ struct Specializer<'a> {
     /// The type of `self` (the receiver), the scrutinee of the top match.
     scrutinee: Type,
     work: &'a mut Vec<KeyedNeed>,
+    /// Every binding name the template iterates with `fields(..)`.
+    walked: fxhash::FxHashSet<String>,
+    /// The `let x: infer` bindings among `walked`: the record walk's targets,
+    /// typed (and unrolled) as [`Self::record_key`].
+    walk_targets: fxhash::FxHashSet<String>,
+    /// Whether the generated method declares the implicit `Location`
+    /// parameter its generated errors are raised at.
+    located: bool,
+    /// The shift-lane spacing of an `infer.from` dispatch's arms: one more
+    /// than the copies the record walk unrolls (see `lane_span`).
+    dispatch_stride: usize,
 }
 
 /// Per-arm variable-to-type bindings (a match pattern binds variant fields).
 type Bindings = HashMap<String, Type>;
 
-impl Specializer<'_> {
+impl<'a> Specializer<'a> {
     fn block(&mut self, b: &Block) -> Block {
         Block {
             stmts: b
@@ -312,38 +384,64 @@ impl Specializer<'_> {
         }
     }
 
+    /// The key the record walk builds: the key itself, or the payload of a
+    /// nullable key (a present value decodes as the payload, which promotes
+    /// into the nullable result).
+    fn record_key(&self) -> &'a Type {
+        match self.key {
+            Type::Nullable(inner) => inner,
+            other => other,
+        }
+    }
+
     fn stmt(&mut self, s: &Stmt, binds: &Bindings) -> Vec<Stmt> {
         match s {
-            // `let ret: infer` -> `let ret: <key>`; other lets keep their (infer-
-            // substituted) annotation.
+            // The record walk's target `let x: infer` (a binding a `fields(x)`
+            // loop iterates) -> `let x: <record key>`; every other let keeps
+            // its (infer-substituted) annotation, so `let y: infer` is the key.
             Stmt::Let {
                 pat,
                 ty,
                 value,
                 is_const,
                 span,
-            } => vec![Stmt::Let {
-                pat: pat.clone(),
-                ty: ty.as_ref().map(|t| self.subst_type(t, binds)),
-                value: value.as_ref().map(|v| self.expr(v, binds)),
-                is_const: *is_const,
-                span: *span,
-            }],
-            // `for f in fields(ret)`: unroll over the key's fields (the key is
-            // the type of `ret`). A non-record key cannot iterate -- the arm is
-            // not viable, so the whole loop is dropped and a later `return ret`
-            // is unreachable; but a non-record key only reaches here in an arm
-            // that also folds elsewhere, so this stays a faithful unroll.
+            } => {
+                let walk_target = match (pat, ty) {
+                    (Pattern::Binding(name, None, _), Some(TypeExpr::Named(t, _)))
+                        if t == "infer" && self.walked.contains(name) =>
+                    {
+                        Some(name)
+                    }
+                    _ => None,
+                };
+                let ty = match walk_target {
+                    Some(name) => {
+                        self.walk_targets.insert(name.clone());
+                        ty.as_ref()
+                            .map(|t| type_to_expr(self.record_key(), t.span()))
+                    }
+                    None => ty.as_ref().map(|t| self.subst_type(t, binds)),
+                };
+                vec![Stmt::Let {
+                    pat: pat.clone(),
+                    ty,
+                    value: value.as_ref().map(|v| self.expr(v, binds)),
+                    is_const: *is_const,
+                    span: *span,
+                }]
+            }
+            // The record walk `for f in fields(x)` over a walk target: unroll
+            // over the record key's fields.
             Stmt::For {
                 pat: Pattern::Binding(var, _, _),
                 iter,
                 body,
                 span,
-            } if is_fields_over(iter, "ret") => {
+            } if fields_loop_binding(iter).is_some_and(|x| self.walk_targets.contains(x)) => {
                 // A non-record key cannot iterate fields: the whole arm is not
                 // viable, so fold it to a runtime decode error. The subsequent
-                // `return ret` is then unreachable.
-                let Type::Record(n) = self.key else {
+                // `return` of the walked binding is then unreachable.
+                let Type::Record(n) = self.record_key() else {
                     return vec![self.error_return(*span)];
                 };
                 let Some(info) = self.program.type_by_id(n.id) else {
@@ -536,46 +634,10 @@ impl Specializer<'_> {
         }
     }
 
-    /// Resolve `infer.from(arg)` at the current key. `arg` must have a
-    /// determinable type (a pattern-bound variable, whose type comes from the
-    /// enclosing arm).
-    fn infer_from(&mut self, arg: &Expr, binds: &Bindings, span: brass_hir::Span) -> Expr {
-        let Some(src) = self.arg_type(arg, binds) else {
-            // Unknown source type: leave `infer.from` as an unresolved call so
-            // the checker reports it clearly rather than the specializer.
-            return Expr::Call(
-                Box::new(Expr::Field(
-                    Box::new(Expr::Ident("infer".into(), span)),
-                    "from".into(),
-                    span,
-                )),
-                vec![Arg { expr: arg.clone() }],
-                span,
-            );
-        };
-        match crate::convert::infer_from(self.program, &src, self.key) {
-            // Identity: the argument already is the target value.
-            crate::convert::InferFrom::Identity => arg.clone(),
-            // A named conversion `Q.from(arg)`.
-            crate::convert::InferFrom::Static { qualifier, .. } => Expr::Call(
-                Box::new(Expr::Field(
-                    Box::new(Expr::Ident(qualifier, span)),
-                    "from".into(),
-                    span,
-                )),
-                vec![Arg { expr: arg.clone() }],
-                span,
-            ),
-            // No conversion: this variant cannot produce the key -- a runtime
-            // decode error (e.g. a JSON string decoded as an int).
-            crate::convert::InferFrom::Absent(_) => self.error_call(span),
-        }
-    }
-
     fn arm_bindings(&self, pat: &Pattern, scrut: &Expr) -> Bindings {
         let mut binds = HashMap::default();
-        // Only the top match on `self` is typed here (the scrutinee is the
-        // receiver); nested matches contribute no field types.
+        // Only a match on `self` is typed here (its scrutinee is the
+        // receiver); a match on anything else contributes no field types.
         if (matches!(scrut, Expr::SelfExpr(_)) || matches!(scrut, Expr::Ident(n, _) if n == "self"))
             && let Pattern::Record(type_variant, _, fields, _) = pat
         {
@@ -600,13 +662,6 @@ impl Specializer<'_> {
             }
         }
         binds
-    }
-
-    fn arg_type(&self, arg: &Expr, binds: &Bindings) -> Option<Type> {
-        match arg {
-            Expr::Ident(n, _) => binds.get(n).cloned(),
-            _ => None,
-        }
     }
 
     fn subst_type(&mut self, t: &TypeExpr, binds: &Bindings) -> TypeExpr {
@@ -670,20 +725,25 @@ impl Specializer<'_> {
         Stmt::Return(Some(self.error_call(span)), span)
     }
 
+    /// `error("cannot decode this value as `<key>`", <location>)`: raised at
+    /// the decoder call's position, which the generated method receives as
+    /// its implicit `Location` parameter.
     fn error_call(&self, span: brass_hir::Span) -> Expr {
-        Expr::Call(
-            Box::new(Expr::Ident("error".into(), span)),
-            vec![Arg {
-                expr: Expr::Str(
-                    vec![StrSeg::Lit(format!(
-                        "cannot decode this value as `{}`",
-                        self.key.type_name()
-                    ))],
-                    span,
-                ),
-            }],
-            span,
-        )
+        let mut args = vec![Arg {
+            expr: Expr::Str(
+                vec![StrSeg::Lit(format!(
+                    "cannot decode this value as `{}`",
+                    self.key.type_name()
+                ))],
+                span,
+            ),
+        }];
+        if self.located {
+            args.push(Arg {
+                expr: Expr::Ident(LOCATION_PARAM.into(), span),
+            });
+        }
+        Expr::Call(Box::new(Expr::Ident("error".into(), span)), args, span)
     }
 
     /// Rewrite `<x>.into()` calls (the method being specialized) to
@@ -951,23 +1011,15 @@ impl RewriteInto<'_> {
     }
 }
 
-fn is_fields_over(iter: &Expr, var: &str) -> bool {
-    let call = match iter {
-        Expr::ErrorProp(inner, _) => inner,
-        other => other,
-    };
-    matches!(call, Expr::Call(c, args, _)
-        if matches!(&**c, Expr::Ident(n, _) if n == "fields")
-            && matches!(args.as_slice(), [a] if matches!(&a.expr, Expr::Ident(n, _) if n == var)))
-}
-
 fn is_static_call(callee: &Expr, ty: &str, method: &str) -> bool {
     matches!(callee, Expr::Field(base, m, _)
         if m == method && matches!(&**base, Expr::Ident(n, _) if n == ty))
 }
 
 /// Render a concrete type back to a `TypeExpr` for use in a synthesized
-/// annotation. Covers the types a decoder targets.
+/// annotation. Covers the types a decoder targets. A declared record or sum
+/// is named by its id ([`brass_hir::generated_type_name`]), so the annotation
+/// denotes that declaration whatever names the template's module can see.
 pub fn type_to_expr(t: &Type, span: brass_hir::Span) -> TypeExpr {
     match t {
         Type::Record(n) | Type::Sum(n) if n.id >= 0 => {
@@ -983,430 +1035,4 @@ pub fn type_to_expr(t: &Type, span: brass_hir::Span) -> TypeExpr {
 }
 
 #[cfg(test)]
-mod tests {
-    use brass_hir::{LoadedModule, NominalType, Substitution};
-
-    use super::*;
-
-    fn lower(src: &str) -> Program {
-        let ast = brass_parser::parse(src).expect("parse");
-        let modules = [LoadedModule {
-            path: vec!["main".into()],
-            ast,
-            is_prelude: false,
-        }];
-        let (program, errors) = brass_hir::lower(&modules);
-        assert!(errors.is_empty(), "lower errors: {errors:?}");
-        program
-    }
-
-    fn receiver_symbol(program: &Program, name: &str) -> String {
-        program
-            .types
-            .values()
-            .find(|info| info.name == name)
-            .expect("receiver")
-            .symbol
-            .clone()
-    }
-
-    fn keyed_need(program: &Program, receiver: &str, key: Type) -> KeyedNeed {
-        KeyedNeed {
-            recv: receiver_symbol(program, receiver),
-            method: "into".into(),
-            key,
-        }
-    }
-
-    #[test]
-    fn specialization_spans_reserve_only_the_lanes_the_body_uses() {
-        // Two leaf specializations need two lanes, not the former fixed 4096
-        // lanes whose very first base exceeded a 32-bit `usize`.
-        let program = lower(
-            "type Decoder = { value: int64 }\n\
-             fun Decoder.into(self) -> infer! {\n\
-               return infer.from(self.value)\n\
-             }\n",
-        );
-        let generated = specialize_all(
-            &program,
-            &[
-                keyed_need(&program, "Decoder", Type::Str),
-                keyed_need(&program, "Decoder", Type::Bool),
-            ],
-        )
-        .expect("specialize");
-        assert_eq!(generated.len(), 2);
-        let shifts: Vec<_> = generated
-            .iter()
-            .map(|generated| {
-                let span = generated.decl.body.span;
-                span.lo - span.source_span().lo
-            })
-            .collect();
-        assert_ne!(shifts[0], shifts[1]);
-        assert!(
-            shifts
-                .iter()
-                .all(|shift| *shift <= 2 * brass_hir::SPAN_SHIFT_UNIT)
-        );
-    }
-
-    #[test]
-    fn fields_loop_uses_the_concrete_record_field_substitution() {
-        // The declaration's open `value` field must specialize recursively at
-        // the concrete instance's `string`, not at the shared declaration hole.
-        let program = lower(
-            "type Target = { value }\n\
-             type Decoder = { marker: int32 }\n\
-             fun Decoder.into(self) -> infer! {\n\
-               let ret: infer\n\
-               for field in fields(ret) {\n\
-                 ret[field] = self.into()!\n\
-               }\n\
-               return ret\n\
-             }\n",
-        );
-        let target = program
-            .types
-            .values()
-            .find(|info| info.name == "Target")
-            .expect("Target");
-        let mut substitution = Substitution::empty();
-        substitution.insert("value", Type::Str);
-        let key = Type::Record(NominalType::with_substitution(
-            target.id,
-            target.name.clone(),
-            substitution,
-        ));
-        let generated = specialize_all(&program, &[keyed_need(&program, "Decoder", key.clone())])
-            .expect("specialize");
-        assert!(generated.iter().any(|decl| decl.key == Type::Str));
-        let root = generated
-            .iter()
-            .find(|decl| decl.key == key)
-            .expect("root specialization");
-        assert_eq!(
-            count_method_calls(&root.decl.body, &mangled_name("into", &Type::Str)),
-            1
-        );
-    }
-
-    #[test]
-    fn infer_substitution_reaches_every_composite_type_expression() {
-        // The shape includes function, tuple, anonymous, mut/ref, typeof, and
-        // refinement nesting so no composite can strand an `infer` annotation.
-        let span = brass_hir::Span::new(1, 2);
-        let infer = || TypeExpr::Named("infer".into(), span);
-        let ty = TypeExpr::Fun(
-            vec![
-                TypeExpr::Tuple(
-                    vec![
-                        TypeExpr::Array(Box::new(infer()), Some(2), span),
-                        TypeExpr::Nullable(
-                            Box::new(TypeExpr::Fallible(Box::new(infer()), span)),
-                            span,
-                        ),
-                    ],
-                    span,
-                ),
-                TypeExpr::Anonymous(
-                    vec![(
-                        "value".into(),
-                        TypeExpr::Mut(Box::new(TypeExpr::Ref(Box::new(infer()), span)), span),
-                        span,
-                    )],
-                    span,
-                ),
-                TypeExpr::TypeOf(
-                    Box::new(Expr::TypeTest(
-                        Box::new(Expr::Ident("x".into(), span)),
-                        infer(),
-                        false,
-                        span,
-                    )),
-                    span,
-                ),
-            ],
-            Box::new(TypeExpr::Refine(
-                Box::new(TypeExpr::Named("Base".into(), span)),
-                vec![(
-                    "slot".into(),
-                    TypeExpr::Fun(vec![infer()], Box::new(infer()), span),
-                    span,
-                )],
-                span,
-            )),
-            span,
-        );
-        let program = Program::empty();
-        let mut work = Vec::new();
-        let mut specializer = Specializer {
-            program: &program,
-            recv: "Receiver",
-            method: "into",
-            key: &Type::Str,
-            scrutinee: Type::Void,
-            work: &mut work,
-        };
-        let substituted = specializer.subst_type(&ty, &HashMap::default());
-        assert_eq!(count_infer_types(&substituted), 0);
-    }
-
-    #[test]
-    fn recursive_call_rewrite_walks_nested_control_flow_and_values() {
-        // These are the nodes the former shallow walker cloned wholesale:
-        // loops, blocks, conditionals, matches, closures, arrays, and unary ops.
-        let span = brass_hir::Span::new(1, 2);
-        let call = || {
-            Expr::Call(
-                Box::new(Expr::Field(
-                    Box::new(Expr::Ident("x".into(), span)),
-                    "into".into(),
-                    span,
-                )),
-                Vec::new(),
-                span,
-            )
-        };
-        let nested = Block {
-            stmts: vec![
-                Stmt::While {
-                    cond: call(),
-                    body: Block {
-                        stmts: vec![Stmt::Expr(Expr::If(
-                            Box::new(call()),
-                            Block {
-                                stmts: vec![Stmt::Expr(Expr::Match(
-                                    Box::new(call()),
-                                    vec![MatchArm {
-                                        pattern: Pattern::Wildcard(span),
-                                        body: call(),
-                                        span,
-                                    }],
-                                    span,
-                                ))],
-                                span,
-                            },
-                            Some(Box::new(Expr::Block(
-                                Block {
-                                    stmts: vec![Stmt::Expr(call())],
-                                    span,
-                                },
-                                span,
-                            ))),
-                            span,
-                        ))],
-                        span,
-                    },
-                    span,
-                },
-                Stmt::For {
-                    pat: Pattern::Binding("item".into(), None, span),
-                    iter: Expr::Array(vec![call()], span),
-                    body: Block {
-                        stmts: vec![Stmt::Let {
-                            pat: Pattern::Binding("f".into(), None, span),
-                            ty: Some(TypeExpr::TypeOf(Box::new(call()), span)),
-                            value: Some(Expr::Closure(
-                                Vec::new(),
-                                Box::new(Expr::Array(
-                                    vec![Expr::Unary(UnaryOp::Not, Box::new(call()), span)],
-                                    span,
-                                )),
-                                span,
-                            )),
-                            is_const: false,
-                            span,
-                        }],
-                        span,
-                    },
-                    span,
-                },
-            ],
-            span,
-        };
-        let original = count_method_calls(&nested, "into");
-        assert!(original >= 8);
-        let rewritten = RewriteInto {
-            method: "into",
-            mangled: "into__string",
-        }
-        .block(&nested);
-        assert_eq!(count_method_calls(&rewritten, "into"), 0);
-        assert_eq!(count_method_calls(&rewritten, "into__string"), original);
-    }
-
-    fn count_infer_types(ty: &TypeExpr) -> usize {
-        match ty {
-            TypeExpr::Named(name, _) => usize::from(name == "infer"),
-            TypeExpr::Array(inner, _, _)
-            | TypeExpr::Nullable(inner, _)
-            | TypeExpr::Fallible(inner, _)
-            | TypeExpr::Mut(inner, _)
-            | TypeExpr::Ref(inner, _) => count_infer_types(inner),
-            TypeExpr::Fun(params, ret, _) => {
-                params.iter().map(count_infer_types).sum::<usize>() + count_infer_types(ret)
-            }
-            TypeExpr::Tuple(items, _) => items.iter().map(count_infer_types).sum(),
-            TypeExpr::Anonymous(fields, _) => {
-                fields.iter().map(|(_, ty, _)| count_infer_types(ty)).sum()
-            }
-            TypeExpr::TypeOf(expr, _) => count_infer_expr(expr),
-            TypeExpr::Refine(base, fields, _) => {
-                count_infer_types(base)
-                    + fields
-                        .iter()
-                        .map(|(_, ty, _)| count_infer_types(ty))
-                        .sum::<usize>()
-            }
-            TypeExpr::TypeSlot(_) | TypeExpr::SelfField(..) => 0,
-        }
-    }
-
-    fn count_infer_expr(expr: &Expr) -> usize {
-        match expr {
-            Expr::TypeTest(subject, ty, _, _) => count_infer_expr(subject) + count_infer_types(ty),
-            _ => 0,
-        }
-    }
-
-    fn count_method_calls(block: &Block, method: &str) -> usize {
-        block
-            .stmts
-            .iter()
-            .map(|stmt| match stmt {
-                Stmt::Let { ty, value, .. } => {
-                    ty.as_ref().map_or(0, |ty| count_type_calls(ty, method))
-                        + value
-                            .as_ref()
-                            .map_or(0, |value| count_expr_calls(value, method))
-                }
-                Stmt::Assign { target, value, .. } => {
-                    count_expr_calls(target, method) + count_expr_calls(value, method)
-                }
-                Stmt::Expr(expr) | Stmt::Return(Some(expr), _) => count_expr_calls(expr, method),
-                Stmt::While { cond, body, .. } => {
-                    count_expr_calls(cond, method) + count_method_calls(body, method)
-                }
-                Stmt::For { iter, body, .. } => {
-                    count_expr_calls(iter, method) + count_method_calls(body, method)
-                }
-                Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => 0,
-            })
-            .sum()
-    }
-
-    fn count_type_calls(ty: &TypeExpr, method: &str) -> usize {
-        match ty {
-            TypeExpr::Array(inner, _, _)
-            | TypeExpr::Nullable(inner, _)
-            | TypeExpr::Fallible(inner, _)
-            | TypeExpr::Mut(inner, _)
-            | TypeExpr::Ref(inner, _) => count_type_calls(inner, method),
-            TypeExpr::Fun(params, ret, _) => {
-                params
-                    .iter()
-                    .map(|param| count_type_calls(param, method))
-                    .sum::<usize>()
-                    + count_type_calls(ret, method)
-            }
-            TypeExpr::Tuple(items, _) => items
-                .iter()
-                .map(|item| count_type_calls(item, method))
-                .sum(),
-            TypeExpr::Anonymous(fields, _) => fields
-                .iter()
-                .map(|(_, ty, _)| count_type_calls(ty, method))
-                .sum(),
-            TypeExpr::TypeOf(expr, _) => count_expr_calls(expr, method),
-            TypeExpr::Refine(base, fields, _) => {
-                count_type_calls(base, method)
-                    + fields
-                        .iter()
-                        .map(|(_, ty, _)| count_type_calls(ty, method))
-                        .sum::<usize>()
-            }
-            TypeExpr::Named(..) | TypeExpr::TypeSlot(_) | TypeExpr::SelfField(..) => 0,
-        }
-    }
-
-    fn count_expr_calls(expr: &Expr, method: &str) -> usize {
-        let own = usize::from(matches!(
-            expr,
-            Expr::Call(callee, _, _)
-                if matches!(&**callee, Expr::Field(_, name, _) if name == method)
-        ));
-        own + match expr {
-            Expr::Unary(_, inner, _) | Expr::ErrorProp(inner, _) | Expr::Field(inner, _, _) => {
-                count_expr_calls(inner, method)
-            }
-            Expr::TypeTest(subject, ty, _, _) => {
-                count_expr_calls(subject, method) + count_type_calls(ty, method)
-            }
-            Expr::Binary(_, left, right, _)
-            | Expr::Index(left, right, _)
-            | Expr::Range(left, right, _) => {
-                count_expr_calls(left, method) + count_expr_calls(right, method)
-            }
-            Expr::Call(callee, args, _) => {
-                count_expr_calls(callee, method)
-                    + args
-                        .iter()
-                        .map(|arg| count_expr_calls(&arg.expr, method))
-                        .sum::<usize>()
-            }
-            Expr::Str(segments, _) => segments
-                .iter()
-                .map(|segment| match segment {
-                    StrSeg::Lit(_) => 0,
-                    StrSeg::Expr(expr) => count_expr_calls(expr, method),
-                })
-                .sum(),
-            Expr::Closure(params, body, _) => {
-                params
-                    .iter()
-                    .map(|param| {
-                        param
-                            .ty
-                            .as_ref()
-                            .map_or(0, |ty| count_type_calls(ty, method))
-                    })
-                    .sum::<usize>()
-                    + count_expr_calls(body, method)
-            }
-            Expr::Array(items, _) => items
-                .iter()
-                .map(|item| count_expr_calls(item, method))
-                .sum(),
-            Expr::TypeLit(_, fields, _) | Expr::VariantLit(_, _, fields, _) => fields
-                .iter()
-                .map(|(_, value)| count_expr_calls(value, method))
-                .sum(),
-            Expr::If(cond, then, els, _) => {
-                count_expr_calls(cond, method)
-                    + count_method_calls(then, method)
-                    + els.as_ref().map_or(0, |els| count_expr_calls(els, method))
-            }
-            Expr::IfLet(_, scrutinee, then, els, _) => {
-                count_expr_calls(scrutinee, method)
-                    + count_method_calls(then, method)
-                    + els.as_ref().map_or(0, |els| count_expr_calls(els, method))
-            }
-            Expr::Match(scrutinee, arms, _) => {
-                count_expr_calls(scrutinee, method)
-                    + arms
-                        .iter()
-                        .map(|arm| count_expr_calls(&arm.body, method))
-                        .sum::<usize>()
-            }
-            Expr::Block(block, _) => count_method_calls(block, method),
-            Expr::Int(..)
-            | Expr::Float(..)
-            | Expr::Bool(..)
-            | Expr::Null(_)
-            | Expr::Ident(..)
-            | Expr::SelfExpr(_) => 0,
-        }
-    }
-}
+mod tests;

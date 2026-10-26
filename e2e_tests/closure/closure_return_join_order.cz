@@ -1,0 +1,23 @@
+// @backends: all
+// A closure's `return`s join like a function's: a literal return adapts to
+// the type the other returns take at each application, whichever `return`
+// comes first, so `return 0` before `return x` does not fix `x` to `int32`.
+fun main() {
+    let literal_first = (b, x) -> {
+        if b {
+            return 0
+        }
+        return x
+    }
+    let value_first = (b, x) -> {
+        if b {
+            return x
+        }
+        return 0
+    }
+    let big: int64 = 5000000000
+    println(literal_first(false, big))
+    println(literal_first(true, big))
+    println(value_first(true, big))
+    println(literal_first(false, 2.5))
+}

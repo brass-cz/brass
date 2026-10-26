@@ -1,6 +1,6 @@
-// float32 conversions must be truncated to 32-bit precision in the JIT, not stored
-// as a raw f64 bit pattern -- otherwise every float32 reads as garbage. The output
-// must match the interpreter byte-for-byte.
+// float32 conversions (`float32.from`, `float32.parse`) produce values at
+// 32-bit precision on the JIT, so arithmetic on them and their rendering
+// match the interpreter byte-for-byte.
 fun main() {
     let a = float32.from(1)
     let b = float32.from(3)

@@ -1,0 +1,21 @@
+// A global initialized from a record literal or from a call has that value's
+// type inside function bodies, like any other global: using it where a `bool`
+// is required is rejected in the function that does so.
+type P = { x: int32 }
+
+fun make() {
+    return P { x: 2 }
+}
+
+let p = P { x: 1 }
+let q = make()
+
+fun f() {
+    let w: bool = p
+    let z: bool = q
+    return w && z
+}
+
+fun main() {
+    println(f())
+}

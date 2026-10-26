@@ -1,0 +1,59 @@
+// @backends: all
+// Rule 1 of bracket literals: an annotation or another inference result
+// decides the literal's type. The expected type may be a tuple parameter,
+// a nullable tuple (a binding, a parameter, an element type), the Ok payload
+// of a fallible return or a nullable return, or an array whose element the
+// elements widen into.
+fun sum2(p: [int32, int32]) -> int32 {
+    const [a, b] = p
+    return a + b
+}
+
+fun first(p: [int32, int32]?) -> int32 {
+    if let q = p {
+        return q[0]
+    }
+    return -1
+}
+
+fun split_once(s: string, delim: string) -> [string, string]! {
+    let parts = s.split(delim)
+    if parts.len() < 2 {
+        return error("delimiter not found")
+    }
+    return [parts[0], parts.slice(1, parts.len()).join(delim)]
+}
+
+fun twice(s: string) -> [string, string]? {
+    if s == "" {
+        return null
+    }
+    return [s, s]
+}
+
+fun main() {
+    println(sum2([1, 2]))
+    println(first([7, 8]))
+    println(first(null))
+    let v: [int32, int32]? = [3, 4]
+    if let w = v {
+        println(w[1])
+    }
+    let pairs: [int32, int32]?[] = [[5, 6], null]
+    println(pairs.len())
+    const [a, b] = split_once("x:y:z", ":")!
+    println(a)
+    println(b)
+    if let t = twice("m") {
+        println(t[1])
+    }
+    let parts = "u:v:w".split(":")
+    let pair: [string, string] = [parts[0], parts.slice(1, parts.len()).join(":")]
+    println(pair[1])
+    let x: int32 = 3
+    let big: int64 = 5000000000
+    let wide: int64[] = [x, big]
+    println(wide)
+    let fs: float64[] = [x, 2.5]
+    println(fs)
+}

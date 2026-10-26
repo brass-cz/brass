@@ -1,8 +1,6 @@
-// Pins that a self-referential record type (`next: Node?`) compiles and runs:
-// completing such a type's field substitution used to recurse without bound and
-// crash the compiler (even `brass check`). Exercises construction, link
-// assignment, traversal (null-terminated loop), field access through a
-// narrowing, and rendering of a node.
+// A self-referential record type (`next: Node?`) is checked and compiled like
+// any other: construction, link assignment, traversal (a null-terminated
+// loop), field access through a narrowing, and rendering of a node.
 type Node = {
     value: int64,
     next: Node?,

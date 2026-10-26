@@ -1,18 +1,44 @@
-//! Typing of record and sum-variant literals and of field access:
-//! literal field lists checked against declared (or refined) field
-//! types, unit-variant names, and the per-variant/common field type of
-//! a sum scrutinee.
+//! Typing of record and sum-variant literals and of field access.
+//!
+//! A literal's fields are checked against the declared (or refined) field
+//! types, each literal instantiating the declaration's type slots afresh. A
+//! record literal, a variant literal and a unit variant may name their type
+//! through a type alias; a record literal through a refinement alias is built
+//! as the record at the alias's instance. A field access is a unit variant
+//! (`Sum.Variant`), a member-presence test, a record field (an absent one
+//! reads as the always-null `never?`), or a sum field: on `self` in a method
+//! checked for one variant, that variant's field, else the field every variant
+//! declares alike.
 
 use std::collections::BTreeMap;
 
 use super::*;
 
+/// What a record or variant literal is checked against: the literal's owner
+/// (`who`, the record symbol or `Sum.Variant`), the variant (for payload
+/// substitution keys), the declared fields, and the substitution of the
+/// instance the literal is built as when something fixes it (a refinement
+/// alias, or a requirement naming the same record).
+pub(super) struct LiteralShape<'s> {
+    pub(super) who: &'s str,
+    pub(super) variant: Option<&'s str>,
+    pub(super) declared: &'s [brass_hir::FieldInfo],
+    pub(super) pins: Option<&'s Substitution>,
+}
+
 impl<'a> Checker<'a> {
+    /// Check a record literal `name { fields }` (or an anonymous one when
+    /// `name` is empty). `name` may be a `type A = R { .. }` alias of a record:
+    /// the literal is then built as `R` at the alias's instance (its pinned
+    /// fields and slots fix the literal's), exactly like an anonymous literal
+    /// stored in a slot of type `A`. `pins` is the instance a requirement the
+    /// literal flows into fixes, when it names the same record.
     pub(super) fn check_record_lit(
         &mut self,
         name: &str,
         fields: &[(String, Expr)],
         span: brass_parser::Span,
+        pins: Option<&Substitution>,
         scopes: &mut ScopeStack,
     ) -> Type {
         // Anonymous structure literal `{ f: v, ... }`: a structural record whose
@@ -25,9 +51,21 @@ impl<'a> Checker<'a> {
             return brass_hir::structural_record(field_tys);
         }
         let tn = self.resolve_self_name(name);
-        let Some(symbol) = self.resolve_type_symbol(&tn) else {
-            self.check_supplied_field_exprs(fields, scopes);
-            return self.fresh_unknown();
+        let (symbol, alias) = match self.resolve_type_symbol(&tn) {
+            Some(symbol) => (symbol, None),
+            None => match self.resolve_alias(&tn) {
+                Some(Type::Record(n)) if n.id >= 0 => match self.program.type_by_id(n.id) {
+                    Some(info) => (info.symbol.clone(), Some(n)),
+                    None => {
+                        self.check_supplied_field_exprs(fields, scopes);
+                        return self.fresh_unknown();
+                    }
+                },
+                _ => {
+                    self.check_supplied_field_exprs(fields, scopes);
+                    return self.fresh_unknown();
+                }
+            },
         };
         let Some(info) = self.program.types.get(&symbol) else {
             self.check_supplied_field_exprs(fields, scopes);
@@ -37,7 +75,7 @@ impl<'a> Checker<'a> {
             fields: declared, ..
         } = &info.kind
         else {
-            // A sum type constructed directly. check_constructions already
+            // A sum type constructed directly. `check_constructions` already
             // reports the direct-table (bare unique) spelling; report the
             // forms only module-aware resolution can name -- a qualified
             // marker (`alias.Sum`), a renamed local, a multi-module import --
@@ -53,11 +91,51 @@ impl<'a> Checker<'a> {
             self.check_supplied_field_exprs(fields, scopes);
             return self.fresh_unknown();
         };
-        let ret = info.type_ref();
-        let substitution = self.check_lit_fields(&symbol, None, declared, fields, span, scopes);
-        apply_nominal_substitution(ret, substitution)
+        let Some(alias) = alias else {
+            let ret = info.type_ref();
+            let substitution = self.check_lit_fields(
+                LiteralShape {
+                    who: &symbol,
+                    variant: None,
+                    declared,
+                    pins,
+                },
+                fields,
+                span,
+                scopes,
+            );
+            return apply_nominal_substitution(ret, substitution);
+        };
+        // Through an alias: the back ends know the record by its symbol.
+        let declared = declared.clone();
+        let substitution = self.check_lit_fields(
+            LiteralShape {
+                who: &symbol,
+                variant: None,
+                declared: &declared,
+                pins: Some(&alias.substitution),
+            },
+            fields,
+            span,
+            scopes,
+        );
+        self.record_literal_nominal(span, symbol);
+        overlay_nominal_substitution(Type::Record(alias), &substitution)
     }
 
+    /// The nominal id of the record a construction head `name` names from the
+    /// current module, directly or through a `type A = R { .. }` alias.
+    pub(super) fn record_head_id(&self, name: &str) -> Option<i32> {
+        self.program
+            .resolve_type_or_alias(&self.current_module, &self.resolve_self_name(name))
+            .filter(|info| !info.is_sum())
+            .map(|info| info.id)
+    }
+
+    /// Check a variant literal `t.variant { fields }`, where `t` may name the
+    /// sum through a `type A = S` alias (see `resolve_sum_head_symbol`). A
+    /// missing variant is reported after module-aware head resolution.
+    /// Recovery checks supplied field values and yields an open type.
     pub(super) fn check_variant_lit(
         &mut self,
         t: &str,
@@ -67,7 +145,7 @@ impl<'a> Checker<'a> {
         scopes: &mut ScopeStack,
     ) -> Type {
         let tn = self.resolve_self_name(t);
-        let Some(symbol) = self.resolve_type_symbol(&tn) else {
+        let Some(symbol) = self.resolve_sum_head_symbol(&tn) else {
             self.check_supplied_field_exprs(fields, scopes);
             return self.fresh_unknown();
         };
@@ -76,14 +154,22 @@ impl<'a> Checker<'a> {
             return self.fresh_unknown();
         };
         let Some(var) = info.variant(variant) else {
+            self.errors.push(TypeError {
+                message: format!("`{t}` has no variant `{variant}`"),
+                span,
+            });
             self.check_supplied_field_exprs(fields, scopes);
             return self.fresh_unknown();
         };
         let ret = info.type_ref();
+        let who = format!("{symbol}.{variant}");
         let substitution = self.check_lit_fields(
-            &format!("{symbol}.{variant}"),
-            Some(variant),
-            &var.fields,
+            LiteralShape {
+                who: &who,
+                variant: Some(variant),
+                declared: &var.fields,
+                pins: None,
+            },
             fields,
             span,
             scopes,
@@ -100,25 +186,15 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_lit_fields(
+    /// Resolve a construction's field requirements using its refinement
+    /// pins, fresh declaration slots, and the concrete meaning of `Self`.
+    /// Wider structural literals reuse these requirements for matching fields.
+    pub(super) fn literal_field_requirements(
         &mut self,
-        who: &str,
-        variant: Option<&str>,
-        declared: &[brass_hir::FieldInfo],
-        fields: &[(String, Expr)],
-        span: brass_parser::Span,
-        scopes: &mut ScopeStack,
-    ) -> Substitution {
-        let mut substitution = Substitution::empty();
-        let mut seen = HashSet::default();
-        for (name, expr) in fields {
-            if !seen.insert(name) {
-                self.errors.push(TypeError {
-                    message: format!("`{who}` literal repeats field `{name}`"),
-                    span: expr.span(),
-                });
-            }
-        }
+        shape: &LiteralShape<'_>,
+    ) -> BTreeMap<String, Type> {
+        let who = shape.who;
+        let pins = shape.pins;
         // The concrete type `Self` denotes in a field type, so a closure-typed
         // field declared `(self, T) -> U` is checked with `self` bound to the
         // type being constructed rather than the abstract `Self`.
@@ -131,40 +207,84 @@ impl<'a> Checker<'a> {
         // through those, the first literal's field values would pin every other
         // literal's slots program-wide (two `Stack { items: [...] }` of different
         // element types in one scope must not conflict).
-        let slot_vars: Vec<u32> = base_info
-            .map(|info| info.slots.iter().map(|(_, v)| *v).collect())
-            .unwrap_or_default();
+        let slot_vars: Vec<(String, u32)> =
+            base_info.map(|info| info.slots.clone()).unwrap_or_default();
         let slot_map: BTreeMap<u32, Type> = slot_vars
             .into_iter()
-            .map(|v| (v, self.fresh_unknown()))
+            .map(|(name, v)| {
+                let pinned = pins.and_then(|p| p.get(&name)).cloned();
+                (v, pinned.unwrap_or_else(|| self.fresh_unknown()))
+            })
             .collect();
+        shape
+            .declared
+            .iter()
+            .filter_map(|field| {
+                let declared = field.resolved_ty.as_ref()?;
+                let want = match &self_ty {
+                    Some(s) => substitute_self(declared, s),
+                    None => declared.clone(),
+                };
+                let want = brass_hir::substitute_vars(&want, &slot_map);
+                // A bare unannotated field is shared by the declaration's uses;
+                // each construction instead gets its own unknown or pinned type.
+                let pinned = pins
+                    .filter(|_| !self.solver.free_vars(&want).is_empty())
+                    .and_then(|p| p.get(&field_substitution_key(shape.variant, &field.name)))
+                    .cloned();
+                let want = match pinned {
+                    Some(pin) => pin,
+                    None if want.is_unknown() => self.fresh_unknown(),
+                    None => want,
+                };
+                Some((field.name.clone(), want))
+            })
+            .collect()
+    }
+
+    /// Check a record or variant literal's `fields` against `shape`,
+    /// returning the instance substitution its open fields take. An open
+    /// field or slot the shape's `pins` fix (a refinement such as
+    /// `Box { item: int64 }`) is checked against the pinned type, so a
+    /// literal value adapts to it.
+    pub(super) fn check_lit_fields(
+        &mut self,
+        shape: LiteralShape<'_>,
+        fields: &[(String, Expr)],
+        span: brass_parser::Span,
+        scopes: &mut ScopeStack,
+    ) -> Substitution {
+        let requirements = self.literal_field_requirements(&shape);
+        let LiteralShape {
+            who,
+            variant,
+            declared,
+            pins: _,
+        } = shape;
+        let mut substitution = Substitution::empty();
+        let mut seen = HashSet::default();
+        for (name, expr) in fields {
+            if !seen.insert(name) {
+                self.errors.push(TypeError {
+                    message: format!("`{who}` literal repeats field `{name}`"),
+                    span: expr.span(),
+                });
+            }
+        }
         for field in declared {
             match fields.iter().find(|(name, _)| name == &field.name) {
                 Some((_, expr)) => {
-                    let got = if let Some(want) = &field.resolved_ty {
-                        let want = match &self_ty {
-                            Some(s) => substitute_self(want, s),
-                            None => want.clone(),
-                        };
-                        // Slot variables occurring in the declared type take this
-                        // literal's own instantiation (see `slot_map` above).
-                        let want = brass_hir::substitute_vars(&want, &slot_map);
-                        // A bare unannotated field's declared variable is SHARED
-                        // by every use of the declaration -- method co-checking
-                        // deliberately binds through it (the scheme links the
-                        // type and its methods). A literal must not check its
-                        // value against whatever that co-checking bound (the
-                        // binding mixes another body's local variables in), so
-                        // each literal checks against a fresh variable and
-                        // records the value's own type in the substitution
-                        // below. Partially-inferred annotations (an `infer?[]`
-                        // slot) keep the shared variable: the store-pin
-                        // machinery relies on it.
-                        let want = if want.is_unknown() {
-                            self.fresh_unknown()
-                        } else {
-                            want
-                        };
+                    // Judged on the declaration as written, not through the
+                    // solver: checking (this literal's or an earlier one's)
+                    // may bind the declaration's shared variable -- an
+                    // `infer[]` field pinned by its value -- and every
+                    // instance must still carry the type it gave the field.
+                    let inferred_field = field
+                        .resolved_ty
+                        .as_ref()
+                        .is_some_and(|t| !brass_hir::is_fully_known(t));
+                    let got = if let Some(want) = requirements.get(&field.name) {
+                        let want = want.clone();
                         // An array-literal value for a sequence-typed slot field
                         // whose element THIS literal must pin (still open after
                         // the per-literal instantiation): type it bottom-up (the
@@ -200,10 +320,6 @@ impl<'a> Checker<'a> {
                     // whose element is inferred from use). This carries the
                     // instance's resolved field type into the typed program and the
                     // back-end seed; a fully concrete annotation is static.
-                    let inferred_field = field
-                        .resolved_ty
-                        .as_ref()
-                        .is_some_and(|t| !self.solver.free_vars(t).is_empty());
                     if inferred_field {
                         substitution.insert(field_substitution_key(variant, &field.name), got);
                     }
@@ -227,10 +343,10 @@ impl<'a> Checker<'a> {
     }
 
     /// A fieldless variant written without braces (`Sum.Variant`) is a value of
-    /// the enclosing sum type. `base` must name a sum type
-    /// rather than a value in scope. Returns `None` when this is an ordinary
-    /// field access. Variants with fields are excluded: they require `{ ... }`
-    /// construction, handled elsewhere.
+    /// the enclosing sum type. `base` must name a sum type, possibly through a
+    /// type alias, rather than a value in scope (`in_scope`). Returns `None`
+    /// when this is an ordinary field access. Variants with fields are
+    /// excluded: they require `{ ... }` construction, handled elsewhere.
     pub(super) fn unit_variant_type(
         &self,
         base: &Expr,
@@ -244,11 +360,10 @@ impl<'a> Checker<'a> {
             return None;
         }
         let resolved = self.resolve_self_name(type_name);
-        let info = self
-            .program
-            .types
-            .get(&resolved)
-            .or_else(|| self.program.resolve_type(&self.current_module, &resolved))?;
+        let info = self.program.types.get(&resolved).or_else(|| {
+            self.program
+                .resolve_type_or_alias(&self.current_module, &resolved)
+        })?;
         let variant = info.variant(name)?;
         if variant.fields.is_empty() {
             Some(info.type_ref())
@@ -257,6 +372,10 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Type the field access `base.name` (not called): a unit variant, a
+    /// member-presence test, or a field read, as the module doc lists. A
+    /// nullable base is reported; an open one records that it must have the
+    /// field (see `ShapeConstraint::HasField`).
     pub(super) fn check_field(
         &mut self,
         base: &Expr,
@@ -274,12 +393,10 @@ impl<'a> Checker<'a> {
             && !self.is_in_scope(base, scopes)
         {
             let resolved = self.resolve_self_name(tname);
-            if let Some(info) = self
-                .program
-                .types
-                .get(&resolved)
-                .or_else(|| self.program.resolve_type(&self.current_module, &resolved))
-                && info.is_sum()
+            if let Some(info) = self.program.types.get(&resolved).or_else(|| {
+                self.program
+                    .resolve_type_or_alias(&self.current_module, &resolved)
+            }) && info.is_sum()
             {
                 let message = match info.variant(name) {
                     Some(_) => format!(
@@ -317,15 +434,18 @@ impl<'a> Checker<'a> {
                     && let TypeKind::Record { fields, .. } = &info.kind
                     && let Some(field) = fields.iter().find(|f| f.name == name)
                 {
-                    return field
-                        .resolved_ty
-                        .clone()
-                        .unwrap_or_else(|| self.fresh_unknown());
+                    // A field declared with `Self` (`next: Self?`) names its
+                    // own record type, as at construction.
+                    return match &field.resolved_ty {
+                        Some(ty) => brass_hir::substitute_self(ty, &info.type_ref()),
+                        None => self.fresh_unknown(),
+                    };
                 }
-                // Accessing a field a structure does not have is an inference
-                // failure typed as the always-null `never?`: an `if` on it is
-                // statically false (then-branch pruned), and using it as a non-null
-                // value is still rejected, which keeps structural checks sound.
+                // A field the record does not have reads as the always-null
+                // `never?` (the member-presence rule): an `if` on it is
+                // statically false (then-branch pruned), and using it as a
+                // non-null value is still rejected, which keeps structural
+                // checks sound.
                 Type::null()
             }
             Type::Sum(sum) => {
@@ -367,6 +487,9 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// While a sum method's body is checked for one variant (its
+    /// `Sum.Variant` qualifier, `Checker::self_variant`), `self.name` reads
+    /// that variant's field. `None` when `base` is not such a `self`.
     pub(super) fn self_variant_field_type(
         &mut self,
         base: &Expr,
@@ -402,6 +525,10 @@ impl<'a> Checker<'a> {
         )
     }
 
+    /// The type of the field `name` read from a value of the sum `sum` whose
+    /// variant is not known: every variant must declare it, at types that
+    /// unify. `None` when one does not, when the types conflict, or when the
+    /// read is unsound for a bare sum value (see below).
     pub(super) fn common_sum_field_type(&mut self, sum: &NominalType, name: &str) -> Option<Type> {
         let field_types = match &self.program.type_by_id(sum.id)?.kind {
             TypeKind::Sum { variants } => variants

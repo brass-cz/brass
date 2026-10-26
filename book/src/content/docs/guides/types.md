@@ -327,7 +327,8 @@ dispatches `display()`, though, because its type is already known.
 
 You can also convert a value to a record type explicitly with `T.from(v)`,
 which yields `T?`, the record when `v` structurally has all of `T`'s fields,
-else `null`:
+else `null` (a type that declares its own static `from` method gets that
+method instead):
 
 ```brass
 type Person = {
@@ -349,6 +350,14 @@ fun get_name(obj) {
 get_name({ name: "Yukawa", age: 42 })   // I am Yukawa
 get_name({ age: 42 })                   // not a Person
 ```
+
+Structural subtyping is for parameters, annotated or not:
+`fun greet(p: Person)` accepts any record with `Person`'s fields and methods,
+and its body runs at the argument's own type. A binding, field, array element
+or return annotated with a record type holds exactly that record. An
+anonymous literal with exactly its fields is built as that record, so
+`let p: Person = { name: "Ada" }` makes a `Person`; any other record converts
+explicitly with `T.from(v)`.
 
 The precise rules for method resolution, ambiguity, and record coercion are in
 the [type system reference](/references/types/#records-and-structural-typing).

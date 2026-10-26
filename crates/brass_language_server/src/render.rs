@@ -1,7 +1,7 @@
 //! Type and signature rendering for hover.
 //!
 //! The compiler's `Type::display` prints every inference variable as a bare
-//! `?`, which is ambiguous when several appear. For hover output we instead
+//! `_`, which is ambiguous when several appear. For hover output we instead
 //! number them `unknown_N` by order of first appearance, as the language
 //! server's contract requires: a function whose parameters carry no annotation
 //! has each unannotated slot shown as a distinct `unknown_N`, numbered in the

@@ -90,5 +90,7 @@ A few points:
   `HashMap`, and the array/string helpers need no import. The shipped
   `std/` tree is imported explicitly with the `std.` prefix, e.g.
   `import std.fs.{ read_file }`.
+- A module that declares a prelude name itself (its own `abs`, say) uses its
+  declaration; every other module still sees the prelude's.
 
 The full rules are in the [modules reference](/references/modules/).

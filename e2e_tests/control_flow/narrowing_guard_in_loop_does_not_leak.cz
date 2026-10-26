@@ -1,0 +1,39 @@
+// @backends: all
+// A guard narrows only the rest of its own block. A guard inside a loop body
+// (the loop may run zero times) or inside an `else` block narrows nothing
+// after that loop or `if`, so each final unchecked read is rejected.
+fun pick(b: bool) -> string? {
+    if b { return "hello" }
+    return null
+}
+fun after_while() {
+    let x = pick(false)
+    let i = 0
+    while i < 0 {
+        if !x { return }
+        i = i + 1
+    }
+    println(x.len())
+}
+fun after_for() {
+    let x = pick(false)
+    for i in [0..0] {
+        if !x { return }
+    }
+    println(x.len())
+}
+fun after_else(k: int32) {
+    let x = pick(false)
+    if k == 3 {
+        println("then")
+    } else {
+        if !x { return }
+        println(x.len())
+    }
+    println(x.len())
+}
+fun main() {
+    after_while()
+    after_for()
+    after_else(3)
+}

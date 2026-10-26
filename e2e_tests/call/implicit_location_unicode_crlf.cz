@@ -1,0 +1,5 @@
+// @backends: all
+fun capture(loc: Location) { println("{loc.line}:{loc.col}") }
+fun main() {
+	if "😀é".len() > 0 { capture() }
+}
