@@ -278,3 +278,16 @@ fun _match_at(
         _names: names,
     }
 }
+
+/** Render `Regex { pattern: "..." }`, quoting the pattern and omitting handles. */
+fun Regex.debug(self) -> string {
+    return "Regex \{ pattern: {self.pattern.debug()} }"
+}
+
+/** Render text, byte offsets and capture groups in an indented `Match` record;
+ * strings are quoted, and the private group-name index is omitted.
+ */
+fun Match.debug(self) -> string {
+    let groups = self.groups.debug().replace("\n", "\n    ")
+    return "Match \{\n    text: {self.text.debug()},\n    start: {self.start},\n    end: {self.end},\n    groups: {groups},\n}"
+}

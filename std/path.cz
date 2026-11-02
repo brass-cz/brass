@@ -415,3 +415,13 @@ fun Path.file_size(self) -> int64! {
 fun Path.modified_age(self) -> int64! {
     return path_modified_age(self.to_string())!
 }
+
+/** Render the path text from `to_string`, with `.` for an empty relative path. */
+fun Path.display(self) -> string {
+    return self.to_string()
+}
+
+/** Render the path text quoted and escaped with `string.debug`, without components. */
+fun Path.debug(self) -> string {
+    return self.to_string().debug()
+}

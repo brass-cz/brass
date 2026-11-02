@@ -1,0 +1,7 @@
+[callable]
+box(7)
+box("seven")
+Outer {
+    value: box("inside"),
+}
+[box(1), box(2)]

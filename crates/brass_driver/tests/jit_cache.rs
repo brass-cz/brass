@@ -339,14 +339,14 @@ fn lazy_groups_share_one_destructor_across_cache_round_trip() {
                 fixture.run_logged(&source, "0", "brass::perf=debug,brass::ir=trace", eager);
             assert_eq!(output.stdout, b"11\n22\n");
             let log = String::from_utf8_lossy(&output.stderr);
-            // Helper names encode the type key: `Box` is a record (`rec<id>`)
-            // whose key lists its `value: string` field.
+            // Match the complete Box field key, excluding unrelated records
+            // which also have a value:string slot (such as a concrete Error).
             let destructors: Vec<_> = log
                 .lines()
                 .filter(|line| {
                     line.starts_with("define ")
                         && line.contains("@pp_fn_drop_5f_rec")
-                        && line.contains("_5f_value_5f_str(")
+                        && line.contains("_5f_fld1_5f_n_5f_int64_5f_fld5_5f_value_5f_str(")
                 })
                 .collect();
             assert_eq!(destructors.len(), 1, "{log}");

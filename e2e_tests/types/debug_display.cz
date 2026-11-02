@@ -1,3 +1,6 @@
+// @backends: all
+import std.collections.{ HashMap }
+
 // The value-to-text protocols (core/show.cz). Every type satisfies `Debug`:
 // primitives via core's methods (`string.debug` is the quoted form), all other
 // types via the built-in traditional renderer. Only primitives (and types that

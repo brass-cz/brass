@@ -1,0 +1,48 @@
+{
+    "a, b": "line\n\"two\""
+}
+{
+    "a, b": "line\n\"two\""
+}
+{
+    "a, b": "line\n\"two\""
+}
+Box {
+    value: {
+        "a, b": "line\n\"two\""
+    },
+}
+[{
+    "a, b": "line\n\"two\""
+}]
+{
+    "child": {
+        "a, b": "line\n\"two\""
+    }
+}
+{
+    "child": {
+        "a, b": "line\n\"two\""
+    }
+}
+{
+    2: Point {
+        x: 3,
+        label: "three",
+    }
+}
+{
+    Key {
+        id: 4,
+    }: "four"
+}
+{
+    "child": {
+        "a": 2
+    }
+}
+{}
+{}
+Box {
+    value: {},
+}

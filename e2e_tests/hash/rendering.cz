@@ -1,0 +1,20 @@
+// @backends: all
+import std.hash.{ Hasher, hex }
+import std.collections.HashMap
+
+type Box = {
+    value: Hasher
+}
+// Debug does not query or consume the opaque state: update/finalize still work.
+fun main() {
+    let hasher = Hasher.sha256()!
+    println(hasher)
+    println(hasher.debug())
+    println(Box { value: hasher })
+    println([hasher])
+    let map = HashMap.new()
+    map.set("hash", hasher)
+    println(map)
+    hasher.update(to_bytes("abc"))!
+    println(hex(hasher.finalize()!))
+}

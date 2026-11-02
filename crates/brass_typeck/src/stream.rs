@@ -50,6 +50,9 @@ pub enum BodyId {
     Function(String),
 }
 
+/// A loop's replacement field lists, one ordered sequence per callable instance.
+pub type InstanceFieldsEntries = Vec<(InstanceKey, Vec<String>)>;
+
 /// The change to the checker's MIR-lowering channels since the previous
 /// event, plus the errors reported in the same window. Additions and
 /// value revisions share the entry vectors (the consumer overwrites by
@@ -66,8 +69,8 @@ pub struct ChannelDelta {
     /// was later contradicted and must be removed.
     pub expr_types: Vec<(Span, Type)>,
     pub expr_types_removed: Vec<Span>,
-    /// Per-instance aggregate seeds of the spans `expr_types` leaves unseeded
-    /// because their instances disagree (see [`aggregate_instance_seeds`]):
+    /// Exact-instance aggregate seeds (see [`aggregate_instance_seeds`]),
+    /// authoritative even when the observed instances agree on `expr_types`:
     /// each entry REPLACES the span's whole per-instance map, and an entry
     /// with no instances removes the span.
     pub instance_seeds: Vec<(Span, Vec<(InstanceKey, Type)>)>,
@@ -95,9 +98,11 @@ pub struct ChannelDelta {
     pub lift_errs: Vec<Span>,
     /// Append-only span set.
     pub null_props: Vec<Span>,
-    /// Append-once per span (a conflicting later observation is an error,
-    /// not a revision).
+    /// Shared field lists; a re-emitted span replaces its representative when
+    /// new instances disagree. `instance_fields` selects each differing list.
     pub fields_loops: Vec<(Span, Vec<String>)>,
+    /// Replacement per-instance field lists; an empty entry removes the override.
+    pub instance_fields: Vec<(Span, InstanceFieldsEntries)>,
     /// Last-write-wins maps: a re-emitted span carries a revised value.
     /// `sum_views` values are emitted resolved; in the terminal delta a
     /// still-open `Result` payload defaults to `void`, mirroring the channel
@@ -153,6 +158,7 @@ impl ChannelDelta {
             && self.lift_errs.is_empty()
             && self.null_props.is_empty()
             && self.fields_loops.is_empty()
+            && self.instance_fields.is_empty()
             && self.sum_views.is_empty()
             && self.type_names.is_empty()
             && self.typeof_types.is_empty()
@@ -170,6 +176,10 @@ impl ChannelDelta {
 /// Progress of a streaming analysis, in emission order.
 #[derive(Clone, Debug)]
 pub enum CheckEvent {
+    /// Monotone body eligibility, emitted before affected body/channel events.
+    /// Omitted declarations remain visible; this event claims no checked coverage
+    /// and cannot settle a priority batch or replace a terminal event.
+    SelectedBodies(std::sync::Arc<fxhash::FxHashSet<Span>>),
     /// The pre-inference static passes (annotation resolution, flow,
     /// definite assignment, ...) finished with these errors. Emitted
     /// before any body event. Consumers attribute diagnostics to
@@ -333,7 +343,9 @@ pub(crate) struct FlushState {
     pub(crate) field_calls: HashMap<Span, Option<Vec<Type>>>,
     pub(crate) lift_errs: fxhash::FxHashSet<Span>,
     pub(crate) null_props: fxhash::FxHashSet<Span>,
-    pub(crate) fields_loops: fxhash::FxHashSet<Span>,
+    pub(crate) fields_loops: HashMap<Span, Vec<String>>,
+    /// Last published instance-qualified field lists.
+    pub(crate) instance_fields: InstanceChannel<Vec<String>>,
     pub(crate) sum_views: HashMap<Span, Type>,
     pub(crate) type_names: HashMap<Span, String>,
     pub(crate) typeof_types: HashMap<Span, Type>,
@@ -392,9 +404,9 @@ pub(crate) fn seeds_from_kind(kind: &brass_hir::TypedExprKind) -> bool {
 /// constructor's instance, an array literal's element representation, a
 /// range's counter type, a closure's or function value's checked type, the
 /// join of literal `if`/`match` branches adapted to a numeric slot). Only
-/// fully-known types every instantiation agrees on are retained; the spans
-/// whose instances disagree are seeded per instance instead
-/// ([`aggregate_instance_seeds`]).
+/// fully-known types every observed instantiation agrees on are retained.
+/// Callable locals use the exact-instance channel first, so an unseen instance
+/// cannot inherit an observed instance's seed ([`aggregate_instance_seeds`]).
 pub fn aggregate_result_types(typed: &TypedProgram, program: &Program) -> HashMap<Span, Type> {
     let mut agg = AggState::default();
     for e in &typed.expressions {
@@ -600,8 +612,8 @@ impl AggState {
 /// fully known. Each entry pairs an instance (an index into `keys`)
 /// with the typed expression it observed (an index into the analysis's
 /// `typed.expressions`), so no type is copied. Monomorphization seeds an
-/// instance's local from these when the instances of its body disagree at
-/// the span (see [`aggregate_instance_seeds`]).
+/// instance's local from these only for that exact instance, even if the
+/// observed instances agree at the span (see [`aggregate_instance_seeds`]).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InstanceObservations {
     pub keys: Vec<InstanceKey>,
@@ -708,11 +720,9 @@ impl InstanceAggState {
         }
     }
 
-    /// Materialize one replacement map only when the shared channel leaves it open.
-    pub(crate) fn seeds_at(&self, span: &Span, shared: bool) -> Option<HashMap<InstanceKey, Type>> {
-        if shared {
-            return None;
-        }
+    /// Materialize the seeds known for this span at their exact callable instances.
+    /// Agreement among observed instances does not authorize an unseen instance.
+    pub(crate) fn seeds_at(&self, span: &Span) -> Option<HashMap<InstanceKey, Type>> {
         let seeds: HashMap<_, _> = self
             .per_span
             .get(span)?
@@ -725,29 +735,24 @@ impl InstanceAggState {
         (!seeds.is_empty()).then_some(seeds)
     }
 
-    /// The per-instance seeds of every span the span-keyed channel does not
-    /// seed (`agreed`, the [`AggState::seedable_map`] of the same
-    /// observations): the spans whose instances disagree.
-    pub(crate) fn seed_map(&self, agreed: &HashMap<Span, Type>) -> InstanceChannel<Type> {
+    /// The exact-instance seeds of every observed span, including spans whose
+    /// observed instances agree on a shared seed.
+    pub(crate) fn seed_map(&self) -> InstanceChannel<Type> {
         self.per_span
             .keys()
-            .filter_map(|span| {
-                self.seeds_at(span, agreed.contains_key(span))
-                    .map(|seeds| (*span, seeds))
-            })
+            .filter_map(|span| self.seeds_at(span).map(|seeds| (*span, seeds)))
             .collect()
     }
 }
 
-/// The per-instance aggregate seeds of the spans the span-keyed channel
-/// (`agreed`, from [`aggregate_result_types`] over the same analysis) leaves
-/// unseeded because the instances of their body disagree: per span, the
-/// type each instance's observations agreed on. `typed` is the analysis's
+/// The per-instance aggregate seeds: per span, the type each exact instance's
+/// observations agreed on. These remain authoritative even when all observed
+/// instances agree: a later, unobserved instance must infer its own local rather
+/// than inherit another instance's representation. `typed` is the analysis's
 /// typed sidecar the observations index.
 pub fn aggregate_instance_seeds(
     observations: &InstanceObservations,
     typed: &TypedProgram,
-    agreed: &HashMap<Span, Type>,
     program: &Program,
 ) -> InstanceChannel<Type> {
     let mut agg = InstanceAggState::default();
@@ -760,7 +765,7 @@ pub fn aggregate_instance_seeds(
         let e = &typed.expressions[*index as usize];
         agg.observe(ids[*key as usize], &e.kind, e.span, &e.ty, program);
     }
-    agg.seed_map(agreed)
+    agg.seed_map()
 }
 
 /// Resolve every checker-recorded method receiver by its enclosing call span.
@@ -1082,6 +1087,7 @@ mod tests {
     pub(super) fn lower(src: &str) -> Program {
         let ast = brass_parser::parse(src).expect("parse");
         let (program, lerr) = brass_hir::lower(&[brass_hir::LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,
@@ -1131,6 +1137,7 @@ mod tests {
         lift_errs: HashSet<Span>,
         null_props: HashSet<Span>,
         fields_loops: HashMap<Span, Vec<String>>,
+        instance_fields: InstanceChannel<Vec<String>>,
         sum_views: HashMap<Span, Type>,
         type_names: HashMap<Span, String>,
         typeof_types: HashMap<Span, Type>,
@@ -1182,6 +1189,14 @@ mod tests {
             for (s, f) in &d.fields_loops {
                 self.fields_loops.insert(*s, f.clone());
             }
+            for (s, entries) in &d.instance_fields {
+                if entries.is_empty() {
+                    self.instance_fields.remove(s);
+                } else {
+                    self.instance_fields
+                        .insert(*s, entries.iter().cloned().collect());
+                }
+            }
             for (s, t) in &d.sum_views {
                 self.sum_views.insert(*s, t.clone());
             }
@@ -1205,7 +1220,9 @@ mod tests {
         let mut m = Merged::default();
         for e in events {
             match e {
-                CheckEvent::StaticChecked(_) | CheckEvent::ContextChecked(_) => {}
+                CheckEvent::SelectedBodies(_)
+                | CheckEvent::StaticChecked(_)
+                | CheckEvent::ContextChecked(_) => {}
                 CheckEvent::ContextReady(d)
                 | CheckEvent::BodyChecked(_, d)
                 | CheckEvent::BatchSettled(d) => m.apply(d),
@@ -1219,8 +1236,8 @@ mod tests {
         m
     }
 
-    /// The replayed stream must land the consumer on exactly the channels
-    /// (and errors) the eager analysis reports, whatever the body order was.
+    /// The replayed stream must land the consumer on its analysis's channels
+    /// and agree with eager analysis wherever both observed the same instance.
     fn assert_stream_matches_eager(src: &str) {
         let program = lower(src);
         let eager = analyze(&program);
@@ -1244,8 +1261,18 @@ mod tests {
         assert_eq!(m.expr_types, aggregate_result_types(&eager.typed, &program));
         assert_eq!(
             m.instance_seeds,
-            aggregate_instance_seeds(&eager.instance_typed, &eager.typed, &m.expr_types, &program)
+            aggregate_instance_seeds(&streamed.instance_typed, &streamed.typed, &program)
         );
+        // The lazy profile skips call-site walks for fully annotated bodies.
+        // That absence must not grant another instance's seed to the caller.
+        let eager_seeds = aggregate_instance_seeds(&eager.instance_typed, &eager.typed, &program);
+        for (span, instances) in &m.instance_seeds {
+            for (key, ty) in instances {
+                if let Some(other) = eager_seeds.get(span).and_then(|seeds| seeds.get(key)) {
+                    assert_eq!(ty, other);
+                }
+            }
+        }
         assert_eq!(m.field_calls, eager.field_calls);
         assert_eq!(
             m.receiver_types,
@@ -1264,6 +1291,7 @@ mod tests {
         assert_eq!(m.lift_errs, eager.lift_errs);
         assert_eq!(m.null_props, eager.null_props);
         assert_eq!(m.fields_loops, eager.fields_loops);
+        assert_eq!(m.instance_fields, eager.instance_fields);
         assert_eq!(m.sum_views, eager.sum_views);
         assert_eq!(m.type_names, eager.type_names);
         assert_eq!(m.typeof_types, eager.typeof_types);
@@ -1303,12 +1331,26 @@ mod tests {
         assert_stream_matches_eager(src);
         let program = lower(src);
         let eager = analyze(&program);
-        let agreed = aggregate_result_types(&eager.typed, &program);
-        let seeds =
-            aggregate_instance_seeds(&eager.instance_typed, &eager.typed, &agreed, &program);
+        let seeds = aggregate_instance_seeds(&eager.instance_typed, &eager.typed, &program);
         assert!(
             seeds.values().any(|per_instance| per_instance.len() == 2),
             "the literal's span carries one seed per instance: {seeds:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_matches_eager_on_recursive_field_lists() {
+        let src = "type Inner = { name: string }\ntype Outer = { child: Inner, age: int32 }\n\
+            fun walk(v) {\n if v: anonymous {} {\n for f in fields(v) {\n println(f)\n walk(v[f])\n }\n }\n }\n\
+            fun main() {\n walk(Outer { child: Inner { name: \"Aki\" }, age: 30 })\n walk(Inner { name: \"Bo\" })\n }\n";
+        assert_stream_matches_eager(src);
+        let result = analyze(&lower(src));
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            result
+                .instance_fields
+                .values()
+                .any(|entries| entries.len() == 2)
         );
     }
 

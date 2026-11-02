@@ -1,0 +1,34 @@
+// @backends: all
+// Each recursive record instance expands its own field names.
+type Leaf = {
+    name: string
+}
+type Branch = {
+    child: Leaf
+    count: int32
+}
+type Root = {
+    branch: Branch
+    enabled: bool
+}
+
+fun walk(value) -> string {
+    if value: anonymous {  } {
+        let out = ""
+        for field in fields(value) {
+            out = out + field + ":" + walk(value[field]) + ";"
+        }
+        return out
+    }
+    return "leaf"
+}
+
+println(
+    walk(
+        Root {
+            branch: Branch { child: Leaf { name: "Aki" }, count: 1 },
+            enabled: true,
+        },
+    ),
+)
+println(walk(Branch { child: Leaf { name: "Aki" }, count: 1 }))

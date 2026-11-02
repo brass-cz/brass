@@ -1,0 +1,18 @@
+// @backends: all
+// User debug may mutate the map; rendering retains the original entry snapshot.
+import std.collections.HashMap
+
+type Value = {
+    text: string
+}
+let values: HashMap { key: string, value: Value } = HashMap.new()
+fun Value.debug(self) -> string {
+    values.clear()
+    return self.text
+}
+fun main() {
+    values.set("a", Value { text: "A" })
+    values.set("b", Value { text: "B" })
+    println(values)
+    println(values.is_empty())
+}

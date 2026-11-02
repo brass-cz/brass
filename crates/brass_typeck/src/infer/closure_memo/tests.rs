@@ -3,6 +3,7 @@ use super::*;
 fn program(closure: &str) -> Program {
     let ast = brass_parser::parse(&format!("fun main() {{ let f = {closure} }}")).unwrap();
     let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,

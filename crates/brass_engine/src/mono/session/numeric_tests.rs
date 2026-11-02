@@ -14,12 +14,12 @@ fn checked_mir(program: &Program) -> MirProgram {
     let seeds = brass_typeck::stream::aggregate_instance_seeds(
         &analysis.instance_typed,
         &analysis.typed,
-        &shared,
         program,
     );
     brass_mir::lower_program_with_types(
         program,
         &brass_mir::CheckerChannels {
+            selected_bodies: None,
             expr_types: &shared,
             receiver_types: &fxhash::FxHashMap::default(),
             receiver_owners: &fxhash::FxHashMap::default(),
@@ -30,6 +30,7 @@ fn checked_mir(program: &Program) -> MirProgram {
             call_locations: &fxhash::FxHashMap::default(),
             lift_errs: &fxhash::FxHashSet::default(),
             fields_loops: &analysis.fields_loops,
+            instance_fields: &analysis.instance_fields,
             type_names: &analysis.type_names,
             typeof_types: &analysis.typeof_types,
             null_props: &analysis.null_props,

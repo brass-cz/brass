@@ -2,5 +2,5 @@
 boxed
 7
 t
-err: [e2e_tests/types/method_declared_fallible_wraps_ok.cz:60:16] unhandled error: negative
+err: [e2e_tests/types/method_declared_fallible_wraps_ok.cz:60:16] error: negative
 3

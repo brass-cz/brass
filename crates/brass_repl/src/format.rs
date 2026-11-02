@@ -3,10 +3,11 @@
 //! `brass_jit_llvm::codegen`).
 //!
 //! The rules the typed path fixes and this mirrors:
-//!  - a float keeps a trailing `.0` when it is an integral finite value below 1e15;
+//!  - float32 uses its own shortest round-trip form, with `.0` for integral values;
+//!    float64 keeps `.0` for integral finite values below 1e15;
 //!  - an unsigned integer renders in its unsigned decimal range, a signed one in
 //!    its signed range;
-//!  - an array or tuple renders as `[e0, e1, ...]`, its elements unquoted;
+//!  - an array or tuple renders as `[e0, e1, ...]`, its elements in effective debug form;
 //!  - a nullable renders its value, or `null`;
 //!  - a record renders as `T {\n    field: <value>,\n}` and a sum variant as
 //!    `T.Variant {\n    field: <value>,\n}` (a field-less variant as bare
@@ -17,48 +18,71 @@
 //!    through `brass_engine::render_record_fields` / `render_variant_fields`,
 //!    so the field decision cannot drift between them.
 
+use brass_engine::render::{RenderForm, resolve_renderer};
 use brass_hir::{IntKind, NominalType, Program, Type};
 
 use crate::value::{MAX_VALUE_DEPTH, Value, VariantObj};
 
-/// Render `v`, whose concrete type is `ty`, as the typed back end would. Errs
-/// when the value nests deeper than [`MAX_VALUE_DEPTH`] -- with self-referential
-/// record types a value can hold a reference cycle, which would otherwise recurse
-/// forever.
+/// Render without executing user code, for builtin numeric conversions.
+/// A custom renderer requires [`format_with_renderer`] and returns an error
+/// here. Values deeper than [`MAX_VALUE_DEPTH`] also return an error, bounding
+/// structural recursion through cyclic values.
 pub fn format_value(program: &Program, v: &Value, ty: &Type) -> Result<String, String> {
-    format_value_at(program, v, ty, 0)
+    format_with_renderer(program, v, ty, RenderForm::Display, &mut |symbol, _| {
+        Err(format!("renderer `{symbol}` needs an interpreter"))
+    })
+}
+
+/// Render with an interpreter callback for the shared resolver's user methods.
+/// No aggregate borrow survives a callback: rendering can execute ordinary code.
+pub fn format_with_renderer(
+    program: &Program,
+    v: &Value,
+    ty: &Type,
+    form: RenderForm,
+    call: &mut impl FnMut(&str, &Value) -> Result<String, String>,
+) -> Result<String, String> {
+    format_value_at(program, v, ty, form, 0, call)
 }
 
 fn format_value_at(
     program: &Program,
     v: &Value,
     ty: &Type,
+    form: RenderForm,
     depth: usize,
+    call: &mut impl FnMut(&str, &Value) -> Result<String, String>,
 ) -> Result<String, String> {
     if depth > MAX_VALUE_DEPTH {
         return Err("value depth exceeded while rendering (cyclic value?)".into());
     }
+    if let Type::Nullable(inner) = ty {
+        return if v.is_null() {
+            Ok("null".into())
+        } else {
+            format_value_at(program, v, inner, form, depth + 1, call)
+        };
+    }
+    if let Some(symbol) = resolve_renderer(program, ty, form) {
+        return call(&symbol, v);
+    }
     Ok(match ty {
+        Type::Str if form == RenderForm::Debug => brass_utils::debug_quote(v.as_str()),
         Type::Str => v.as_str().to_string(),
         Type::Bool => bool_str(v.as_bool()),
         Type::Int(k) => int_str(v.as_int(), *k),
-        Type::Float(_) => float_str(v.as_float()),
-        // A nullable renders its value when present, else "null".
-        Type::Nullable(inner) => {
-            if v.is_null() {
-                "null".to_string()
-            } else {
-                format_value_at(program, v, inner, depth + 1)?
-            }
-        }
+        Type::Float(brass_hir::FloatKind::F32) => brass_utils::float32_str(v.as_float() as f32),
+        Type::Float(brass_hir::FloatKind::F64) => float_str(v.as_float()),
         Type::Slice(elem) | Type::Array(elem, _) => {
             let Value::Array(items) = v else {
                 return Ok("[]".to_string());
             };
-            let rendered: Vec<String> = items
-                .borrow()
-                .iter()
-                .map(|e| format_value_at(program, e, elem, depth + 1))
+            let len = items.borrow().len();
+            let rendered: Vec<String> = (0..len)
+                .map(|i| {
+                    let value = items.borrow().get(i).cloned().unwrap_or(Value::Void);
+                    format_value_at(program, &value, elem, RenderForm::Debug, depth + 1, call)
+                })
                 .collect::<Result<_, _>>()?;
             format!("[{}]", rendered.join(", "))
         }
@@ -68,13 +92,12 @@ fn format_value_at(
             let Value::Array(items) = v else {
                 return Ok("[]".to_string());
             };
-            let items = items.borrow();
             let rendered: Vec<String> = elems
                 .iter()
                 .enumerate()
                 .map(|(i, ety)| {
-                    let e = items.get(i).cloned().unwrap_or(Value::Void);
-                    format_value_at(program, &e, ety, depth + 1)
+                    let e = items.borrow().get(i).cloned().unwrap_or(Value::Void);
+                    format_value_at(program, &e, ety, RenderForm::Debug, depth + 1, call)
                 })
                 .collect::<Result<_, _>>()?;
             format!("[{}]", rendered.join(", "))
@@ -83,12 +106,12 @@ fn format_value_at(
             Value::Record(fields) => {
                 // An unavailable layout renders as the bare `T {}`, like the JIT.
                 let layout = brass_engine::render_record_fields(program, n).unwrap_or_default();
-                render_named_fields(program, record_header(n), &layout, &fields.borrow(), depth)?
+                render_named_fields(program, record_header(n), &layout, fields, depth, call)?
             }
             _ => n.name.clone(),
         },
         Type::Sum(n) => match v {
-            Value::Variant(var) => render_sum(program, n, var, depth)?,
+            Value::Variant(var) => render_sum(program, n, var, depth, call)?,
             _ => n.name.clone(),
         },
         // A value with no rendering of its own -- a function-valued field of
@@ -113,7 +136,7 @@ fn int_str(v: i64, k: IntKind) -> String {
     }
 }
 
-/// A float with the typed path's trailing-`.0` rule.
+/// A float64 with the typed path's trailing-`.0` rule.
 pub use brass_utils::float_str;
 
 /// The label a record renders under: its nominal name, or `anonymous` for a
@@ -133,29 +156,18 @@ fn render_named_fields(
     program: &Program,
     header: &str,
     fields: &[(String, Type)],
-    values: &fxhash::FxHashMap<String, Value>,
+    values: &std::cell::RefCell<fxhash::FxHashMap<String, Value>>,
     depth: usize,
+    call: &mut impl FnMut(&str, &Value) -> Result<String, String>,
 ) -> Result<String, String> {
     if fields.is_empty() {
         return Ok(format!("{header} {{}}"));
     }
     let mut out = format!("{header} {{\n");
     for (fname, fty) in fields {
-        let fv = values.get(fname).cloned().unwrap_or(Value::Void);
-        // A string-typed field value renders in its quoted, escaped debug form
-        // (a present nullable string too; `null` stays bare), so the struct
-        // output distinguishes the string "1" from the number 1 -- mirroring
-        // the JIT renderer.
-        let quoted = match fty {
-            Type::Str => true,
-            Type::Nullable(inner) if matches!(**inner, Type::Str) => !fv.is_null(),
-            _ => false,
-        };
-        let rendered = if quoted {
-            brass_utils::debug_quote(fv.as_str())
-        } else {
-            format_value_at(program, &fv, fty, depth + 1)?.replace('\n', "\n    ")
-        };
+        let fv = values.borrow().get(fname).cloned().unwrap_or(Value::Void);
+        let rendered = format_value_at(program, &fv, fty, RenderForm::Debug, depth + 1, call)?
+            .replace('\n', "\n    ");
         out.push_str(&format!("    {fname}: {rendered},\n"));
     }
     out.push('}');
@@ -170,6 +182,7 @@ fn render_sum(
     n: &NominalType,
     var: &VariantObj,
     depth: usize,
+    call: &mut impl FnMut(&str, &Value) -> Result<String, String>,
 ) -> Result<String, String> {
     let Some((_tag, fields)) = brass_engine::render_variant_fields(program, n, &var.variant) else {
         return Ok(n.name.clone());
@@ -178,6 +191,6 @@ fn render_sum(
     if fields.is_empty() {
         Ok(header)
     } else {
-        render_named_fields(program, &header, &fields, &var.fields.borrow(), depth)
+        render_named_fields(program, &header, &fields, &var.fields, depth, call)
     }
 }

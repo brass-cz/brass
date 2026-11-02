@@ -108,3 +108,18 @@ pub(super) fn discarded_call_borrows_alias(rv: &Rvalue, local_types: &[Type]) ->
             Rvalue::Call(_, args) if matches!(args.first(), Some(Operand::Local(_)))
         )
 }
+
+/// Managed locals owned by this invocation, in release order. Parameters and
+/// captures remain borrowed, and spawned closures belong to their worker.
+/// A return additionally excludes its moved-out operand from this sequence.
+pub fn return_owned_locals<'a>(f: &'a MonoFunction<'_>) -> impl Iterator<Item = LocalId> + 'a {
+    let spawn_moved = spawn_moved_locals(f);
+    f.local_types.iter().enumerate().filter_map(move |(i, ty)| {
+        let id = LocalId(i as u32);
+        (rc_managed(ty)
+            && !f.body.params.contains(&id)
+            && !f.captures.contains(&id)
+            && !spawn_moved.contains(&id))
+        .then_some(id)
+    })
+}

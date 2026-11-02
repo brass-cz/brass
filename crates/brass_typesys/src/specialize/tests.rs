@@ -7,6 +7,7 @@ use super::*;
 fn lower(src: &str) -> Program {
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         path: vec!["main".into()],
         ast,
         is_prelude: false,

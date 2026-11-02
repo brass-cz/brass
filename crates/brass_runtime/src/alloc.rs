@@ -638,6 +638,14 @@ pub extern "C-unwind" fn pp_float_to_str(v: f64) -> *mut Header {
     unsafe { pp_str_const(s.as_ptr(), s.len() as i64) }
 }
 
+/// Render a float32 in its shortest round-trip form. The ABI carries it widened
+/// exactly to f64; converting back recovers the source value before formatting.
+pub extern "C-unwind" fn pp_float32_to_str(v: f64) -> *mut Header {
+    let s = brass_utils::float32_str(v as f32);
+    // The pointer/length come from a live local String, so they are valid.
+    unsafe { pp_str_const(s.as_ptr(), s.len() as i64) }
+}
+
 /// Write a string's bytes to stdout (typed `print`).
 ///
 /// # Safety

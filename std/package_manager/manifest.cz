@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 import std.data.toml.TomlValue
 import std.path.Path
 import std.regex.Regex

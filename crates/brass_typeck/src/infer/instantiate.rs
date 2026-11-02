@@ -14,7 +14,7 @@ mod methods;
 mod observed;
 
 /// How deep the re-elaboration of callee bodies at call sites may nest. Each
-/// level is a distinct callable (a repeat is already caught as recursion), so a
+/// level is a distinct callable or reflected instance, so a
 /// real program's chain is short; this only bounds a pathological one.
 const MAX_ELABORATION_DEPTH: usize = 64;
 
@@ -43,7 +43,7 @@ struct FunctionCall<'a> {
 
 impl<'a> Checker<'a> {
     /// Whether another callee body may be re-elaborated: recursion is guarded per
-    /// callable by `instantiating`, but a call graph can still expand faster than
+    /// callable (or reflected instance) by `instantiating`, but calls can expand faster than
     /// it converges. Rather than hang, stop re-elaborating (call sites fall back
     /// to declared/precomputed returns) and report it once.
     ///
@@ -134,6 +134,19 @@ impl<'a> Checker<'a> {
             self.record_numeric_call(span, numeric_layout.clone(), self.current_instance());
         }
         let key = format!("fn:{symbol}");
+        let key = if self.instantiating.contains(&key) {
+            let Some(key) = self.fields_recursion_key(
+                key,
+                &brass_hir::InstanceCallable::Function(symbol.to_owned()),
+                body.span,
+                arg_types,
+            ) else {
+                return fallback_ret;
+            };
+            key
+        } else {
+            key
+        };
         // Co-check effects share the ordinary journal under a distinct flavor.
         // Type-test probes commit hole bindings, and recursion must read the
         // shared fallback instead of consulting or populating the body memo.
@@ -269,6 +282,7 @@ impl<'a> Checker<'a> {
             };
         }
         if !self.elaboration_allowed(symbol, span) {
+            self.report_incomplete_fields(body.span);
             self.instantiating.remove(&key);
             return fallback_ret;
         }

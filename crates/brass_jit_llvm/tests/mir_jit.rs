@@ -73,6 +73,7 @@ fn engine_jits_unboxed_typed_instances() {
 
     let ast = brass_parser::parse(SRC).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -129,6 +130,7 @@ fun use_flt() {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -189,6 +191,7 @@ fun fdemo() {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -253,6 +256,7 @@ fun demo_mutate() {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -302,6 +306,7 @@ fun rect_area() {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -351,6 +356,7 @@ fun nested_field() {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -394,6 +400,7 @@ fun text_len() {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -442,6 +449,7 @@ fun eq_len() {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -496,6 +504,7 @@ fun sum_loop() {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -551,6 +560,7 @@ fun count_built() {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -606,6 +616,7 @@ fun pop_empty_is_null() -> int32 {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -663,6 +674,7 @@ fun rendered_len() -> int64 {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -708,6 +720,7 @@ fun adder() {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -754,6 +767,7 @@ fun via_run() {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -792,6 +806,7 @@ fun main() {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -854,6 +869,7 @@ fun unwrap_or_zero() -> int32 {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -908,6 +924,7 @@ fun err_val() {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -967,6 +984,7 @@ fun err_case() {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1019,6 +1037,7 @@ fun byte_overflow() {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1085,6 +1104,7 @@ fun result() -> int32 {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1125,6 +1145,7 @@ fun scaled() {
 ";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1165,6 +1186,7 @@ fn sync_makes_spawned_results_observable() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1198,6 +1220,7 @@ fn rc_reclaims_string_temporaries() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1237,6 +1260,7 @@ fn rc_reclaims_loop_string_temporaries() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1276,6 +1300,7 @@ fn rc_balances_string_interpolation() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1322,6 +1347,7 @@ fn rc_reclaims_record_temporaries() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1358,6 +1384,7 @@ fn rc_recursive_destructor_releases_record_fields() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1398,6 +1425,7 @@ fn rc_reclaims_array_and_sum() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1446,6 +1474,7 @@ fn rc_releases_overwritten_field_element_and_global() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1483,6 +1512,7 @@ fn rc_recursive_array_releases_string_elements() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1519,6 +1549,7 @@ fn rc_recursive_sum_releases_variant_fields() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1556,6 +1587,7 @@ fn rc_reclaims_spawned_closures() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1593,6 +1625,7 @@ fn rc_spawned_closure_releases_heap_capture() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1628,6 +1661,7 @@ fn array_renders_as_bracketed_list() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1661,6 +1695,7 @@ fn trailing_nullable_param_is_optional() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1695,6 +1730,7 @@ fn captured_mutated_local_is_a_shared_cell() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1727,6 +1763,7 @@ fn cycle_collector_reclaims_record_cycle() {
                }\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1760,6 +1797,7 @@ fn cycle_collector_reclaims_two_node_cycle() {
                }\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1793,6 +1831,7 @@ fn cycle_collector_reclaims_data_owned_by_cycle() {
                }\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1829,6 +1868,7 @@ fn full_width_numbers_render() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1854,6 +1894,7 @@ fn rc_recursive_tuple_releases_managed_elements() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1886,6 +1927,7 @@ fn aggregate_rendering_releases_intermediate_strings() {
                fun main() {\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1921,6 +1963,7 @@ fn cycle_collector_reclaims_sum_cycle() {
                }\n";
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -1938,4 +1981,48 @@ fn cycle_collector_reclaims_sum_cycle() {
         before,
         "the recursive sum is reclaimed"
     );
+}
+
+/// Every multi-exit path balances managed temporaries, including a moved local
+/// and a borrowed parameter returned through a caller that owns its reference.
+#[test]
+fn rc_shared_cleanup_balances_all_return_paths() {
+    let _guard = JIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let source = r#"
+fun choose(input: string, n: int32) -> string {
+    let a = string.from(n)
+    let b = a + input
+    if n == 0 { return input }
+    if n == 1 { return a }
+    return b
+}
+fun work() -> int32 {
+    let source = string.from(123)
+    let a = choose(source, 0)
+    let b = choose(source, 1)
+    let c = choose(source, 2)
+    return 7
+}
+fun main() {}
+"#;
+    let (program, errors) = lower(&[LoadedModule {
+        source: None,
+        is_prelude: false,
+        path: vec!["main".into()],
+        ast: brass_parser::parse(source).unwrap(),
+    }]);
+    assert!(errors.is_empty());
+    let mir = lower_program(&program);
+    let mono = monomorphize(&mir, &program).unwrap();
+    brass_jit_llvm::disable_jit_cache();
+    let ctx = Context::create();
+    let mut backend = LlvmCodegen::new_backend(&ctx, &program);
+    Engine::run(&mut backend, &mono).unwrap();
+    // Prime interned literals, then require a stable heap across every exit.
+    assert_eq!(backend.run_entry_i32("work"), Some(7));
+    let before = brass_runtime::mem::pp_live_blocks();
+    for _ in 0..20 {
+        assert_eq!(backend.run_entry_i32("work"), Some(7));
+        assert_eq!(brass_runtime::mem::pp_live_blocks(), before);
+    }
 }

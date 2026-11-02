@@ -82,9 +82,9 @@ impl BodyBuilder {
     }
 
     /// Allocate the unnamed result local of the expression at `site`, whose
-    /// type the checker may seed: `shared` is the seed every instance of the
-    /// body agrees on (a `Known` local), and the site lets monomorphization
-    /// look up a per-instance seed when the instances disagree (see
+    /// type the checker may seed: `shared` is the seed observed instances
+    /// agree on (a `Known` local), and the site lets monomorphization look up
+    /// the authoritative exact-instance seed (see
     /// [`LocalDecl::seed_site`]).
     pub fn fresh_seeded_local(
         &mut self,

@@ -1,0 +1,11 @@
+// @backends: all
+import std.collections.HashMap
+
+fun main() {
+    let child: HashMap { key: string, value: int32 } = HashMap.new()
+    child.set("a", 2)
+    let m: HashMap { key: string, value: HashMap { key: string, value: int32 } } = HashMap.new()
+    m.set("child", child)
+    let v = m
+    println(v.debug())
+}

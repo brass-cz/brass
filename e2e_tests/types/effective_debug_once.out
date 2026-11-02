@@ -1,0 +1,10 @@
+debug 7
+[value(7)]
+debug 7
+Holder {
+    value: value(7),
+}
+debug 7
+[value(7)]
+debug 7
+[value(7)]

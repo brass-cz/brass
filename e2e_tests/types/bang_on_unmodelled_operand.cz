@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // @backends: all
 // `!` on an operand whose kind the source does not spell out (a builtin
 // container's `get`, an unannotated parameter) takes the operand's checked

@@ -192,6 +192,7 @@ fn actual_error_leaf_preserves_both_payload_instances() {
     )))
     .unwrap();
     let (p, errors) = brass_hir::lower(&[LoadedModule {
+        source: None,
         is_prelude: true,
         path: vec!["error".into()],
         ast,

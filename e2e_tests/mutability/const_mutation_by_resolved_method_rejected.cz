@@ -1,18 +1,26 @@
+import std.collections.{ HashMap }
+
 // Mutating a const value through a method is rejected whatever produced the
 // const -- an unannotated constructor call, an alias of a mutable value, an
-// identity call, the prelude's `HashMap.new()` -- and through a `let` alias:
+// identity call, an imported `HashMap.new()` -- and through a `let` alias:
 // the verdict is read from the method the call resolves to (it writes through
 // its receiver, or through the argument the const is passed in), not from a
 // type spelled in the source.
-type V = { x: int32 }
+type V = {
+    x: int32
+}
 
 fun V.bump(self) {
     self.x += 1
 }
 
-type P = { x: int32 }
+type P = {
+    x: int32
+}
 
-type Sink = { total: int32 }
+type Sink = {
+    total: int32
+}
 
 fun Sink.absorb(self, p: ref(mut(P))) {
     p.x = 0

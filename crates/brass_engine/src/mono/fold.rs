@@ -13,7 +13,12 @@ use super::*;
 /// joins an instance's returns and infers its `Result` payloads over the
 /// reachable blocks only, so a dead arm's returns and `error(..)` sites do not
 /// shape the instance.
-pub fn reachable_blocks(program: &Program, body: &MirBody, local_types: &[Type]) -> Vec<bool> {
+pub fn reachable_blocks(
+    program: &Program,
+    body: &MirBody,
+    local_types: &[Type],
+    fields: &HashMap<brass_parser::Span, Vec<String>>,
+) -> Vec<bool> {
     let mut reached = vec![false; body.blocks.len()];
     let mut stack = vec![body.entry];
     while let Some(id) = stack.pop() {
@@ -23,7 +28,7 @@ pub fn reachable_blocks(program: &Program, body: &MirBody, local_types: &[Type])
         match &body.block(id).term {
             Terminator::Goto(b) => stack.push(*b),
             Terminator::CondBranch { cond, then, els } => {
-                match cond_static_truthiness(program, body, local_types, cond) {
+                match cond_static_truthiness(program, body, local_types, cond, fields) {
                     Some(true) => stack.push(*then),
                     Some(false) => stack.push(*els),
                     None => {
@@ -68,7 +73,11 @@ pub fn cond_static_truthiness(
     body: &MirBody,
     local_types: &[Type],
     cond: &Operand,
+    fields: &HashMap<brass_parser::Span, Vec<String>>,
 ) -> Option<bool> {
+    if let Some(selected) = fields_test_of(body, cond, fields) {
+        return Some(selected);
+    }
     // An `if let x = e` presence test folds on the *subject's* nullability, not
     // its truthiness: any non-nullable subject -- including a bool -- is an
     // irrefutable bind (always then), a bare `null` is always absent, and only
@@ -193,7 +202,8 @@ fn variant_uninhabited(program: &Program, ty: &Type, variant: &str) -> bool {
     })
 }
 
-/// The blocks an instance reaches once its TYPE TESTS are folded against the
+/// The blocks an instance reaches after selecting its checked field expansions
+/// and folding its TYPE TESTS against the
 /// seeded (parameter/annotation) types -- before the type fixpoint has run.
 /// Only a test whose subject is already fully known decides; every other
 /// condition conservatively keeps both successors. Monomorphization uses this
@@ -205,6 +215,7 @@ pub fn type_test_live_blocks(
     program: &Program,
     body: &MirBody,
     seeded: &[Option<Type>],
+    fields: &HashMap<brass_parser::Span, Vec<String>>,
 ) -> Vec<bool> {
     let mut reached = vec![false; body.blocks.len()];
     let mut stack = vec![body.entry];
@@ -215,13 +226,15 @@ pub fn type_test_live_blocks(
         match &body.block(id).term {
             Terminator::Goto(b) => stack.push(*b),
             Terminator::CondBranch { cond, then, els } => {
-                let decided = type_test_of(body, cond).and_then(|(subj, pattern)| {
-                    let ty = match subj {
-                        Operand::Local(l) => seeded.get(l.index())?.clone()?,
-                        Operand::Const(_) => return None,
-                    };
-                    brass_hir::is_fully_known(&ty)
-                        .then(|| brass_typesys::type_test_accepts(program, pattern, &ty))
+                let decided = fields_test_of(body, cond, fields).or_else(|| {
+                    type_test_of(body, cond).and_then(|(subj, pattern)| {
+                        let ty = match subj {
+                            Operand::Local(l) => seeded.get(l.index())?.clone()?,
+                            Operand::Const(_) => return None,
+                        };
+                        brass_hir::is_fully_known(&ty)
+                            .then(|| brass_typesys::type_test_accepts(program, pattern, &ty))
+                    })
                 });
                 match decided {
                     Some(true) => stack.push(*then),
@@ -310,4 +323,31 @@ fn presence_subject_type<'t>(
         }
     }
     None
+}
+
+/// The checker-selected truth of a field-list guard. An absent observation leaves
+/// it undecided; monomorphization rejects a live guard without a selection.
+fn fields_test_of(
+    body: &MirBody,
+    cond: &Operand,
+    selected: &HashMap<brass_parser::Span, Vec<String>>,
+) -> Option<bool> {
+    if selected.is_empty() {
+        return None;
+    }
+    let Operand::Local(id) = cond else {
+        return None;
+    };
+    body.blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| {
+            if let MirStmt::Assign(dest, Rvalue::FieldsTest { site, fields }) = stmt
+                && dest == id
+            {
+                selected.get(site).map(|names| names == fields)
+            } else {
+                None
+            }
+        })
 }

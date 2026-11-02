@@ -1,0 +1,33 @@
+null
+[true,2,"text"]
+false
+"line\n\"quoted\"\\end"
+-8
+-16
+32
+64
+8
+16
+32
+64
+1.5
+2.5
+9007199254740992
+null
+null
+7
+{"missing":null,"child":{"label":"nested"},"enabled":true}
+{"label":"second shape"}
+{"count":4}
+{"to_json":"ordinary field"}
+"hook"
+true
+"nullable hook"
+[{"label":"a"},{"label":"b"}]
+[null,{"label":"c"}]
+[[1,2],[3]]
+[true,false]
+[]
+{}
+{"present":9,"absent":null}
+{"inner":{"children":[{"label":"map child"}]}}

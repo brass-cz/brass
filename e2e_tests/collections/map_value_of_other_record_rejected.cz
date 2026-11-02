@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // A map's key and value types are pinned by the map instance, and `set`
 // stores its arguments in the map's own slots: they are storage, not
 // parameters instantiated at the argument's type. A record of another type

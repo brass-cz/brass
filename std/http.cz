@@ -917,3 +917,10 @@ fun _fetch_uri(uri: URI) {
     let url_str = uri.to_string()
     error("URL has no authority: {url_str}")!
 }
+
+/** Render `HttpClient { host: "...", port: n }` from stored endpoint values;
+ * the connector closure is omitted, and no connection is opened.
+ */
+fun HttpClient.debug(self) -> string {
+    return "HttpClient \{ host: {self.host.debug()}, port: {self.port} }"
+}

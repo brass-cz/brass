@@ -1,2 +1,2 @@
 7
-err: [e2e_tests/types/static_method_prop_infers_fallible.cz:10:16] unhandled error: bad id
+err: [e2e_tests/types/static_method_prop_infers_fallible.cz:10:16] error: bad id

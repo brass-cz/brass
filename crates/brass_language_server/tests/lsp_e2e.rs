@@ -375,3 +375,82 @@ fn published_diagnostics(messages: &[Value]) -> Option<Vec<Value>> {
         .find(|m| m["method"] == json!("textDocument/publishDiagnostics"))
         .and_then(|m| m["params"]["diagnostics"].as_array().cloned())
 }
+
+#[test]
+fn opened_dependency_roots_do_not_leak_into_importers() {
+    // Exercise open/close ownership through the transport, not only DocAnalyzer.
+    let root = std::env::temp_dir().join(format!("czls-selected-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let library = "fun good() { return 7 }\nfun bad() -> int32 { return false }";
+    std::fs::write(root.join("lib.cz"), library).unwrap();
+    let main_uri = format!("file://{}", root.join("main.cz").display());
+    let lib_uri = format!("file://{}", root.join("lib.cz").display());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_czls"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut seen = Vec::new();
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"rootUri":null}}),
+        );
+        read_until(&mut reader, &mut seen, 1);
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+        );
+        let open = |uri: &str, text: &str| json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"brass","version":1,"text":text}}});
+        send(
+            &mut stdin,
+            &open(&main_uri, "import lib.{ good }\nlet x = good()"),
+        );
+        let importer = next_diagnostics(&mut reader, &mut seen);
+        send(&mut stdin, &open(&lib_uri, library));
+        let opened = next_diagnostics(&mut reader, &mut seen);
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":lib_uri}}}),
+        );
+        let closed = next_diagnostics(&mut reader, &mut seen);
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":main_uri}}}),
+        );
+        let saved = next_diagnostics(&mut reader, &mut seen);
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","id":9,"method":"shutdown","params":{}}),
+        );
+        read_until(&mut reader, &mut seen, 9);
+        send(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","method":"exit","params":{}}),
+        );
+        let _ = tx.send((importer, opened, closed, saved));
+    });
+    let result = rx.recv_timeout(Duration::from_secs(30));
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(root);
+    let (importer, opened, closed, saved) =
+        result.expect("selected-document conversation completed");
+    assert!(importer.is_empty(), "{importer:?}");
+    assert!(!opened.is_empty(), "opening checks the unused own body");
+    assert!(
+        closed.is_empty(),
+        "closing clears its published diagnostics"
+    );
+    assert!(
+        saved.is_empty(),
+        "opening another buffer does not widen this selection"
+    );
+}

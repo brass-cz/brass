@@ -43,7 +43,7 @@ impl Monomorphizer<'_, '_> {
             Rvalue::TypeName(_) => Ok(Some(Type::Str)),
             // A type test: always a bool; the answer is folded per instance
             // from the operand's monomorphized type (see `fold`).
-            Rvalue::TypeTest(..) => Ok(Some(Type::Bool)),
+            Rvalue::TypeTest(..) | Rvalue::FieldsTest { .. } => Ok(Some(Type::Bool)),
             Rvalue::Bin(op, a, b) => {
                 if is_comparison(*op) || matches!(op, BinOp::And | BinOp::Or) {
                     Ok(Some(Type::Bool))
@@ -231,32 +231,17 @@ impl Monomorphizer<'_, '_> {
                 ))),
                 "_argv" => Ok(Some(Type::Slice(Box::new(Type::Str)))),
                 "_flush" => Ok(Some(Type::Void)),
-                // `to_string` only has a typed conversion for scalars/strings;
-                // other arguments fall back so formatting stays correct.
-                // A value whose type declares a USER `display` method renders
-                // through it instead (`"{v}"` prefers `display` over the
-                // built-in `debug` rendering); the instance is created here so
-                // the back ends can route the call to it.
+                // Prepare implicit nominal renderers before either back end emits them.
                 "to_string" => match args.first() {
                     Some(op) => match self.operand_type(op, local_types)? {
-                        Some(t) if self.display_method_declared(&t) => {
-                            match self.method_call_type(
-                                "display",
-                                args,
+                        Some(t) if is_printable(&t) => Ok(self
+                            .prepare_rendering(
+                                &t,
+                                crate::render::RenderForm::Display,
                                 cur_sym,
                                 cur_ret,
-                                local_types,
-                            )? {
-                                None => Ok(None),
-                                Some(Type::Str) => Ok(Some(Type::Str)),
-                                Some(other) => Err(format!(
-                                    "`display` on `{}` must return `string`, found `{}`",
-                                    t.display(),
-                                    other.display()
-                                )),
-                            }
-                        }
-                        Some(t) if is_printable(&t) => Ok(Some(Type::Str)),
+                            )?
+                            .then_some(Type::Str)),
                         Some(t) => Err(format!(
                             "to_string of `{}` is unsupported on the typed backend",
                             t.display()
@@ -483,21 +468,9 @@ impl Monomorphizer<'_, '_> {
         match args.first() {
             None => Ok(Some(Type::Void)),
             Some(op) => match self.operand_type(op, local_types)? {
-                // `print`/`println` render like a `"{v}"` segment: a USER
-                // `display` method wins. Instantiate it here so the back ends
-                // can route the conversion to it.
-                Some(t) if self.display_method_declared(&t) => {
-                    match self.method_call_type("display", args, cur_sym, cur_ret, local_types)? {
-                        None => Ok(None),
-                        Some(Type::Str) => Ok(Some(Type::Void)),
-                        Some(other) => Err(format!(
-                            "`display` on `{}` must return `string`, found `{}`",
-                            t.display(),
-                            other.display()
-                        )),
-                    }
-                }
-                Some(t) if is_printable(&t) => Ok(Some(Type::Void)),
+                Some(t) if is_printable(&t) => Ok(self
+                    .prepare_rendering(&t, crate::render::RenderForm::Display, cur_sym, cur_ret)?
+                    .then_some(Type::Void)),
                 Some(t) => Err(format!(
                     "print of `{}` is unsupported on the typed backend",
                     t.display()
@@ -505,23 +478,6 @@ impl Monomorphizer<'_, '_> {
                 None => Ok(None),
             },
         }
-    }
-
-    /// Whether `t` is a nominal whose declaration carries a USER `display`
-    /// method -- the `Display` protocol -- or a nullable of one. `"{v}"`
-    /// interpolation and `print`/`println` prefer it over the built-in `debug`
-    /// rendering; a nullable renders `null` when absent and through the inner
-    /// type's `display` when present, so its instance is created for the
-    /// inner type too.
-    fn display_method_declared(&self, t: &Type) -> bool {
-        let (Type::Record(n) | Type::Sum(n)) = unwrap_nullable(t) else {
-            return false;
-        };
-        let Some(info) = self.program.type_by_id(n.id) else {
-            return false;
-        };
-        self.by_method
-            .contains_key(&(info.symbol.as_str(), "display"))
     }
 
     /// Concrete types of every argument operand, or `None` if one is not yet

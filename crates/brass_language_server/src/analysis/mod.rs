@@ -3,11 +3,12 @@
 //!
 //! Type diagnostics run on every open and save, so they run incrementally: only
 //! the changed items and their users are re-checked (see [`items`]), against a
-//! module graph reduced to the affected items plus the definitions they depend
-//! on. Hover and go-to-definition need type information for the whole document,
+//! module graph reduced to affected items for core-only buffers. Imported graphs
+//! retain all own roots and recompute reachability when the buffer changes. Hover and go-to-definition need type information for the whole document,
 //! so they request a whole-program analysis when the feature needs it.
 
 pub mod items;
+mod selection;
 pub mod world;
 
 use fxhash::FxHashSet as HashSet;
@@ -21,40 +22,6 @@ use brass_parser::ast::{Module, TopLevel};
 
 use items::{Diag, DiagSeverity, Item, ItemCache, ItemKind};
 use world::SourceMap;
-
-/// The context seeds this server session has built, keyed by
-/// [`context_fingerprint`]: the inference tables of everything except the
-/// active document, reused so a full check re-infers only the document. A
-/// context is the prelude plus a project's dependencies, so there are few.
-/// Nothing is persisted; a new server process starts empty.
-static CONTEXT_SEEDS: std::sync::OnceLock<
-    std::sync::Mutex<fxhash::FxHashMap<u64, std::sync::Arc<brass_typeck::ContextTables>>>,
-> = std::sync::OnceLock::new();
-
-/// The context seed for `world`: from this process's memory, else built from a
-/// context-only run. `None` when the context itself has diagnostics; the
-/// unseeded pipeline then reports them as before.
-fn context_seed_for(world: &world::World) -> Option<std::sync::Arc<brass_typeck::ContextTables>> {
-    let key = context_fingerprint(world);
-    let seeds = CONTEXT_SEEDS.get_or_init(Default::default);
-    if let Some(seed) = seeds.lock().ok()?.get(&key) {
-        return Some(seed.clone());
-    }
-    // The qualified-use rewrite is per-module (a module's own imports and
-    // aliases), so applying it to the context alone yields exactly the ASTs
-    // the combined pipeline lowers.
-    let mut ctx = world.context_modules.to_vec();
-    if !brass_resolve::resolve_qualified_uses(&mut ctx).is_empty() {
-        return None;
-    }
-    let (ctx_program, errors) = lower(&ctx);
-    if !errors.is_empty() {
-        return None;
-    }
-    let seed = std::sync::Arc::new(brass_typeck::context_seed(&ctx_program)?);
-    seeds.lock().ok()?.insert(key, seed.clone());
-    Some(seed)
-}
 
 /// A full analysis of one document version, used by hover and go-to-definition.
 /// Carries the span map so a definition target in another file can be located.
@@ -160,16 +127,13 @@ impl DocAnalyzer {
         // Run the front end on the reduced module graph (the whole document on a
         // from-scratch check). Its diagnostics are authoritative for the
         // affected items and for anything outside the document's items.
-        let main_for_run = if d.full {
+        let main_for_run = if d.full || world.has_dependencies() {
             world.main_ast.clone()
         } else {
             reduce_main(&world.main_ast, &new_items, &d.reduced)
         };
-        let (_program, _typed, _schemes, _returns, _method_returns, run_diags) = run_pipeline(
-            &world.context_modules,
-            main_for_run,
-            context_seed_for(&world),
-        );
+        let (_program, _typed, _schemes, _returns, _method_returns, run_diags) =
+            run_pipeline(&world, main_for_run);
 
         // Attribute this run's diagnostics to the items they fall in; the rest
         // (dependency-module errors) become the refreshed global bucket.
@@ -204,12 +168,6 @@ impl DocAnalyzer {
             out.extend(item.diags.iter().cloned());
         }
         out.extend(global);
-        out.extend(
-            world
-                .load_errors
-                .into_iter()
-                .map(|(message, span)| (message, span, DiagSeverity::Error)),
-        );
         render_secondary_locations(&mut out, &world.sources);
         localize(out, world.main_base, text.len())
     }
@@ -223,7 +181,7 @@ impl DocAnalyzer {
         let world = world::build(&self.path, text);
         let main = world.main_ast.clone();
         let (program, typed, schemes, function_returns, method_returns, _diags) =
-            run_pipeline(&world.context_modules, main, context_seed_for(&world));
+            run_pipeline(&world, main);
         FullAnalysis {
             program,
             typed,
@@ -255,9 +213,11 @@ fn import_fingerprint(module: &Module) -> u64 {
 }
 
 /// Hash the loaded context's identities and source bytes: the context's
-/// identity for both the incremental item diff and [`CONTEXT_SEEDS`]. Source
-/// offsets are intentionally excluded because an active-buffer length change
-/// can move bases without changing any dependency.
+/// identity for incremental diagnostics and context seeds. A dependency graph
+/// also includes the active source: an edit can change selection or negative
+/// member facts without changing any imported bytes. This conservatively forces
+/// a whole-buffer diagnostic refresh for such edits. Core-only buffers keep the
+/// item-level diff. Seeds additionally compare the exact selected request.
 fn context_fingerprint(world: &world::World) -> u64 {
     let mut hash = DefaultHasher::new();
     world
@@ -269,6 +229,24 @@ fn context_fingerprint(world: &world::World) -> u64 {
         .entries()
         .filter(|(base, _)| *base != world.main_base)
         .for_each(|(_, source)| source.hash(&mut hash));
+    for module in &world.context_modules {
+        if let Some(source) = &module.source {
+            source.location.hash(&mut hash);
+        }
+    }
+    if world.has_dependencies() {
+        world
+            .main_source
+            .as_ref()
+            .map(|s| &s.location)
+            .hash(&mut hash);
+        world
+            .sources
+            .entries()
+            .find(|(base, _)| *base == world.main_base)
+            .map(|(_, source)| source)
+            .hash(&mut hash);
+    }
     hash.finish()
 }
 
@@ -277,9 +255,8 @@ fn context_fingerprint(world: &world::World) -> u64 {
 /// typed-expression sidecar, and all diagnostics as `(message, global span)`.
 #[allow(clippy::type_complexity)]
 fn run_pipeline(
-    context: &[LoadedModule],
+    world: &world::World,
     main: Module,
-    seed: Option<std::sync::Arc<brass_typeck::ContextTables>>,
 ) -> (
     Program,
     TypedProgram,
@@ -288,8 +265,9 @@ fn run_pipeline(
     fxhash::FxHashMap<(String, String), brass_hir::Type>,
     Vec<Diag>,
 ) {
-    let mut modules = context.to_vec();
+    let mut modules = world.context_modules.clone();
     modules.push(LoadedModule {
+        source: world.main_source.clone(),
         is_prelude: false,
         path: vec!["main".into()],
         ast: main,
@@ -301,17 +279,50 @@ fn run_pipeline(
     let qualified_errors = brass_resolve::resolve_qualified_uses(&mut modules);
 
     let (program, lower_errors) = lower(&modules);
+    let view = selection::view(&program, world);
+    let owners = view
+        .as_ref()
+        .map(|_| brass_typeck::reachability::DiagnosticOwners::new(&program));
+    let reports = |span| {
+        view.as_ref().is_none_or(|view| {
+            view.reports(
+                &owners
+                    .as_ref()
+                    .expect("selected ownership")
+                    .body_owner(span),
+            )
+        })
+    };
+    let seed = selection::context_seed(world, view.as_ref());
     let mut diags: Vec<Diag> = Vec::new();
-    for e in qualified_errors {
+    for e in qualified_errors.into_iter().filter(|e| reports(e.span)) {
         diags.push((e.message, e.span, DiagSeverity::Error));
     }
-    for e in lower_errors {
+    for e in lower_errors.into_iter().filter(|e| reports(e.span)) {
         diags.push((e.message, e.span, DiagSeverity::Error));
     }
     for e in brass_resolve::check_imports(&modules) {
         diags.push((e.message, e.span, DiagSeverity::Error));
     }
-    let analysis = brass_typeck::analyze_with(&program, seed.as_deref());
+    for (message, span) in &world.load_errors {
+        let report = view.as_ref().is_none_or(|view| {
+            !message.starts_with("syntax error:")
+                || world.sources.locate(span.lo).is_none_or(|p| {
+                    view.reports(&owners.as_ref().expect("selected ownership").syntax_owner(
+                        *span,
+                        p.src,
+                        span.lo - p.local,
+                    ))
+                })
+        });
+        if report {
+            diags.push((message.clone(), *span, DiagSeverity::Error));
+        }
+    }
+    let analysis = match &view {
+        Some(view) => brass_typeck::analyze_selected(&program, seed.as_deref(), view),
+        None => brass_typeck::analyze_with(&program, seed.as_deref()),
+    };
     for e in &analysis.errors {
         diags.push((e.message.clone(), e.span, DiagSeverity::Error));
     }

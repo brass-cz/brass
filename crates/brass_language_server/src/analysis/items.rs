@@ -73,7 +73,8 @@ pub struct ItemCache {
     /// top-level item spans, so item hashes alone cannot notice their edits.
     pub import_fingerprint: u64,
     /// Hash of every source that supplies the active module's analysis
-    /// context. A dependency edit can change an unchanged item's meaning.
+    /// context and, for selected graphs, the active buffer. Any selection-input
+    /// edit invalidates all carried diagnostics, including negative member facts.
     pub context_fingerprint: u64,
 }
 

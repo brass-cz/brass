@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // TOML: a value tree, a recursive-descent parser, accessors, a serializer, and a
 // reflective decoder into typed structures. A library (pure Brass, no plugin) --
 // import it explicitly:
@@ -1530,4 +1532,70 @@ fun _encode_utf8(cp: int64) -> string! {
         bytes.push(_u8(128 + cp % 64))
     }
     return _bytes_to_string(bytes)!
+}
+
+/**
+ * Render content without storage fields: quoted strings, decimal integers,
+ * floats with their float spelling, booleans, and unquoted date/time text.
+ * Tables use four-space-indented quoted keys; empty tables are `{}`. Arrays
+ * stay inline if every child is one line, otherwise one indented child per line.
+ */
+fun TomlValue.debug(self) -> string {
+    return _debug_toml(self)
+}
+
+/** Render the same content text as `debug` for print and interpolation. */
+fun TomlValue.display(self) -> string {
+    return _debug_toml(self)
+}
+
+// One recursive traversal owns the scalar and container text for both forms.
+fun _debug_toml(value: TomlValue) -> string {
+    match value {
+        TomlValue.String { value } => {
+            return value.debug()
+        },
+        TomlValue.Integer { value } => {
+            return "{value}"
+        },
+        TomlValue.Float { value } => {
+            return "{value}"
+        },
+        TomlValue.Bool { value } => {
+            return "{value}"
+        },
+        TomlValue.Datetime { value } => {
+            return value
+        },
+        TomlValue.Array { value } => {
+            let items: string[] = []
+            let multiline = false
+            for child in value {
+                let text = _debug_toml(child)
+                if text.find("\n") != null {
+                    multiline = true
+                }
+                items.push(text)
+            }
+            if !multiline {
+                return "[{items.join(", ")}]"
+            }
+            let lines: string[] = []
+            for text in items {
+                lines.push("    " + text.replace("\n", "\n    "))
+            }
+            return "[\n{lines.join(",\n")}\n]"
+        },
+        TomlValue.Table { values } => {
+            if values.is_empty() {
+                return "\{}"
+            }
+            let lines: string[] = []
+            for [key, child] in values.pairs() {
+                let text = _debug_toml(child).replace("\n", "\n    ")
+                lines.push("    {key.debug()}: {text}")
+            }
+            return "\{\n{lines.join(",\n")}\n}"
+        },
+    }
 }

@@ -4,8 +4,10 @@ description: "What a run pays at start-up, how compiled code runs, and when --ea
 ---
 
 The default command is tuned for short edit-run cycles. Start with
-`brass app.cz`; use `brass check` when you need a complete check, and add
-`--eager` when every diagnostic must be reported before the program starts.
+`brass app.cz`; use `brass check` to check own code completely, and add
+`--eager` when selected diagnostics must be reported before the program starts.
+All modes check dependency bodies only where reached or needed for shared
+inference; importing a declaration does not by itself require its body.
 
 ## What a run pays at start-up
 
@@ -13,7 +15,7 @@ The default command is tuned for short edit-run cycles. Start with
 
 - Each function is checked before it can execute. Unused functions do not
   delay the current run, so a successful run is only a verdict on the code it
-  needed. Use `brass check` to check every function.
+  needed. Use `brass check` to check every own function.
 - Native code is compiled when it is needed. Code behind an untaken branch
   may never be compiled during that run.
 - Checking is never cached: each run checks what it needs from source. Native
@@ -25,8 +27,8 @@ These details normally require no tuning. The practical commands are:
 
 ```bash
 brass app.cz          # run with low start-up latency
-brass check app.cz    # check the complete program without running it
-brass --eager app.cz  # check the complete program, then run
+brass check app.cz    # check own code + reached dependencies
+brass --eager app.cz  # check own code + reached dependencies, then run
 ```
 
 ## When to use `--eager`
@@ -35,15 +37,15 @@ brass --eager app.cz  # check the complete program, then run
 brass --eager app.cz
 ```
 
-`--eager` finishes the whole-program check before execution begins. Native
+`--eager` finishes checking own code and reached dependencies before execution begins. Native
 compilation is unchanged -- both commands optimize and translate functions on
-first use -- so the flag buys a complete verdict up front, not different
+first use -- so the flag buys the selected verdict up front, not different
 generated code, at the cost of checking code the run may never need.
 
 Reach for it when:
 
 - you want a complete check and the run in one command;
-- every diagnostic must appear before the program produces output or side
+- every selected diagnostic must appear before the program produces output or side
   effects (a default run stops at an error in code it reaches, which can be
   after earlier output);
 - you are diagnosing a difference between a default run and `brass check`.

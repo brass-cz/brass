@@ -3,6 +3,14 @@ title: "Types and methods"
 description: "Records, methods, sum types, interfaces, and structural subtyping by example."
 ---
 
+Use `brass check program.cz` to check every item in your own code, including
+unused functions and methods. Dependency bodies are checked only where
+reached or needed for shared inference; an unused library body does not
+produce diagnostics. This also applies to recoverable syntax errors inside
+such a body, but a broken declaration boundary remains an error. See the
+[execution model](/references/execution/#complete-checking-and-compilation)
+for package ownership and the reporting rules in each mode.
+
 ## Record types
 
 New types are defined with their fields:
@@ -153,9 +161,10 @@ fun main() {
 Annotating the binding `let s: Names` pins `item` to `string` before anything
 is stored, and `greet` accepts any stack whose `item` is `string`: the alias
 unifies with a matching instance instead of demanding a distinct nominal
-type. The prelude's `HashMap` is built exactly this way — `key` and `value`
+type. `HashMap` from `std.collections` is built this way — `key` and `value`
 slots, pinned by the first stored pair or by an alias such as
-`type Counts = HashMap { key: string, value: int64 }`.
+`type Counts = HashMap { key: string, value: int64 }` after
+`import std.collections.{ HashMap }`.
 
 Slots, refinements, and their exact rules are in the
 [type system reference](/references/types/#type-slots-and-refinements).

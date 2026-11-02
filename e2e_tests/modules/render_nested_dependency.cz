@@ -1,0 +1,8 @@
+// @backends: all
+import render_library.{ Used }
+type Holder = {
+    value: Used
+}
+fun main() {
+    println(Holder { value: Used.Value })
+}

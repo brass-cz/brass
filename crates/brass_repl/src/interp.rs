@@ -22,18 +22,19 @@ use std::rc::Rc;
 
 use brass_engine::{
     EqualityKind, MonoFunction, MonoProgram, aggregate_field_type, binary_operand_type,
-    closure_symbol, display_instance, element_type, equality_kind, float_kind_name,
-    instance_symbol, is_comparison, method_symbol, nullable_display_instance, numeric_conv_ret,
-    operand_type_of, prim_method_instance, record_field_names, record_field_type,
-    record_from_succeeds, result_ok_type, static_symbol, str_const, unwrap_nullable,
+    closure_symbol, element_type, equality_kind, float_kind_name, instance_symbol, is_comparison,
+    method_symbol, numeric_conv_ret, operand_type_of, prim_method_instance, record_field_names,
+    record_field_type, record_from_succeeds, result_ok_type, static_symbol, str_const,
+    unwrap_nullable,
 };
 use brass_hir::{FloatKind, IntKind, Program, RESULT_TYPE_ID, Type};
 use brass_mir::{Callee, Literal, MirStmt, Operand, Place, Projection, Rvalue, Terminator};
 use brass_parser::ast::{BinOp, UnaryOp};
 use brass_utils::builtin_errors;
 
-use crate::format::format_value;
+use crate::format::{format_value, format_with_renderer};
 use crate::value::{ClosureObj, MAX_VALUE_DEPTH, Value, VariantObj};
+use brass_engine::render::RenderForm;
 
 /// Guard against unbounded native recursion: a runaway recursive Brass program
 /// would otherwise overflow the host stack and abort the process. Deep enough for
@@ -75,7 +76,7 @@ impl<'p, 'm> Interp<'p, 'm> {
                 self.run_instance(f, Vec::new(), &[])?;
             }
         }
-        if let Some(main) = program.lookup("main") {
+        if let Some(main) = program.entry_function() {
             self.run_instance(main, Vec::new(), &[])?;
         }
         Ok(())
@@ -128,6 +129,7 @@ impl<'p, 'm> Interp<'p, 'm> {
                         f.body,
                         &f.local_types,
                         cond,
+                        &f.fields,
                     ) {
                         Some(true) => *then,
                         Some(false) => *els,
@@ -273,6 +275,9 @@ impl<'p, 'm> Interp<'p, 'm> {
                 pattern,
                 &operand_type_of(op, &f.local_types),
             ))),
+            Rvalue::FieldsTest { site, fields } => {
+                Ok(Value::Bool(f.fields.get(site) == Some(fields)))
+            }
             Rvalue::Bin(op, a, b) => {
                 let operand_ty = if is_comparison(*op) {
                     binary_operand_type(a, b, &f.local_types)
@@ -631,8 +636,11 @@ impl<'p, 'm> Interp<'p, 'm> {
                     // a core primitive `debug` renders through the traditional
                     // formatter, exactly like a `"{v}"` segment.
                     let v = self.eval_operand(f, frame, &args[0], &arg_types[0])?;
-                    let hir = self.hir;
-                    return Ok(Value::str(format_value(hir, &v, &arg_types[0])?));
+                    return Ok(Value::str(self.render_value(
+                        &v,
+                        &arg_types[0],
+                        RenderForm::Debug,
+                    )?));
                 } else {
                     instance_symbol(name, &arg_types)
                 }
@@ -777,22 +785,11 @@ impl<'p, 'm> Interp<'p, 'm> {
             "to_string" => {
                 let ty = operand_type_of(&args[0], &f.local_types);
                 let v = self.eval_operand(f, frame, &args[0], &ty)?;
-                // A `"{v}"` segment routes to the USER `display` instance the
-                // monomorphizer created when the value's type declares one.
-                let program = self.program;
-                if let Some(inst) = display_instance(program, &ty) {
-                    return self.run_instance(inst, vec![v], &[]);
-                }
-                // A nullable of such a type renders `null` when absent and
-                // through the inner type's `display` when present.
-                if let Some(inst) = nullable_display_instance(program, &ty) {
-                    if v.is_null() {
-                        return Ok(Value::str("null"));
-                    }
-                    return self.run_instance(inst, vec![v], &[]);
-                }
-                let hir = self.hir;
-                Ok(Value::str(format_value(hir, &v, &ty)?))
+                Ok(Value::str(self.render_value(
+                    &v,
+                    &ty,
+                    RenderForm::Display,
+                )?))
             }
             "print" | "println" => self.eval_io(f, frame, name, args),
             "spawn" | "sync" | "with" | "_with_all" => Err(
@@ -986,8 +983,11 @@ impl<'p, 'm> Interp<'p, 'm> {
         let raw_arg_ty = operand_type_of(&args[0], &f.local_types);
         if ty == "string" {
             let v = self.eval_operand(f, frame, &args[0], &raw_arg_ty)?;
-            let hir = self.hir;
-            return Ok(Value::str(format_value(hir, &v, &raw_arg_ty)?));
+            return Ok(Value::str(self.render_value(
+                &v,
+                &raw_arg_ty,
+                RenderForm::Display,
+            )?));
         }
         // Keep the interpreter's conversion contract identical to the typed
         // backend even though a present nullable is represented transparently.
@@ -1001,6 +1001,25 @@ impl<'p, 'm> Interp<'p, 'm> {
             return Err(format!("unknown conversion target `{ty}`"));
         };
         Ok(convert(&target, method, arg_ty, &v))
+    }
+
+    /// Invoke implicit renderers through the shared per-instance authority.
+    fn render_value(
+        &mut self,
+        value: &Value,
+        ty: &Type,
+        form: RenderForm,
+    ) -> Result<String, String> {
+        let program = self.program;
+        format_with_renderer(self.hir, value, ty, form, &mut |symbol, value| {
+            let instance = program
+                .lookup(symbol)
+                .ok_or_else(|| format!("missing renderer `{symbol}`"))?;
+            Ok(self
+                .run_instance(instance, vec![value.clone()], &[])?
+                .as_str()
+                .to_string())
+        })
     }
 
     /// `print`/`println`: render a non-string argument through `to_string`, write
@@ -1018,23 +1037,7 @@ impl<'p, 'm> Interp<'p, 'm> {
             Some(op) => {
                 let ty = operand_type_of(op, &f.local_types);
                 let v = self.eval_operand(f, frame, op, &ty)?;
-                let program = self.program;
-                if matches!(ty, Type::Str) {
-                    v.as_str().to_string()
-                } else if let Some(inst) = display_instance(program, &ty) {
-                    // Like a `"{v}"` segment, `print`/`println` prefer the USER
-                    // `display` method when the value's type declares one.
-                    self.run_instance(inst, vec![v], &[])?.as_str().to_string()
-                } else if let Some(inst) = nullable_display_instance(program, &ty) {
-                    if v.is_null() {
-                        "null".to_string()
-                    } else {
-                        self.run_instance(inst, vec![v], &[])?.as_str().to_string()
-                    }
-                } else {
-                    let hir = self.hir;
-                    format_value(hir, &v, &ty)?
-                }
+                self.render_value(&v, &ty, RenderForm::Display)?
             }
         };
         write_output(self.out, &s, newline)?;

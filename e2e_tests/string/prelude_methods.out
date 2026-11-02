@@ -7,8 +7,8 @@ false
 2
 true
 xy-b-xy
-[a, b, c]
-[a, , b]
+["a", "b", "c"]
+["a", "", "b"]
 1
-[abc]
+["abc"]
 x, y, z

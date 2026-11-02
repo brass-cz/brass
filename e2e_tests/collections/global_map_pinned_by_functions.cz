@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // @backends: all
 // A global container built without element types (`HashMap.new()`) takes
 // them from how the functions use it: the initializer and `main` share one

@@ -39,9 +39,11 @@ A normal run reports errors in the code it needs:
 - These body rules also apply to instance and static methods, including
   methods reached through a function compiled during execution. Their source
   diagnostics are checked before native compilation of the affected batch.
-- An uncalled function's body errors do not affect the current run. Its check
-  may continue in the background until the program exits. Declaration and
-  signature errors are still subject to the checks above.
+- An uncalled own function's body errors do not affect the current run. Its
+  check may continue in the background until the program exits. Unreached
+  dependency bodies are not checked or reported. Declaration and signature
+  errors needed to establish the loaded catalog remain subject to the checks
+  above.
 - Pattern contracts follow these same body rules: refutable `let`, `const`,
   and `for` patterns, duplicate bindings, and unreachable match arms reject
   a needed body before it executes. They do not reject a run that never
@@ -55,12 +57,14 @@ and statically pruned branches follow the checker's selection rules (see
 
 Errors use the same diagnostic text and source locations as `brass check`, and
 a run that stops on an error prints the checker's complete verdict, including
-errors in bodies the run never reached. Match coverage is checked after the
+errors in selected bodies the run never executed. Unselected dependency
+bodies contribute no diagnostics. Match coverage is checked after the
 relevant argument types are known, before the affected body can execute.
 Checker warnings remain non-fatal in all modes.
 
 Consequently, a successful run is not a complete whole-program verdict. Use
-`brass check` in CI and whenever all code must be validated.
+`brass check` in CI to validate every item in your own code, including unused
+functions and methods.
 
 A reflective specialization discovered only after execution starts completes
 checking and reports any source errors. If checking succeeds but the running
@@ -69,11 +73,34 @@ rerun with `--eager`; it does not replay earlier side effects.
 
 ### Complete checking and compilation
 
-`brass check program.cz` checks the complete program without running it and
-prints nothing on success. `brass --eager program.cz` performs the same
-complete check before anything runs, then executes the program; native code
-is still optimized and translated on first use, exactly as in a normal run.
-The interpreter and REPL also check eagerly.
+`brass check program.cz` checks every item in the own package, including
+unused functions and methods, and prints nothing on success. Dependencies are
+checked only for reached items and the shared inference those items require.
+For a bare file, own code is the entry and its locally resolved imports;
+`core`, std, package-map and external include imports remain dependencies.
+Package checks also process the package's unimported source files.
+
+Importing a declaration does not by itself require checking its body.
+Reachability includes implicit calls such as rendering, conversions and
+operators, generated reflective methods, and every loaded module initializer.
+Declarations and method signatures remain available even when their bodies
+are not selected. A method needed to establish shared type inference is
+selected even if no execution call reaches it.
+
+A recoverable syntax error inside an unreached dependency body follows the
+same reporting rule when the parser can still identify its declaration.
+Syntax errors that prevent establishing declaration boundaries remain errors.
+Own-file syntax errors are always reported.
+
+`brass --eager program.cz` performs the same selected check before anything
+runs, then executes the program; native code is still optimized and translated
+on first use, exactly as in a normal run. The interpreter and REPL also check
+eagerly. Each REPL submission checks the accumulated own code and recomputes
+its dependency selection without replaying earlier effects.
+
+The language server fully checks the open file, even when it belongs to a
+dependency. Files merely imported by that buffer use dependency reachability.
+Completion lists declared members independently of body selection.
 
 ### Monomorphization and reflection
 
@@ -86,7 +113,10 @@ for either kind of concrete function may still be compiled on first use.
 After preparation, execution order is:
 
 1. module initializers, in dependency order;
-2. `main`, if it is defined.
+2. the entry file's `main`, if it is defined.
+
+An imported module's `main` is an ordinary function. It runs only when called
+explicitly, including when the entry file has no `main` of its own.
 
 A `spawn` is an exception to first-use compilation: every function the new
 task can statically reach is compiled before the task starts because worker
@@ -214,8 +244,8 @@ eviction.
 
 ```bash
 brass program.cz         # lazy check + run (JIT)
-brass --eager program.cz # whole-program check + compile, then run
-brass check program.cz   # check only (always whole-program)
+brass --eager program.cz # check own code + reached dependencies, then run
+brass check program.cz   # check own code + reached dependencies
 brass repl [program.cz]  # interpreter / interactive REPL
 brass --no-jit-cache program.cz # run without cache reads or writes
 brass cache info         # inspect the shared JIT object cache

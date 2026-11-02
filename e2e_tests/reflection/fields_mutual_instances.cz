@@ -1,0 +1,37 @@
+// @backends: all
+// Mutual recursion retains the instance across a forwarding function.
+type Leaf = {
+    name: string
+}
+type Branch = {
+    child: Leaf
+    count: int32
+}
+type Root = {
+    branch: Branch
+    enabled: bool
+}
+
+fun descend(value) -> string {
+    return walk(value)
+}
+
+fun walk(value) -> string {
+    if value: anonymous {  } {
+        let out = ""
+        for field in fields(value) {
+            out = out + field + ":" + descend(value[field]) + ";"
+        }
+        return out
+    }
+    return "leaf"
+}
+
+println(
+    descend(
+        Root {
+            branch: Branch { child: Leaf { name: "Aki" }, count: 1 },
+            enabled: true,
+        },
+    ),
+)

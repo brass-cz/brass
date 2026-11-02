@@ -9,6 +9,7 @@
 //! a subset of its items.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use brass_hir::LoadedModule;
 use brass_parser::Span;
@@ -18,6 +19,8 @@ pub use brass_resolve::{SourceMap, prelude_module_names, prelude_source};
 
 /// The assembled module graph for one analysis of the active document.
 pub struct World {
+    /// Loader identity retained when the entry AST is split from its context.
+    pub main_source: Option<Arc<brass_hir::ModuleSource>>,
     pub sources: SourceMap,
     /// Byte-offset base of the active document; add it to a document-local
     /// offset to get a global span offset, or subtract to go back.
@@ -47,20 +50,37 @@ pub struct World {
 pub fn build(main_path: &Path, main_src: &str) -> World {
     let search = brass_resolve::SearchPaths::from_env();
     let root = main_path.parent().unwrap_or(Path::new("."));
-    let mut front = brass_resolve::frontend::assemble(main_path, main_src, root, &search);
+    let mut front = brass_resolve::frontend::assemble_recovered(main_path, main_src, root, &search);
     // The shared front end appends the entry module last; split its AST off
     // so everything remaining is the context.
-    let main_ast = front
+    let main = front
         .modules
         .pop()
-        .expect("the shared front end always appends the entry module")
-        .ast;
+        .expect("the shared front end always appends the entry module");
+    // The active buffer is the editor's own root. Merely imported local files
+    // have dependency policy until they are opened as a separate document.
+    for module in &mut front.modules {
+        if let Some(source) = &mut module.source {
+            let source = Arc::make_mut(source);
+            if let brass_hir::SourceOrigin::Own(package) = &source.origin {
+                source.origin = brass_hir::SourceOrigin::Dependency(package.clone());
+            }
+        }
+    }
     World {
         sources: front.sources,
         main_base: front.entry_base,
         context_modules: front.modules,
-        main_ast,
+        main_ast: main.ast,
+        main_source: main.source,
         load_errors: front.load_errors,
         parse_errors: front.parse_errors,
+    }
+}
+
+impl World {
+    /// Whether dependency bodies require item selection rather than full core checking.
+    pub(super) fn has_dependencies(&self) -> bool {
+        self.context_modules.iter().any(|module| !module.is_prelude)
     }
 }

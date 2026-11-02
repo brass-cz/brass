@@ -44,7 +44,7 @@ impl EffectHistory {
 
 /// An ordered inventory whose comparison names the first differing effect.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct EffectSnapshot(Vec<(String, String)>);
+pub(in crate::infer) struct EffectSnapshot(Vec<(String, String)>);
 
 /// Consistent variable renaming shared by every field in one snapshot.
 #[derive(Default)]
@@ -138,10 +138,111 @@ impl EffectSnapshot {
     /// Make an independent test checker authoritative for a fresh consumer.
     /// Production probe clones intentionally cannot publish; this explicit test
     /// fork starts a new publication history rather than inheriting cursors.
-    pub(super) fn fork<'a>(checker: &Checker<'a>) -> Checker<'a> {
+    pub(in crate::infer) fn fork<'a>(checker: &Checker<'a>) -> Checker<'a> {
         let mut fork = checker.clone();
         *fork.channel_changes.get_mut() = ChannelChanges::default();
         fork
+    }
+
+    /// Project declaration-owned fields, schemes, qualified globals and their
+    /// aliases after independent shared preparation. Body-local diagnostics,
+    /// publications and unused sum method returns are deliberately excluded.
+    pub(in crate::infer) fn capture_shared(checker: &Checker<'_>) -> Self {
+        let mut snapshot = Self(Vec::new());
+        let mut canon = Canonical::default();
+        for id in 0..checker.program.next_infer_var {
+            canon.ty(&Type::Unknown(id));
+        }
+        let mut cells = BTreeMap::new();
+        for info in checker.program.types.values() {
+            let groups = match &info.kind {
+                brass_hir::TypeKind::Record { fields, .. } => vec![(String::new(), fields)],
+                brass_hir::TypeKind::Sum { variants } => variants
+                    .iter()
+                    .map(|v| (v.name.clone(), &v.fields))
+                    .collect(),
+            };
+            for (variant, fields) in groups {
+                for field in fields {
+                    if let Some(ty) = &field.resolved_ty {
+                        cells.insert(
+                            format!("{}.{}:{}", info.symbol, variant, field.name),
+                            ty.clone(),
+                        );
+                    }
+                }
+            }
+        }
+        for (module, globals) in &checker.global_defs {
+            for (name, ty) in globals {
+                cells.insert(format!("global:{}/{}", module.join("/"), name), ty.clone());
+            }
+        }
+        let shapes = cells
+            .values()
+            .flat_map(brass_hir::type_vars)
+            .collect::<std::collections::BTreeSet<_>>();
+        snapshot.put(
+            "shared cells",
+            cells
+                .into_iter()
+                .map(|(name, ty)| {
+                    (
+                        name,
+                        canon.ty(&ty),
+                        canon.ty(&checker.solver.resolve_reference(&ty)),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        snapshot.put(
+            "shared shapes",
+            shapes
+                .into_iter()
+                .map(|id| {
+                    (
+                        canon.ty(&Type::Unknown(id)),
+                        checker.shape_constraints.get(&id).map(|shapes| {
+                            shapes
+                                .iter()
+                                .map(|shape| canon.shape(shape))
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        snapshot.put(
+            "schemes",
+            unordered(
+                checker
+                    .build_schemes()
+                    .into_iter()
+                    .collect::<BTreeMap<_, _>>(),
+            ),
+        );
+        snapshot.put(
+            "record co return links",
+            checker
+                .co_return_links
+                .iter()
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .map(|(owner, links)| {
+                    (
+                        owner,
+                        links
+                            .iter()
+                            .map(|(a, b)| {
+                                (canon.ty(&checker.resolve(a)), canon.ty(&checker.resolve(b)))
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        snapshot.put("co global reads", unordered(&checker.co_global_reads));
+        snapshot
     }
 
     /// Capture input/result identities, the solver, co effects and every channel.
@@ -430,7 +531,7 @@ impl EffectSnapshot {
     }
 
     /// Return the first semantic difference, including both values for diagnosis.
-    pub(super) fn compare(&self, other: &Self) -> Result<(), String> {
+    pub(in crate::infer) fn compare(&self, other: &Self) -> Result<(), String> {
         for (left, right) in self.0.iter().zip(&other.0) {
             if left != right {
                 return Err(format!("{}: walk={:?}, replay={:?}", left.0, left.1, right));
@@ -469,6 +570,7 @@ impl EffectSnapshot {
             lift_errs,
             null_props,
             fields_loops,
+            instance_fields,
             sum_views,
             type_names,
             typeof_types,
@@ -566,6 +668,18 @@ impl EffectSnapshot {
             })),
         );
         self.put(format!("{label}/fields loops"), unordered(fields_loops));
+        self.put(
+            format!("{label}/instance fields"),
+            unordered(instance_fields.into_iter().map(|(span, entries)| {
+                (
+                    span,
+                    unordered(entries.into_iter().map(|(mut key, fields)| {
+                        canon.instance(&mut key);
+                        (key, fields)
+                    })),
+                )
+            })),
+        );
         self.put(format!("{label}/type names"), unordered(type_names));
         self.put(format!("{label}/errors"), errors);
         self.put(format!("{label}/warnings"), warnings);

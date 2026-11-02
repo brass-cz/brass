@@ -19,7 +19,10 @@ fn e2e_case(rel: &str) -> PathBuf {
 /// (success, stdout + stderr).
 fn check(case: &Path, memo_check: bool) -> (bool, String) {
     let mut command = support::brass_command(env!("CARGO_BIN_EXE_brass"));
-    command.arg("check").arg(case);
+    command.arg("check").arg(case).env(
+        "BRASS_PACKAGES",
+        format!("std={}/../..", env!("CARGO_MANIFEST_DIR")),
+    );
     if memo_check {
         command.env("BRASS_MEMO_CHECK", "1");
     } else {

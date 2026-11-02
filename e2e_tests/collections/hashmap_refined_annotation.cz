@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // A binding annotated with a refinement alias pins the map's key/value types up
 // front. The witness-free constructor's inferred slot array is seeded from the
 // annotation (so it is a concrete `_Entry<string, int64>` array, not an open
@@ -5,10 +7,7 @@
 // value: an int64 variable, an int32 variable (widened), and a bare integer
 // literal (which would default to int32) all store as int64.
 
-type Scores = HashMap {
-    key: string,
-    value: int64,
-}
+type Scores = HashMap { key: string, value: int64 }
 
 fun main() {
     let m: Scores = HashMap.new()

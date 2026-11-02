@@ -82,8 +82,8 @@ impl ReplayPlan {
 /// later input makes it available again.
 pub(crate) fn plan(prior: &[String], program: &Program) -> ReplayPlan {
     let module = program
-        .functions
-        .get("main")
+        .entry_function()
+        .and_then(|symbol| program.functions.get(symbol))
         .map(|f| f.module.clone())
         .unwrap_or_else(|| vec!["main".to_string()]);
     let info = MutationInfo::analyze(program);
@@ -525,6 +525,7 @@ mod tests {
         let src = format!("fun main() {{\n{}\n}}\n", prior.join("\n"));
         let ast = parse(&src).expect("parse");
         let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,

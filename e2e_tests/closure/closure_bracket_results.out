@@ -40,4 +40,4 @@ captured elements
 int32[]
 [1, 2]
 [int32, string]
-[1, x]
+[1, "x"]

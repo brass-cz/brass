@@ -1436,6 +1436,7 @@ impl<'a> Checker<'a> {
         }
         self.return_values.push(Vec::new());
         self.speculation_depth += 1;
+        self.fields_probe_depth += 1;
         if negated {
             if let Some(e) = els {
                 self.check_branch_expr(e, &mut probe_scopes, true, None);
@@ -1443,6 +1444,7 @@ impl<'a> Checker<'a> {
         } else {
             self.check_branch(then, &mut probe_scopes, true, None);
         }
+        self.fields_probe_depth -= 1;
         self.speculation_depth -= 1;
         self.return_values.pop();
         for id in &hole_ids {

@@ -1,0 +1,14 @@
+cannot convert HashMap with non-string keys to JSON
+cannot convert HashMap with non-string keys to JSON
+cannot convert Unsupported to JSON
+cannot convert (int32) -> int32 to JSON
+JSON number is not finite: NaN
+JSON number is not finite: inf
+JSON number is not finite: -inf
+JSON number is not finite: NaN
+JSON number is not finite: inf
+JSON number is not finite: -inf
+custom conversion failed
+cannot convert Unsupported to JSON
+JSON number is not finite: inf
+cannot convert Unsupported to JSON

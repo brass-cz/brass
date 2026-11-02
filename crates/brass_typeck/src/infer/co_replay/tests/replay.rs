@@ -250,6 +250,7 @@ fn check_depth_boundaries_and_budget() {
 fn receiver_functions_remain_methods_for_admission() {
     let ast = brass_parser::parse("fun string.identity(self) { return self }").unwrap();
     let (p, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+        source: None,
         path: vec!["core".into(), "fixture".into()],
         is_prelude: true,
         ast,

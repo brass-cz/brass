@@ -61,14 +61,15 @@ pub(crate) fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), 
     // streamed channels. Syntax and module-graph problems abort here, before
     // any thread starts, exactly as eagerly.
     let search = brass_resolve::SearchPaths::from_env();
-    let front = match front_load(&label, &src, &root, &search) {
+    let (front, prepared) = match front_load(&label, &src, &root, &search) {
         Ok(front) => front,
         Err(diags) => return Err(print_diags(diags)),
     };
     // Lower on this side first. Keyed calls before execution wait for the
     // append-only `KeyedReady` continuation (`LazyState::awaiting_keyed`);
     // calls discovered during execution require `--eager`.
-    let (mut program, lower_errors) = lower(&front.modules);
+    let (mut program, lower_errors) =
+        prepared.map_or_else(|| lower(&front.modules), |prepared| prepared.lowered);
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
     let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -94,7 +95,7 @@ pub(crate) fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), 
                 paused,
                 requests_closed: false,
             };
-            check_front(front, &search, LocationTables::Omit, Some(&mut sched))
+            check_front(front, None, &search, LocationTables::Omit, Some(&mut sched))
         }
     });
     let _checker_cleanup = CheckerCleanup {
@@ -117,6 +118,7 @@ pub(crate) fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), 
         .map(|(symbol, function)| (symbol.clone(), function.decl.span.lo, function.decl.span.hi))
         .collect();
     let mut lazy = LazyState {
+        selected_bodies: None,
         completion: super::policy::CompletionState::from_env(),
         counters,
         events: events_rx,
@@ -126,7 +128,11 @@ pub(crate) fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), 
         inits_checked: 0,
         held: Vec::new(),
         printed_warnings: HashSet::default(),
-        needed: HashSet::from_iter(["main".to_string()]),
+        needed: program
+            .entry_function()
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
         stop,
         paused,
         needs_eager: false,
@@ -142,7 +148,7 @@ pub(crate) fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), 
         outstanding_batches: std::collections::VecDeque::new(),
         finished: false,
     };
-    let settled = lazy.wait_gate(program.inits.len(), program.functions.contains_key("main"));
+    let settled = lazy.wait_gate(program.inits.len(), program.entry_function());
     if lazy.needs_eager {
         return finish_eagerly(
             &rt,
@@ -282,7 +288,7 @@ pub(crate) fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), 
                     // channels; only a skip against the checker's final
                     // state is a rejection, reported like the eager JIT.
                     let main_skipped =
-                        program.functions.contains_key("main") && mono.lookup("main").is_none();
+                        program.entry_function().is_some() && mono.entry_function().is_none();
                     drop(mono);
                     if main_skipped {
                         if !lazy.closed {
@@ -597,7 +603,7 @@ pub(crate) fn run_lazy(label: String, src: String, root: PathBuf) -> Result<(), 
     // The deferred runtime: reject an untypeable `main` exactly as `run_mono`
     // would, compile the startup set, then run with the resolver installed --
     // a deferred site's first call lands there.
-    if program.functions.contains_key("main") && mono.lookup("main").is_none() {
+    if program.entry_function().is_some() && mono.entry_function().is_none() {
         // A rejected entry may have prevented monomorphization from exposing
         // its method dependencies. Prefer the completed source verdict over
         // a secondary lowering failure, as for MonoStop::Fail above.

@@ -1,0 +1,133 @@
+"line\n\"two\""
+true
+2
+true
+2.0
+true
+true
+true
+2026-10-31T12:34:56Z
+true
+[]
+["line\n\"two\"", 2, 2.0, true, 2026-10-31T12:34:56Z]
+{}
+{}
+{
+    "servers": [
+        {
+            "name": "one"
+        },
+        {
+            "name": "two"
+        }
+    ],
+    "numbers": [1, 2],
+    "title": "demo",
+    "created": 2026-10-31T12:34:56Z,
+    "owner": {
+        "name": "Ada"
+    }
+}
+{
+    "servers": [
+        {
+            "name": "one"
+        },
+        {
+            "name": "two"
+        }
+    ],
+    "numbers": [1, 2],
+    "title": "demo",
+    "created": 2026-10-31T12:34:56Z,
+    "owner": {
+        "name": "Ada"
+    }
+}
+{
+    "servers": [
+        {
+            "name": "one"
+        },
+        {
+            "name": "two"
+        }
+    ],
+    "numbers": [1, 2],
+    "title": "demo",
+    "created": 2026-10-31T12:34:56Z,
+    "owner": {
+        "name": "Ada"
+    }
+}
+Box {
+    value: {
+        "servers": [
+            {
+                "name": "one"
+            },
+            {
+                "name": "two"
+            }
+        ],
+        "numbers": [1, 2],
+        "title": "demo",
+        "created": 2026-10-31T12:34:56Z,
+        "owner": {
+            "name": "Ada"
+        }
+    },
+}
+[{
+    "servers": [
+        {
+            "name": "one"
+        },
+        {
+            "name": "two"
+        }
+    ],
+    "numbers": [1, 2],
+    "title": "demo",
+    "created": 2026-10-31T12:34:56Z,
+    "owner": {
+        "name": "Ada"
+    }
+}]
+{
+    "document": {
+        "servers": [
+            {
+                "name": "one"
+            },
+            {
+                "name": "two"
+            }
+        ],
+        "numbers": [1, 2],
+        "title": "demo",
+        "created": 2026-10-31T12:34:56Z,
+        "owner": {
+            "name": "Ada"
+        }
+    }
+}
+[
+    {},
+    {
+        "servers": [
+            {
+                "name": "one"
+            },
+            {
+                "name": "two"
+            }
+        ],
+        "numbers": [1, 2],
+        "title": "demo",
+        "created": 2026-10-31T12:34:56Z,
+        "owner": {
+            "name": "Ada"
+        }
+    }
+]

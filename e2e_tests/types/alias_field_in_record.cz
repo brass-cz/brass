@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // A record field declared with a `type Alias = Base { .. }` refinement
 // resolves to the alias's concrete instance, although the alias is not a
 // nominal type of its own: the field is fully typed, so the record builds and
@@ -14,7 +16,7 @@ fun Report.build(title: string) -> Report {
     let counts: Counts = HashMap.new()
     counts.set("hits", 3)
     counts.set("misses", 1)
-    return Report { title: title, counts: counts }
+    return Report { title, counts }
 }
 
 const r = Report.build("run")

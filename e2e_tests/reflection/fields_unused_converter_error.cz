@@ -1,0 +1,30 @@
+// @lazy: pass
+// @eager: fail
+// Open recursive arguments must not expand an unused generic body indefinitely.
+type Value = Null | Array { values: Value[] }
+
+fun convert(value) -> Value! {
+    if value: Value {
+        return value
+    } else if value: infer? {
+        if let inner = value {
+            return convert(inner)
+        }
+        return Value.Null
+    } else if value: infer[] {
+        let elements: Value[] = []
+        for element in value {
+            elements.push(convert(element)!)
+        }
+        return Value.Array { values: elements }
+    } else if value: anonymous {  } {
+        for field in fields(value) {
+            convert(value[field])!
+        }
+    }
+    return Value.Null
+}
+
+fun main() {
+    println(1)
+}

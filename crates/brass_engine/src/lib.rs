@@ -25,13 +25,13 @@ mod codegen;
 mod engine;
 mod equality;
 mod mono;
-mod render;
+pub mod render;
 
 pub use codegen::{
     Codegen, ViewFieldPlan, aggregate_field_type, batch_spawns, element_type, program_uses_with,
     rc_managed, record_field_names, record_field_type, record_from_field_flows,
-    record_from_succeeds, result_ok_type, spawn_precompile, str_const, strip_wrappers,
-    view_field_plans,
+    record_from_succeeds, result_ok_type, return_owned_locals, spawn_precompile, str_const,
+    strip_wrappers, view_field_plans,
 };
 pub use engine::Engine;
 pub use equality::{EqualityKind, equality_defined, equality_kind};

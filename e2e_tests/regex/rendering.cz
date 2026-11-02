@@ -1,0 +1,30 @@
+// @backends: all
+import std.regex.Regex
+import std.collections.HashMap
+
+type Box = {
+    value
+}
+// Rendering uses stored pattern/capture data, without handle or name-index text.
+fun main() {
+    let regex = Regex.new("(?<word>a+)(b)?")!
+    println(regex)
+    println(regex.debug())
+    println(Box { value: regex })
+    println([regex])
+    let map = HashMap.new()
+    map.set("pattern", regex)
+    println(map)
+    if let found = regex.find("aaa") {
+        println(found)
+        println(found.debug())
+        println(Box { value: found })
+        println([found])
+        let matches = HashMap.new()
+        matches.set("first", found)
+        println(matches)
+        if let group = found.named("word") {
+            println(group.text)
+        }
+    }
+}

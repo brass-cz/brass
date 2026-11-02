@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // `get_or`'s default is returned where the stored value is, so it must be of
 // the map's value type: the method's two returns (`e.value` and `dflt`) are
 // one type, and a wrong-typed default is an argument type error at the call.

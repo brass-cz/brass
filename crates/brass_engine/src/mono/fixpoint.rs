@@ -42,7 +42,7 @@ pub(super) fn live_reachable(
         .iter()
         .map(|t| t.clone().unwrap_or(Type::Never))
         .collect();
-    reachable_blocks(program, body, &probe)
+    reachable_blocks(program, body, &probe, &HashMap::default())
         .into_iter()
         .zip(live)
         .map(|(r, l)| r && *l)

@@ -91,7 +91,7 @@ fun HashMap.from_pairs(pairs) {
 // value, so the table is key-type agnostic; the per-byte modulus keeps the
 // accumulator in a non-negative 31-bit range, so the final index is in range.
 fun HashMap._hash(self, key) -> int64 {
-    let bytes = _string_bytes(string.from(key))
+    let bytes = to_bytes(string.from(key))
     let h: int64 = 2166136261
     for b in bytes {
         h = (h * 16777619 + b) % 2147483647
@@ -322,12 +322,12 @@ fun HashMap.clear(self) {
 }
 
 /**
- * Render the map JSON-style for `"{m}"` interpolation and `println` (the
- * `Display` protocol): one `"key": value` line per pair, both sides in their
- * `debug` form, so string keys and values are quoted. Iteration order is the
- * map's own (unspecified). An empty map renders as `{}`.
+ * Render the map as `{}` or one indented `key: value` line per pair. Both
+ * keys and values use effective debug, with quoted strings and four-space
+ * indentation for multiline text. Entries are captured before invoking user debug;
+ * iteration order is the map's own (unspecified).
  */
-fun HashMap.display(self) -> string {
+fun HashMap.debug(self) -> string {
     if self.is_empty() {
         return "\{}"
     }
@@ -338,4 +338,9 @@ fun HashMap.display(self) -> string {
         lines.push("    {rendered_key}: {rendered_value}")
     }
     return "\{\n{lines.join(",\n")}\n}"
+}
+
+/** Render the same entry text as `debug`, including in print and interpolation. */
+fun HashMap.display(self) -> string {
+    return self.debug()
 }

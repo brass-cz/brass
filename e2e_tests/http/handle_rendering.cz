@@ -1,0 +1,27 @@
+// @backends: all
+import std.http.HttpClient
+import std.net.{ Tcp, TcpListener, Udp, TlsStream }
+import std.fs.File
+import std.collections.HashMap
+
+type Box = {
+    value
+}
+// Synthetic wrappers exercise rendering without opening or querying a socket.
+fun show(value) {
+    println(value)
+    println(value.debug())
+    println(Box { value })
+    println([value])
+    let map = HashMap.new()
+    map.set("handle", value)
+    println(map)
+}
+fun main() {
+    show(HttpClient.http("example.com", 80))
+    show(HttpClient.https("example.com", 443))
+    show(Tcp { _sock: File.from_fd(0), _fd: 0 })
+    show(TcpListener { _sock: File.from_fd(0), _fd: 0 })
+    show(Udp { _sock: File.from_fd(0), _fd: 0 })
+    show(TlsStream { _handle: 0 })
+}

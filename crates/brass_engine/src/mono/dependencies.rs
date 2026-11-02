@@ -9,6 +9,7 @@ use brass_parser::Span;
 pub(super) enum Read {
     Seed(Span),
     Dispatch(Span),
+    Fields(Span),
     Return(String, Vec<Type>),
     NumericCalls,
 }
@@ -26,6 +27,7 @@ impl Read {
             Self::Dispatch(span) => {
                 contains(&changes.dispatch, span) || contains(&changes.instance_dispatch, span)
             }
+            Self::Fields(span) => contains(&changes.instance_fields, span),
             Self::NumericCalls => {
                 !changes.numeric_calls.changed.is_empty()
                     || !changes.numeric_calls.removed.is_empty()

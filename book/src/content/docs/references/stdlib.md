@@ -7,12 +7,11 @@ The standard library has two layers:
 
 - **`core` -- the implicit prelude**: every module under `core/` (`io`,
   `array`, `string`, `math`, `conv`, `assert`, `error`, `is`, `default`,
-  `show`, `collections`) plus the runtime builtins. It is embedded in the
-  compiler, and the public names of every core module are in scope in every
-  program with no import -- `HashMap` included.
+  `show`) plus the runtime builtins. It is embedded in the compiler. The
+  public names of every core module are in scope with no import.
 - **`std` -- the shipped library tree**: the `std/` directory distributed
-  beside the toolchain (`fs`, `net`, `process`, `path`, `env`, `hash`,
-  `regex`, `semver`, `url`, `http`, `data.json`, `data.toml`, ...), imported
+  beside the toolchain (`collections`, `fs`, `net`, `process`, `path`, `env`,
+  `hash`, `regex`, `semver`, `url`, `http`, `data.json`, `data.toml`, ...), imported
   explicitly with the `std.` prefix, e.g. `import std.fs.{ read_file }`.
   Native parts arrive as plugins, so `std` lives on disk rather than in the
   compiler. The complete toolchain binds it automatically; see
@@ -80,6 +79,11 @@ The nullable `context` overload belongs to the compiler because `T?` has no
 nominal type. Its `Result<T, E>?` case recognizes the prelude `Result` and
 removes the outer `?`; it never constructs `Result<Result<T, E>, ...>`.
 
+`Error.display()`, print and interpolation write `[file:line:col] error: <message>`
+for each trace line, newest context first and the original error last. Each context
+adds four spaces of indentation. An unhandled `!` abort retains the label
+`unhandled error` instead.
+
 ## Type tests and defaults
 
 Each primitive type implements only its **own** `is_<type>` method:
@@ -124,10 +128,10 @@ Methods on any array (`fun infer[].m`), so `arr.map(f)` works with no import:
 These return new arrays; only the builtin `push`/`pop`/`insert`/`remove`
 mutate in place.
 
-## `core.collections`
+## `std.collections`
 
-Part of the implicit prelude: `HashMap` needs no import. Keys may be of any
-type that renders to a stable string and compares with `==` (structural
+Use `import std.collections.{ HashMap }`. Keys may be of any type that
+renders to a stable string and compares with `==` (structural
 [equality](/references/types/#equality)); values may be of any type. Key and
 value types are inferred from `set` or `from_pairs`, or pinned by a refinement
 (`type Counts = HashMap { key: string, value: int32 }`).
@@ -145,7 +149,7 @@ value types are inferred from `set` or `from_pairs`, or pinned by a refinement
 | `m.keys()` / `m.values()`   | `() -> K[]` / `() -> V[]`    | unspecified slot order                     |
 | `m.pairs()`                 | `() -> [K, V][]`             | same order as `keys()`                     |
 | `m.clear()`                 | `() -> void`                 | remove all pairs, retaining inferred types |
-| `m.display()`               | `() -> string`               | JSON-style text; what `"{m}"` prints       |
+| `m.debug()` / `m.display()` | `() -> string` | entry text with quoted strings; also used when nested |
 
 ## `core.string`
 
@@ -200,21 +204,49 @@ floating-point rounding).
 The rendering protocols behind `print`, `println`, `"{v}"`, and
 `string.from`:
 
-| Type      | Shape                           | Satisfied by                                                             |
-| --------- | ------------------------------- | ------------------------------------------------------------------------ |
-| `Debug`   | `{ debug: (Self) -> string }`   | every type: the primitives declare it here, others use the built-in form |
-| `Display` | `{ display: (Self) -> string }` | the primitives, and a type declaring `fun T.display(self)`               |
+| Type      | Shape                          | Satisfied by                                                        |
+| --------- | ------------------------------ | ------------------------------------------------------------------- |
+| `Debug`   | `{ debug: (Self) -> string }`   | non-nullable values: declared methods or the built-in structural form |
+| `Display` | `{ display: (Self) -> string }` | the primitives, and a type declaring `fun T.display(self)`            |
 
-A value renders through its type's `display` when the type declares one, and
-otherwise in the built-in `debug` form; a nullable renders `null` or its
-present value's rendering. `debug` and `display` agree on every primitive
-except `string`, whose `debug` form is quoted, with quotes, backslashes, and
-control characters escaped (`"a".debug()` is `"\"a\""`). The built-in form
-writes a record or variant as its name and fields, one field per line, a tuple
-or array as `[a, b]`, and a function-valued field as `<opaque>`. The values
-inside it are in their own built-in form whatever `display` their types
-declare, except that the string elements of an array or tuple are unquoted
-(string fields are quoted). `v.debug()` forces the debug form.
+At the top level, `print`, `println`, `"{v}"`, and `string.from(v)` call the
+nominal type's `display` when declared, otherwise its **effective debug**.
+A top-level string is raw; a nullable displays `null` or its present value by
+the same rules.
+Float32 uses its shortest round-trip spelling in both forms, retaining `.0` for
+integral values; float64 keeps its own spelling.
+
+Effective debug calls the nominal type's `debug` when declared, otherwise the
+builtin structural form. `v.debug()` and every nested position use this form:
+array, fixed-array, slice and tuple elements; record fields; sum payloads; and
+present nullable children. A nested value never uses its `display` implicitly.
+
+The builtin form writes a record or variant as its name and fields, one field
+per line, an array or tuple as `[a, b]`, and a callable field as `<opaque>`.
+All fields, including `_`-prefixed fields, remain visible. String children
+are quoted and escaped, including quotes, backslashes and control characters:
+`["a, b", "c", ""]` stays unambiguous. Multi-line custom text is indented at
+each record-field or sum-payload level. Arrays and tuples add no indentation
+level, just as for builtin structural children. There is no size elision. An unnarrowed nullable still
+has no `.debug()` method, and functions or closures cannot be rendered alone.
+
+Standard-library containers and handles own their debug text. `HashMap` renders
+entries rather than slots or capacity; `TomlValue` renders its content tree, and
+`JsonValue` uses `pretty`. A nested `Path` is its quoted path text. URI and
+semantic versions display their `to_string()` spelling and retain structural
+debug text.
+
+Handle renderers only inspect stored values; they do not perform IO or mutate
+what they render:
+
+| Type | Debug content |
+| --- | --- |
+| `Regex` | quoted pattern |
+| `Match` | quoted text, byte offsets and capture groups; no private name index |
+| `File` | stored path when present and stored closed state; no descriptor |
+| `Command` | program, quoted arguments, environment override pairs and stream policies |
+| `HttpClient` | host and port; no connector closure |
+| `Child`, `Hasher`, `Tcp`, `TcpListener`, `Udp`, `TlsStream` | `TypeName { .. }`; opaque native state is omitted |
 
 ## `core.assert`
 
@@ -322,7 +354,8 @@ answers with a path builds a new one, so a `Path` may be shared freely.
 | `Path.parse(s)`                         | `(string) -> Path`                     | absolute when `s` starts with `/`               |
 | `Path.current_dir()`                    | `() -> Path!`                          | the working directory                           |
 | `Path.home()` / `temp_dir()`            | `() -> Path!`                          | the home / temporary directory                  |
-| `p.to_string()`                         | `() -> string`                         | `.` for the empty path                          |
+| `p.to_string()` / `p.display()` | `() -> string` | path text; `.` for the empty path |
+| `p.debug()` | `() -> string` | quoted and escaped path text |
 | `p.components()`                        | `() -> string[]`                       | a copy, the root included as `/`                |
 | `p.depth()`                             | `() -> int64`                          | component count                                 |
 | `p.is_absolute()` / `is_root()`         | `() -> bool`                           | shape of the path, not what is on disk          |
@@ -624,7 +657,7 @@ distinct from empty.
 | ----------------------------------------- | ---------------------------------- | ------------------------------------------ |
 | `Version.parse(text)`                     | `(string) -> Version!`             | the whole string must be a version         |
 | `Version.new(major, minor, patch)`        | `(int64, int64, int64) -> Version!` | rejects negatives; no pre-release or build |
-| `v.to_string()`                           | `() -> string`                     | parsing the result yields an equal version |
+| `v.to_string()` / `v.display()` | `() -> string`                     | parsing the result yields an equal version |
 | `v.compare(other)`                        | `(Version) -> int64`               | `-1` / `0` / `1` by precedence             |
 | `v.equals` / `less_than` / `greater_than` | `(Version) -> bool`                | in terms of `compare`                      |
 | `v.is_prerelease()`                       | `() -> bool`                       |                                            |
@@ -757,7 +790,7 @@ type URI = {
 | --------------------------- | -------------------- | ----------------------------------------------------------------- |
 | `URI.parse(text)`           | `(string) -> URI!`   | parse an absolute URI; a scheme is required                       |
 | `URI.parse_reference(text)` | `(string) -> URI!`   | also accepts relative references                                  |
-| `uri.to_string()`           | `() -> string`       | reassemble without decoding components                            |
+| `uri.to_string()` / `uri.display()` | `() -> string`       | reassemble without decoding components                            |
 | `uri.authority_string()`    | `() -> string?`      | serialized authority, or `null`                                   |
 | `uri.resolve(reference)`    | `(string) -> URI!`   | resolve a relative or absolute reference against an absolute base |
 | `uri.path_segments()`       | `() -> string[]!`    | split and percent-decode path segments                            |
@@ -847,7 +880,7 @@ Networking is unavailable in the browser playground.
 import std.data.json.{ JsonValue }
 ```
 
-A JSON value tree, parser, accessors, serializer, and a reflective decoder.
+A JSON value tree, parser, accessors, serializer, and reflective conversions.
 The whole surface hangs off `JsonValue`, so the type is the only name to import.
 A pure-Brass module under the installed `std` package.
 
@@ -869,7 +902,11 @@ not the source document's ordering (stable for a given input).
 | Function / method                                 | Signature                           | Behavior                                                                                                             |
 | ------------------------------------------------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `JsonValue.parse(text)`                           | `(string) -> JsonValue!`            | whole input must be one JSON value                                                                                   |
-| `j.stringify()`                                   | `-> string`                         | serialize back to JSON text                                                                                          |
+| `j.stringify()`                                   | `-> string`                         | compact JSON text                                                                                                    |
+| `JsonValue.from(value)`                           | `-> JsonValue!`                     | convert a value recursively; unsupported types and non-finite numbers return errors                                  |
+| `j.pretty()`                                      | `-> string`                         | JSON with four-space indentation; empty containers stay inline                                                       |
+| `j.display()`                                     | `-> string`                         | the same text as `pretty`, also used by `println` and interpolation                                                  |
+| `j.debug()` | `-> string` | the same text as `pretty`, including when nested in other values |
 | `j.as_bool()` / `j.as_number()` / `j.as_string()` | `-> bool!` / `float64!` / `string!` | payload, or a decode error naming the expected kind                                                                  |
 | `j.is_null()`                                     | `-> bool`                           |                                                                                                                      |
 | `j.get(key)`                                      | `(string) -> JsonValue!`            | object field, or an error naming the missing field                                                                   |
@@ -896,6 +933,52 @@ const u: User = JsonValue.parse(src)!.into()!
 println("{u.name} {u.age} {u.address.city}")   // Aki 30 Tokyo
 ```
 
+`JsonValue.from` accepts booleans, strings, every integer and floating-point
+width, nullable values, arrays, string-keyed `HashMap`s, and records. A nullable
+value becomes `null` or its converted inner value. Arrays convert each element;
+records become objects named by their fields. Map entries are inserted in map
+order, but object output order is unspecified. An existing `JsonValue` passes
+through unchanged.
+
+Numbers become `float64`; integers beyond 2^53 can lose precision. Non-finite
+numbers, non-string map keys, functions, and sums without a conversion hook
+return ordinary `!` errors naming the value or type. A nested error fails the
+whole conversion without returning a partial tree.
+
+```brass norun
+import std.data.json.{ JsonValue }
+
+type User = { name: string, active: bool }
+const user = User { name: "Aki", active: true }
+println(JsonValue.from(user)!.pretty())
+```
+
+For a custom conversion, declare `fun T.to_json(self) -> JsonValue!`. This hook
+takes precedence over the ordinary mapping, except for `JsonValue` itself.
+Hook errors propagate to the caller.
+
+```brass norun
+import std.data.json.{ JsonValue }
+
+type Label = { text: string }
+fun Label.to_json(self) -> JsonValue! {
+    return JsonValue.String { value: self.text }
+}
+println(JsonValue.from(Label { text: "hello" })!.stringify()) // "hello"
+```
+
+`stringify`, `pretty`, `display` and `debug` write finite integral numbers with
+magnitude at most 2^53 as integers (`2`, `-3`, and `0` for negative zero). Other
+numbers keep their float spelling; parsing still stores numbers as float64.
+
+`pretty` puts each member or element on its own line, indented by four spaces.
+Empty objects and arrays remain `{}` and `[]`. `stringify` adds no whitespace.
+Both render strings and numbers identically, so parsing either text yields the
+same JSON value. `display`, including interpolation and `println`, and `debug`
+all use `pretty`. A JSON value inside a record, array or map therefore retains
+its JSON shape, without exposing the object map's storage. Each nonempty JSON
+array still puts every element on its own line.
+
 ## `std.data.toml`
 
 ```brass norun
@@ -919,6 +1002,7 @@ type TomlValue =
 | ----------------------- | ------------------------ | ------------------------------------------------------------ |
 | `TomlValue.parse(text)` | `(string) -> TomlValue!` | parse a complete TOML document; the root is a table          |
 | `value.stringify()`     | `() -> string`           | serialize as TOML; nested containers use inline form         |
+| `value.debug()` / `value.display()` | `() -> string` | inspect the content tree, without map storage fields |
 | `value.as_string()`     | `() -> string!`          | extract a string                                             |
 | `value.as_integer()`    | `() -> int64!`           | extract an integer                                           |
 | `value.as_float()`      | `() -> float64!`         | extract a float                                              |
@@ -940,6 +1024,24 @@ of wrapping. Date and time values are retained as source text after their
 lexical fields and calendar ranges are validated. `stringify()` escapes control
 characters and writes `nan`, `inf`, and `-inf` in lowercase. Tables use
 `HashMap`, so key order is not preserved by `keys()` or `stringify()`.
+
+Printing, interpolation and `debug()` show the same TOML content tree. Strings
+are quoted and escaped, integers print as `2`, floats retain their float spelling
+(`2.0`), booleans print as `true` or `false`, and date/time values are unquoted
+source text. Tables use quoted keys and four-space indentation, with `{}` for an
+empty table. Arrays use `[a, b]` when every child is one line; otherwise each
+child occupies its own indented line. Nested tables, arrays of tables and TOML
+values inside other records or maps retain this form. This inspection text is
+distinct from the TOML serialization returned by `stringify()`.
+
+```brass norun
+import std.data.toml.TomlValue
+
+println(TomlValue.Integer { value: 2 }) // 2
+println(TomlValue.Float { value: 2.0 }) // 2.0
+println(TomlValue.String { value: "two" }) // "two"
+println(TomlValue.Datetime { value: "2026-10-31" }) // 2026-10-31
+```
 
 Reflective decoding supports scalar and record targets recursively. It does
 not decode a TOML array directly into a typed array; use `as_array()` and

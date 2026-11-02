@@ -203,6 +203,11 @@ pub enum Rvalue {
     /// operand's own type, and branch folding prunes the untaken arm, so the
     /// test never exists at runtime.
     TypeTest(Operand, Type),
+    /// True when the checker selected these field names for the enclosing instance.
+    FieldsTest {
+        site: brass_parser::Span,
+        fields: Vec<String>,
+    },
 }
 
 impl fmt::Display for Literal {
@@ -311,6 +316,7 @@ impl fmt::Display for Rvalue {
             }
             Rvalue::TypeName(op) => write!(f, "typename {op}"),
             Rvalue::TypeTest(op, pattern) => write!(f, "typetest {op}: {}", pattern.display()),
+            Rvalue::FieldsTest { site, fields } => write!(f, "fields-test {site:?}: {fields:?}"),
         }
     }
 }

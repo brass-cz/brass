@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // @backends: all
 // A generic body that builds a witness-free container (`HashMap.new()`)
 // instantiated at two element types: each instance builds its own map type

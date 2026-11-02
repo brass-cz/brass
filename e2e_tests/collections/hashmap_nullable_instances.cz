@@ -1,0 +1,11 @@
+// @backends: all
+// Different map instances preserve present and absent nullable values.
+import std.collections.{ HashMap }
+let numbers: HashMap { key: string, value: int32? } = HashMap.new()
+let words: HashMap { key: string, value: string } = HashMap.new()
+numbers.set("present", 9)
+numbers.set("absent", null)
+words.set("word", "ok")
+println(numbers.get("present"))
+println(numbers.get("absent"))
+println(words.get("word"))

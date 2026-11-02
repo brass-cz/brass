@@ -11,14 +11,14 @@
 //! recovered graph anyway.
 
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use brass_hir::LoadedModule;
 use brass_parser::Span;
 
 use crate::loader::{
-    SearchPaths, SourceMap, canonicalize_imports, inject_module_path, load_modules,
-    module_location, parse_stdlib,
+    Recovery, RecoveryObserver, SearchPaths, SourceMap, canonicalize_imports, inject_module_path,
+    load_modules_observing, module_location, parse_stdlib,
 };
 
 /// The parsed embedded core library, shared for the life of the process: it never
@@ -89,6 +89,52 @@ pub struct Frontend {
 /// recovered AST in the graph, graph problems leave the graph partial, and
 /// both are reported in the result for the caller to abort on or diagnose.
 pub fn assemble(entry_path: &Path, entry_src: &str, root: &Path, search: &SearchPaths) -> Frontend {
+    assemble_inner(entry_path, entry_src, root, search, ())
+}
+
+/// Assemble with explicit observation of recovered dependency ASTs. Those ASTs
+/// stay outside the executable graph; errors and loading order are unchanged.
+pub fn assemble_with_recovery(
+    entry_path: &Path,
+    entry_src: &str,
+    root: &Path,
+    search: &SearchPaths,
+    observer: &mut dyn FnMut(LoadedModule),
+) -> Frontend {
+    assemble_inner(
+        entry_path,
+        entry_src,
+        root,
+        search,
+        RecoveryObserver(observer),
+    )
+}
+
+/// Assemble a complete recovered catalog while preserving every diagnostic.
+/// Callers must reject catalog errors and check recoverable body ownership before
+/// using the recovered graph for execution.
+pub fn assemble_recovered(
+    entry_path: &Path,
+    entry_src: &str,
+    root: &Path,
+    search: &SearchPaths,
+) -> Frontend {
+    assemble_inner(
+        entry_path,
+        entry_src,
+        root,
+        search,
+        crate::loader::RecoveryCatalog,
+    )
+}
+
+fn assemble_inner<R: Recovery>(
+    entry_path: &Path,
+    entry_src: &str,
+    root: &Path,
+    search: &SearchPaths,
+    recovery: R,
+) -> Frontend {
     let cache = stdlib_cache();
     let mut sources = cache.sources.clone();
     let (mut modules, stdlib_error) = match &cache.modules {
@@ -104,9 +150,10 @@ pub fn assemble(entry_path: &Path, entry_src: &str, root: &Path, search: &Search
     let (mut entry_ast, parse_errors) = brass_parser::parse_recovering(entry_src, entry_base);
     // The entry's `_PATH`: its canonical on-disk location, or the label as
     // written when no file exists behind it.
+    let entry_location = module_location(entry_path);
     inject_module_path(
         &mut entry_ast,
-        &module_location(entry_path),
+        &entry_location.display().to_string(),
         Span::new(entry_base, entry_base),
     );
     let parse_errors: Vec<(String, Span)> = parse_errors
@@ -116,19 +163,26 @@ pub fn assemble(entry_path: &Path, entry_src: &str, root: &Path, search: &Search
 
     let mut load_errors = Vec::new();
     let targets = canonicalize_imports(&[], root, &mut entry_ast.imports, search);
-    load_modules(
+    load_modules_observing(
         &targets,
         root,
         &mut sources,
         &mut modules,
         &mut load_errors,
         search,
+        recovery,
     );
 
     // The entry joins the graph under the fixed module path `main`, LAST (the
     // context-prefix invariant documented on `Frontend::modules`): its file
     // dependencies were all pushed by the loop above.
     modules.push(LoadedModule {
+        source: Some(Arc::new(brass_hir::ModuleSource {
+            location: entry_location,
+            origin: brass_hir::SourceOrigin::Own(brass_hir::PackageId::new(root)),
+            base: entry_base,
+            len: entry_src.len(),
+        })),
         is_prelude: false,
         path: vec!["main".into()],
         ast: entry_ast,

@@ -1,0 +1,62 @@
+null
+null
+true
+true
+true
+true
+2
+2
+true
+"two"
+"two"
+true
+[]
+[]
+true
+{}
+{}
+true
+[
+    1,
+    "two"
+]
+[
+    1,
+    "two"
+]
+true
+{
+    "child": {
+        "ok": true
+    },
+    "n": 2
+}
+{
+    "child": {
+        "ok": true
+    },
+    "n": 2
+}
+true
+Box {
+    value: {
+        "items": [
+            1,
+            "two"
+        ]
+    },
+}
+[{
+    "items": [
+        1,
+        "two"
+    ]
+}]
+{
+    "document": {
+        "items": [
+            1,
+            "two"
+        ]
+    }
+}

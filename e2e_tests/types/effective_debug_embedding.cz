@@ -1,0 +1,18 @@
+// @backends: all
+import std.collections.HashMap
+type Temp = {
+    c: int32
+}
+type Box = {
+    value
+}
+fun main() {
+    let map: HashMap { key: string, value: int32 } = HashMap.new()
+    map.set("a", 2)
+    println([Temp { c: 2 }])
+    println([map])
+    println([[map]])
+    println([1, map])
+    println(Box { value: map })
+    println(Box { value: [map] })
+}

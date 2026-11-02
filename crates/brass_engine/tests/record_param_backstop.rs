@@ -11,6 +11,7 @@ use brass_hir::LoadedModule;
 fn monomorphize_unchecked(source: &str) -> Option<String> {
     let ast = brass_parser::parse(source).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,

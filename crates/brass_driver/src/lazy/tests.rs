@@ -49,6 +49,7 @@ pub(super) fn state(
     let (requests, request_rx) = tokio::sync::mpsc::unbounded_channel();
     (
         LazyState {
+            selected_bodies: None,
             completion: None,
             counters: LazyCounters::default(),
             events: receiver,
@@ -308,6 +309,7 @@ fn lowering_frontier_preserves_contracts_and_resets_after_body_only_appends() {
         "fun absent() { return 1 }\nfun contract() { return 2 }\nfun required() { return 3 }\nfun untouched() { return 4 }\n",
     ).unwrap();
     let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -409,6 +411,7 @@ fn startup_contract_retry_requires_an_unchanged_missing_pass() {
     use super::frontier::settle_demands;
     let ast = brass_parser::parse("fun f() { return 1 }\nfun g() { return 2 }\n").unwrap();
     let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -462,6 +465,7 @@ fn queued_background_revision_prevents_the_startup_absent_contract_fold() {
     use super::frontier::settle_demands;
     let ast = brass_parser::parse("fun f() { return 1 }\nfun g() { return 2 }\n").unwrap();
     let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,

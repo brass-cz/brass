@@ -31,7 +31,7 @@ pub fn check(program: &Program) -> Vec<TypeError> {
 pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -> Vec<TypeError> {
     let mut errors = Vec::new();
     for f in program.functions.values() {
-        if !modules.checks(&f.module) {
+        if !modules.checks(&f.module) || !modules.checks_body(f.decl.span) {
             continue;
         }
         check_body(program, &f.module, None, &f.decl.body, &mut errors);
@@ -43,6 +43,9 @@ pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -
         match &info.kind {
             TypeKind::Record { methods, .. } => {
                 for m in methods.values() {
+                    if !modules.checks_body(m.decl.span) {
+                        continue;
+                    }
                     if brass_hir::keyed_return(m.decl.ret.as_ref()) {
                         continue;
                     }
@@ -54,6 +57,9 @@ pub(crate) fn check_in(program: &Program, modules: crate::AnalysisModules<'_>) -
             TypeKind::Sum { variants } => {
                 for v in variants {
                     for m in v.methods.values() {
+                        if !modules.checks_body(m.decl.span) {
+                            continue;
+                        }
                         if brass_hir::keyed_return(m.decl.ret.as_ref()) {
                             continue;
                         }

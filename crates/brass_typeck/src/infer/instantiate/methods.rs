@@ -57,6 +57,25 @@ impl Checker<'_> {
         // through a variant not yet on the stack, growing the work factorially
         // in the variant count -- see `Checker::instantiating`.
         let key = format!("method:{self_type}.{method_name}");
+        let key = if self.instantiating.contains(&key)
+            && let Some(body) = &method.body
+        {
+            let inputs: Vec<_> = receiver_ty.iter().chain(arg_types).cloned().collect();
+            let Some(key) = self.fields_recursion_key(
+                key,
+                &brass_hir::InstanceCallable::Method {
+                    owner: self_type.to_owned(),
+                    method: method_name.to_owned(),
+                },
+                body.span,
+                &inputs,
+            ) else {
+                return fallback_ret;
+            };
+            key
+        } else {
+            key
+        };
         // A co-check records return links and an active type-test probe commits
         // bindings for its holes. Recursive calls must take the fallback path.
         let method_rejection = self
@@ -177,6 +196,9 @@ impl Checker<'_> {
             return fallback_ret;
         }
         if !self.elaboration_allowed(&format!("{owner}.{method_name}"), span) {
+            if let Some(body) = &method.body {
+                self.report_incomplete_fields(body.span);
+            }
             self.instantiating.remove(&key);
             return fallback_ret;
         }

@@ -1,0 +1,26 @@
+// @backends: all
+import std.data.json.JsonValue
+fun verify(value: float64, expected: string) {
+    let json = JsonValue.Number { value }
+    assert(json.stringify() == expected)
+    assert(json.pretty() == expected)
+    assert(json.display() == expected)
+    assert(json.debug() == expected)
+    assert("{json}" == expected)
+    println(json)
+}
+fun main() {
+    verify(2.0, "2")
+    verify(-3.0, "-3")
+    verify(-0.0, "0")
+    verify(0.0, "0")
+    verify(9007199254740992.0, "9007199254740992")
+    verify(-9007199254740992.0, "-9007199254740992")
+    verify(9007199254740994.0, "9007199254740994")
+    verify(2.5, "2.5")
+    verify(1e20, "100000000000000000000")
+    verify(float64.parse("inf")!, "inf")
+    verify(float64.parse("-inf")!, "-inf")
+    verify(float64.parse("NaN")!, "NaN")
+    assert(JsonValue.parse("2.0")!.as_number()! == 2.0)
+}

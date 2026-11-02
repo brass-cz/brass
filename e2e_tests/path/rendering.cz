@@ -1,0 +1,20 @@
+// @backends: all
+import std.path.Path
+import std.collections.HashMap
+
+type Box = {
+    path: Path
+}
+// Display is path text; every nested path uses quoted debug text.
+fun main() {
+    let path = Path.parse("src/a, b.cz")
+    println(path)
+    println("{path}")
+    println(path.debug())
+    println(Box { path })
+    println([path, Path.parse("")])
+    let map = HashMap.new()
+    map.set("source", path)
+    println(map)
+    println(Path.parse("a\"b").debug())
+}

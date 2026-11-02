@@ -107,8 +107,9 @@ type Error = { value, location: Location, frames: Frame[] }
 `error(value)` wraps its payload:
 `Result.Err { error: Error { value, location: <call site>, frames: [] } }`.
 `Result.context(self, ctx)` appends a `Frame` to a failed result and leaves a
-success untouched. An unhandled `!` renders the trace through
-`Error.display`, newest context first:
+success untouched. An unhandled `!` renders the trace with the label
+`unhandled error`, newest context first. Printing an `Error` directly or calling
+`Error.display` uses the same layout with the label `error`:
 
 ```brass
 fun a() -> infer! {

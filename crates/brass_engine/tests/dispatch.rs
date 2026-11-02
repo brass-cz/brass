@@ -348,6 +348,7 @@ impl Codegen for TextBackend {
 fn render(src: &str) -> String {
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -434,6 +435,7 @@ fn monomorphize_skips_unsupported_roots() {
                fun pure() {\n  return 6 * 7\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -460,6 +462,7 @@ fn failed_frame_rolls_back_mutually_recursive_callee() {
                fun run_ping() {\n  return ping(3)\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -484,6 +487,7 @@ fn monomorphize_types_module_globals() {
     let src = "let counter = 7\nfun get() {\n  return counter\n}\n";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -514,6 +518,7 @@ fn main_module_top_level_failure_is_surfaced_not_dropped() {
                println(a(5))\n";
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -547,6 +552,7 @@ fn narrowed_nullable_array_ops_type_and_keep_the_init() {
         let src = format!("fun f(a: int32[]?) {{\n  if a {{\n    {body}\n  }}\n}}\nf([1, 2, 3])\n");
         let ast = brass_parser::parse(&src).expect("parse");
         let modules = [LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,

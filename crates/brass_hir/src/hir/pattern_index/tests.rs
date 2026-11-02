@@ -5,6 +5,7 @@ fn program(sources: &[(&str, &str)]) -> Program {
     let modules: Vec<_> = sources
         .iter()
         .map(|(module, source)| LoadedModule {
+            source: None,
             path: if module.is_empty() {
                 Vec::new()
             } else {

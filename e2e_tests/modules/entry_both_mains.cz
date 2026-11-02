@@ -1,0 +1,10 @@
+// @backends: all
+import entry_library
+println("entry initializer")
+fun answer() -> int32! {
+    return 7
+}
+fun main() {
+    println("entry main")
+    println(answer()!)
+}

@@ -44,6 +44,16 @@ impl Monomorphizer<'_, '_> {
                     format!("internal error: missing field `{}` of `{ty}`", fdecl.name)
                 })?;
             let t = match self.operand_type(&value.1, local_types)? {
+                // A declared numeric field fixes its stored representation,
+                // even when an unseeded literal has its default width. The
+                // construction coerces the operand at the field store, so its
+                // type describes that destination rather than the raw operand.
+                Some(Type::Int(_) | Type::Float(_))
+                    if let Some(declared @ (Type::Int(_) | Type::Float(_))) =
+                        &fdecl.resolved_ty =>
+                {
+                    declared.clone()
+                }
                 // A declared-nullable field keeps its declared type whatever
                 // initializes it: a `null` carries the bare `Nullable(Never)` and
                 // coerces to it, and a NON-null value is wrapped into the

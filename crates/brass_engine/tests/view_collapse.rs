@@ -30,6 +30,7 @@ const DISPLAY: &str = "fun display(obj) -> string {\n\
 fn shapes_with_the_same_view_share_one_display_instance() {
     let ast = brass_parser::parse(DISPLAY).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -52,6 +53,7 @@ fn shapes_with_the_same_view_share_one_display_instance() {
     let mir = brass_mir::lower_program_with_types(
         &program,
         &brass_mir::CheckerChannels {
+            selected_bodies: None,
             expr_types: &fxhash::FxHashMap::default(),
             receiver_types: &fxhash::FxHashMap::default(),
             receiver_owners: &fxhash::FxHashMap::default(),
@@ -62,6 +64,7 @@ fn shapes_with_the_same_view_share_one_display_instance() {
             call_locations: &fxhash::FxHashMap::default(),
             lift_errs: &fxhash::FxHashSet::default(),
             fields_loops: &analysis.fields_loops,
+            instance_fields: &analysis.instance_fields,
             type_names: &analysis.type_names,
             typeof_types: &analysis.typeof_types,
             null_props: &analysis.null_props,

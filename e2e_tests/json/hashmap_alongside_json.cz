@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 import std.data.json.{ JsonValue }
 
 // A user HashMap next to the json library, whose parser instantiates its own

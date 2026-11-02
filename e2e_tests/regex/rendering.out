@@ -1,0 +1,84 @@
+Regex { pattern: "(?<word>a+)(b)?" }
+Regex { pattern: "(?<word>a+)(b)?" }
+Box {
+    value: Regex { pattern: "(?<word>a+)(b)?" },
+}
+[Regex { pattern: "(?<word>a+)(b)?" }]
+{
+    "pattern": Regex { pattern: "(?<word>a+)(b)?" }
+}
+Match {
+    text: "aaa",
+    start: 0,
+    end: 3,
+    groups: [Group {
+        text: "aaa",
+        start: 0,
+        end: 3,
+    }, Group {
+        text: "aaa",
+        start: 0,
+        end: 3,
+    }, null],
+}
+Match {
+    text: "aaa",
+    start: 0,
+    end: 3,
+    groups: [Group {
+        text: "aaa",
+        start: 0,
+        end: 3,
+    }, Group {
+        text: "aaa",
+        start: 0,
+        end: 3,
+    }, null],
+}
+Box {
+    value: Match {
+        text: "aaa",
+        start: 0,
+        end: 3,
+        groups: [Group {
+            text: "aaa",
+            start: 0,
+            end: 3,
+        }, Group {
+            text: "aaa",
+            start: 0,
+            end: 3,
+        }, null],
+    },
+}
+[Match {
+    text: "aaa",
+    start: 0,
+    end: 3,
+    groups: [Group {
+        text: "aaa",
+        start: 0,
+        end: 3,
+    }, Group {
+        text: "aaa",
+        start: 0,
+        end: 3,
+    }, null],
+}]
+{
+    "first": Match {
+        text: "aaa",
+        start: 0,
+        end: 3,
+        groups: [Group {
+            text: "aaa",
+            start: 0,
+            end: 3,
+        }, Group {
+            text: "aaa",
+            start: 0,
+            end: 3,
+        }, null],
+    }
+}
+aaa

@@ -32,8 +32,11 @@ reachable match arms) follow the same body rules, including in closures and
 each concrete generic instance. Module initializers are always checked.
 Uninstantiated reflective method templates and statically pruned branches
 follow the ordinary checker selection rules.
-Checker warnings are non-fatal. Only `brass check` gives a complete
-whole-program verdict.
+Checker warnings are non-fatal. `brass check` checks own-package items
+completely, including unused functions. Dependencies are checked only where
+reached or required for shared inference, in every mode. Unreached dependency
+bodies produce no diagnostics, including recoverable body syntax errors;
+errors that hide declaration boundaries remain errors.
 
 ## Syntax essentials
 
@@ -215,7 +218,8 @@ type Names = Stack { item: string }   // alias pinning the slot
   a construction literal; an open slot is fixed by the first value stored.
 - A refined alias such as `type Names = Stack { item: string }` or
   `type Counts = HashMap { key: string, value: int64 }` pins type slots
-  without creating a new nominal type.
+  without creating a new nominal type. Import `std.collections.{ HashMap }`
+  before using the map alias.
 
 ## Control flow and patterns
 
@@ -321,7 +325,7 @@ match load_number("12") {
 - Growable arrays mutate with `push`, `pop`, `insert`, and `remove`.
   `map`, `filter`, `fold`, `each`, `slice`, `reverse`, and `sort` return new
   values except that `each` is for side effects.
-- `HashMap` is in the prelude: `HashMap.new()`, `from_pairs`, `set`, `get`,
+- Import `std.collections.{ HashMap }`: `HashMap.new()`, `from_pairs`, `set`, `get`,
   `get_or`, `contains_key`, `delete`, `size`, `is_empty`, `keys`, `values`,
   `pairs`, and `clear`. Iteration order is unspecified.
 - String APIs are `split`, `trim`, `starts_with`, `ends_with`, `find`,
@@ -330,13 +334,16 @@ match load_number("12") {
   direct indexing or public substring operation; use `chars`, `split`,
   `find`, or `replace`.
 - `print` and `println` take one value. Use interpolation for several values.
-- Every value has `v.debug() -> string`, its canonical rendering (`Debug`
+- A non-nullable, non-callable value has `v.debug() -> string`, its structural rendering (`Debug`
   protocol; a string debugs quoted: `"a".debug()` is `"\"a\""`). Primitives
   also have `v.display()` (a string displays unquoted). `"{v}"` and
   `print`/`println` render through a type's own `display` method when it
   declares one, else through `debug`; a nullable renders `null` when absent
   and otherwise exactly like its value. `string.from(v)` renders the same
-  text as `"{v}"`. `"{v.debug()}"` forces the debug form.
+  text as `"{v}"`. `"{v.debug()}"` forces the debug form. Every nested element,
+  field or payload uses its type's `debug` when declared, otherwise builtin
+  structure. Nested strings are quoted and escaped, including array and tuple
+  elements; multiline custom text is indented at each embedding level.
   `HashMap` declares `display`: JSON-style `"key": value` lines.
 
 ## Reflection and definite assignment
@@ -378,7 +385,6 @@ No import is needed for core names:
 - Conversion: `to_bytes`, `to_text`, `T.from`, `T.parse`, `string.from`.
 - Errors: `Result`, `Error`, `error`, `context`.
 - Testing/defaults: `assert(condition, message?)`, `T.default()`.
-- Collections: `HashMap`.
 - Reflection/concurrency builtins: `fields`, `typeof`, `spawn`, `with`,
   `sync`.
 
@@ -443,8 +449,8 @@ reading results that tasks mutate.
 ## Execution and tools
 
 - `brass file.cz`: demand-driven check, native compile, and run.
-- `brass check file.cz`: complete check without execution; use in CI.
-- `brass --eager file.cz`: complete check before anything runs, then run;
+- `brass check file.cz`: check own code completely and reached dependencies; use in CI.
+- `brass --eager file.cz`: the same selected check before anything runs, then run;
   native compilation is first-use in both modes.
 - `brass --no-jit-cache file.cz`: run without JIT cache reads or writes;
   put the flag before the program filename, as with `--eager`.

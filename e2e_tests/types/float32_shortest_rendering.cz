@@ -1,0 +1,35 @@
+// @backends: all
+type Box = {
+    value: float32
+}
+type Choice = | Value { value: float32 }
+fun verify(value: float32, expected: string) {
+    assert(string.from(value) == expected)
+    assert(value.debug() == expected)
+    assert(value.display() == expected)
+    assert("{value}" == expected)
+    println(value)
+    println([value])
+    println(Box { value })
+    println(Choice.Value { value })
+    print(value)
+    println("")
+    println([value, true])
+    let fixed: float32[1] = [value]
+    println(fixed)
+    println([value].slice(0, 1))
+    let present: float32? = value
+    println(present)
+    println([present, null])
+}
+fun main() {
+    verify(0.1, "0.1")
+    verify(1.2345678, "1.2345678")
+    verify(2.0, "2.0")
+    verify(-0.0, "-0.0")
+    verify(0.00000001, "0.00000001")
+    verify(1e20, "100000000000000000000.0")
+    let narrow: float32 = 0.1
+    let wide: float64 = narrow
+    assert(string.from(wide) == "0.10000000149011612")
+}

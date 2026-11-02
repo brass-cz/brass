@@ -114,7 +114,7 @@ pub(super) fn flush_delta(
         }
     }
     state.instance_seen = checker.instance_typed.len();
-    let instance_want = state.instance_agg.seed_map(&want);
+    let instance_want = state.instance_agg.seed_map();
     for (span, seeds) in &instance_want {
         if state.instance_flushed.get(span) != Some(seeds) {
             delta.instance_seeds.push((
@@ -170,11 +170,31 @@ pub(super) fn flush_delta(
         delta.null_props.push(*s);
     }
     state.null_props.extend(delta.null_props.iter().copied());
-    for (span, fields) in &checker.fields_loops {
-        if state.fields_loops.insert(*span) {
+    let (shared, instances) = checker.settled_fields_loops();
+    for (span, fields) in &shared {
+        if state.fields_loops.get(span) != Some(fields) {
             delta.fields_loops.push((*span, fields.clone()));
         }
     }
+    for (span, entries) in &instances {
+        if state.instance_fields.get(span) != Some(entries) {
+            delta.instance_fields.push((
+                *span,
+                entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ));
+        }
+    }
+    for span in state.instance_fields.keys() {
+        if !instances.contains_key(span) {
+            delta.instance_fields.push((*span, Vec::new()));
+        }
+    }
+    state.fields_loops = shared;
+    state.instance_fields = instances;
+
     // Last-write-wins maps. `sum_views` values mirror the eager channel
     // copy: resolved against the current substitution, with a still-open
     // `Result` payload defaulted to `void` -- an Err-only flow may leave the

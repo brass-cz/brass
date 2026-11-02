@@ -560,12 +560,14 @@ mod tests {
     fn pattern_errors(body: &str) -> Vec<ResolveError> {
         let mut modules = vec![
             LoadedModule {
+                source: None,
                 is_prelude: false,
                 path: vec!["shapes".into()],
                 ast: brass_parser::parse("type Shape = X { v: int32 } | Y\ntype _Hidden = A | B\n")
                     .expect("library"),
             },
             LoadedModule {
+                source: None,
                 is_prelude: false,
                 path: vec!["main".into()],
                 ast: brass_parser::parse(&format!(
@@ -605,11 +607,13 @@ mod tests {
         // Preserve its dotted spelling and distinguish it from a sum qualifier.
         let mut modules = vec![
             LoadedModule {
+                source: None,
                 is_prelude: false,
                 path: vec!["shapes".into()],
                 ast: brass_parser::parse("type P = { x: int32 }\n").expect("library"),
             },
             LoadedModule {
+                source: None,
                 is_prelude: false,
                 path: vec!["main".into()],
                 ast: brass_parser::parse("import shapes as shapes\nlet shapes.P { x } = p\n")

@@ -1,0 +1,31 @@
+// @backends: all
+// Expanded loops retain break, continue and field order for every shape.
+type A = {
+    skip: int32
+    keep: string
+    stop: bool
+    after: int32
+}
+type B = {
+    keep: string
+    stop: bool
+}
+type Empty = {
+}
+
+fun visit(value) {
+    for field in fields(value) {
+        if field == "skip" {
+            continue
+        }
+        if field == "stop" {
+            break
+        }
+        println("{field}={value[field]}")
+    }
+    println("done")
+}
+
+visit(A { skip: 1, keep: "a", stop: true, after: 2 })
+visit(B { keep: "b", stop: false })
+visit(Empty { })

@@ -135,7 +135,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         self.declare_globals(program, true);
         self.mir.init_symbols = program.init_symbols.clone();
         self.mir.frozen_globals = immutable_heap_globals(program);
-        self.mir.lazy_has_main = program.lookup("main").is_some();
+        self.mir.entry_symbol = program.entry_function().map(|f| f.symbol.clone());
         self.emit_freeze_globals_fn();
         self.module
             .verify()
@@ -208,6 +208,7 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         let mut helper_codegen = Self::new_backend(self.ctx, self.program);
         helper_codegen.previous_helpers = Some(self.mir.helpers.clone());
         helper_codegen.region_barriers = region_barriers;
+        helper_codegen.mir.lazy_signatures = Some(signatures.clone());
         // The first new instance fixes this batch's identity independently of
         // hash-map order or which group ORC happens to materialize first.
         let helper_name = format!(
@@ -306,8 +307,8 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         if !self.mir.frozen_globals.is_empty() {
             symbols.push(FREEZE_GLOBALS_FN.into());
         }
-        if self.mir.lazy_has_main {
-            symbols.push(mangle_fn("main"));
+        if let Some(entry) = &self.mir.entry_symbol {
+            symbols.push(mangle_fn(entry));
         }
         symbols.iter().map(|s| jit.lookup(s)).collect()
     }

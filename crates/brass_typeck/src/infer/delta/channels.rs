@@ -109,13 +109,7 @@ pub(super) fn publish(
             }
         }
     }
-    for span in changes.take(Channel::FieldsLoop) {
-        if let Some(fields) = checker.fields_loops.get(&span)
-            && state.fields_loops.insert(span)
-        {
-            delta.fields_loops.push((span, fields.clone()));
-        }
-    }
+    super::fields::publish(checker, state, delta);
     let mut spans = changes.take(Channel::SumView);
     spans.extend(sum_dirty);
     for span in spans {

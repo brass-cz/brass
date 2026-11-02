@@ -1440,7 +1440,8 @@ impl<'a> Checker<'a> {
     /// Move the errors recorded past `before` onto `span`, prefixed with
     /// `frame` (deduplicated -- one inconsistency can surface at several body
     /// sites). Used to point a callee-body re-elaboration failure at the
-    /// caller's value instead of a span inside the callee.
+    /// caller's value instead of a span inside the callee. Field-list limit
+    /// diagnostics retain their loop location.
     fn reattribute_errors(&mut self, before: usize, frame: &str, span: brass_parser::Span) {
         let mut seen: HashSet<String> = HashSet::default();
         let kept: Vec<TypeError> = self
@@ -1448,6 +1449,9 @@ impl<'a> Checker<'a> {
             .split_off(before)
             .into_iter()
             .filter_map(|e| {
+                if Self::is_incomplete_fields(&e) {
+                    return Some(e);
+                }
                 let message = format!("{frame}: {}", e.message);
                 seen.insert(message.clone())
                     .then_some(TypeError { message, span })

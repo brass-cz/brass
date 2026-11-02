@@ -108,10 +108,10 @@ pub fn prim_method_instance(
     (program.lookup(&sym).is_some() || program.deferred.contains_key(&sym)).then_some(sym)
 }
 
-/// The USER `display` instance that `"{v}"` interpolation and
+/// The effective top-level renderer instance that `"{v}"` interpolation and
 /// `print`/`println` route a (non-nullable) value of type `ty` to, when the
-/// monomorphizer created one: a record/sum declaring `display` renders
-/// through it. A nullable value is never looked up here -- [`method_symbol`]'s
+/// monomorphizer created one: `display` takes precedence over `debug`.
+/// A nullable value is never looked up here -- [`method_symbol`]'s
 /// receiver keying would find the inner type's instance and hand it the cell;
 /// see [`nullable_display_instance`].
 pub fn display_instance<'p, 'm>(
@@ -121,11 +121,13 @@ pub fn display_instance<'p, 'm>(
     if matches!(ty, Type::Nullable(_)) {
         return None;
     }
-    program.lookup(&method_symbol("display", std::slice::from_ref(ty)))
+    let symbol =
+        crate::render::resolve_renderer(program.hir, ty, crate::render::RenderForm::Display)?;
+    program.lookup(&symbol)
 }
 
-/// For a nullable `ty` (`T?`) whose inner `T` renders through a USER
-/// `display` ([`display_instance`]), that instance. Rendering such a value
+/// For a nullable `ty` (`T?`) whose inner `T` has a top-level user renderer
+/// ([`display_instance`]), that instance. Rendering such a value
 /// (`"{v}"`, `print`/`println`) yields `null` when it is absent and calls the
 /// instance on the unwrapped value when it is present, so a present value
 /// renders exactly as the non-null value would. `None` for any other type.

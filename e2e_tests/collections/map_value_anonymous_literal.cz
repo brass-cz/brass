@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // @backends: all
 // An anonymous record literal whose fields are exactly the map's value
 // record is built as that record when it is stored with `set`.

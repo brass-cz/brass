@@ -8,6 +8,7 @@ fn missing_target_keeps_the_symbol_and_argument_effects() {
     )
     .unwrap();
     let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,

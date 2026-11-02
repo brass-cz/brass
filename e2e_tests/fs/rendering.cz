@@ -1,0 +1,20 @@
+// @backends: all
+import std.fs.File
+import std.collections.HashMap
+
+type Box = {
+    file: File
+}
+// A standard stream can be inspected without writing, closing or exposing its fd.
+fun main() {
+    let file = File.stdout()
+    println(file)
+    println(file.debug())
+    println(Box { file })
+    println([file])
+    let map = HashMap.new()
+    map.set("stream", file)
+    println(map)
+    // Stored path/closed-state rendering performs no filesystem query.
+    println(File { _fd: -1, _path: "missing.txt", _borrowed: false })
+}

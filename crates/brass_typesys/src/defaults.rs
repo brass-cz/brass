@@ -65,6 +65,7 @@ mod tests {
         )
         .expect("parse");
         let modules = [LoadedModule {
+            source: None,
             path: vec!["main".into()],
             ast,
             is_prelude: false,

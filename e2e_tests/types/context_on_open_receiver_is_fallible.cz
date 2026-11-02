@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // @backends: all
 // `m.get(k).context(..)!` on an unannotated map parameter propagates an
 // error at every instance where the map's `get` answers a nullable, so the

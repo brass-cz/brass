@@ -21,13 +21,20 @@ pub(super) struct RegionGraph {
 
 impl RegionGraph {
     /// Collect all reference edges without elaborating bodies or changing channels.
-    pub(super) fn new(program: &Program, completed: &HashSet<String>) -> Self {
+    pub(super) fn new(
+        program: &Program,
+        completed: &HashSet<String>,
+        selected: Option<&HashSet<brass_parser::Span>>,
+    ) -> Self {
         let mut graph = Self {
             edges: HashMap::default(),
             opaque: HashSet::default(),
             can_drain: true,
         };
         for (symbol, function) in &program.functions {
+            if selected.is_some_and(|spans| !spans.contains(&function.decl.span)) {
+                continue;
+            }
             let mut edges = HashSet::default();
             // Keep implicit method dispatch and result conversions outside the
             // certificate. Open frames may forward values through free calls,
@@ -114,10 +121,10 @@ impl RegionGraph {
                     variants.iter().flat_map(|v| v.methods.values()).collect()
                 }
             };
-            if methods
-                .iter()
-                .any(|m| brass_hir::keyed_return(m.decl.ret.as_ref()))
-            {
+            if methods.iter().any(|m| {
+                selected.is_none_or(|spans| spans.contains(&m.decl.span))
+                    && brass_hir::keyed_return(m.decl.ret.as_ref())
+            }) {
                 tracing::debug!(target: "brass::perf", symbol = %info.symbol, "lazy: reflective completion template");
                 graph.can_drain = false;
             }
@@ -237,12 +244,13 @@ mod tests {
     fn graph(source: &str) -> RegionGraph {
         let ast = brass_parser::parse(source).unwrap();
         let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,
         }]);
         assert!(errors.is_empty());
-        RegionGraph::new(&program, &HashSet::default())
+        RegionGraph::new(&program, &HashSet::default(), None)
     }
 
     /// Function values and calls inside closures both create exclusion edges.
@@ -270,6 +278,30 @@ mod tests {
         assert!(!graph("fun mixed(a) { let x = a!\n return error(1) }\n").can_drain());
         assert!(!graph("type T = {}\nfun T.f(self, x) -> infer! { return x }\n").can_drain());
         assert!(graph("fun plain(x) { return x }\n").can_drain());
+    }
+
+    /// Only omitted bodies may bypass the warning preflight; membership is not coverage.
+    #[test]
+    fn unselected_warning_body_does_not_block_completion() {
+        let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+            source: None,
+            is_prelude: false,
+            path: vec!["main".into()],
+            ast: brass_parser::parse("fun mixed(a, b) { let x = a!\n return b! }\n").unwrap(),
+        }]);
+        assert!(errors.is_empty());
+        let mut selected = HashSet::default();
+        assert!(RegionGraph::new(&program, &HashSet::default(), Some(&selected)).can_drain());
+        selected.insert(program.functions["mixed"].decl.span);
+        assert!(!RegionGraph::new(&program, &HashSet::default(), Some(&selected)).can_drain());
+        assert!(
+            RegionGraph::new(
+                &program,
+                &HashSet::from_iter(["mixed".into()]),
+                Some(&selected)
+            )
+            .can_drain()
+        );
     }
 
     /// A bad callee excludes callers even when the caller itself is clean.

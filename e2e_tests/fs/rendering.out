@@ -1,0 +1,10 @@
+File { closed: false }
+File { closed: false }
+Box {
+    file: File { closed: false },
+}
+[File { closed: false }]
+{
+    "stream": File { closed: false }
+}
+File { path: "missing.txt", closed: true }

@@ -1,0 +1,24 @@
+first
+second
+last
+Outer {
+    value: Inner {
+        value: first
+        second
+        last,
+    },
+}
+[first
+second
+last]
+[[first
+second
+last]]
+[1, first
+second
+last]
+Choice.Value {
+    value: first
+    second
+    last,
+}

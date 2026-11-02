@@ -7,4 +7,4 @@ true
 2
 demo 3 localhost 5432
 localhost
-error: [std/data/toml.cz:125:20] unhandled error: missing key 'nope'
+error: [std/data/toml.cz:127:20] error: missing key 'nope'

@@ -134,6 +134,44 @@ impl FnLower<'_, '_> {
         last
     }
 
+    /// Unroll one checked field sequence, preserving the loop's control flow.
+    fn lower_fields_body(
+        &mut self,
+        body: &Block,
+        var: &str,
+        fields: &[String],
+        exit: crate::BlockId,
+    ) {
+        for (i, field) in fields.iter().enumerate() {
+            let next = self.b.new_block();
+            let expanded = brass_hir::expand_fields_body(body, var, field, i);
+            self.push_scope();
+            // The compile-time copies form one logical loop. A
+            // `break` leaves the whole sequence, while `continue`
+            // advances to the next expanded field.
+            self.loops.push(crate::lower::LoopFrame {
+                cont: next,
+                brk: exit,
+                writeback: None,
+            });
+            for stmt in &expanded.stmts {
+                if self.b.terminated() {
+                    break;
+                }
+                self.lower_stmt(stmt);
+            }
+            if !self.b.terminated() {
+                self.b.terminate(Terminator::Goto(next));
+            }
+            self.loops.pop();
+            self.pop_scope();
+            self.b.switch_to(next);
+        }
+        if !self.b.terminated() {
+            self.b.terminate(Terminator::Goto(exit));
+        }
+    }
+
     /// Lower one statement, possibly emitting control flow.
     pub(crate) fn lower_stmt(&mut self, s: &Stmt) {
         match s {
@@ -168,36 +206,38 @@ impl FnLower<'_, '_> {
                     && let Pattern::Binding(var, _, _) = pat
                 {
                     let fields = fields.clone();
-                    let exit = self.b.new_block();
-                    for (i, field) in fields.iter().enumerate() {
-                        let next = self.b.new_block();
-                        let expanded = brass_hir::expand_fields_body(body, var, field, i);
-                        self.push_scope();
-                        // The compile-time copies form one logical loop. A
-                        // `break` leaves the whole sequence, while `continue`
-                        // advances to the next expanded field.
-                        self.loops.push(crate::lower::LoopFrame {
-                            cont: next,
-                            brk: exit,
-                            writeback: None,
-                        });
-                        for stmt in &expanded.stmts {
-                            if self.b.terminated() {
-                                break;
-                            }
-                            self.lower_stmt(stmt);
+                    if let Some(instances) = self.ctx.instance_fields.get(span) {
+                        let mut alternatives: Vec<_> = instances.values().cloned().collect();
+                        alternatives.sort();
+                        alternatives.dedup();
+                        let exit = self.b.new_block();
+                        for fields in alternatives {
+                            let selected = self.b.new_block();
+                            let other = self.b.new_block();
+                            let cond = self.b.emit_known(
+                                Rvalue::FieldsTest {
+                                    site: *span,
+                                    fields: fields.clone(),
+                                },
+                                Type::Bool,
+                            );
+                            self.b.terminate(Terminator::CondBranch {
+                                cond,
+                                then: selected,
+                                els: other,
+                            });
+                            self.b.switch_to(selected);
+                            self.lower_fields_body(body, var, &fields, exit);
+                            self.b.switch_to(other);
                         }
-                        if !self.b.terminated() {
-                            self.b.terminate(Terminator::Goto(next));
-                        }
-                        self.loops.pop();
-                        self.pop_scope();
-                        self.b.switch_to(next);
+                        // A checked live loop always has a selected expansion.
+                        self.b.terminate(Terminator::Unreachable);
+                        self.b.switch_to(exit);
+                    } else {
+                        let exit = self.b.new_block();
+                        self.lower_fields_body(body, var, &fields, exit);
+                        self.b.switch_to(exit);
                     }
-                    if !self.b.terminated() {
-                        self.b.terminate(Terminator::Goto(exit));
-                    }
-                    self.b.switch_to(exit);
                     return;
                 }
                 self.lower_for(pat, iter, body)
@@ -327,7 +367,7 @@ impl FnLower<'_, '_> {
                 let v = self.lower_expr(value);
                 if let Some(annotation) = ty {
                     let shared = self.slot_type(annotation);
-                    let local = self.b.fresh_seeded_local(annotation.span(), shared);
+                    let local = self.annotation_local(name, Some(annotation), shared);
                     self.b.push(MirStmt::Assign(local, Rvalue::Use(v)));
                     // Promotion derives its element type from the seeded local,
                     // which may have a different type in each instance.
@@ -423,7 +463,17 @@ impl FnLower<'_, '_> {
         shared: Option<Type>,
     ) -> LocalId {
         match annotation {
-            Some(annotation) => self.b.fresh_seeded_local(annotation.span(), shared),
+            Some(annotation) => {
+                // A source-declared type is not an observed instance seed.
+                // Only scope-dependent annotations need the checker channel.
+                if let Some(ty) = resolve_simple_type(annotation)
+                    .or_else(|| self.resolve_concrete_annotation(annotation))
+                {
+                    self.b.fresh_local_typed(None, ty)
+                } else {
+                    self.b.fresh_seeded_local(annotation.span(), shared)
+                }
+            }
             None => self.b.fresh_local(Some(name.to_string())),
         }
     }

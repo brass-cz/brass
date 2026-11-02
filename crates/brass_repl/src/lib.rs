@@ -56,7 +56,7 @@ fn validate_monomorphized(
     program: &Program,
     mono: &brass_engine::MonoProgram<'_>,
 ) -> Result<(), String> {
-    if program.functions.contains_key("main") && mono.lookup("main").is_none() {
+    if program.entry_function().is_some() && mono.entry_function().is_none() {
         // `main_skip` is the first construct that made `main` untypeable --
         // the diagnostic the user needs, same as the JIT engine's error path.
         return Err(match &mono.main_skip {

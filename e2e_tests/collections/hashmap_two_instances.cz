@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // Two HashMap instantiations with different value types in one program. Both
 // render as the bare name `HashMap` (their members are all `_`-private), yet
 // each instance keeps its own per-type code -- destructor, rendering, deep

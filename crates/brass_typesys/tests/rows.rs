@@ -8,6 +8,7 @@ use brass_typesys::{Presence, RowInfo, RowTy, check_row};
 fn analyze(src: &str) -> (brass_hir::Program, RowInfo) {
     let ast = brass_parser::parse(src).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,

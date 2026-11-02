@@ -100,13 +100,13 @@ fn late_nonpending_closure_keeps_its_terminal_publication_boundary() {
 }
 
 #[test]
-fn shared_poisoning_exposes_previously_suppressed_instance_seeds() {
+fn instance_seeds_remain_authoritative_before_shared_disagreement() {
     let program = Program::empty();
     let mut checker = Checker::new(&program, Rc::new(brass_typesys::RowInfo::analyze(&program)));
     let span = Span::new(5, 6);
     let mut state = stream::FlushState::default();
     let mut reference = stream::FlushState::default();
-    for ty in [Type::Bool, Type::Str] {
+    for (index, ty) in [Type::Bool, Type::Str].into_iter().enumerate() {
         let tag = checker.intern_tag(
             InstanceCallable::Function("f".into()),
             std::slice::from_ref(&ty),
@@ -119,6 +119,10 @@ fn shared_poisoning_exposes_previously_suppressed_instance_seeds() {
             Some(tag),
         );
         boundary(&checker, &mut state, &mut reference, false);
+        assert_eq!(state.instance_flushed[&span].len(), index + 1);
+        if index == 0 {
+            assert!(state.expr_flushed.contains_key(&span));
+        }
     }
     assert!(!state.expr_flushed.contains_key(&span));
     assert_eq!(state.instance_flushed[&span].len(), 2);
@@ -435,5 +439,30 @@ fn numeric_arguments_never_seed_an_unseen_instance_from_shared_mir() {
         assert!(!state.expr_flushed.contains_key(&span));
     }
     assert_eq!(state.instance_flushed[&span].len(), 2);
+    boundary(&checker, &mut state, &mut reference, true);
+}
+
+#[test]
+fn fields_lists_publish_divergence_and_retain_single_instance_channel() {
+    let program = Program::empty();
+    let mut checker = Checker::new(&program, Rc::new(brass_typesys::RowInfo::analyze(&program)));
+    let span = Span::new(7, 8);
+    let a = checker.intern_tag(InstanceCallable::Function("walk".into()), &[Type::Str]);
+    let b = checker.intern_tag(InstanceCallable::Function("walk".into()), &[Type::Bool]);
+    let mut state = stream::FlushState::default();
+    let mut reference = stream::FlushState::default();
+    assert!(checker.record_fields_loop_in(span, vec!["a".into()], Some(a.clone())));
+    let delta = boundary(&checker, &mut state, &mut reference, false);
+    assert_eq!(delta.fields_loops, vec![(span, vec!["a".into()])]);
+    assert!(delta.instance_fields.is_empty());
+    // Repeated observations publish no redundant replacement.
+    assert!(checker.record_fields_loop_in(span, vec!["a".into()], Some(a.clone())));
+    assert!(boundary(&checker, &mut state, &mut reference, false).is_empty());
+    assert!(checker.record_fields_loop_in(span, vec!["b".into()], Some(b)));
+    let delta = boundary(&checker, &mut state, &mut reference, false);
+    assert!(delta.fields_loops.is_empty());
+    assert_eq!(delta.instance_fields[0].1.len(), 2);
+    assert!(!checker.record_fields_loop_in(span, vec!["wrong".into()], Some(a)));
+    assert_eq!(checker.errors.len(), 1);
     boundary(&checker, &mut state, &mut reference, true);
 }

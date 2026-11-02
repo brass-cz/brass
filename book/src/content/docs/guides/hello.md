@@ -24,8 +24,10 @@ Hello, world!
 ```
 
 A Brass source file is a script: top-level statements run from top to bottom.
-You can also define a `main` function, which is called after the top-level
-statements have run:
+You can also define a `main` function in the entry file, which is called after
+the top-level statements have run. Imported modules run their top-level
+statements first, in dependency order; their `main` functions run only when
+called explicitly:
 
 ```brass
 fun main() {
@@ -38,7 +40,7 @@ This produces the same output.
 ## Checking without running
 
 An ordinary run checks each function before that function can execute, but it
-does not wait for unused functions. To check the whole program without
+does not wait for unused own functions. To check own code completely without
 executing it, use `brass check`:
 
 ```bash
@@ -47,7 +49,9 @@ brass check hello.cz
 
 It prints nothing when the program is well-typed, and exits 0; otherwise it
 prints the type errors and exits non-zero.
-Running `brass` with no arguments starts an interactive REPL.
+Dependencies are checked only where reached or required for shared inference;
+unused dependency bodies are not checked or reported. Running `brass` with no
+arguments starts an interactive REPL.
 
 ### A run only checks what it runs
 
@@ -69,17 +73,17 @@ reports the error in `broken`.
 What this means in practice:
 
 - **A green run is not a full type check.** Use `brass check` for the
-  whole-program verdict, e.g. in CI, before a commit, or after a refactor.
+  complete own-code verdict, e.g. in CI, before a commit, or after a refactor.
 - Errors in code the run does need still stop it. An error in the top-level
   statements or in `main` aborts before anything executes; an error in a
   function first reached mid-run stops the run right there, though output
   already produced stands and the run exits non-zero. The unit is the whole
   function: an error anywhere in a function the run calls counts, even in a
   branch execution would never take.
-- Unused code may continue checking in the background until the program
+- Unused own code may continue checking in the background until the program
   exits. Its errors never stop a run, but a run that fails for another
   reason reports them together with the error that stopped it.
-- `brass --eager hello.cz` runs with the check-everything-first behavior
+- `brass --eager hello.cz` checks own code and reached dependencies first
   (identical to `brass check` followed by the run). The REPL and the
   interpreter back end always check eagerly.
 

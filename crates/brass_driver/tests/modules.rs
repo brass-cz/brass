@@ -1922,13 +1922,13 @@ fn same_named_sum_method_qualifiers_resolve_symbols() {
 }
 
 #[test]
-fn checking_core_entry_modules_terminates() {
+fn checking_library_entry_modules_terminates() {
     // Loading a core file as main redeclares prelude names; a checker error is
     // acceptable, but method-return inference must finish within the deadline.
     use std::process::Stdio;
     use std::time::{Duration, Instant};
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for file in ["core/error.cz", "core/collections.cz"] {
+    for file in ["core/error.cz", "std/collections.cz"] {
         let mut child = support::brass_command(env!("CARGO_BIN_EXE_brass"))
             .arg("check")
             .arg(root.join(file))

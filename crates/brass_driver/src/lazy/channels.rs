@@ -25,6 +25,8 @@ pub(super) struct MergedChannels {
     pub(super) sum_views: HashMap<Span, brass_hir::Type>,
     pub(super) lift_errs: HashSet<Span>,
     pub(super) fields_loops: HashMap<Span, Vec<String>>,
+    /// Field lists for loops whose callable instances disagree.
+    pub(super) instance_fields: brass_hir::InstanceChannel<Vec<String>>,
     pub(super) type_names: HashMap<Span, String>,
     pub(super) typeof_types: HashMap<Span, brass_hir::Type>,
     pub(super) null_props: HashSet<Span>,
@@ -40,7 +42,9 @@ impl MergedChannels {
         match event {
             // Diagnostics are held by `LazyState::take`; only channel content
             // is merged here.
-            CheckEvent::StaticChecked(_) | CheckEvent::ContextChecked(_) => {}
+            CheckEvent::SelectedBodies(_)
+            | CheckEvent::StaticChecked(_)
+            | CheckEvent::ContextChecked(_) => {}
             CheckEvent::ContextReady(d)
             | CheckEvent::BatchSettled(d)
             | CheckEvent::BodyChecked(_, d)
@@ -102,6 +106,14 @@ impl MergedChannels {
         self.sum_views.extend(d.sum_views);
         self.lift_errs.extend(d.lift_errs);
         self.fields_loops.extend(d.fields_loops);
+        for (span, entries) in d.instance_fields {
+            if entries.is_empty() {
+                self.instance_fields.remove(&span);
+            } else {
+                self.instance_fields
+                    .insert(span, entries.into_iter().collect());
+            }
+        }
         self.type_names.extend(d.type_names);
         self.typeof_types.extend(d.typeof_types);
         self.type_tests.extend(d.type_tests);

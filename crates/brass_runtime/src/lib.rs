@@ -49,6 +49,7 @@ pub fn symbols() -> Vec<(&'static str, usize)> {
         alloc::pp_str_debug,
         alloc::pp_int_to_str,
         alloc::pp_float_to_str,
+        alloc::pp_float32_to_str,
         alloc::pp_bool_to_str,
         alloc::pp_print_str,
         alloc::pp_println_str,

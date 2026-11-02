@@ -4,4 +4,4 @@ true
 20
 leaf
 2
-err [e2e_tests/control_flow/mutual_recursion.cz:57:16] unhandled error: too deep
+err [e2e_tests/control_flow/mutual_recursion.cz:57:16] error: too deep

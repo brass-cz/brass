@@ -13,7 +13,7 @@ use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use brass_hir::LoadedModule;
+use brass_hir::{LoadedModule, ModuleSource, PackageId, SourceOrigin};
 use brass_parser::ast::{
     Expr, ImportDecl, ImportedName, Module, Pattern, Stmt, StrSeg, TopLevel, TypeExpr,
 };
@@ -28,7 +28,7 @@ mod source_tests;
 // module is just adding a file.
 include!(concat!(env!("OUT_DIR"), "/stdlib.rs"));
 
-/// Names of the embedded core modules (`io`, `array`, `collections`, ...),
+/// Names of the embedded core modules (`io`, `array`, `string`, ...),
 /// used by import-path completion.
 pub fn prelude_module_names() -> impl Iterator<Item = &'static str> {
     STDLIB.iter().map(|(name, _)| *name)
@@ -63,19 +63,15 @@ pub fn inject_module_path(ast: &mut Module, location: &str, span: Span) {
     ast.items.insert(0, TopLevel::Stmt(decl));
 }
 
-/// A module's `_PATH` value: its canonical absolute path, falling back to the
-/// path as written when the file cannot be canonicalized (it was deleted, or an
-/// unsaved language-server buffer).
-pub(crate) fn module_location(file: &Path) -> String {
-    std::fs::canonicalize(file)
-        .unwrap_or_else(|_| file.to_path_buf())
-        .display()
-        .to_string()
+/// Canonical source location, preserving operating-system path bytes. Missing
+/// sources (including unsaved editor buffers) retain the supplied location.
+pub(crate) fn module_location(file: &Path) -> PathBuf {
+    std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf())
 }
 
 /// Whether an import path refers to an embedded core module supplied as
 /// [`STDLIB`] rather than a file on disk: either its bare name (`io`) or its
-/// `core.`-qualified form (`core.io`, `core.collections`). Every core module
+/// `core.`-qualified form (`core.io`, `core.array`). Every core module
 /// is already in implicit scope; an explicit import of one is still accepted
 /// so a program can alias or qualify its names.
 pub fn is_prelude_path(path: &[String]) -> bool {
@@ -342,12 +338,45 @@ fn module_file_under(r: &Path, segs: &[String]) -> Option<ModuleFile> {
 /// Any other path searches the project `root` first, then each include
 /// directory in order, so the first root that serves the path wins.
 fn find_module_file(root: &Path, search: &SearchPaths, segs: &[String]) -> Option<ModuleFile> {
+    find_module_route(root, search, segs).map(|(file, _, _)| file)
+}
+
+/// Retain the successful search root without repeating the filesystem lookup.
+/// The boolean distinguishes a named package route from an open include route.
+fn find_module_route<'a>(
+    root: &'a Path,
+    search: &'a SearchPaths,
+    segs: &[String],
+) -> Option<(ModuleFile, &'a Path, bool)> {
     if let Some(pkg_root) = segs.first().and_then(|s| search.packages.get(s.as_str())) {
-        return module_file_under(pkg_root, segs);
+        return module_file_under(pkg_root, segs).map(|file| (file, pkg_root.as_path(), true));
     }
     std::iter::once(root)
         .chain(search.includes.iter().map(PathBuf::as_path))
-        .find_map(|r| module_file_under(r, segs))
+        .find_map(|r| module_file_under(r, segs).map(|file| (file, r, false)))
+}
+
+/// A relative dependency import stays a dependency even if a local route serves
+/// it. An explicit package/include route supplies its own dependency identity.
+fn route_origin(
+    root: &Path,
+    route: &Path,
+    package: bool,
+    path: &[String],
+    importer: Option<&SourceOrigin>,
+) -> SourceOrigin {
+    if package {
+        return SourceOrigin::Dependency(PackageId::new(&route.join(&path[0])));
+    }
+    if route != root {
+        return SourceOrigin::Dependency(PackageId::new(route));
+    }
+    match importer {
+        Some(SourceOrigin::Dependency(package)) | Some(SourceOrigin::Plugin(package)) => {
+            SourceOrigin::Dependency(package.clone())
+        }
+        _ => SourceOrigin::Own(PackageId::new(root)),
+    }
 }
 
 /// The source text serving module path `segs` as seen from `root`: the `.cz`
@@ -381,6 +410,12 @@ pub fn parse_stdlib(sources: &mut SourceMap) -> Result<Vec<LoadedModule>, String
         let mut path = vec!["core".to_string()];
         path.extend(name.split('/').map(str::to_string));
         modules.push(LoadedModule {
+            source: Some(Arc::new(ModuleSource {
+                location: label.into(),
+                origin: SourceOrigin::Core,
+                base,
+                len: src.len(),
+            })),
             is_prelude: true,
             path,
             ast,
@@ -543,6 +578,59 @@ pub fn load_modules(
     errors: &mut Vec<LoadError>,
     search: &SearchPaths,
 ) {
+    load_modules_observing(targets, root, sources, out, errors, search, ());
+}
+
+/// Compile-time observer policy; the ordinary loader has no observer storage
+/// or branch and never constructs a recovered module for observation.
+pub(crate) trait Recovery {
+    /// Whether recovered AST metadata is needed by this loader specialization.
+    const ENABLED: bool;
+    /// Retain recovered declarations so the caller can apply body ownership.
+    const RETAIN: bool = false;
+    /// Receive a discarded dependency AST without admitting it to the graph.
+    fn observe(&mut self, module: LoadedModule);
+}
+
+impl Recovery for () {
+    const ENABLED: bool = false;
+    fn observe(&mut self, _: LoadedModule) {}
+}
+
+/// Keep recovered modules and follow their imports; diagnostics remain intact
+/// for the caller to classify against declaration/body boundaries.
+pub(crate) struct RecoveryCatalog;
+
+impl Recovery for RecoveryCatalog {
+    const ENABLED: bool = false;
+    const RETAIN: bool = true;
+    fn observe(&mut self, _: LoadedModule) {}
+}
+
+/// Explicit recovery callback used only by the observing frontend.
+pub(crate) struct RecoveryObserver<'a>(
+    /// The callback supplied by the explicit observing caller.
+    pub(crate) &'a mut dyn FnMut(LoadedModule),
+);
+
+impl Recovery for RecoveryObserver<'_> {
+    const ENABLED: bool = true;
+    fn observe(&mut self, module: LoadedModule) {
+        (self.0)(module);
+    }
+}
+
+/// Load normally while optionally handing discarded recovered dependency ASTs
+/// to an observer. Observation never adds a module or follows its imports.
+pub(crate) fn load_modules_observing<R: Recovery>(
+    targets: &[(Vec<String>, Span)],
+    root: &Path,
+    sources: &mut SourceMap,
+    out: &mut Vec<LoadedModule>,
+    errors: &mut Vec<LoadError>,
+    search: &SearchPaths,
+    recovery: R,
+) {
     let mut context = LoadContext {
         root,
         sources,
@@ -551,13 +639,14 @@ pub fn load_modules(
         out,
         errors,
         search,
+        recovery,
     };
     for (path, trigger_span) in targets {
-        load_module(path, *trigger_span, &mut context);
+        load_module(path, *trigger_span, None, &mut context);
     }
 }
 
-struct LoadContext<'a> {
+struct LoadContext<'a, R> {
     root: &'a Path,
     sources: &'a mut SourceMap,
     visited: HashSet<String>,
@@ -565,9 +654,15 @@ struct LoadContext<'a> {
     out: &'a mut Vec<LoadedModule>,
     errors: &'a mut Vec<LoadError>,
     search: &'a SearchPaths,
+    recovery: R,
 }
 
-fn load_module(path: &[String], trigger_span: Span, context: &mut LoadContext<'_>) {
+fn load_module<R: Recovery>(
+    path: &[String],
+    trigger_span: Span,
+    importer: Option<&SourceOrigin>,
+    context: &mut LoadContext<'_, R>,
+) {
     let key = path.join(".");
     if crate::is_private_module(path) {
         context.errors.push(LoadError {
@@ -587,21 +682,35 @@ fn load_module(path: &[String], trigger_span: Span, context: &mut LoadContext<'_
         return;
     }
 
-    let (file, src) = match find_module_file(context.root, context.search, path) {
+    let resolved = find_module_route(context.root, context.search, path);
+    let origin = resolved
+        .as_ref()
+        .map(|(_, route, package)| route_origin(context.root, route, *package, path, importer));
+    let (file, src) = match resolved.map(|(file, _, _)| file) {
         // A native plugin library may serve the path instead of a `.cz` file
         // (`plugins/math.so` for `import plugins.math`), as a module
         // synthesized from the plugin's manifest.
         Some(ModuleFile::Plugin(lib)) => {
             match crate::plugin::synthesize_plugin_module(&lib, &key) {
-                Ok(src) => load_synthesized(
-                    &lib,
-                    src,
-                    path,
-                    context.sources,
-                    context.out,
-                    trigger_span,
-                    context.errors,
-                ),
+                Ok(src) => {
+                    let package = match origin.expect("resolved plugin route") {
+                        SourceOrigin::Own(package)
+                        | SourceOrigin::Dependency(package)
+                        | SourceOrigin::Plugin(package) => package,
+                        SourceOrigin::Core => unreachable!("disk routes are not embedded core"),
+                    };
+                    if let Some(module) = load_synthesized(
+                        &lib,
+                        src,
+                        path,
+                        package,
+                        context.sources,
+                        trigger_span,
+                        context.errors,
+                    ) {
+                        context.out.push(module);
+                    }
+                }
                 Err(message) => context.errors.push(LoadError {
                     message,
                     span: trigger_span,
@@ -659,47 +768,72 @@ fn load_module(path: &[String], trigger_span: Span, context: &mut LoadContext<'_
         }
     };
     let label = file.display().to_string();
-    let location = module_location(&file);
+    let identity_path = module_location(&file);
+    let location = identity_path.display().to_string();
     let base = context.sources.add(Some(file), label, src.clone());
     let (ast, parse_errors) = brass_parser::parse_recovering(&src, base);
     if !parse_errors.is_empty() {
+        if R::ENABLED {
+            context.recovery.observe(LoadedModule {
+                source: Some(Arc::new(ModuleSource {
+                    location: identity_path.clone(),
+                    origin: origin.clone().expect("resolved module route"),
+                    base,
+                    len: src.len(),
+                })),
+                is_prelude: false,
+                path: path.to_vec(),
+                ast: ast.clone(),
+            });
+        }
         for e in parse_errors {
             context.errors.push(LoadError {
                 message: format!("syntax error: {}", e.message),
                 span: e.span,
             });
         }
-        context.stack.remove(&key);
-        context.visited.insert(key);
-        return;
+        if !R::RETAIN {
+            context.stack.remove(&key);
+            context.visited.insert(key);
+            return;
+        }
     }
     let mut ast = ast;
     inject_module_path(&mut ast, &location, Span::new(base, base));
     let dir = path[..path.len() - 1].to_vec();
     for (target, _) in canonicalize_imports(&dir, context.root, &mut ast.imports, context.search) {
-        load_module(&target, trigger_span, context);
+        // Only imports within this namespace inherit dependency ownership. A
+        // root fallback outside it retains the successful route's ownership.
+        let importer = origin.as_ref().filter(|_| target.starts_with(&dir));
+        load_module(&target, trigger_span, importer, context);
     }
     context.stack.remove(&key);
     context.visited.insert(key.clone());
     context.out.push(LoadedModule {
+        source: Some(Arc::new(ModuleSource {
+            location: identity_path,
+            origin: origin.expect("resolved module route"),
+            base,
+            len: src.len(),
+        })),
         is_prelude: false,
         path: path.to_vec(),
         ast,
     });
 }
 
-/// Parse a module synthesized from a plugin manifest and push it. The source
+/// Parse a module synthesized from a plugin manifest, retaining its search root. The source
 /// is generated, so a parse failure is a synthesis bug, reported (with the
 /// offending text's label) rather than crashing the front end.
 fn load_synthesized(
     lib: &Path,
     src: String,
     path: &[String],
+    package: PackageId,
     sources: &mut SourceMap,
-    out: &mut Vec<LoadedModule>,
     trigger_span: Span,
     errors: &mut Vec<LoadError>,
-) {
+) -> Option<LoadedModule> {
     let label = format!("<plugin:{}>", path.join("."));
     // The library file is registered as this entry's path, so a span in the
     // wrapper locates the `.so` and `SourceMap::plugins` pairs the module with
@@ -708,19 +842,28 @@ fn load_synthesized(
     match parse_with_base(&src, base) {
         Ok(mut ast) => {
             inject_module_path(&mut ast, &label, Span::new(base, base));
-            out.push(LoadedModule {
+            Some(LoadedModule {
+                source: Some(Arc::new(ModuleSource {
+                    location: module_location(lib),
+                    origin: SourceOrigin::Plugin(package),
+                    base,
+                    len: src.len(),
+                })),
                 is_prelude: false,
                 path: path.to_vec(),
                 ast,
             })
         }
-        Err(e) => errors.push(LoadError {
-            message: format!(
-                "internal: synthesized plugin module `{label}` failed to parse: {}",
-                e.message
-            ),
-            span: trigger_span,
-        }),
+        Err(e) => {
+            errors.push(LoadError {
+                message: format!(
+                    "internal: synthesized plugin module `{label}` failed to parse: {}",
+                    e.message
+                ),
+                span: trigger_span,
+            });
+            None
+        }
     }
 }
 

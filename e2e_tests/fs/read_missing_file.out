@@ -1,2 +1,2 @@
-error: [<plugin:std.libfs>:49:12] unhandled error: /nonexistent/brass_missing.txt: No such file or directory (os error 2)
+error: [<plugin:std.libfs>:49:12] error: /nonexistent/brass_missing.txt: No such file or directory (os error 2)
 still running

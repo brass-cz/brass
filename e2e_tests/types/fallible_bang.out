@@ -1,2 +1,2 @@
 ok 7
-err [e2e_tests/types/fallible_bang.cz:5:9] unhandled error: -3
+err [e2e_tests/types/fallible_bang.cz:5:9] error: -3

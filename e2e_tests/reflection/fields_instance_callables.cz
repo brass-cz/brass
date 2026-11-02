@@ -1,0 +1,19 @@
+// @backends: all
+// A generic method selects fields using its receiver and argument types.
+type A = {
+    x: int32
+}
+type B = {
+    y: string
+    z: bool
+}
+type Walker = {
+}
+fun Walker.visit(self, value) {
+    for f in fields(value) {
+        println("{f}: {value[f]}")
+    }
+}
+const w = Walker { }
+w.visit(A { x: 1 })
+w.visit(B { y: "two", z: true })

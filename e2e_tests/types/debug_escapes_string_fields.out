@@ -3,28 +3,28 @@ P {
     s: "q\"t\n",
     n: "a\\b",
     missing: null,
-    arr: [a", b],
+    arr: ["a\"", "b"],
 }
 P {
     x: 1,
     s: "q\"t\n",
     n: "a\\b",
     missing: null,
-    arr: [a", b],
+    arr: ["a\"", "b"],
 }
 P {
     x: 1,
     s: "q\"t\n",
     n: "a\\b",
     missing: null,
-    arr: [a", b],
+    arr: ["a\"", "b"],
 }
 P {
     x: 1,
     s: "q\"t\n",
     n: "a\\b",
     missing: null,
-    arr: [a", b],
+    arr: ["a\"", "b"],
 }
 S.A {
     v: "x\"y\ttab",
@@ -35,7 +35,7 @@ S.A {
 }
 anonymous {
     a: anonymous {
-        b: [c"d],
+        b: ["c\"d"],
     },
     s: "e\rf",
 }

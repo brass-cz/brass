@@ -131,9 +131,15 @@ No plumbing is needed: `error` and `context` pick up their call site through
 an implicit `Location` argument the compiler fills in. When you handle the
 error yourself, the same information is on the `Error` record: `error.value`
 is the raised value, `error.location` the position, and `error.display()`
-renders the trace text above. A failure that never went through
+renders the same trace with `error:` in place of `unhandled error:`. A failure that never went through
 `error(..)`/`context` (a plain builtin error hit at the top level) keeps the
 short `unhandled error: <message>` form.
+
+Printing an `Error` directly, interpolating it or calling `display()` uses
+`[file:line:col] error: <message>` on each trace line. Contexts appear newest
+first, followed by the original error, with one extra indent per context.
+The `unhandled error` label is reserved for an unhandled `!` abort.
+
 
 ## Your own Result type
 

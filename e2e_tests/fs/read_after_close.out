@@ -1,2 +1,2 @@
-read after close: [<plugin:std.libfs>:17:12] unhandled error: file is closed
+read after close: [<plugin:std.libfs>:17:12] error: file is closed
 double close ok

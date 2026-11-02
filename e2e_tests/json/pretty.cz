@@ -1,0 +1,37 @@
+// @backends: all
+import std.data.json.{ JsonValue }
+
+type Child = {
+    name: string
+}
+type Record = {
+    child: Child
+    values: int32[]
+}
+
+fun verify(value: JsonValue) {
+    assert(
+        JsonValue.parse(value.pretty())! == JsonValue.parse(value.stringify())!,
+    )
+    assert(value.display() == value.pretty())
+    assert("{value}" == value.pretty())
+    println(value.pretty())
+}
+
+fun main() {
+    // Scalars and empty containers stay inline, including nested empty values.
+    verify(JsonValue.Null)
+    verify(JsonValue.Bool { value: false })
+    verify(JsonValue.Number { value: -1.25 })
+    verify(JsonValue.parse("\"\\b\\f\\n\\r\\t\\u0001\\\"\\\\雪\"")!)
+    verify(JsonValue.parse("[]")!)
+    verify(JsonValue.parse("\{\}")!)
+    verify(JsonValue.parse("[[], \{\}, [true, false], \{\"a\": [1, 2]\}]")!)
+    verify(
+        JsonValue.from(
+            Record { child: Child { name: "Aki" }, values: [1, 2] },
+        )!,
+    )
+    // The Display protocol also makes println use pretty JSON directly.
+    println(JsonValue.parse("[\{\"line\\n\\\"key\": \"x\\ny\"\}]")!)
+}

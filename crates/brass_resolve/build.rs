@@ -3,7 +3,7 @@
 //! `(module key, include_str!(source))` pairs:
 //!
 //! - `STDLIB` -- every `.cz` under `core/`, keyed by its `core/`-relative
-//!   path without the extension (`io`, `array`, `collections`, ...). Every
+//!   path without the extension (`io`, `array`, `string`, ...). Every
 //!   entry is part of the implicit prelude: its public names are in scope in
 //!   every program with no import.
 //!

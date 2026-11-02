@@ -1,11 +1,11 @@
-[a, null]
-[a, null]
-[a, null]
-[a, b]
-[1, x]
+["a", null]
+["a", null]
+["a", null]
+["a", "b"]
+[1, "x"]
 R {
     s: "q",
-    xs: [z, null],
+    xs: ["z", null],
 }
 R {
     s: null,
@@ -14,5 +14,5 @@ R {
 S.V {
     s: "w",
 }
-[[m, null]]
-[plain]
+[["m", null]]
+["plain"]

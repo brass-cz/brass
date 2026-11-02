@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // `T!` names only the OK payload: the error type is INFERRED, from the
 // body's `error(..)` sites and the errors it forwards. A body whose ONLY
 // propagation is its own recursive `!` forwards the very variable being

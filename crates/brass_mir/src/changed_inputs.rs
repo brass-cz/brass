@@ -64,6 +64,8 @@ pub struct ChangedInputs {
     pub dispatch: ChangedKeys<Span>,
     /// Per-instance dispatch maps, replaced or removed as whole span entries.
     pub instance_dispatch: ChangedKeys<Span>,
+    /// Checked per-instance field lists for divergent reflection loops.
+    pub instance_fields: ChangedKeys<Span>,
     /// Return contracts, keyed by structural call inputs rather than spans.
     pub returns: ChangedKeys<(String, Vec<Type>)>,
     /// Numeric storage selections, including the complete caller identity.

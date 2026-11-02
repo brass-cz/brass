@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // A `for` loop variable is a PATTERN, not just a name, so each element
 // destructures in the loop header: `HashMap.pairs()` yields `[key, value]`
 // tuples, which `for [k, v] in m.pairs()` takes apart. The same tuple pattern
@@ -34,6 +36,8 @@ fun main() {
     let [k, v] = ps[1]
     println("{k}/{v}")
     match ps[2] {
-        [k2, v2] => { println("{k2}:{v2}") }
+        [k2, v2] => {
+            println("{k2}:{v2}")
+        },
     }
 }

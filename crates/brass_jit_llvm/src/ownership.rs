@@ -89,6 +89,9 @@ pub struct GuardedAccess {
 /// Task-entry and deferred-closure wrappers do not count as caller accesses.
 #[derive(Clone, Debug, Default)]
 pub struct AutoAcquireReport {
+    /// Whether ownership operations or closure-body normalization can rewrite syntax.
+    /// False certifies unchanged bodies; true requires re-lowering before reuse.
+    pub may_rewrite: bool,
     /// Spawn arguments that the rewrite cannot analyze.
     pub errors: Vec<SpawnError>,
     /// Inserted access guards, before deduplication by execution scope and root.

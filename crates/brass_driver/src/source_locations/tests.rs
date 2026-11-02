@@ -9,6 +9,7 @@ fn module(sources: &mut SourceMap, label: &str, src: &str) -> (usize, LoadedModu
     (
         base,
         LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,

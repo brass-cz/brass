@@ -270,6 +270,7 @@ impl<'m> Monomorphizer<'m, '_> {
             seed_returned_closure(body, fun, &mut local_types);
         }
         let scans = self.body_scans(body);
+        let fields = self.field_selections(body);
 
         // The blocks this instance actually owns, once its type tests fold. A
         // type-test-dead block is never typed or compiled here and contributes
@@ -283,7 +284,7 @@ impl<'m> Monomorphizer<'m, '_> {
         // seeds and with the smaller live set, until the decisions are stable
         // (each round only shrinks the set).
         let seeds = local_types;
-        let mut live = fold::type_test_live_blocks(self.program, body, &seeds);
+        let mut live = fold::type_test_live_blocks(self.program, body, &seeds, &fields);
         // A self-recursive call reads the return type computed so far. When
         // the finished return is wider (a `return 0` joined with the float a
         // recursive sum produces), the body is typed again with the call
@@ -352,7 +353,7 @@ impl<'m> Monomorphizer<'m, '_> {
                     ));
                 }
             };
-            let decided = fold::type_test_live_blocks(self.program, body, &local_types);
+            let decided = fold::type_test_live_blocks(self.program, body, &local_types, &fields);
             let narrowed: Vec<bool> = decided.iter().zip(&live).map(|(d, l)| *d && *l).collect();
             if narrowed != live {
                 live = narrowed;
@@ -477,7 +478,7 @@ impl<'m> Monomorphizer<'m, '_> {
             && let Some(declared) = &ret
             && !matches!(declared, Type::Nullable(_))
         {
-            let reachable = reachable_blocks(self.program, body, &local_types);
+            let reachable = reachable_blocks(self.program, body, &local_types, &fields);
             for (i, block) in body.blocks.iter().enumerate() {
                 if reachable[i]
                     && let Terminator::Return(op) = &block.term
@@ -511,11 +512,28 @@ impl<'m> Monomorphizer<'m, '_> {
                 ));
             }
         }
+        for (block, live) in
+            body.blocks
+                .iter()
+                .zip(reachable_blocks(self.program, body, &local_types, &fields))
+        {
+            if live {
+                for stmt in &block.stmts {
+                    if let MirStmt::Assign(_, Rvalue::FieldsTest { site, .. }) = stmt
+                        && !fields.contains_key(site)
+                    {
+                        return Err(format!(
+                            "internal error: field loop has no checked expansion for `{sym}`"
+                        ));
+                    }
+                }
+            }
+        }
         self.validate(
             body,
             &sym,
             &local_types,
-            &reachable_blocks(self.program, body, &local_types),
+            &reachable_blocks(self.program, body, &local_types, &fields),
         )?;
 
         // Validate what mutual recursion assumed about this instance while it
@@ -568,6 +586,7 @@ impl<'m> Monomorphizer<'m, '_> {
                 is_closure,
                 fallible,
                 keyed,
+                fields,
                 closure_targets,
             },
         );

@@ -6,6 +6,7 @@
 
 use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use brass_parser::Span;
 use brass_parser::ast::{FunDecl, Method, Module, Param, Stmt, TypeExpr};
@@ -186,6 +187,8 @@ pub struct LoadedModule {
     /// that embeds the prelude; every other module -- including the nested
     /// standard-library ones -- requires an explicit import.
     pub is_prelude: bool,
+    /// Shared resolver provenance; absent for AST graphs without a source route.
+    pub source: Option<Arc<crate::ModuleSource>>,
 }
 
 /// A concrete method synthesized from a reflective `-> infer!` template.
@@ -414,6 +417,9 @@ pub struct FunInfo {
 pub struct ModuleInit {
     pub path: Vec<String>,
     pub stmts: Vec<Stmt>,
+    /// Loader provenance for this module, including empty initializers. Absent
+    /// for synthetic AST graphs without a source route.
+    pub source: Option<Arc<crate::ModuleSource>>,
 }
 
 /// The collected, id-assigned program.
@@ -438,6 +444,8 @@ pub struct Program {
     /// order-dependent phantom type errors.
     pub next_infer_var: u32,
     pub functions: HashMap<String, FunInfo>,
+    /// The entry module's free `main`, independent of its storage-symbol spelling.
+    pub(crate) entry_function: Option<String>,
     pub inits: Vec<ModuleInit>,
     /// Paths of the implicit-prelude modules (see [`LoadedModule::is_prelude`]):
     /// their public names are visible in every module with no import. All other
@@ -527,6 +535,7 @@ impl Program {
             pattern_index: pattern_index::PatternIndex::default(),
             next_infer_var: 0,
             functions: HashMap::default(),
+            entry_function: None,
             inits: Vec::new(),
             prelude_modules: HashSet::default(),
             module_imports: HashMap::default(),
@@ -537,6 +546,12 @@ impl Program {
             primitive_methods: HashMap::default(),
             type_aliases: HashMap::default(),
         }
+    }
+
+    /// The entry module's free `main` storage symbol, if declared. Imported
+    /// functions never become the entry, even when they have the only `main` name.
+    pub fn entry_function(&self) -> Option<&str> {
+        self.entry_function.as_deref()
     }
 
     /// The declaration with nominal identity `id`, when collected in this program.

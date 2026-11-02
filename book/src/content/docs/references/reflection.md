@@ -40,11 +40,17 @@ follows ordinary lexical scoping: a binding of the same name in the body
 shadows it from that point on, and only the uses before the binding decay to
 the field name.
 
-In an unannotated (generic) function, `x`'s record type is the one each call
-instantiates the function with, so the loop is checked per instantiation; a
-call with a non-record argument is rejected. The function's body is lowered
-once for all its instantiations, so they must all expand the same field names
-in the same order; the fields' types may differ.
+In an unannotated (generic) function or method, each call supplies the record
+type for the loop. Different instantiations may visit different field names,
+in each record's field order. Recursive calls can visit nested records.
+The compiler checks and selects each instance's expansion; iteration does not
+inspect fields at runtime. A call with a non-record argument is rejected.
+
+Recursive checking permits at most eight additional active expansions with
+distinct concrete argument types across the call chain. Nested record types
+can require such expansions, including calls through helper functions. Exceeding
+this bound is a compile-time error at the `fields()` loop. The compiler never
+substitutes another instance's field list.
 
 ## `typeof(x)`
 
@@ -211,6 +217,8 @@ The target's own field names drive the lookup, and a missing key is a decode
 error naming the field:
 
 ```brass
+import std.collections.{ HashMap }
+
 type Config = { width: int64, height: int64, depth: int64 }
 
 fun from_map(source: HashMap) -> Config! {

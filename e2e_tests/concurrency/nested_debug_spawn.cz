@@ -1,0 +1,15 @@
+// A worker's builtin renderer may call user debug through generated type glue.
+type Value = {
+    number: int32
+}
+fun Value.debug(self) -> string {
+    return "value({self.number})"
+}
+fun main() {
+    spawn(
+        () -> {
+            println([Value { number: 7 }])
+        },
+    )
+    sync()
+}

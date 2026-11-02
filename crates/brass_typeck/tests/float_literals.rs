@@ -5,6 +5,7 @@ use brass_parser::Span;
 fn analyze(src: &str) -> brass_typeck::Analysis {
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,

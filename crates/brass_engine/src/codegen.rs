@@ -36,7 +36,7 @@ mod ownership;
 mod types;
 
 pub use concurrency::{batch_spawns, program_uses_with, spawn_precompile};
-pub use ownership::rc_managed;
+pub use ownership::{rc_managed, return_owned_locals};
 pub use types::{
     ViewFieldPlan, aggregate_field_type, element_type, record_field_names, record_field_type,
     record_from_field_flows, record_from_succeeds, result_ok_type, str_const, strip_wrappers,
@@ -112,7 +112,7 @@ pub trait Codegen {
     /// Render value `v` of type `ty` as a string (string interpolation).
     fn to_string(&mut self, v: Self::Value, ty: &Type) -> Self::Value;
     /// Render the nullable value `v` (a `T?` with inner type `inner`) through
-    /// `T`'s USER `display` instance `symbol` (returning `ret`, a string): the
+    /// `T`'s effective top-level renderer `symbol` (returning `ret`, a string): the
     /// string `null` when `v` is absent, else the instance's result on the
     /// unwrapped value. The result is an owned string either way, like
     /// [`Codegen::to_string`] of a nullable.
@@ -441,7 +441,8 @@ pub trait Codegen {
         // emit -- a bare `null` narrowed to `never` -- so it is skipped, its
         // block terminated as `unreachable` to stay well-formed. The matching
         // `CondBranch` folds to a direct jump (see `codegen_terminator`).
-        let reachable = crate::mono::reachable_blocks(program.hir, f.body, &f.local_types);
+        let reachable =
+            crate::mono::reachable_blocks(program.hir, f.body, &f.local_types, &f.fields);
         for (i, live) in reachable.iter().enumerate() {
             let id = BlockId(i as u32);
             if *live {
@@ -657,22 +658,17 @@ pub trait Codegen {
     /// by `spawn` (the thread now owns it and releases it). A local unassigned on
     /// this path is null-initialized, so its release is a no-op.
     fn emit_drops(&mut self, f: &MonoFunction, returned: Option<LocalId>) {
-        let spawn_moved = spawn_moved_locals(f);
-        for (i, ty) in f.local_types.iter().enumerate() {
-            if !rc_managed(ty) {
-                continue;
+        self.emit_inline_drops(f, returned);
+    }
+
+    /// Emit the ordered return releases directly, excluding the moved-out local.
+    /// Back ends that share cleanup use this for bodies with only one return.
+    fn emit_inline_drops(&mut self, f: &MonoFunction, returned: Option<LocalId>) {
+        for id in return_owned_locals(f) {
+            if Some(id) != returned {
+                let v = self.load_local(id);
+                self.emit_release(v, f.local_type(id));
             }
-            let id = LocalId(i as u32);
-            if Some(id) == returned
-                || f.body.params.contains(&id)
-                || f.captures.contains(&id)
-                || spawn_moved.contains(&id)
-            {
-                continue;
-            }
-            let ty = ty.clone();
-            let v = self.load_local(id);
-            self.emit_release(v, &ty);
         }
     }
 
@@ -745,8 +741,13 @@ pub trait Codegen {
                 // A statically-known condition folds to a direct jump, leaving the
                 // dead arm (skipped in `codegen_function`) without a predecessor.
                 let cty = operand_type_of(cond, &f.local_types);
-                match crate::mono::cond_static_truthiness(program.hir, f.body, &f.local_types, cond)
-                {
+                match crate::mono::cond_static_truthiness(
+                    program.hir,
+                    f.body,
+                    &f.local_types,
+                    cond,
+                    &f.fields,
+                ) {
                     Some(true) => self.emit_goto(*then),
                     Some(false) => self.emit_goto(*els),
                     // A bool branches directly; any other (runtime) type is reduced
@@ -793,6 +794,9 @@ pub trait Codegen {
                     &operand_type_of(op, &f.local_types),
                 );
                 self.const_bool(matched)
+            }
+            Rvalue::FieldsTest { site, fields } => {
+                self.const_bool(f.fields.get(site) == Some(fields))
             }
             Rvalue::Bin(op, a, b) => {
                 // Comparisons yield bool but operate on the operands' type;
@@ -1635,7 +1639,7 @@ pub trait Codegen {
     }
 
     /// Render a nullable value `v` of type `ty` whose inner type renders
-    /// through the USER `display` instance `symbol`: the string `null` when
+    /// through the effective top-level renderer `symbol`: the string `null` when
     /// absent, else the instance called on the unwrapped value -- the text the
     /// non-null value renders as. Shared by `"{v}"` and `print`/`println`.
     fn render_nullable_display(
@@ -1671,9 +1675,8 @@ pub trait Codegen {
                 if matches!(ty, Type::Str) {
                     v
                 } else if let Some(inst) = display_instance(program, &ty) {
-                    // Like a `"{v}"` segment, `print`/`println` prefer the USER
-                    // `display` method when the value's type declares one (the
-                    // monomorphizer created the instance).
+                    // The shared Display resolver prefers display, then debug;
+                    // monomorphization has prepared the selected instance.
                     let symbol = inst.symbol.clone();
                     let ret = inst.ret.clone();
                     self.call(&symbol, &[v], &ret)

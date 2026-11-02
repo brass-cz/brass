@@ -1,0 +1,10 @@
+// @backends: all
+// Ordinary local imports remain own code; only Used is rendered.
+type Used = | Value
+fun Used.debug(self) -> string {
+    return "selected debug"
+}
+type Unused = | Value
+fun Unused.debug(self) -> string {
+    return "unused"
+}

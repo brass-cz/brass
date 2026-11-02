@@ -38,6 +38,7 @@ fn lower_first(src: &str) -> (MirBody, Vec<brass_mir::MirClosure>) {
 fn lower_whole(src: &str) -> String {
     let ast = brass_parser::parse(src).expect("source parses");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".to_string()],
         ast,
@@ -309,11 +310,13 @@ fn uninitialized_nominal_uses_the_visible_module_definition() {
     .expect("b parses");
     let modules = [
         LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["a".to_string()],
             ast: a,
         },
         LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["b".to_string()],
             ast: b,

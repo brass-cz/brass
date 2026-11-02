@@ -125,14 +125,19 @@ impl<'m> Monomorphizer<'m, '_> {
             let sym = sym.clone();
             return self.resolve_free(cur_sym, cur_ret, &sym, arg_types);
         }
-        // The built-in `debug`: every remaining receiver renders through the
-        // runtime's traditional formatter (the same code a `"{v}"` segment
-        // emits), so every type satisfies the `Debug` protocol. Core's
-        // primitive implementations and a user-declared `debug` were consulted
-        // above and win.
+        // Builtin structural debug prepares the effective debug methods of
+        // its children. Core primitive methods and a declared nominal debug
+        // were consulted above and own their rendering.
         if name == "debug" && arg_types.len() == 1 {
             return if is_printable(&arg_types[0]) {
-                Ok(Some(Type::Str))
+                Ok(self
+                    .prepare_rendering(
+                        &arg_types[0],
+                        crate::render::RenderForm::Debug,
+                        cur_sym,
+                        cur_ret,
+                    )?
+                    .then_some(Type::Str))
             } else {
                 Err(format!(
                     "debug of `{}` is unsupported on the typed backend",

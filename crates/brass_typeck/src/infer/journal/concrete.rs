@@ -19,7 +19,8 @@ pub(super) fn unchanged(entry: &ElaborationJournalEntry) -> bool {
         ElaborationJournalEntry::SumView(_, ty)
         | ElaborationJournalEntry::TypeOf(_, ty)
         | ElaborationJournalEntry::TypeTest(_, ty) => atomic(ty),
-        ElaborationJournalEntry::NumericCall { instance, .. } => instance.is_none(),
+        ElaborationJournalEntry::NumericCall { instance, .. }
+        | ElaborationJournalEntry::FieldsLoop { instance, .. } => instance.is_none(),
         ElaborationJournalEntry::KeyedCall { key, instance, .. } => {
             instance.is_none() && atomic(key)
         }
@@ -36,7 +37,6 @@ pub(super) fn unchanged(entry: &ElaborationJournalEntry) -> bool {
         | ElaborationJournalEntry::LiftErr(..)
         | ElaborationJournalEntry::TypeName(..)
         | ElaborationJournalEntry::LiteralNominal(..)
-        | ElaborationJournalEntry::FieldsLoop(..)
         | ElaborationJournalEntry::ViewArg(..) => true,
     }
 }

@@ -5,6 +5,7 @@ use super::{call, checker};
 /// Receiver fixtures use the core namespace that owns primitive methods.
 fn program(source: &str) -> brass_hir::Program {
     let (p, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["core".into()],
         ast: brass_parser::parse(source).unwrap(),
@@ -204,7 +205,7 @@ fn nested_method_global_reads_keep_defining_modules() {
     let modules = [
         ("a", "const value = \"a\"\ntype Item = { n: int32 }\nfun Item.read(self) -> string { return value }\nfun entry() -> string { return Item { n: 0 }.read() }"),
         ("b", "const value = \"b\"\ntype Item = { n: int32 }\nfun Item.read(self) -> string { return value }\nfun entry() -> string { return Item { n: 0 }.read() }"),
-    ].map(|(name, source)| brass_hir::LoadedModule { is_prelude: false, path: vec![name.into()], ast: brass_parser::parse(source).unwrap() });
+    ].map(|(name, source)| brass_hir::LoadedModule { source: None, is_prelude: false, path: vec![name.into()], ast: brass_parser::parse(source).unwrap() });
     let (p, errors) = brass_hir::lower(&modules);
     assert!(errors.is_empty(), "{errors:?}");
     let mut seed = checker(&p);

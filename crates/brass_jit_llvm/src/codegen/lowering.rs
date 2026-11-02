@@ -23,8 +23,7 @@ use super::aggregate::{closure_layout, elem_of, type_size_align};
 use super::session::immutable_heap_globals;
 use super::{
     LlvmCodegen, MirSlot, codegen_is_int_cmp, float_predicate, int_predicate, int_runtime_tag,
-    nominal_layout_differs, rendered_string_is_owned, same_representation, ty_is_signed,
-    unwrap_copy_wrappers,
+    nominal_layout_differs, same_representation, ty_is_signed, unwrap_copy_wrappers,
 };
 
 impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
@@ -51,7 +50,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
         self.declare_globals(program, true);
         self.mir.init_symbols = program.init_symbols.clone();
         self.mir.frozen_globals = immutable_heap_globals(program);
-        self.mir.lazy_has_main = program.lookup("main").is_some();
+        self.mir.entry_symbol = program.entry_function().map(|f| f.symbol.clone());
     }
 
     fn finalize(&mut self) -> Result<(), String> {
@@ -87,6 +86,15 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
             .expect("body of an undeclared instance");
         let body = func.body;
         self.cur_fn = Some(f);
+        self.mir.share_return_cleanup = func
+            .body
+            .blocks
+            .iter()
+            .filter(|block| matches!(block.term, brass_mir::Terminator::Return(_)))
+            .take(2)
+            .count()
+            > 1;
+        self.mir.return_cleanup = None;
 
         let setup = self.ctx.append_basic_block(f, "setup");
         let blocks: Vec<BasicBlock<'ctx>> = (0..body.blocks.len())
@@ -155,6 +163,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
     }
 
     fn end_body(&mut self) {
+        self.finish_return_cleanup();
         self.mir.locals.clear();
         self.mir.blocks.clear();
     }
@@ -742,7 +751,12 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
                         .build_float_ext(fv, self.ctx.f64_type(), "fx")
                         .unwrap()
                 };
-                self.call_to_str("pp_float_to_str", &[wide.into()])
+                let renderer = if k.bits() == 32 {
+                    "pp_float32_to_str"
+                } else {
+                    "pp_float_to_str"
+                };
+                self.call_to_str(renderer, &[wide.into()])
             }
             // A nullable renders its value when present, else "null" -- a branch
             // since the result is one string or the other (matches `display`).
@@ -855,7 +869,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
                 self.builder.position_at_end(elembb);
                 let ep = self.elem_ptr(arr, elem_llty, i);
                 let ev = self.builder.build_load(elem_llty, ep, "ev").unwrap();
-                let es = self.to_string(ev, &elem_ty);
+                let es = self.effective_debug(ev, &elem_ty);
                 let cur2 = self.builder.build_load(ptrt, result, "cur2").unwrap();
                 let ap = self
                     .builder
@@ -864,9 +878,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
                     .try_as_basic_value()
                     .unwrap_basic();
                 self.release(cur2);
-                if rendered_string_is_owned(&elem_ty) {
-                    self.release(es);
-                }
+                self.release(es);
                 self.builder.build_store(result, ap).unwrap();
                 let inc = self
                     .builder
@@ -920,7 +932,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
                     let (llty, offset) = layout[i];
                     let fp = self.field_ptr(tup, offset);
                     let ev = self.builder.build_load(llty, fp, "te").unwrap();
-                    let es = self.to_string(ev, ety);
+                    let es = self.effective_debug(ev, ety);
                     let next = self
                         .builder
                         .build_call(concat, &[cur.into(), es.into()], "ap")
@@ -928,9 +940,7 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
                         .try_as_basic_value()
                         .unwrap_basic();
                     self.release(cur);
-                    if rendered_string_is_owned(ety) {
-                        self.release(es);
-                    }
+                    self.release(es);
                     cur = next;
                 }
                 let close = self.const_str("]");
@@ -2139,6 +2149,14 @@ impl<'ctx, 'p> EngineCodegen for LlvmCodegen<'ctx, 'p> {
         }
         let fp = self.field_ptr(base.into_pointer_value(), offset);
         self.builder.build_store(fp, v).unwrap();
+    }
+
+    fn emit_drops(&mut self, f: &MonoFunction, returned: Option<LocalId>) {
+        if self.mir.share_return_cleanup {
+            self.emit_shared_return_cleanup(f, returned);
+        } else {
+            self.emit_inline_drops(f, returned);
+        }
     }
 
     fn emit_return(&mut self, v: Option<BasicValueEnum<'ctx>>) {

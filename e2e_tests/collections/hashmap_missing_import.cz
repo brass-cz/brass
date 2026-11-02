@@ -1,0 +1,5 @@
+// @backends: all
+// A map constructor requires its defining module to be imported.
+fun main() {
+    HashMap.new()
+}

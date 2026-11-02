@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // A closure whose `!` propagates the null of a builtin container's `get`
 // returns a nullable: reading its result as a plain `int32` is rejected.
 fun main() {

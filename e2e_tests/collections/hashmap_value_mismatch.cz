@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // A HashMap's value type is fixed by use: `set("a", "b")` makes this a
 // `string -> string` map, and a later `set` of an `int32` value is a type
 // error at the call site.

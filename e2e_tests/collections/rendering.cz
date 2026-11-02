@@ -1,0 +1,43 @@
+// @backends: all
+import std.collections.HashMap
+
+type Point = {
+    x: int32
+    label: string
+}
+type Box = {
+    value
+}
+type Key = {
+    id: int32
+}
+type Counts = HashMap { key: string, value: int32 }
+// Map entries expose content at every depth, including a map inside a record.
+fun main() {
+    let words = HashMap.new()
+    words.set("a, b", "line\n\"two\"")
+    println(words)
+    println("{words}")
+    println(words.debug())
+    println(Box { value: words })
+    println([words])
+    let nested = HashMap.new()
+    nested.set("child", words)
+    println(nested)
+    println(nested.debug())
+    let points = HashMap.new()
+    points.set(2, Point { x: 3, label: "three" })
+    println(points)
+    let keys = HashMap.new()
+    keys.set(Key { id: 4 }, "four")
+    println(keys)
+    let child: Counts = HashMap.new()
+    child.set("a", 2)
+    let pinned: HashMap { key: string, value: Counts } = HashMap.new()
+    pinned.set("child", child)
+    println(pinned.debug())
+    let empty: Counts = HashMap.new()
+    println(empty)
+    println(empty.debug())
+    println(Box { value: empty })
+}

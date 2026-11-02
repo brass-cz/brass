@@ -1,0 +1,24 @@
+{
+    "active": true,
+    "branch": {
+        "count": 2,
+        "leaf": {
+            "name": "nested"
+        }
+    }
+}
+{
+    "inner": {
+        "roots": [
+            {
+                "active": true,
+                "branch": {
+                    "count": 2,
+                    "leaf": {
+                        "name": "nested"
+                    }
+                }
+            }
+        ]
+    }
+}

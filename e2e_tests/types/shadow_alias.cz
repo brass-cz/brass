@@ -1,6 +1,14 @@
-// A type alias that shadows a prelude name resolves methods on its target.
-type Container = { value: int32 }
-fun Container.new() { return Container { value: 4 } }
-fun Container.len(self) { return self.value }
+// A user-defined type alias resolves methods on its target.
+type Container = {
+    value: int32
+}
+fun Container.new() {
+    return Container { value: 4 }
+}
+fun Container.len(self) {
+    return self.value
+}
 type HashMap = Container
-fun main() { println(HashMap.new().len()) }
+fun main() {
+    println(HashMap.new().len())
+}

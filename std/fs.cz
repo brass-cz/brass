@@ -306,3 +306,14 @@ fun _as_text(path) -> string! {
     }
     return error("expected a string or a `Path`, found `{typeof(path)}`")
 }
+
+/** Render `File { path: "...", closed: bool }` from stored state only. Adopted
+ * streams omit the path; descriptors and ownership flags are never printed.
+ */
+fun File.debug(self) -> string {
+    let closed = self._fd < 0
+    if self._path == "" {
+        return "File \{ closed: {closed} }"
+    }
+    return "File \{ path: {self._path.debug()}, closed: {closed} }"
+}

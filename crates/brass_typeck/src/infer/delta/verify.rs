@@ -133,6 +133,17 @@ pub(super) fn assert_delta(actual: &ChannelDelta, expected: &ChannelDelta) {
         .collect();
     assert_eq!(map(&a), map(&b), "instance_dispatch");
     let a: Vec<_> = actual
+        .instance_fields
+        .iter()
+        .map(|(s, entries)| (*s, map(entries)))
+        .collect();
+    let b: Vec<_> = expected
+        .instance_fields
+        .iter()
+        .map(|(s, entries)| (*s, map(entries)))
+        .collect();
+    assert_eq!(map(&a), map(&b), "instance_fields");
+    let a: Vec<_> = actual
         .instance_returns
         .iter()
         .map(|(s, args, ret)| ((s, args), ret))

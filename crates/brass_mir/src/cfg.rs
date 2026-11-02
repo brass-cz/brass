@@ -65,11 +65,11 @@ pub struct LocalDecl {
     pub name: Option<String>,
     /// For the result local of an expression the checker records an
     /// aggregate seed for (a call, a record or array literal), that
-    /// expression's source span. `ty` carries the seed every instance of the
-    /// body shares (when there is one); a span whose instances disagree has
-    /// per-instance seeds instead ([`crate::MirProgram::instance_seeds`]),
-    /// which monomorphization looks up by this span for the instance it is
-    /// typing.
+    /// expression's source span. `ty` carries the seed observed instances
+    /// share (when there is one). Callable bodies require an exact-instance seed
+    /// ([`crate::MirProgram::instance_seeds`]); absence of the entire span from
+    /// that channel also means no seed, never permission to use the shared type.
+    /// Source-fixed annotations have no seed site.
     pub seed_site: Option<brass_parser::Span>,
 }
 

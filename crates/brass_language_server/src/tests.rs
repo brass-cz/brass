@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 
+mod item_selection;
 mod source_locations;
 
 use crate::analysis::items::Diag;
@@ -12,7 +13,9 @@ use crate::features::{completion, definition, diagnostics, hover, semantic_token
 use tower_lsp_server::ls_types::{CompletionItem, DiagnosticSeverity, HoverContents, Position};
 
 fn path() -> PathBuf {
-    PathBuf::from("/tmp/brass_lsp_test/main.cz")
+    // An unsaved buffer beside std/ resolves the shipped library without
+    // process-global environment changes.
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../__lsp_test__.cz")
 }
 
 fn sorted(mut v: Vec<Diag>) -> Vec<Diag> {
@@ -722,7 +725,7 @@ fn hover_member_reference_ignores_containing_call_inference() {
 /// key/value via the call arguments -- rather than bare `unknown_N`.
 #[test]
 fn hover_method_call_specializes_unannotated_params() {
-    let src = "fun main() {\n    let m = HashMap.new()\n    m.set(\"a\", \"b\")\n}\n";
+    let src = "import std.collections.{ HashMap }\nfun main() {\n    let m = HashMap.new()\n    m.set(\"a\", \"b\")\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "set(", false);
     let h = hover::hover(&doc, &full, pos).expect("hover over the set call");
@@ -738,7 +741,7 @@ fn hover_method_call_specializes_unannotated_params() {
 /// being left as `unknown`.
 #[test]
 fn hover_method_call_resolves_return_from_receiver() {
-    let src = "fun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    let v = map.get(\"a\")\n}\n";
+    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    let v = map.get(\"a\")\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "get(", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the get call"));
@@ -753,7 +756,7 @@ fn hover_method_call_resolves_return_from_receiver() {
 /// over them, so the LSP can resolve a method against a receiver instance.
 #[test]
 fn full_analysis_exposes_record_schemes() {
-    let src = "fun main() {\n    let map = HashMap.new()\n}\n";
+    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n}\n";
     let full = full_analysis(src);
     let scheme = full.schemes.get("HashMap").expect("HashMap scheme");
     assert!(
@@ -771,7 +774,7 @@ fn full_analysis_exposes_record_schemes() {
 /// the value type taken from the instance's `entries` element, not the call.
 #[test]
 fn hover_method_return_resolved_from_instance_via_scheme() {
-    let src = "fun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    let v = map.get(\"a\")\n}\n";
+    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    let v = map.get(\"a\")\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "get(", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover get"));
@@ -788,7 +791,7 @@ fn hover_method_return_resolved_from_instance_via_scheme() {
 /// a `HashMap` reads as just its slots and operations.
 #[test]
 fn hover_record_instance_shows_resolved_public_members() {
-    let src = "fun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n}\n";
+    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "map.set", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the map value"));
@@ -865,7 +868,7 @@ fn hover_record_instance_shows_pinned_type_slots() {
 /// nothing or a bare expression type.
 #[test]
 fn hover_type_alias_shows_base_and_pinned_slots() {
-    let src = "type Counts = HashMap { key: string, value: int64 }\n\nfun main() {\n    let m: Counts = HashMap.new()\n    m.set(\"a\", 1)\n    println(m.get(\"a\"))\n}\n";
+    let src = "import std.collections.{ HashMap }\ntype Counts = HashMap { key: string, value: int64 }\n\nfun main() {\n    let m: Counts = HashMap.new()\n    m.set(\"a\", 1)\n    println(m.get(\"a\"))\n}\n";
     let full = full_analysis(src);
     for last in [false, true] {
         let (doc, pos) = position(src, "Counts", last);
@@ -886,7 +889,7 @@ fn hover_type_alias_shows_base_and_pinned_slots() {
 /// name, so there is no receiver expression for the value-method path).
 #[test]
 fn hover_type_qualified_method_shows_signature() {
-    let src = "fun main() {\n    let m = HashMap.new()\n    m.set(\"a\", 1)\n}\n";
+    let src = "import std.collections.{ HashMap }\nfun main() {\n    let m = HashMap.new()\n    m.set(\"a\", 1)\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "new", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the static method"));
@@ -904,7 +907,7 @@ fn hover_type_qualified_method_shows_signature() {
 /// its open type slots as declared.
 #[test]
 fn hover_type_name_hides_internal_members() {
-    let src = "fun main() {\n    let map = HashMap.new()\n}\n";
+    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "HashMap.new", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the HashMap type"));
@@ -1072,7 +1075,7 @@ fn completion_offers_types_and_functions() {
 #[test]
 fn type_alias_completes_and_navigates_to_its_declaration() {
     let src = concat!(
-        "type Counts = HashMap { key: string, value: int64 }\n",
+        "import std.collections.{ HashMap }\ntype Counts = HashMap { key: string, value: int64 }\n",
         "fun main() {\n",
         "    let map: Counts = Counts.new()\n",
         "    Cou\n",
@@ -1087,7 +1090,7 @@ fn type_alias_completes_and_navigates_to_its_declaration() {
     let full = full_analysis(src);
     let (doc, pos) = position(src, "Counts =", true);
     let location = definition::definition(&doc, &full, pos).expect("alias definition");
-    assert_eq!(location.range.start.line, 0);
+    assert_eq!(location.range.start.line, 1);
 }
 
 /// A nominal refinement alias exposes the static methods of its target while
@@ -1095,7 +1098,7 @@ fn type_alias_completes_and_navigates_to_its_declaration() {
 #[test]
 fn completion_offers_static_members_after_type_alias() {
     let src = concat!(
-        "type Counts = HashMap { key: string, value: int64 }\n",
+        "import std.collections.{ HashMap }\ntype Counts = HashMap { key: string, value: int64 }\n",
         "fun main() {\n",
         "    Counts.\n",
         "}\n",
@@ -1120,10 +1123,15 @@ fn imported_type_alias_completes_with_rename_and_definition() {
         "brass_lsp_alias_completion_test-{}",
         std::process::id()
     ));
-    std::fs::create_dir_all(&root).expect("create alias module directory");
+    std::fs::create_dir_all(root.join("std")).expect("create alias module directory");
+    std::fs::copy(
+        path().parent().unwrap().join("std/collections.cz"),
+        root.join("std/collections.cz"),
+    )
+    .expect("copy collections module");
     std::fs::write(
         root.join("aliases.cz"),
-        "type Counts = HashMap { key: string, value: int64 }\n",
+        "import std.collections.{ HashMap }\ntype Counts = HashMap { key: string, value: int64 }\n",
     )
     .expect("write alias module");
     let main = root.join("main.cz");
@@ -1152,7 +1160,7 @@ fn imported_type_alias_completes_with_rename_and_definition() {
     let (doc, pos) = position(src, "Totals", false);
     let location = definition::definition(&doc, &full, pos).expect("remote alias definition");
     assert!(location.uri.as_str().ends_with("/aliases.cz"));
-    assert_eq!(location.range.start.line, 0);
+    assert_eq!(location.range.start.line, 1);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1282,28 +1290,28 @@ fn completion_offers_direct_import_names() {
 /// core.|` offers `collections` and `math` alike), and the brace list of a
 /// core module offers its public types with their docs.
 #[test]
-fn completion_offers_core_segments() {
+fn completion_offers_core_and_std_segments() {
     let analyzer = DocAnalyzer::new(path());
     let src = "import core.";
     let doc = Document::new(src.to_string(), 1);
     let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(src.len()));
     let core_segs = labels(&items);
     assert!(
-        core_segs.contains(&"collections".to_string()),
-        "core module: {core_segs:?}"
+        !core_segs.contains(&"collections".to_string()),
+        "collections is not a core module: {core_segs:?}"
     );
     assert!(
         core_segs.contains(&"math".to_string()),
         "core module: {core_segs:?}"
     );
 
-    let src = "import core.collections.{ ";
+    let src = "import std.collections.{ ";
     let doc = Document::new(src.to_string(), 1);
     let items = completion::completion(&doc, &analyzer, &path(), doc.position_at(src.len()));
     let names = labels(&items);
     assert!(
         names.contains(&"HashMap".to_string()),
-        "core exports: {names:?}"
+        "std exports: {names:?}"
     );
 }
 
@@ -1608,6 +1616,7 @@ fn completion_offers_record_fields() {
 #[test]
 fn completion_hides_private_members_unless_typed() {
     let src = concat!(
+        "import std.collections.{ HashMap }\n",
         "fun main() {\n",
         "    let m = HashMap.new()\n",
         "    m.set(\"a\", 1)\n",
@@ -1643,6 +1652,7 @@ fn completion_hides_private_members_unless_typed() {
 #[test]
 fn completion_method_detail_resolves_via_scheme() {
     let src = concat!(
+        "import std.collections.{ HashMap }\n",
         "fun main() {\n",
         "    let m = HashMap.new()\n",
         "    m.set(\"a\", 1)\n",
@@ -1664,13 +1674,13 @@ fn completion_method_detail_resolves_via_scheme() {
     );
 }
 
-/// `HashMap` lives in the embedded core module `core.collections`, and its
-/// operations are `fun HashMap.m(...)` methods. Core modules are all in the
-/// implicit prelude, so `HashMap.new(...)` types to `HashMap` and `m.` offers
+/// `HashMap` is imported from `std.collections`, and its operations are
+/// `fun HashMap.m(...)` methods. `HashMap.new(...)` types to `HashMap`, so `m.` offers
 /// its methods -- with no import.
 #[test]
-fn completion_offers_hashmap_prelude_methods() {
+fn completion_offers_imported_hashmap_methods() {
     let src = concat!(
+        "import std.collections.{ HashMap }\n",
         "fun main() {\n",
         "    let m = HashMap.new()\n",
         "    m.\n",
@@ -1718,7 +1728,7 @@ fn hover_import_renamed_name_resolves_remote_declaration() {
 /// module path segment shows the module the import resolves to.
 #[test]
 fn hover_import_type_and_module_path() {
-    let src = "import core.collections.{ HashMap }\nfun main() {\n    let m = HashMap.new()\n    m.set(\"a\", 1)\n}\n";
+    let src = "import std.collections.{ HashMap }\nfun main() {\n    let m = HashMap.new()\n    m.set(\"a\", 1)\n}\n";
     let full = full_analysis(src);
     let (doc, pos) = position(src, "HashMap", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the imported type"));
@@ -1727,7 +1737,7 @@ fn hover_import_type_and_module_path() {
     let (doc, pos) = position(src, "collections", false);
     let text = hover_text(&hover::hover(&doc, &full, pos).expect("hover the path segment"));
     assert!(
-        text.contains("module core.collections"),
+        text.contains("module std.collections"),
         "module path: {text}"
     );
 }
@@ -1952,8 +1962,7 @@ fn hover_infers_for_loop_iterand_and_element() {
 #[test]
 fn hashmap_instance_type_mismatch_is_reported_at_the_call() {
     let mut a = DocAnalyzer::new(path());
-    let src =
-        "fun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    map.get(1)\n}\n";
+    let src = "import std.collections.{ HashMap }\nfun main() {\n    let map = HashMap.new()\n    map.set(\"a\", \"b\")\n    map.get(1)\n}\n";
     let diags = a.diagnostics(src);
     assert!(
         diags

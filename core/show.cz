@@ -1,19 +1,20 @@
-// Value-to-text protocols. Every type satisfies `Debug`: primitives implement
-// `debug` here, and every other type falls back to the compiler's built-in
-// renderer (the traditional record/sum/array display), so `v.debug()` works on
-// any value. Only primitives implement `Display` out of the box; a user type
-// satisfies it by declaring its own `fun T.display(self) -> string`. String
-// interpolation (`"{v}"`, and `print`/`println`) prefers `display` when the
-// value's type implements it and falls back to `debug` otherwise; write
-// `"{v.debug()}"` to force the debug form.
+// Value-to-text protocols: display is human text; debug is structural text.
+// Print, interpolation and string.from prefer a nominal display, then effective
+// debug. Top-level strings are raw; nullables display null or the inner value.
+// Effective debug prefers a nominal debug method, otherwise builtin structure.
+// Every nested element, field and payload uses effective debug, including inner
+// nullable values. Strings are quoted and escaped in every nested position.
+// Builtin structure includes private fields and shows callable fields as opaque.
+// Embedded multiline text gains one indent level per record or sum field;
+// array and tuple elements add no level, like builtin structural children.
 
 /**
- * The rendering every type satisfies: `debug` returns the value's canonical
- * text form. The primitives implement it in this module (a string debugs
- * QUOTED: `"a".debug()` is `"\"a\""`); every other type falls back to the
- * compiler's built-in renderer, so `v.debug()` works on any value. A `"{v}"`
- * segment and `print`/`println` use it when the type declares no `display`;
- * `"{v.debug()}"` forces this form.
+ * Structural text. A nominal type may declare `fun T.debug(self) -> string`;
+ * otherwise builtin structure renders its children through effective debug.
+ * Strings are quoted and escaped, including array, slice, fixed-array and tuple
+ * elements. A top-level value without display also uses its effective debug.
+ * An unnarrowed nullable has no `.debug()` method; narrow it before calling.
+ * Functions and closures cannot render alone; callable fields show `<opaque>`.
  */
 type Debug = {
     debug: (Self) -> string
@@ -158,10 +159,12 @@ fun uint64.display(self) -> string {
     return string.from(self)
 }
 
+/** Shortest float32 round-trip text; integral values keep `.0`. */
 fun float32.debug(self) -> string {
     return string.from(self)
 }
 
+/** The same shortest float32 text as `debug`, without widening to float64. */
 fun float32.display(self) -> string {
     return string.from(self)
 }

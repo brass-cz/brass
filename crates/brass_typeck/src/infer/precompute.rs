@@ -402,7 +402,10 @@ impl<'a> Checker<'a> {
     /// settled and before the body's checked event: a body's return contract
     /// is validated before the consumer may compile it.
     pub(super) fn report_uninferable_function_error_type(&mut self, f: &FunInfo) {
-        if self.seeded_module(&f.module) || f.signature.ret_ty.is_none() {
+        if !self.selects_body(f.decl.span)
+            || self.seeded_module(&f.module)
+            || f.signature.ret_ty.is_none()
+        {
             return;
         }
         if let Some(ret) = self.function_returns.get(&f.symbol)
@@ -423,7 +426,10 @@ impl<'a> Checker<'a> {
                 continue;
             }
             let mut method = |qualifier: &str, name: &String, m: &brass_hir::MethodInfo| {
-                if brass_hir::keyed_return(m.decl.ret.as_ref()) || m.signature.ret_ty.is_none() {
+                if !self.selects_body(m.decl.span)
+                    || brass_hir::keyed_return(m.decl.ret.as_ref())
+                    || m.signature.ret_ty.is_none()
+                {
                     return;
                 }
                 let key = (qualifier.to_string(), name.clone());
@@ -634,7 +640,10 @@ or drop the `!`"
                 // A seeded context type keeps the scheme the seed carried: its
                 // co-check did not run here, so generalizing now would produce
                 // an empty shell over nothing.
-                if self.seeded_module(&info.module) {
+                if !self.prepares_scheme(&info.symbol) {
+                    continue;
+                }
+                if self.seeded_scheme(&info.symbol, &info.module) {
                     if let Some(scheme) = self.schemes.get(&info.symbol) {
                         out.insert(info.symbol.clone(), scheme.clone());
                     }
@@ -667,6 +676,21 @@ or drop the `!`"
         let self_ty = info.type_ref();
         let mut scheme_methods = std::collections::BTreeMap::new();
         for (name, method) in methods {
+            debug_assert!(
+                (self.preparation.is_none() && self.item_seed.is_none())
+                    || method.decl.body.is_none()
+                    || brass_hir::keyed_return(method.decl.ret.as_ref())
+                    || method
+                        .signature
+                        .ret_ty
+                        .as_ref()
+                        .is_some_and(brass_hir::is_fully_known)
+                    || self
+                        .method_returns
+                        .contains_key(&(info.symbol.clone(), name.clone())),
+                "record scheme requires an unprepared inferred return: {}.{name}",
+                info.symbol
+            );
             // Return-path links the co-check recorded for this method: each
             // ties two inference variables that are one type (a parameter
             // returned on one path, a stored field's value on another).
@@ -1069,7 +1093,7 @@ or drop the `!`"
         let mut props = LightProps::default();
         for init in &program.inits {
             // A seeded context module's globals are already in `global_defs`.
-            if self.seeded_module(&init.path) {
+            if self.seeded_globals(&init.path) {
                 continue;
             }
             // Annotations and names resolve in the initializer's own module.
@@ -1270,6 +1294,7 @@ mod tests {
         // conceal unknown or cross-module return entries.
         let modules =
             [("a", "int32"), ("b", "string")].map(|(module, ty)| brass_hir::LoadedModule {
+                source: None,
                 is_prelude: false,
                 path: vec![module.into()],
                 ast: brass_parser::parse(&format!(
@@ -1310,6 +1335,7 @@ mod tests {
         // prelude declaration's (inferred) return -- its Err is the prelude
         // `Error` -- not by the builtin stand-in used without a prelude.
         let prelude = |name: &str, src: &str| brass_hir::LoadedModule {
+            source: None,
             is_prelude: true,
             path: vec!["core".into(), name.into()],
             ast: brass_parser::parse(src).unwrap(),
@@ -1318,6 +1344,7 @@ mod tests {
             prelude("error", include_str!("../../../../core/error.cz")),
             prelude("io", include_str!("../../../../core/io.cz")),
             brass_hir::LoadedModule {
+                source: None,
                 is_prelude: false,
                 path: vec!["main".into()],
                 ast: brass_parser::parse("fun ask() { return input() }").unwrap(),

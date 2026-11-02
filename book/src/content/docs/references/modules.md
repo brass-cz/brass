@@ -143,17 +143,19 @@ To take the path apart, hand it to [`std.path`](/references/stdlib/#stdpath):
 ## The standard library
 
 The embedded `core/` modules (`io`, `array`, `string`, `math`, `conv`,
-`assert`, `error`, `is`, `default`, `show`, `collections`) form the **implicit
-prelude**: their public names are in scope everywhere without an import,
-`HashMap` included. They can also be imported explicitly by their bare name
-(`import io.{ ... }`) or `core` path (`import core.io.{ ... }`), to alias or
+`assert`, `error`, `is`, `default`, `show`) form the **implicit prelude**:
+their public names are in scope everywhere without an import. They can also
+be imported explicitly by their bare name (`import io.{ ... }`) or `core`
+path (`import core.io.{ ... }`), to alias or
 qualify a name. A module's own declaration of a prelude name (`println`,
 `abs`, ...) shadows the prelude's in that module only; every other module
 still sees the prelude's.
 
-The shipped `std/` tree (`fs`, `net`, `process`, `data.json`, ...) is not
-embedded. It resolves as the package named `std`, which an installed
-toolchain binds automatically, and imports with the `std.` prefix
+Import `HashMap` with `import std.collections.{ HashMap }`.
+
+The shipped `std/` tree (`collections`, `fs`, `net`, `process`, `data.json`,
+...) is not embedded. It resolves as the package named `std`, which an
+installed toolchain binds automatically, and imports with the `std.` prefix
 (`import std.fs.{ read_file }`). See the
 [standard library reference](/references/stdlib/).
 

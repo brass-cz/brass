@@ -113,16 +113,6 @@ pub(in crate::infer) struct NumericState {
 }
 
 impl Checker<'_> {
-    /// Whether an independent body needs an origin negotiation at its own root.
-    pub(in crate::infer) fn numeric_body_needs_settlement(
-        &self,
-        body: &Block,
-        scopes: &ScopeStack,
-    ) -> bool {
-        !self.numeric_body_is_settled()
-            && self.numeric_unsettled_body_needs_settlement(body, scopes)
-    }
-
     /// Structural root decision after the ordinary-instance certificate declined.
     pub(in crate::infer) fn numeric_unsettled_body_needs_settlement(
         &self,

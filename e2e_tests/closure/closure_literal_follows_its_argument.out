@@ -4,6 +4,6 @@ abababab
 6
 [1, 2]
 int32[]
-[a, b]
+["a", "b"]
 string[]
 42

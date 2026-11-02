@@ -17,6 +17,17 @@ pub struct ResolveError {
     pub span: Span,
 }
 
+impl ResolveError {
+    /// Attribute a qualified-use error through an optional body-ownership
+    /// sidecar. Import/declaration errors remain catalog diagnostics.
+    pub fn body_owner(
+        &self,
+        owners: &brass_hir::diagnostics::DiagnosticOwners,
+    ) -> brass_hir::diagnostics::DiagnosticOwner {
+        owners.body_owner(self.span)
+    }
+}
+
 /// Check each import against the loaded modules: the name must be public and
 /// exported by the named module. A bare core-module path (`io`) is checked
 /// against the loaded `core.io` module's exports; importing from any other
@@ -171,6 +182,7 @@ mod tests {
 
     fn module(path: &[&str], src: &str) -> LoadedModule {
         LoadedModule {
+            source: None,
             is_prelude: false,
             path: path.iter().map(|s| s.to_string()).collect(),
             ast: parse(src).expect("parse"),

@@ -1,0 +1,40 @@
+fun TomlValue.to_json(self) -> JsonValue! {
+    return _to_json(self)
+}
+
+// Recurse through a free function to avoid rechecking a sum method per variant.
+fun _to_json(value: TomlValue) -> JsonValue! {
+    match value {
+        TomlValue.String { value } => {
+            return JsonValue.String { value }
+        },
+        TomlValue.Datetime { value } => {
+            return JsonValue.String { value }
+        },
+        TomlValue.Integer { value } => {
+            return JsonValue.from(value)
+        },
+        TomlValue.Float { value } => {
+            return JsonValue.from(value)
+        },
+        TomlValue.Bool { value } => {
+            return JsonValue.Bool { value }
+        },
+        TomlValue.Array { value } => {
+            let elements: JsonValue[] = []
+            for element in value {
+                elements.push(_to_json(element)!)
+            }
+            return JsonValue.Array { value: elements }
+        },
+        TomlValue.Table { values } => {
+            let members: HashMap { key: string, value: JsonValue } = HashMap.new()
+            for key in values.keys() {
+                if let member = values.get(key) {
+                    members.set(key, _to_json(member)!)
+                }
+            }
+            return JsonValue.Object { values: members }
+        },
+    }
+}

@@ -73,6 +73,10 @@ fn check_method_bodies(checker: &mut Checker, program: &Program, schemes_only: b
                         continue;
                     }
                     if let Some(body) = &m.decl.body {
+                        if !checker.prepares_method(&t.symbol, &m.signature.name, schemes_only) {
+                            continue;
+                        }
+                        let observation = checker.begin_item_inventory(t, m, None, schemes_only);
                         let m_started = std::time::Instant::now();
                         let mut scopes = checker.signature_scopes(&m.signature.params);
                         let ret = m.signature.ret_ty.clone();
@@ -104,6 +108,8 @@ fn check_method_bodies(checker: &mut Checker, program: &Program, schemes_only: b
                         {
                             checker.co_method_returns.insert(key, full);
                         }
+                        checker.finish_item_inventory(observation);
+                        checker.covered_method(&t.symbol, &m.signature.name);
                     }
                 }
             }
@@ -114,6 +120,13 @@ fn check_method_bodies(checker: &mut Checker, program: &Program, schemes_only: b
                             continue;
                         }
                         if let Some(body) = &m.decl.body {
+                            let qualifier = format!("{}.{}", t.symbol, v.name);
+                            if !checker.prepares_method(&qualifier, &m.signature.name, schemes_only)
+                            {
+                                continue;
+                            }
+                            let observation =
+                                checker.begin_item_inventory(t, m, Some(v.tag), schemes_only);
                             let mut scopes = checker.signature_scopes(&m.signature.params);
                             let ret = m.signature.ret_ty.clone();
                             checker.check_block_with_self_variant(
@@ -123,8 +136,7 @@ fn check_method_bodies(checker: &mut Checker, program: &Program, schemes_only: b
                                 &t.symbol,
                                 &v.name,
                             );
-                            let key =
-                                (format!("{}.{}", t.symbol, v.name), m.signature.name.clone());
+                            let key = (qualifier, m.signature.name.clone());
                             checker.settle_method_return(&key, body, ret.is_none());
                             if let Some(inferred) = checker.method_returns.get(&key).cloned() {
                                 checker.warn_implicit_nullable_result(
@@ -133,6 +145,8 @@ fn check_method_bodies(checker: &mut Checker, program: &Program, schemes_only: b
                                     &inferred,
                                 );
                             }
+                            checker.finish_item_inventory(observation);
+                            checker.covered_method(&key.0, &m.signature.name);
                         }
                     }
                 }
@@ -166,8 +180,10 @@ fn seed_schemes(
     rows: Rc<brass_typesys::RowInfo>,
     numeric_enabled: bool,
     stats: &mut stats::ElaborationStats,
+    view: Option<&crate::reachability::AnalysisView>,
 ) -> (HashMap<String, TypeScheme>, Option<(ContextTables, u32)>) {
     let mut pre = Checker::new_with_numeric(program, rows, numeric_enabled);
+    pre.select_preparation(view);
     let applied = seed.map(|(tables, next)| (pre.apply_seed(tables, next), next));
     pre.precompute_global_bindings();
     pre.precompute_returns();
@@ -191,7 +207,7 @@ pub fn analyze(program: &Program) -> Inference {
 pub fn analyze_with(program: &Program, seed: Option<&ContextTables>) -> Inference {
     let modules = crate::AnalysisModules::new(seed);
     let (_, const_calls) = crate::constck::check_in(program, modules);
-    analyze_inner(program, seed, None, Rc::new(const_calls)).0
+    analyze_inner(program, seed, None, Rc::new(const_calls), None).0
 }
 
 /// Check only append-only methods synthesized from keyed templates, reusing
@@ -324,6 +340,7 @@ fn analyze_generated_attempt(
     let closure_bindings = checker.finalized_closure_bindings();
     let instance_typed = checker.finalized_instance_typed();
     let (keyed_calls, instance_keyed_calls) = checker.settled_keyed_calls();
+    let (fields_loops, instance_fields) = checker.settled_fields_loops();
     let numeric_calls = checker.numeric_call_map();
     let field_calls = checker.field_call_map();
     stats.record_checker(&checker);
@@ -336,7 +353,8 @@ fn analyze_generated_attempt(
         view_args: checker.view_args,
         lift_errs: checker.lift_errs,
         sum_views,
-        fields_loops: checker.fields_loops,
+        fields_loops,
+        instance_fields,
         type_names: checker.type_names,
         keyed_calls,
         numeric_calls,
@@ -400,11 +418,13 @@ pub(crate) fn analyze_inner<'p>(
     seed: Option<&ContextTables>,
     mut ctl: Option<&mut StreamCtl>,
     const_calls: Rc<crate::constck::ConstCalls>,
+    view: Option<&crate::reachability::AnalysisView>,
 ) -> (
     Inference,
     Option<stream::ChannelDelta>,
     InferenceCleanup<'p>,
 ) {
+    let seed = seed.filter(|s| s.item_identity_matches(program));
     let mut stats = stats::ElaborationStats::default();
     let ordinary = analyze_attempt(
         program,
@@ -413,13 +433,14 @@ pub(crate) fn analyze_inner<'p>(
         Rc::clone(&const_calls),
         false,
         &mut stats,
+        view,
     );
     // Streaming has a single attempt. Eager numeric retries belong to the
     // same analysis and contribute to its one summary.
     let result = if ctl.is_some() || ordinary.0.errors.is_empty() {
         ordinary
     } else {
-        analyze_attempt(program, seed, None, const_calls, true, &mut stats)
+        analyze_attempt(program, seed, None, const_calls, true, &mut stats, view)
     };
     stats.emit_summary();
     result
@@ -432,6 +453,7 @@ fn analyze_attempt<'p>(
     const_calls: Rc<crate::constck::ConstCalls>,
     numeric_enabled: bool,
     stats: &mut stats::ElaborationStats,
+    view: Option<&crate::reachability::AnalysisView>,
 ) -> (
     Inference,
     Option<stream::ChannelDelta>,
@@ -446,10 +468,18 @@ fn analyze_attempt<'p>(
     let remapped = seed.map(|s| s.remapped(next_unknown_after_program(program)));
     let rows = Rc::new(brass_typesys::RowInfo::analyze(program));
     let t = std::time::Instant::now();
-    let (seeded, remapped) =
-        seed_schemes(program, remapped, Rc::clone(&rows), numeric_enabled, stats);
+    let (seeded, remapped) = seed_schemes(
+        program,
+        remapped,
+        Rc::clone(&rows),
+        numeric_enabled,
+        stats,
+        view,
+    );
     phase("typeck/seed-schemes", t);
     let mut checker = Checker::new_with_numeric(program, rows, numeric_enabled);
+    checker.select_preparation(view);
+    checker.observe_item_roots();
     checker.const_calls = const_calls;
     checker.lazy_profile = ctl.is_some();
     if checker.lazy_profile {
@@ -466,6 +496,15 @@ fn analyze_attempt<'p>(
     checker.precompute_returns();
     checker.settle_numeric_globals();
     phase("typeck/precompute", t);
+    if streaming
+        && checker
+            .preparation
+            .as_ref()
+            .zip(view)
+            .is_some_and(|(current, original)| current.selection != original.selection)
+    {
+        checker.refresh_selected_facts(seed);
+    }
     // Check each type's method bodies, then generalize each record type into a
     // scheme. Generalizing before the function bodies are checked makes the
     // schemes available at call sites (a function instantiates a method's scheme
@@ -478,6 +517,11 @@ fn analyze_attempt<'p>(
     checker.observe_scheme_install();
     phase("typeck/method-bodies", t);
     if let Some(ctl) = ctl.as_deref_mut() {
+        if let Some(view) = &checker.preparation {
+            ctl.sched.emit(stream::CheckEvent::SelectedBodies(
+                view.body_spans().clone(),
+            ));
+        }
         checker.report_uninferable_method_error_types();
         let delta = flush_delta(&checker, &mut ctl.state, false);
         if ctl.sched.completion_observations() {
@@ -511,6 +555,11 @@ fn analyze_attempt<'p>(
 
             let mut perf = brass_utils::PerfLog::start("typeck/fn-bodies");
             for (symbol, f) in &program.functions {
+                if view.is_some_and(|view| view.preparation_only)
+                    || !checker.selects_body(f.decl.span)
+                {
+                    continue;
+                }
                 // Context bodies were checked by the run that produced the seed;
                 // their call-site behavior is still exact, because a call from the
                 // entry re-elaborates the callee body at the call's own types.
@@ -519,6 +568,11 @@ fn analyze_attempt<'p>(
                 }
                 let fn_started = std::time::Instant::now();
                 check_function_body(&mut checker, symbol, f);
+                if let Some(view) = &mut checker.preparation {
+                    let view = Rc::make_mut(view);
+                    let id = view.functions[symbol].clone();
+                    view.coverage_mut().bodies.insert(id);
+                }
                 perf.item(symbol.clone(), fn_started.elapsed());
             }
             perf.report();
@@ -541,12 +595,21 @@ fn analyze_attempt<'p>(
                 let mut method_bodies: Vec<&Block> = Vec::new();
                 match &info.kind {
                     TypeKind::Record { methods, .. } => {
-                        method_bodies.extend(methods.values().filter_map(|m| m.decl.body.as_ref()));
+                        method_bodies.extend(
+                            methods
+                                .values()
+                                .filter(|m| checker.selects_body(m.decl.span))
+                                .filter_map(|m| m.decl.body.as_ref()),
+                        );
                     }
                     TypeKind::Sum { variants } => {
                         for v in variants {
-                            method_bodies
-                                .extend(v.methods.values().filter_map(|m| m.decl.body.as_ref()));
+                            method_bodies.extend(
+                                v.methods
+                                    .values()
+                                    .filter(|m| checker.selects_body(m.decl.span))
+                                    .filter_map(|m| m.decl.body.as_ref()),
+                            );
                         }
                     }
                 }
@@ -582,9 +645,17 @@ fn analyze_attempt<'p>(
             // `main` first, the rest sorted so the static order is
             // deterministic.
             let mut queue: std::collections::VecDeque<String> = {
-                let mut symbols: Vec<String> = program.functions.keys().cloned().collect();
+                let mut symbols: Vec<String> = program
+                    .functions
+                    .iter()
+                    .filter(|(_, f)| checker.selects_body(f.decl.span))
+                    .map(|(s, _)| s.clone())
+                    .collect();
                 symbols.sort();
-                if let Some(pos) = symbols.iter().position(|s| s == "main") {
+                if let Some(pos) = symbols
+                    .iter()
+                    .position(|s| program.entry_function() == Some(s.as_str()))
+                {
                     let main = symbols.remove(pos);
                     symbols.insert(0, main);
                 }
@@ -615,7 +686,9 @@ fn analyze_attempt<'p>(
                 // scheduler also releases this wait when execution begins.
                 let parked = ctl.sched.paused()
                     && priority.is_empty()
-                    && queue.front().is_some_and(|symbol| symbol != "main");
+                    && queue
+                        .front()
+                        .is_some_and(|symbol| program.entry_function() != Some(symbol.as_str()));
                 let requests = if parked {
                     ctl.sched.wait_for_requests()
                 } else {
@@ -626,7 +699,9 @@ fn analyze_attempt<'p>(
                 // work while the entry gate is still paused.
                 if ctl.sched.paused()
                     && priority.is_empty()
-                    && queue.front().is_some_and(|symbol| symbol != "main")
+                    && queue
+                        .front()
+                        .is_some_and(|symbol| program.entry_function() != Some(symbol.as_str()))
                 {
                     continue;
                 }
@@ -653,6 +728,24 @@ fn analyze_attempt<'p>(
                         ctl.sched.emit(stream::CheckEvent::BatchSettled(delta));
                     }
                     continue;
+                }
+                if checker.select_demand(&symbol) {
+                    let view = checker.preparation.as_ref().expect("selected demand");
+                    ctl.sched.emit(stream::CheckEvent::SelectedBodies(
+                        view.body_spans().clone(),
+                    ));
+                    let mut added: Vec<_> = program
+                        .functions
+                        .iter()
+                        .filter(|(name, f)| {
+                            !done.contains(*name)
+                                && !queue.contains(*name)
+                                && view.selects_body(f.decl.span)
+                        })
+                        .map(|(name, _)| name.clone())
+                        .collect();
+                    added.sort();
+                    queue.extend(added);
                 }
                 let f = &program.functions[&symbol];
                 // A demanded body checks at the instance the demand named
@@ -710,6 +803,16 @@ fn analyze_attempt<'p>(
                             let brass_hir::InstanceCallable::Function(name) = &next.callable else {
                                 unreachable!()
                             };
+                            if checker.select_demand(name) {
+                                ctl.sched.emit(stream::CheckEvent::SelectedBodies(
+                                    checker
+                                        .preparation
+                                        .as_ref()
+                                        .expect("completion selection")
+                                        .body_spans()
+                                        .clone(),
+                                ));
+                            }
                             done.insert(name.clone());
                             checker.completion.active = true;
                             check_stream_function(&mut checker, name, Some(&next.args), &mut perf);
@@ -783,7 +886,27 @@ fn analyze_attempt<'p>(
     // The cross-module tables, deep-resolved so a consumer without this run's
     // solver sees exactly what this run's `resolve` would have shown; whatever
     // stays open is genuinely generic.
+    let items = checker.preparation.as_ref().map(|view| {
+        let mut view = (**view).clone();
+        if let Some(seed) = &checker.item_seed {
+            view.coverage_mut()
+                .co_checks
+                .extend(seed.coverage.co_checks.iter().cloned());
+            view.coverage_mut()
+                .bodies
+                .extend(seed.coverage.bodies.iter().cloned());
+        }
+        std::sync::Arc::make_mut(&mut view.shared).schemes = checker
+            .schemes
+            .keys()
+            .map(|s| view.types[s].clone())
+            .collect();
+        std::sync::Arc::make_mut(&mut view.shared).initializers =
+            view.initializers.values().cloned().collect();
+        view
+    });
     let context_tables = ContextTables {
+        items,
         ordinary_numeric: !checker.numeric_enabled && checker.numeric_seed_ordinary,
         schemes: checker
             .schemes
@@ -868,6 +991,7 @@ fn analyze_attempt<'p>(
     let closure_bindings = checker.finalized_closure_bindings();
     let instance_typed = checker.finalized_instance_typed();
     let (keyed_calls, instance_keyed_calls) = checker.settled_keyed_calls();
+    let (fields_loops, instance_fields) = checker.settled_fields_loops();
     let numeric_calls = checker.numeric_call_map();
     let field_calls = checker.field_call_map();
     stats.record_checker(&checker);
@@ -880,7 +1004,8 @@ fn analyze_attempt<'p>(
         view_args: std::mem::take(&mut checker.view_args),
         lift_errs: std::mem::take(&mut checker.lift_errs),
         sum_views,
-        fields_loops: std::mem::take(&mut checker.fields_loops),
+        fields_loops,
+        instance_fields,
         type_names: std::mem::take(&mut checker.type_names),
         keyed_calls,
         numeric_calls,
@@ -922,6 +1047,11 @@ pub(super) fn check_stream_function(
         crate::exhaustive::check_block(checker.program, &checker.typed, &f.module, &f.decl.body);
     checker.errors.extend(errors);
     checker.report_uninferable_function_error_type(f);
+    if let Some(view) = &mut checker.preparation {
+        let view = Rc::make_mut(view);
+        let id = view.functions[symbol].clone();
+        view.coverage_mut().bodies.insert(id);
+    }
     perf.item(symbol.to_owned(), started.elapsed());
     if let (Some(args), Some(ret)) = (args, ret) {
         checker.record_instance_return(symbol.to_owned(), args.to_vec(), ret);
@@ -939,36 +1069,32 @@ fn check_function_body(checker: &mut Checker, symbol: &str, f: &FunInfo) {
     checker.current_module = f.module.clone();
     let mut scopes = checker.signature_scopes(&f.signature.params);
     let ret = f.signature.ret_ty.clone();
-    // The root module's bare `main` symbol is the program entry; its `!`
+    // The entry module's `main` is the program entry; its `!`
     // propagations abort at runtime, waiving the fallible-return-context
     // requirement for its own body.
-    checker.in_entry_main = symbol == "main";
+    checker.in_entry_main = checker.program.entry_function() == Some(symbol);
     let empty_arrays_from = checker.empty_array_elems.len();
-    let tagged = checker.numeric_enabled
-        || (checker.lazy_profile && checker.numeric_body_needs_settlement(&f.decl.body, &scopes));
-    if tagged {
-        let inputs: Vec<_> = f
-            .signature
-            .params
-            .iter()
-            .map(|param| {
-                scopes
-                    .iter()
-                    .rev()
-                    .find_map(|scope| scope.get(&param.name))
-                    .cloned()
-                    .unwrap_or_else(|| checker.fresh_unknown())
-            })
-            .collect();
-        checker.enter_instance(
-            brass_hir::InstanceCallable::Function(symbol.to_owned()),
-            &inputs,
-        );
-    }
+    // A declaration pass observes its own frame, not every future instance.
+    // Record that identity even when no numeric settlement is needed.
+    let inputs: Vec<_> = f
+        .signature
+        .params
+        .iter()
+        .map(|param| {
+            scopes
+                .iter()
+                .rev()
+                .find_map(|scope| scope.get(&param.name))
+                .cloned()
+                .unwrap_or_else(|| checker.fresh_unknown())
+        })
+        .collect();
+    checker.enter_instance(
+        brass_hir::InstanceCallable::Function(symbol.to_owned()),
+        &inputs,
+    );
     checker.check_block_root(&f.decl.body, &mut scopes, ret.as_ref());
-    if tagged {
-        checker.leave_instance();
-    }
+    checker.leave_instance();
     let concrete = !checker.seeded_module(&f.module)
         && f.signature.params.iter().all(|p| {
             p.resolved_ty
@@ -1056,7 +1182,7 @@ fn check_function_body_at(
         .collect();
     let arg_types = arg_types.as_slice();
     let mut scopes = checker.signature_call_frame(&f.signature.params, arg_types, &[], None);
-    checker.in_entry_main = symbol == "main";
+    checker.in_entry_main = checker.program.entry_function() == Some(symbol);
     let errors_before = checker.errors.len();
     checker.enter_instance(
         brass_hir::InstanceCallable::Function(symbol.to_string()),
@@ -1185,3 +1311,6 @@ pub(super) fn check_init_body(checker: &mut Checker, init: &ModuleInit) {
                 .any(|(lo, hi)| span.lo >= lo && span.hi <= hi)
         }));
 }
+
+#[cfg(test)]
+mod selection_tests;

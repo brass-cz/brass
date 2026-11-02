@@ -7,6 +7,7 @@ use super::Checker;
 use brass_hir::Type;
 
 mod admission;
+mod item_inventory;
 mod methods;
 mod provenance;
 /// Opt-in method dependency windows, independent of memo admission.

@@ -1,0 +1,5 @@
+// @backends: all
+println("dependency initializer")
+fun main() {
+    println("dependency main")
+}

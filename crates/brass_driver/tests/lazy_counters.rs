@@ -82,6 +82,7 @@ fn verify(fixture: &Fixture, chain: bool) {
             ("co_hits", 0),
             ("co_misses", 0),
             ("elaborations", if chain { 134 } else { 0 }),
+            // Core-only inputs use genuine complete context coverage.
             ("dedicated_passes", if chain { 72 } else { 1 }),
         ],
     );

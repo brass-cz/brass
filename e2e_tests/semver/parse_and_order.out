@@ -14,7 +14,7 @@ v1.0.0 -> rejected
  -> rejected
 1 4 2
 rc.1 build.5
-[rc, 1]
+["rc", "1"]
 true
 null null
 false

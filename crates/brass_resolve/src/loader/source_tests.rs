@@ -53,3 +53,37 @@ fn snapshots_share_lazy_indexes_but_distinct_sources_do_not() {
     assert_eq!(snapshot.locate(revised + 2).unwrap().line_col(), (1, 3));
     assert_eq!(sources.locate(base + 2).unwrap().line_col(), (2, 1));
 }
+
+/// Two wrapper modules can be synthesized from one library; their dispatch
+/// namespaces must remain distinct even when their source spans are identical.
+#[test]
+fn plugin_provenance_names_the_wrapper_and_library() {
+    let mut sources = SourceMap::default();
+    let mut modules = Vec::new();
+    let mut errors = Vec::new();
+    let lib = std::path::Path::new("missing-plugin.so");
+    for name in ["first", "second"] {
+        let module = super::load_synthesized(
+            lib,
+            "fun answer() { return 42 }".into(),
+            &[name.into()],
+            brass_hir::PackageId::new(std::path::Path::new("plugin-package")),
+            &mut sources,
+            brass_parser::Span::new(0, 0),
+            &mut errors,
+        )
+        .unwrap();
+        modules.push(module);
+    }
+    assert!(errors.is_empty());
+    let a = modules[0].source.as_ref().unwrap();
+    let b = modules[1].source.as_ref().unwrap();
+    assert_ne!(a.module_id(&modules[0].path), b.module_id(&modules[1].path));
+    assert_eq!(
+        a.origin,
+        brass_hir::SourceOrigin::Plugin(brass_hir::PackageId::new(std::path::Path::new(
+            "plugin-package"
+        )))
+    );
+    assert_eq!(a.origin, b.origin);
+}

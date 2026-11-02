@@ -296,3 +296,8 @@ fun _is_numeric(id: string) -> bool {
     }
     return true
 }
+
+/** Render the semantic-version text from `to_string` for print and interpolation. */
+fun Version.display(self) -> string {
+    return self.to_string()
+}

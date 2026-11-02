@@ -1,4 +1,4 @@
 100
 102
 1
-err: [e2e_tests/types/refinement_alias_in_signature.cz:26:16] unhandled error: duplicate key 'a'
+err: [e2e_tests/types/refinement_alias_in_signature.cz:27:16] error: duplicate key 'a'

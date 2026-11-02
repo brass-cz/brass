@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // An UNANNOTATED, FALLIBLE function that reads one map and builds a DIFFERENT
 // one: the input's value type (a record) is not the output's (a string). The
 // `return error(..)` path produces no Ok value, so the Ok payload is the map

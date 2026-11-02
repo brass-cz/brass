@@ -1,0 +1,25 @@
+// @backends: all
+let current: int32? = 1
+type Clears = {
+}
+type Box = {
+    value
+}
+type Pair = {
+    first
+    second
+}
+fun Clears.debug(self) -> string {
+    current = null
+    return "cleared"
+}
+fun main() {
+    if current {
+        // Different substitutions of one owner must both contribute effects.
+        println(
+            Pair { first: Box { value: 1 }, second: Box { value: Clears { } } },
+        )
+        const after: int32 = current
+        println(after)
+    }
+}

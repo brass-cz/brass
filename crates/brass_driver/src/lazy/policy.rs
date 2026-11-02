@@ -130,6 +130,13 @@ impl CompletionState {
         self.checked_context.extend(symbols.iter().cloned());
     }
 
+    /// New eligible bodies invalidate the warning and region screen. A selection
+    /// published during a drain cannot receive a certificate from the old graph.
+    pub(super) fn selection_changed(&mut self) {
+        self.graph = None;
+        self.blocked |= self.mode != LazyPolicy::Demand;
+    }
+
     /// A keyed discovery cannot be brought forward by draining this stream.
     pub(super) fn block(&mut self) {
         self.blocked = true;
@@ -187,7 +194,7 @@ impl LazyState {
                 .union(&self.checked_fns)
                 .cloned()
                 .collect();
-            let graph = RegionGraph::new(program, &completed);
+            let graph = RegionGraph::new(program, &completed, self.selected_bodies.as_deref());
             if !graph.can_drain() {
                 tracing::debug!(target: "brass::perf", "lazy: policy preserves discovery timing");
                 policy.blocked = true;
@@ -200,10 +207,19 @@ impl LazyState {
         // fold their revisions into this frontier before estimating work left.
         self.pump_pending();
         let policy = self.completion.as_mut().expect("auto observations");
+        if policy.graph.is_none() || policy.blocked {
+            return false;
+        }
         policy.inputs.unchecked_bodies = program
             .functions
-            .keys()
-            .filter(|s| !self.checked_fns.contains(*s) && !policy.checked_context.contains(*s))
+            .iter()
+            .filter(|(s, f)| {
+                self.selected_bodies
+                    .as_ref()
+                    .is_none_or(|spans| spans.contains(&f.decl.span))
+                    && !self.checked_fns.contains(*s)
+                    && !policy.checked_context.contains(*s)
+            })
             .count();
         tracing::debug!(target: "brass::perf", resolves = policy.inputs.runtime_resolves,
             retries = policy.inputs.retries, unchecked = policy.inputs.unchecked_bodies,
@@ -222,7 +238,14 @@ impl LazyState {
         while !self.finished && !self.closed && !self.needs_eager {
             self.pump_blocking();
         }
-        if self.finished && !self.needs_eager && !self.awaiting_keyed {
+        if self.finished
+            && !self.needs_eager
+            && !self.awaiting_keyed
+            && self
+                .completion
+                .as_ref()
+                .is_some_and(|policy| !policy.blocked && policy.graph.is_some())
+        {
             let graph = self
                 .completion
                 .as_mut()
@@ -289,6 +312,29 @@ mod tests {
             "a certificate is supplied once"
         );
         assert!(lazy.needed.is_empty());
+    }
+
+    /// A newly selected body must be screened even if an earlier graph allowed draining.
+    #[test]
+    fn selection_growth_invalidates_cached_preflight() {
+        let (mut lazy, _) = crate::lazy::tests::state(vec![]);
+        let (program, _) = brass_hir::lower(&[]);
+        lazy.completion = Some(super::CompletionState {
+            mode: LazyPolicy::Demand,
+            inputs: PolicyInputs::default(),
+            entered: true,
+            blocked: false,
+            checked_context: Default::default(),
+            graph: Some(super::RegionGraph::new(&program, &Default::default(), None)),
+            region: None,
+        });
+        lazy.take(brass_typeck::stream::CheckEvent::SelectedBodies(
+            Default::default(),
+        ));
+        let policy = lazy.completion.as_ref().unwrap();
+        assert!(policy.graph.is_none());
+        assert!(!policy.blocked);
+        assert!(!lazy.finished);
     }
 
     /// Short paths, cold libraries and expensive remaining checks must not switch.

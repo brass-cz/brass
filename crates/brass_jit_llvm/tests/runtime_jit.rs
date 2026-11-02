@@ -10,6 +10,7 @@ use inkwell::context::Context;
 fn lower(src: &str) -> (brass_hir::Program, brass_mir::MirProgram) {
     let ast = brass_parser::parse(src).expect("parse");
     let (program, errs) = brass_hir::lower(&[brass_hir::LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,

@@ -1,0 +1,1 @@
+fields_growing_instances.cz:5:22: error: cannot determine this `fields(..)` loop's field list within the elaboration limit

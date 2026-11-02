@@ -460,34 +460,20 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Rendering a value of type `ty` (`print`/`println`, a `"{v}"` segment)
-    /// runs its type's `display` method when it declares one, which is user
-    /// code like any other call. This mirrors the back ends' routing
-    /// (`brass_engine::display_instance` / `nullable_display_instance`): a
-    /// record or sum value renders through `display`, and so does a present
-    /// nullable of one; arrays (and their elements) use the built-in
-    /// renderer. A still-open type is decided by the per-instantiation checks
-    /// of its generic body.
+    /// Rendering can invoke a top-level display or debug methods at any
+    /// structural depth. Those calls invalidate mutable narrowings like explicit calls.
     pub(super) fn invalidate_after_rendering(&mut self, ty: &Type, scopes: &ScopeStack) {
-        let resolved = self.resolve(ty);
-        let rendered = match peel_value_wrappers(&resolved) {
-            Type::Nullable(inner) => peel_value_wrappers(inner),
-            other => other,
-        };
-        let runs_code = match rendered {
-            Type::Record(n) | Type::Sum(n) => {
-                self.program
-                    .type_by_id(n.id)
-                    .is_some_and(|info| match &info.kind {
-                        TypeKind::Record { methods, .. } => methods.contains_key("display"),
-                        TypeKind::Sum { variants } => {
-                            variants.iter().any(|v| v.methods.contains_key("display"))
-                        }
-                    })
-            }
-            _ => false,
-        };
-        if runs_code {
+        self.invalidate_after_rendering_form(ty, brass_hir::rendering::RenderForm::Display, scopes);
+    }
+
+    /// Apply the same call-effect rule to explicit structural debug rendering.
+    pub(super) fn invalidate_after_rendering_form(
+        &mut self,
+        ty: &Type,
+        form: brass_hir::rendering::RenderForm,
+        scopes: &ScopeStack,
+    ) {
+        if brass_hir::rendering::rendering_runs_code(self.program, &self.resolve(ty), form) {
             self.invalidate_narrowed_after_call(scopes);
         }
     }

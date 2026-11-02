@@ -23,7 +23,7 @@
 //! ([`crate::render_record_fields`] / [`crate::render_variant_fields`]); the
 //! REPL interpreter walks its runtime values by the same kinds and lists. The
 //! monomorphizer accepts `==` exactly when [`equality_defined`] holds, and the
-//! prelude `HashMap` compares keys with this `==`.
+//! `std.collections.HashMap` compares keys with this `==`.
 
 use brass_hir::{Program, Type};
 

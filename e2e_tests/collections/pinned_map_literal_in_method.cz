@@ -1,14 +1,15 @@
+import std.collections.{ HashMap }
+
 // A bare integer literal stored into a width-pinned container takes the
 // receiver's width (`int64` for a `Counts` map) inside a METHOD body just as
 // inside a function body, also through a parameter annotated with the
 // refinement alias.
 
-type Counts = HashMap {
-    key: string
-    value: int64
-}
+type Counts = HashMap { key: string, value: int64 }
 
-type Tally = { runs: int64 }
+type Tally = {
+    runs: int64
+}
 
 // The literals here are checked inside a METHOD body.
 fun Tally.build(self) -> Counts {

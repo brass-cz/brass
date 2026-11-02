@@ -364,3 +364,8 @@ fun _first_segment_has_colon(path: string) -> bool {
     }
     return index_of(cs, ":", 0, end) != null
 }
+
+/** Render the URI text from `to_string` for print and interpolation. */
+fun URI.display(self) -> string {
+    return self.to_string()
+}

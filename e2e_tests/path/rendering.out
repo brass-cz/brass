@@ -1,0 +1,11 @@
+src/a, b.cz
+src/a, b.cz
+"src/a, b.cz"
+Box {
+    path: "src/a, b.cz",
+}
+["src/a, b.cz", "."]
+{
+    "source": "src/a, b.cz"
+}
+"a\"b"

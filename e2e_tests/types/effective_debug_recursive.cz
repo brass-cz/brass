@@ -1,0 +1,20 @@
+// @backends: all
+// A custom recursive debug is an ordinary recursive method instance.
+type Tree = Leaf { value: string } | Children { values: Tree[] }
+fun Tree.debug(self) -> string {
+    return match self {
+        Tree.Leaf { value } => value.debug(),
+        Tree.Children { values } => values.debug(),
+    }
+}
+fun main() {
+    const tree = Tree.Children {
+        values: [
+            Tree.Leaf { value: "a" },
+            Tree.Children { values: [Tree.Leaf { value: "b" }] },
+        ],
+    }
+    println(tree)
+    println([tree])
+    println(tree.debug())
+}

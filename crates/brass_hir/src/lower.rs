@@ -18,8 +18,21 @@ pub struct LowerError {
     pub span: Span,
 }
 
-/// Collect all modules into a `Program`. Errors list duplicate declarations.
+/// Collect a dependency-ordered module graph whose last module is the entry.
+/// Errors list duplicate declarations. Use [`lower_context`] for a context
+/// prefix without an entry module.
 pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
+    lower_modules(modules, modules.len().checked_sub(1))
+}
+
+/// Collect dependency modules for shared preparation without an implicit entry.
+pub fn lower_context(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
+    lower_modules(modules, None)
+}
+
+/// Collect declarations and bind the entry identity before storage names escape.
+fn lower_modules(modules: &[LoadedModule], entry: Option<usize>) -> (Program, Vec<LowerError>) {
+    let mut entry_function = None;
     let mut types: HashMap<String, TypeInfo> = HashMap::default();
     let mut functions: HashMap<String, FunInfo> = HashMap::default();
     let mut inits = Vec::new();
@@ -55,7 +68,7 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
         _ => None,
     });
 
-    for m in modules {
+    for (module_index, m) in modules.iter().enumerate() {
         // Record the names this module imports so per-module visibility can
         // tell an imported cross-module name from an inaccessible one.
         let imported = module_imports.entry(m.path.clone()).or_default();
@@ -146,6 +159,9 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
                 }
                 TopLevel::Fun(f) => {
                     let symbol = fn_name_modules.prelude_first_symbol(&f.name, m);
+                    if Some(module_index) == entry && f.name == "main" {
+                        entry_function = Some(symbol.clone());
+                    }
                     // Same symbol => same name defined twice in the same module:
                     // a genuine duplicate. A different module yields a different
                     // symbol, so cross-module same names coexist.
@@ -172,6 +188,7 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
         inits.push(ModuleInit {
             path: m.path.clone(),
             stmts,
+            source: m.source.clone(),
         });
     }
 
@@ -229,6 +246,7 @@ pub fn lower(modules: &[LoadedModule]) -> (Program, Vec<LowerError>) {
         type_names: HashSet::default(),
         pattern_index: Default::default(),
         functions,
+        entry_function,
         inits,
         prelude_modules: modules
             .iter()
@@ -1291,6 +1309,7 @@ mod tests {
     fn lower_messages(src: &str) -> Vec<String> {
         let ast = parse(src).expect("parse");
         let (_, errors) = lower(&[LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,
@@ -1302,6 +1321,7 @@ mod tests {
         let loaded: Vec<LoadedModule> = modules
             .iter()
             .map(|(path, src)| LoadedModule {
+                source: None,
                 is_prelude: false,
                 path: path.iter().map(|s| s.to_string()).collect(),
                 ast: parse(src).expect("parse"),
@@ -1338,6 +1358,7 @@ mod tests {
         let loaded: Vec<LoadedModule> = modules
             .iter()
             .map(|(path, src)| LoadedModule {
+                source: None,
                 is_prelude: false,
                 path: path.iter().map(|s| s.to_string()).collect(),
                 ast: parse(src).expect("parse"),
@@ -1358,6 +1379,7 @@ mod tests {
         let loaded: Vec<LoadedModule> = modules
             .iter()
             .map(|(path, src)| LoadedModule {
+                source: None,
                 is_prelude: false,
                 path: path.iter().map(|s| s.to_string()).collect(),
                 ast: parse(src).expect("parse"),
@@ -1366,6 +1388,25 @@ mod tests {
         let (program, errors) = lower(&loaded);
         assert!(errors.is_empty(), "lower errors: {errors:?}");
         program
+    }
+
+    #[test]
+    fn entry_function_belongs_to_the_last_module_only() {
+        // Canonical symbols and the entry role are independent of namespace spelling.
+        let program = lower_program(&[
+            (&["dependency"], "fun main() {}"),
+            (&["app"], "fun main() {}"),
+        ]);
+        assert_eq!(program.entry_function(), Some("main@app"));
+        let program = lower_program(&[(&["dependency"], "fun main() {}"), (&["app"], "let x = 1")]);
+        assert_eq!(program.entry_function(), None);
+        let context = [LoadedModule {
+            source: None,
+            is_prelude: false,
+            path: vec!["dependency".into()],
+            ast: parse("fun main() {}").unwrap(),
+        }];
+        assert_eq!(super::lower_context(&context).0.entry_function(), None);
     }
 
     #[test]
@@ -1436,11 +1477,13 @@ mod tests {
         // imports even when their global storage symbol is bare.
         let loaded = vec![
             LoadedModule {
+                source: None,
                 is_prelude: true,
                 path: vec!["core".into(), "test".into()],
                 ast: parse("fun builtin_value() -> int32 { return 1 }\n").expect("parse"),
             },
             LoadedModule {
+                source: None,
                 is_prelude: false,
                 path: vec!["main".into()],
                 ast: parse("fun run() -> int32 { return builtin_value() }\n").expect("parse"),
@@ -1462,16 +1505,19 @@ mod tests {
         // own (qualified) definition, every other module the prelude's.
         let loaded = vec![
             LoadedModule {
+                source: None,
                 is_prelude: true,
                 path: vec!["core".into(), "io".into()],
                 ast: parse("fun show(v) { return 1 }\n").expect("parse"),
             },
             LoadedModule {
+                source: None,
                 is_prelude: false,
                 path: vec!["other".into()],
                 ast: parse("fun show(v) { return 2 }\n").expect("parse"),
             },
             LoadedModule {
+                source: None,
                 is_prelude: false,
                 path: vec!["main".into()],
                 ast: parse("import other\nfun run() { return show(0) }\n").expect("parse"),
@@ -1608,6 +1654,7 @@ mod tests {
         )
         .expect("parse");
         let (program, errors) = lower(&[LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,
@@ -1661,6 +1708,7 @@ mod tests {
         let ast = parse("fun bad(value: MissingParam) -> MissingReturn { return value }\n")
             .expect("parse");
         let (program, errors) = lower(&[LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,
@@ -1691,6 +1739,7 @@ mod tests {
         )
         .expect("parse");
         let (program, errors) = lower(&[LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,
@@ -1726,6 +1775,7 @@ mod tests {
         )
         .expect("parse");
         let (program, errors) = lower(&[LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,
@@ -1754,6 +1804,7 @@ mod tests {
     fn assigns_stable_unknowns_to_unannotated_interface_method_signatures() {
         let ast = parse("type Consumer = {\n    consume(self, value)\n}\n").expect("parse");
         let (program, errors) = lower(&[LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,
@@ -1787,6 +1838,7 @@ mod tests {
         )
         .expect("parse");
         let (program, errors) = lower(&[LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,
@@ -1828,6 +1880,7 @@ mod tests {
         )
         .expect("parse");
         let (program, errors) = lower(&[LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,

@@ -1,0 +1,10 @@
+// @backends: all
+// Each concrete call adds a record layer; expansion must stop at the loop.
+fun grow(value) -> int32 {
+    if value: anonymous {  } {
+        for field in fields(value) {
+        }
+    }
+    return grow({ child: value })
+}
+println(grow({ start: 1 }))

@@ -6,6 +6,7 @@ use brass_hir::LoadedModule;
 fn symbols(source: &str, name: &str) -> Vec<String> {
     let ast = brass_parser::parse(source).expect("parse");
     let modules = [LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -22,12 +23,12 @@ fn symbols(source: &str, name: &str) -> Vec<String> {
     let seeds = brass_typeck::stream::aggregate_instance_seeds(
         &analysis.instance_typed,
         &analysis.typed,
-        &shared,
         &program,
     );
     let mir = brass_mir::lower_program_with_types(
         &program,
         &brass_mir::CheckerChannels {
+            selected_bodies: None,
             expr_types: &shared,
             receiver_types: &fxhash::FxHashMap::default(),
             receiver_owners: &fxhash::FxHashMap::default(),
@@ -38,6 +39,7 @@ fn symbols(source: &str, name: &str) -> Vec<String> {
             call_locations: &fxhash::FxHashMap::default(),
             lift_errs: &fxhash::FxHashSet::default(),
             fields_loops: &analysis.fields_loops,
+            instance_fields: &analysis.instance_fields,
             type_names: &analysis.type_names,
             typeof_types: &analysis.typeof_types,
             null_props: &analysis.null_props,
@@ -84,6 +86,7 @@ fn unchanged_literal_floors_publish_no_contracts_or_value_instances() {
     let source = "fun keep(x) { let y = x\nreturn y }\nfun main() { let total = 0\ntotal += keep(1)\ntotal += keep(2)\ntotal += keep(100) }\n";
     let ast = brass_parser::parse(source).expect("parse");
     let (program, errors) = brass_hir::lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,

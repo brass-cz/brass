@@ -19,6 +19,7 @@ impl Scheduler for Recorder {
 
 fn program(source: &str) -> Program {
     let (program, errors) = brass_hir::lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast: brass_parser::parse(source).expect("parse"),

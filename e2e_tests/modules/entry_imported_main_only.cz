@@ -1,0 +1,3 @@
+// @backends: all
+import entry_library
+println("entry initializer")

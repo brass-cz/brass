@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 import std.process.{ Command, Stdio }
 import std.path.Path
 import std.fs.{ read_file, create_dir, move_dir, remove_dir }

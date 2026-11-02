@@ -1,0 +1,8 @@
+[main.cz:8:3] error: loading config
+    [config.cz:2:7] error: missing key
+[main.cz:8:3] error: loading config
+    [config.cz:2:7] error: missing key
+[main.cz:8:3] error: loading config
+    [config.cz:2:7] error: missing key
+[outer.cz:3:4] error: [main.cz:8:3] error: loading config
+    [config.cz:2:7] error: missing key

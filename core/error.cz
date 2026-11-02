@@ -38,29 +38,31 @@ type Error = {
     frames: Frame[]
 }
 
-// The rendered trace: the newest context first, one indent level per frame,
-// the original error last. The unhandled-`!` abort prints this verbatim.
+// The rendered trace: newest context first, one indent level per frame,
+// with `[file:line:col] error: <message>` on every line.
 fun Error.display(self) -> string {
+    return _render_trace(self.frames, self.location, "error") + "{self.value}"
+}
+
+// Render context lines and the origin prefix with one label. The caller renders
+// the payload afterwards, preserving its effects after the trace is captured.
+fun _render_trace(frames: Frame[], origin: Location, label: string) -> string {
     let out = ""
     let indent = ""
-    let i = self.frames.len() - 1
+    let i = frames.len() - 1
     while i >= 0 {
-        let f = self.frames[i]
+        let f = frames[i]
         out = out +
             indent +
             "[" +
             f.location.display() +
-            "] unhandled error: " +
+            "] {label}: " +
             f.message +
             "\n"
         indent = indent + "    "
         i = i - 1
     }
-    return out +
-        indent +
-        "[" +
-        self.location.display() +
-        "] unhandled error: {self.value}"
+    return out + indent + "[" + origin.display() + "] {label}: "
 }
 
 // Raise an error: wrap the payload with the caller's position. The `loc`
@@ -98,11 +100,18 @@ fun Result.context(self, ctx: string, loc: Location) {
 }
 
 // The unhandled-`!` abort renders its Err payload through this: a payload
-// carrying a trace (an `Error`) renders itself, anything else keeps the
+// carrying a trace (an `Error`) uses the unhandled label; anything else keeps the
 // plain prefix form. The `frames` presence test dispatches statically per
 // payload type.
 fun _render_unhandled(e) -> string {
     if e.frames {
+        if e: Error {
+            let prefix = _render_trace(e.frames, e.location, "unhandled error")
+            if e.value: Error {
+                return prefix + _render_unhandled(e.value)
+            }
+            return prefix + "{e.value}"
+        }
         return e.display()
     }
     return "unhandled error: {e}"

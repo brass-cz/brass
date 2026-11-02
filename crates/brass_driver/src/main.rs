@@ -15,6 +15,8 @@
 //! interpreter: with a file it runs the file, with none it starts an interactive
 //! session. Argument parsing is `clap`'s derive interface.
 
+mod item_preparation;
+mod item_shadow;
 #[cfg(jit_backend)]
 mod lazy;
 #[cfg(jit_backend)]
@@ -187,7 +189,8 @@ fn parse_cli() -> Cli {
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let file_at = program_file_index(&argv);
     let split = file_at.map_or(argv.len(), |i| i + 1);
-    let mut cli = Cli::parse_from(argv[..split].iter().cloned());
+    let mut cli = Cli::try_parse_from(argv[..split].iter().cloned())
+        .unwrap_or_else(|error| item_shadow::parse_project_cli(&argv[..split], error));
     let rest: Vec<String> = argv[split..]
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -215,7 +218,7 @@ fn program_file_index(argv: &[std::ffi::OsString]) -> Option<usize> {
             continue;
         }
         if !positional_only && token.starts_with('-') {
-            index += 1;
+            index += if token == "--project-root" { 2 } else { 1 };
             continue;
         }
         if !positional_only && matches!(token.as_ref(), "check" | "help" | "cache") {
@@ -233,7 +236,7 @@ fn program_file_index(argv: &[std::ffi::OsString]) -> Option<usize> {
                 if positional_only || !token.starts_with('-') {
                     return Some(index);
                 }
-                index += 1;
+                index += if token == "--project-root" { 2 } else { 1 };
             }
             return None;
         }
@@ -271,7 +274,10 @@ fn exit_code(r: Result<(), u8>) -> ExitCode {
 /// a helper that spawns is promoted and guarded too. Returns rejected spawn
 /// arguments and warnings describing inserted access guards.
 #[cfg(jit_backend)]
-fn auto_acquire_modules(modules: &mut [LoadedModule]) -> (Vec<(String, Span)>, Vec<String>) {
+fn auto_acquire_modules<const SELECTED: bool>(
+    modules: &mut [LoadedModule],
+    view: Option<&brass_typeck::reachability::AnalysisView>,
+) -> (Vec<(String, Span)>, Vec<String>, bool) {
     use brass_jit_llvm::ownership::{auto_acquire, spawn_capture_summaries};
     use brass_parser::ast::{Block, Member, TypeBody};
 
@@ -375,6 +381,7 @@ fn auto_acquire_modules(modules: &mut [LoadedModule]) -> (Vec<(String, Span)>, V
         mutated
     };
 
+    let mut may_rewrite = false;
     let mut warnings = Vec::new();
     let mut errors: Vec<(String, Span)> = Vec::new();
     let mut push_errors = |errs: Vec<brass_jit_llvm::ownership::SpawnError>| {
@@ -406,6 +413,9 @@ fn auto_acquire_modules(modules: &mut [LoadedModule]) -> (Vec<(String, Span)>, V
         for item in &mut m.ast.items {
             match item {
                 TopLevel::Fun(f) => {
+                    if SELECTED && view.is_some_and(|view| !view.selects_body(f.span)) {
+                        continue;
+                    }
                     let params = names(&f.params);
                     push_errors(brass_jit_llvm::ownership::pre_spawn_errors(
                         &f.body.stmts,
@@ -413,6 +423,9 @@ fn auto_acquire_modules(modules: &mut [LoadedModule]) -> (Vec<(String, Span)>, V
                         &mutated_globals,
                     ));
                     let report = auto_acquire(&mut f.body.stmts, &params, &summaries);
+                    if SELECTED {
+                        may_rewrite |= report.may_rewrite;
+                    }
                     let context = match &f.recv {
                         Some(brass_parser::ast::TypeExpr::Named(name, _)) => {
                             format!("{name}.{}", f.name)
@@ -436,6 +449,7 @@ fn auto_acquire_modules(modules: &mut [LoadedModule]) -> (Vec<(String, Span)>, V
                     };
                     for member in members {
                         if let Member::Method(method) = member
+                            && (!SELECTED || view.is_none_or(|view| view.selects_body(method.span)))
                             && let Some(body) = &mut method.body
                         {
                             let params = names(&method.params);
@@ -445,6 +459,9 @@ fn auto_acquire_modules(modules: &mut [LoadedModule]) -> (Vec<(String, Span)>, V
                                 &mutated_globals,
                             ));
                             let report = auto_acquire(&mut body.stmts, &params, &summaries);
+                            if SELECTED {
+                                may_rewrite |= report.may_rewrite;
+                            }
                             warnings.extend(report_spawn_ownership(
                                 &report,
                                 &format!("{}.{}", t.name, method.name),
@@ -457,7 +474,7 @@ fn auto_acquire_modules(modules: &mut [LoadedModule]) -> (Vec<(String, Span)>, V
             }
         }
     }
-    (errors, warnings)
+    (errors, warnings, may_rewrite)
 }
 
 /// Format one warning per execution scope and lock root with an inserted access
@@ -562,6 +579,8 @@ impl Checked {
 /// thread.
 #[derive(Default)]
 struct OwnedChannels {
+    /// Eligibility from the same analysis that supplied these channels.
+    selected_bodies: Option<std::sync::Arc<HashSet<Span>>>,
     /// Checker-resolved aggregate result types that seed MIR locals, keyed by
     /// span (see `brass_typeck::stream::aggregate_result_types`).
     expr_types: HashMap<Span, brass_hir::Type>,
@@ -592,6 +611,8 @@ struct OwnedChannels {
     /// Field lists of checker-approved fields-loops, keyed by loop-statement
     /// span; MIR lowering unrolls them (see `brass_hir::expand`).
     fields_loops: HashMap<Span, Vec<String>>,
+    /// Field lists selected by callable instance.
+    instance_fields: brass_hir::InstanceChannel<Vec<String>>,
     /// Resolved `typeof(x)` strings, keyed by call span.
     type_names: HashMap<Span, String>,
     /// Resolved binding types of `typeof`-bearing local annotations.
@@ -604,7 +625,7 @@ struct OwnedChannels {
     type_tests: HashMap<Span, brass_hir::Type>,
     /// Reflective call sites routed to append-only generated methods.
     keyed_dispatch: HashMap<Span, String>,
-    /// Per-instance aggregate seeds of the spans `expr_types` leaves unseeded
+    /// Exact-instance aggregate seeds, authoritative over `expr_types`
     /// (see `brass_typeck::stream::aggregate_instance_seeds`).
     instance_seeds: brass_hir::InstanceChannel<brass_hir::Type>,
     /// Reflective call sites whose instances dispatch to different
@@ -617,6 +638,7 @@ struct OwnedChannels {
 impl OwnedChannels {
     fn borrow(&self) -> brass_mir::CheckerChannels<'_> {
         brass_mir::CheckerChannels {
+            selected_bodies: self.selected_bodies.as_deref(),
             expr_types: &self.expr_types,
             receiver_types: &self.receiver_types,
             receiver_owners: &self.receiver_owners,
@@ -627,6 +649,7 @@ impl OwnedChannels {
             call_locations: &self.call_locations,
             lift_errs: &self.lift_errs,
             fields_loops: &self.fields_loops,
+            instance_fields: &self.instance_fields,
             type_names: &self.type_names,
             typeof_types: &self.typeof_types,
             null_props: &self.null_props,
@@ -692,7 +715,7 @@ fn context_seed(
     phase_name: &'static str,
 ) -> Option<brass_typeck::ContextTables> {
     let t = std::time::Instant::now();
-    let (ctx_program, ctx_errors) = lower(ctx);
+    let (ctx_program, ctx_errors) = brass_hir::lower_context(ctx);
     let analysis = brass_typeck::analyze_with(&ctx_program, None);
     for error in analysis.errors.iter().take(5) {
         tracing::debug!(
@@ -923,8 +946,8 @@ fn analyze_fresh(
     sched: Option<&mut dyn brass_typeck::stream::Scheduler>,
 ) -> Result<AnalyzedProgram, Vec<String>> {
     let search = brass_resolve::SearchPaths::from_env();
-    let front = front_load(main_label, main_src, root, &search)?;
-    check_front(front, &search, locations, sched)
+    let (front, prepared) = front_load(main_label, main_src, root, &search)?;
+    check_front(front, prepared, &search, locations, sched)
 }
 
 /// The assembled front end, ready to check: the final module graph
@@ -934,6 +957,8 @@ fn analyze_fresh(
 /// checker thread -- assembling once instead of parsing the program twice.
 #[derive(Clone)]
 pub(crate) struct FrontEnd {
+    /// Stable selected request carried across the checker thread boundary.
+    selection: Option<std::sync::Arc<brass_typeck::reachability::CheckSelection>>,
     modules: Vec<LoadedModule>,
     sources: brass_resolve::SourceMap,
     /// Qualified-use and spawn-ownership diagnostics: not fatal on their own
@@ -953,19 +978,25 @@ pub(crate) fn front_load(
     main_src: &str,
     root: &Path,
     search: &brass_resolve::SearchPaths,
-) -> Result<FrontEnd, Vec<String>> {
+) -> Result<(FrontEnd, Option<Box<item_preparation::Prepared>>), Vec<String>> {
     let t = std::time::Instant::now();
     let entry_path = PathBuf::from(main_label);
-    let front = brass_resolve::frontend::assemble(&entry_path, main_src, root, search);
+    let front = brass_resolve::frontend::assemble_recovered(&entry_path, main_src, root, search);
     // A prelude parse failure is a build bug; nothing else can be trusted.
     if let Some(message) = front.stdlib_error {
         return Err(vec![message]);
     }
+    let item_check = item_preparation::has_dependencies(&front.modules);
     let sources = front.sources;
+    if tracing::enabled!(target: "brass::item_selection", tracing::Level::TRACE)
+        && !front.parse_errors.is_empty()
+    {
+        item_shadow::syntax(&front.modules, &sources, &front.parse_errors);
+    }
     if !front.parse_errors.is_empty() {
         return Err(render_errors(&front.parse_errors, &sources));
     }
-    if !front.load_errors.is_empty() {
+    if !front.load_errors.is_empty() && !item_check {
         return Err(render_errors(&front.load_errors, &sources));
     }
     let mut modules = front.modules;
@@ -985,22 +1016,41 @@ pub(crate) fn front_load(
     // a capture); those diagnostics join the analysis errors, and the ownership
     // warnings -- which describe how an accepted spawn is compiled -- are then
     // withheld.
-    #[cfg(jit_backend)]
-    {
-        let (spawn_errors, warnings) = auto_acquire_modules(&mut modules);
-        if spawn_errors.is_empty() {
-            for w in warnings {
-                eprintln!("{w}");
+    let prepared = if item_check {
+        Some(item_preparation::front(
+            &mut modules,
+            &sources,
+            &mut errors,
+            front.load_errors,
+        )?)
+    } else {
+        #[cfg(jit_backend)]
+        {
+            let (spawn_errors, warnings, _) = auto_acquire_modules::<false>(&mut modules, None);
+            if spawn_errors.is_empty() {
+                for warning in warnings {
+                    eprintln!("{warning}");
+                }
             }
+            errors.extend(spawn_errors);
         }
-        errors.extend(spawn_errors);
+        None
+    };
+
+    if tracing::enabled!(target: "brass::item_selection", tracing::Level::TRACE) {
+        item_shadow::observe(&modules, &entry_path);
     }
 
-    Ok(FrontEnd {
-        modules,
-        sources,
-        errors,
-    })
+    let selection = prepared.as_ref().map(|p| p.view.selection().clone());
+    Ok((
+        FrontEnd {
+            selection,
+            modules,
+            sources,
+            errors,
+        },
+        prepared,
+    ))
 }
 
 /// Statically check an assembled front end and package the result: the check
@@ -1008,6 +1058,7 @@ pub(crate) fn front_load(
 /// executes over its copy of the modules.
 pub(crate) fn check_front(
     front: FrontEnd,
+    prepared: Option<Box<item_preparation::Prepared>>,
     search: &brass_resolve::SearchPaths,
     locations: LocationTables,
     mut sched: Option<&mut dyn brass_typeck::stream::Scheduler>,
@@ -1017,6 +1068,7 @@ pub(crate) fn check_front(
     };
     let streaming = sched.is_some();
     let FrontEnd {
+        selection,
         modules,
         sources,
         errors: front_errors,
@@ -1027,11 +1079,35 @@ pub(crate) fn check_front(
     // entry. A context with diagnostics yields no seed (or a partial one), and
     // the full run reports every diagnostic itself.
     let ctx_end = modules.len() - 1;
-    let ctx_seed = context_seed(&modules[..ctx_end], &sources, "front/context-check");
+    // Dependency selection needs the combined catalog before context preparation.
+    let selected = prepared.or_else(|| {
+        selection.map(|selection| {
+            let started = std::time::Instant::now();
+            let lowered = lower(&modules);
+            brass_utils::perf_phase("item/checker-hir", started.elapsed());
+            let view = brass_typeck::reachability::AnalysisView::with_selection(
+                &lowered.0,
+                selection,
+                Default::default(),
+                Default::default(),
+            );
+            Box::new(item_preparation::Prepared { lowered, view })
+        })
+    });
+    let ctx_seed = match &selected {
+        Some(prepared) => {
+            item_preparation::context_seed(&modules[..ctx_end], &sources, prepared.view.selection())
+        }
+        None => context_seed(&modules[..ctx_end], &sources, "front/context-check"),
+    };
 
     tracing::debug!(modules = modules.len(), "lowering module graph to HIR");
     let t = std::time::Instant::now();
-    let (program, lower_errors) = lower(&modules);
+    let (lowered, view) = selected.map_or_else(
+        || (lower(&modules), None),
+        |prepared| (prepared.lowered, Some(prepared.view)),
+    );
+    let (program, lower_errors) = lowered;
     phase("front/lower-hir", t);
     let mut errors: Vec<(String, Span)> = front_errors;
     for e in lower_errors {
@@ -1064,10 +1140,21 @@ pub(crate) fn check_front(
     }
     let t = std::time::Instant::now();
     let mut analysis = match sched.as_deref_mut() {
-        Some(s) => brass_typeck::analyze_streaming(&program, ctx_seed.as_ref(), s),
-        None => brass_typeck::analyze_with(&program, ctx_seed.as_ref()),
+        Some(s) => match &view {
+            Some(view) => {
+                brass_typeck::analyze_streaming_selected(&program, ctx_seed.as_ref(), s, view)
+            }
+            None => brass_typeck::analyze_streaming(&program, ctx_seed.as_ref(), s),
+        },
+        None => match &view {
+            Some(view) => brass_typeck::analyze_selected(&program, ctx_seed.as_ref(), view),
+            None => brass_typeck::analyze_with(&program, ctx_seed.as_ref()),
+        },
     };
     phase("front/typecheck", t);
+    if tracing::enabled!(target: "brass::item_selection", tracing::Level::TRACE) {
+        item_shadow::diagnostics(&program, &analysis.errors, &analysis.warnings);
+    }
     // Reflective decoders are appended directly to this HIR. The continuation
     // checker reuses the completed first pass's tables and visits only the new
     // method bodies; source ASTs and existing HIR items remain untouched.
@@ -1082,6 +1169,11 @@ pub(crate) fn check_front(
             Ok((generated, keyed_dispatch, instance_dispatch)) => {
                 phase("front/keyed-continuation", t);
                 if let Some(s) = sched {
+                    if let Some(view) = &analysis.context_tables.items {
+                        s.emit(brass_typeck::stream::CheckEvent::SelectedBodies(
+                            view.body_spans().clone(),
+                        ));
+                    }
                     let mut delta = analysis_channel_delta(&analysis, &program);
                     delta.instance_dispatch = instance_dispatch
                         .iter()
@@ -1118,6 +1210,11 @@ pub(crate) fn check_front(
                 // the final snapshot so provisional errors removed by
                 // specialization cannot survive in the consumer either.
                 if let Some(s) = sched {
+                    if let Some(view) = &analysis.context_tables.items {
+                        s.emit(brass_typeck::stream::CheckEvent::SelectedBodies(
+                            view.body_spans().clone(),
+                        ));
+                    }
                     let mut delta = analysis_channel_delta(&analysis, &program);
                     delta
                         .errors
@@ -1165,7 +1262,6 @@ pub(crate) fn check_front(
     let instance_seeds = brass_typeck::stream::aggregate_instance_seeds(
         &analysis.instance_typed,
         &analysis.typed,
-        &expr_types,
         &program,
     );
     let receiver_types = brass_typeck::stream::method_receiver_types(&analysis.typed, &program);
@@ -1175,6 +1271,11 @@ pub(crate) fn check_front(
         LocationTables::Omit => HashMap::default(),
     };
     let channels = OwnedChannels {
+        selected_bodies: analysis
+            .context_tables
+            .items
+            .as_ref()
+            .map(|v| v.body_spans().clone()),
         expr_types,
         instance_seeds,
         receiver_types,
@@ -1186,6 +1287,7 @@ pub(crate) fn check_front(
         call_locations,
         lift_errs: analysis.lift_errs,
         fields_loops: analysis.fields_loops,
+        instance_fields: analysis.instance_fields,
         type_names: analysis.type_names,
         typeof_types: analysis.typeof_types,
         null_props: analysis.null_props,
@@ -1212,7 +1314,6 @@ fn analysis_channel_delta(
     let instance_seeds = brass_typeck::stream::aggregate_instance_seeds(
         &analysis.instance_typed,
         &analysis.typed,
-        &expr_types,
         program,
     )
     .into_iter()
@@ -1240,6 +1341,11 @@ fn analysis_channel_delta(
             .collect(),
         lift_errs: analysis.lift_errs.iter().copied().collect(),
         null_props: analysis.null_props.iter().copied().collect(),
+        instance_fields: analysis
+            .instance_fields
+            .iter()
+            .map(|(s, es)| (*s, es.iter().map(|(k, v)| (k.clone(), v.clone())).collect()))
+            .collect(),
         fields_loops: analysis
             .fields_loops
             .iter()
@@ -1289,7 +1395,7 @@ fn specialize_keyed(
     program: &mut Program,
     analysis: &mut brass_typeck::Analysis,
 ) -> Result<KeyedSpecializationResult, (String, Span)> {
-    let seed = analysis.context_tables.clone();
+    let mut seed = analysis.context_tables.clone();
     let mut pending = analysis.keyed_calls.clone();
     let mut pending_instances = analysis.instance_keyed_calls.clone();
     let keyed_spans: HashSet<Span> = pending.keys().copied().collect();
@@ -1376,6 +1482,10 @@ fn specialize_keyed(
             let error = &errors[0];
             (error.message.clone(), brass_hir::unshift_span(error.span))
         })?;
+        if let Some(view) = &seed.items {
+            seed.items = Some(view.with_generated(program, &fresh));
+            analysis.context_tables.items = seed.items.clone();
+        }
         let mut next_pending = HashMap::default();
         let mut next_pending_instances: brass_hir::InstanceChannel<_> = HashMap::default();
         for generated in &fresh {
@@ -1401,6 +1511,9 @@ fn specialize_keyed(
             analysis.sum_views.extend(continuation.sum_views);
             analysis.lift_errs.extend(continuation.lift_errs);
             analysis.fields_loops.extend(continuation.fields_loops);
+            analysis
+                .instance_fields
+                .extend(continuation.instance_fields);
             analysis.type_names.extend(continuation.type_names);
             analysis.typeof_types.extend(continuation.typeof_types);
             analysis.type_tests.extend(continuation.type_tests);
@@ -1738,19 +1851,64 @@ fn brace_balanced(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        module_path_at, program_file_index, remove_provisional_keyed_diagnostics,
-        retain_diagnostic_free_context,
+        Cli, Command, item_shadow, module_path_at, program_file_index,
+        remove_provisional_keyed_diagnostics, retain_diagnostic_free_context,
     };
     use brass_hir::LoadedModule;
     use brass_parser::Span;
     use brass_parser::ast::Module;
+    use clap::Parser;
     use std::ffi::OsString;
+    use std::path::PathBuf;
 
     fn argv(args: &[&str]) -> Vec<OsString> {
         std::iter::once("brass")
             .chain(args.iter().copied())
             .map(OsString::from)
             .collect()
+    }
+
+    #[test]
+    fn explicit_project_root_uses_only_the_cold_cli_extension() {
+        for args in [
+            argv(&["--project-root", "/package", "check", "main.cz"]),
+            argv(&["check", "main.cz", "--project-root=/package"]),
+        ] {
+            let error = match Cli::try_parse_from(&args) {
+                Ok(_) => panic!("ordinary parser unexpectedly contains project metadata"),
+                Err(error) => error,
+            };
+            let cli = item_shadow::parse_project_cli(&args, error);
+            assert!(matches!(cli.command, Some(Command::Check { file }) if file == "main.cz"));
+            assert_eq!(
+                item_shadow::PROJECT_ROOT.get(),
+                Some(&PathBuf::from("/package"))
+            );
+        }
+    }
+
+    #[test]
+    fn project_root_is_driver_input_only_before_the_program_file() {
+        for (args, expected) in [
+            (
+                vec![
+                    "--project-root",
+                    "/package",
+                    "main.cz",
+                    "--project-root",
+                    "arg",
+                ],
+                Some(3),
+            ),
+            (vec!["--project-root=/package", "main.cz"], Some(2)),
+            (
+                vec!["repl", "--project-root", "/package", "main.cz"],
+                Some(4),
+            ),
+            (vec!["--project-root", "/package", "check", "main.cz"], None),
+        ] {
+            assert_eq!(program_file_index(&argv(&args)), expected);
+        }
     }
 
     #[test]
@@ -1814,6 +1972,7 @@ mod tests {
         };
         brass_resolve::inject_module_path(&mut ast, path, Span::new(base, base));
         LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec![path.to_string()],
             ast,

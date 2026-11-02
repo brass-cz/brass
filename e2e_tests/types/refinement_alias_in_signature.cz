@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // A `type Alias = Base { .. }` refinement naming a concrete instance resolves
 // in a callable's SIGNATURE exactly as in a `let` annotation or a sum
 // variant's field, although the alias is not a nominal type:
@@ -13,12 +15,11 @@
 // callable; the duplicate key that `_child` reports reaches the caller of
 // `Cursor.grow` as an Err.
 
-type _Tbl = HashMap {
-    key: string
-    value: int64
-}
+type _Tbl = HashMap { key: string, value: int64 }
 
-type Cursor = { at: int64 }
+type Cursor = {
+    at: int64
+}
 
 // Free function: parameter and fallible return both name the alias.
 fun _child(parent: _Tbl, key: string, weight: int64) -> _Tbl! {

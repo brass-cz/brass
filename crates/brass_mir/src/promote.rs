@@ -289,7 +289,7 @@ fn rvalue_reads_only(
         Rvalue::Closure { captures, .. } => !captures.iter().any(tracked_op),
         // `typeof(x)` and a type test consult only the operand's type, never
         // its value.
-        Rvalue::TypeName(_) | Rvalue::TypeTest(..) => true,
+        Rvalue::TypeName(_) | Rvalue::TypeTest(..) | Rvalue::FieldsTest { .. } => true,
     }
 }
 

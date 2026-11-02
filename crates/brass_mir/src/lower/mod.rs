@@ -139,6 +139,7 @@ type GlobalTemplate = (
 /// so deeply nested closure lowering can borrow this context immutably and still
 /// register the closures it discovers without a borrow conflict.
 pub(crate) struct ProgramCtx<'p> {
+    selected_bodies: Option<&'p fxhash::FxHashSet<Span>>,
     program: &'p Program,
     /// The shared program-wide tables (see [`LowerTables`]).
     tables: &'p LowerTables,
@@ -155,6 +156,7 @@ pub(crate) struct ProgramCtx<'p> {
     call_locations: &'p HashMap<Span, (String, u32, u32)>,
     lift_errs: &'p fxhash::FxHashSet<Span>,
     fields_loops: &'p HashMap<Span, Vec<String>>,
+    instance_fields: &'p brass_hir::InstanceChannel<Vec<String>>,
     type_names: &'p HashMap<Span, String>,
     typeof_types: &'p HashMap<Span, Type>,
     null_props: &'p fxhash::FxHashSet<Span>,
@@ -168,6 +170,7 @@ pub(crate) struct ProgramCtx<'p> {
 impl<'p> ProgramCtx<'p> {
     fn new(program: &'p Program, tables: &'p LowerTables, channels: &CheckerChannels<'p>) -> Self {
         ProgramCtx {
+            selected_bodies: channels.selected_bodies,
             program,
             tables,
             expr_types: channels.expr_types,
@@ -181,6 +184,7 @@ impl<'p> ProgramCtx<'p> {
             call_locations: channels.call_locations,
             lift_errs: channels.lift_errs,
             fields_loops: channels.fields_loops,
+            instance_fields: channels.instance_fields,
             type_names: channels.type_names,
             typeof_types: channels.typeof_types,
             null_props: channels.null_props,
@@ -913,6 +917,7 @@ pub fn lower_body(
     let no_type_tests = HashMap::default();
     let tables = LowerTables::new(program);
     let channels = CheckerChannels {
+        selected_bodies: None,
         expr_types: &no_types,
         receiver_types: &no_types,
         receiver_owners: &HashMap::default(),
@@ -923,6 +928,7 @@ pub fn lower_body(
         call_locations: &no_call_locations,
         lift_errs: &no_lift_errs,
         fields_loops: &no_fields_loops,
+        instance_fields: &HashMap::default(),
         type_names: &no_type_names,
         typeof_types: &no_typeof_types,
         null_props: &no_null_props,
@@ -998,6 +1004,7 @@ pub fn lower_program(program: &Program) -> MirProgram {
     lower_program_with_types(
         program,
         &CheckerChannels {
+            selected_bodies: None,
             expr_types: &HashMap::default(),
             receiver_types: &HashMap::default(),
             receiver_owners: &HashMap::default(),
@@ -1008,6 +1015,7 @@ pub fn lower_program(program: &Program) -> MirProgram {
             call_locations: &HashMap::default(),
             lift_errs: &fxhash::FxHashSet::default(),
             fields_loops: &HashMap::default(),
+            instance_fields: &HashMap::default(),
             type_names: &HashMap::default(),
             typeof_types: &HashMap::default(),
             null_props: &fxhash::FxHashSet::default(),
@@ -1032,6 +1040,9 @@ pub fn lower_program(program: &Program) -> MirProgram {
 /// nullable `!`) are then unsupported, and a call-site `Location` degrades to
 /// a placeholder.
 pub struct CheckerChannels<'a> {
+    /// Optional eligible body spans. Absence retains whole-program lowering;
+    /// omitted method declarations still participate in HIR presence and dispatch.
+    pub selected_bodies: Option<&'a fxhash::FxHashSet<Span>>,
     /// Checker-resolved expression types, keyed by source span, that every
     /// instance of the enclosing body agrees on. They seed the MIR locals
     /// whose type cannot be reconstructed from their operands: the result of
@@ -1081,7 +1092,10 @@ pub struct CheckerChannels<'a> {
     /// Field lists of `for f in fields(x)` loops, keyed by the loop statement's
     /// span: the checker resolved the record type and checked one expanded copy
     /// per field; lowering unrolls the same copies (`brass_hir::expand`).
+    /// A divergent span retains a representative here; `instance_fields` owns its selections.
     pub fields_loops: &'a HashMap<Span, Vec<String>>,
+    /// Checked field lists for divergent callable instances.
+    pub instance_fields: &'a brass_hir::InstanceChannel<Vec<String>>,
     /// Type names the checker resolved for expressions, keyed by span: a
     /// `typeof(x)` call's static type (`typeof(x).method(..)` routes as a
     /// static call on it), and the declared record an anonymous record
@@ -1142,11 +1156,11 @@ fn subset_ctx<'p>(
 /// Lower one free function into `out` (the per-function core of
 /// [`lower_program_with_types`]).
 fn lower_function_into(ctx: &ProgramCtx, out: &mut MirProgram, info: &brass_hir::FunInfo) {
-    // The entry `main` (the root module's bare `main` symbol) is the
+    // The entry module's `main`, identified by the lowered program, is the
     // program: a failed `expr!` there aborts with the error instead of
     // propagating (there is no caller to receive a Result), so `!` alone
     // does not make `main` fallible -- only an explicit `error(...)` does.
-    let entry_main = info.symbol == "main";
+    let entry_main = ctx.program.entry_function() == Some(info.symbol.as_str());
     let mut body = lower_one(
         ctx,
         info.module.clone(),
@@ -1189,6 +1203,12 @@ fn lower_methods_into(ctx: &ProgramCtx, out: &mut MirProgram, program: &Program)
                 ms.sort();
                 for m in ms {
                     let method = &methods[m];
+                    if ctx
+                        .selected_bodies
+                        .is_some_and(|spans| !spans.contains(&method.decl.span))
+                    {
+                        continue;
+                    }
                     // A reflective `-> infer!` template is never lowered (generic
                     // over the key); the driver injected concrete specializations.
                     if brass_hir::keyed_return(method.decl.ret.as_ref()) {
@@ -1214,6 +1234,12 @@ fn lower_methods_into(ctx: &ProgramCtx, out: &mut MirProgram, program: &Program)
                     ms.sort();
                     for m in ms {
                         let method = &v.methods[m];
+                        if ctx
+                            .selected_bodies
+                            .is_some_and(|spans| !spans.contains(&method.decl.span))
+                        {
+                            continue;
+                        }
                         if brass_hir::keyed_return(method.decl.ret.as_ref()) {
                             continue;
                         }
@@ -1250,6 +1276,12 @@ pub fn lower_program_with_types(program: &Program, channels: &CheckerChannels<'_
     let mut fn_names: Vec<&String> = program.functions.keys().collect();
     fn_names.sort();
     for name in fn_names {
+        if channels
+            .selected_bodies
+            .is_some_and(|spans| !spans.contains(&program.functions[name].decl.span))
+        {
+            continue;
+        }
         lower_function_into(&ctx, &mut out, &program.functions[name]);
     }
 
@@ -1269,6 +1301,7 @@ pub fn lower_program_with_types(program: &Program, channels: &CheckerChannels<'_
     out.instance_returns = channels.instance_returns.clone();
     out.instance_seeds = channels.instance_seeds.clone();
     out.instance_dispatch = channels.instance_dispatch.clone();
+    out.instance_fields = channels.instance_fields.clone();
     out.numeric_calls = channels.numeric_calls.clone();
     // Constant array literals whose value is only ever read become
     // once-initialized globals (see the `promote` module); running on the shared

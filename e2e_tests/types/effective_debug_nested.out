@@ -1,0 +1,33 @@
+human 1
+human 1
+token(1)
+only(2)
+only(2)
+only(2)
+[token(1)]
+[token(1), token(3)]
+[token(1), token(3)]
+[token(1), "a, b", "", true]
+Holder {
+    item: token(1),
+    optional: token(5),
+    text: "quoted",
+    _hidden: "visible",
+}
+Holder {
+    item: token(1),
+    optional: null,
+    text: null,
+    _hidden: "visible",
+}
+Choice.Item {
+    value: token(1),
+}
+human 5
+null
+[token(5), null]
+["a, b", "c", "", "quote\"", "line\n"]
+[["a", "b"], ["c", "d"]]
+["a, b", "c", ""]
+["a, b", "c", ""]
+[]

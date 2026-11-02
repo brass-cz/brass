@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // A call that returns nothing has no value to pass: a parameter binds a
 // name, so a `void` argument is rejected exactly like `let y = nothing()` --
 // to a function, to a method (here a map's `set`), and to a closure. (An array

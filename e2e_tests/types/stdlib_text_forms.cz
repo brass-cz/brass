@@ -1,0 +1,22 @@
+// @backends: all
+import std.url.URI
+import std.semver.Version
+import std.collections.HashMap
+
+type Box = {
+    value
+}
+// URI and Version display their standard spelling; debug remains structural.
+fun main() {
+    let uri = URI.parse("https://example.com/a?q=two#part")!
+    let version = Version.parse("1.2.3-alpha.1+build")!
+    println(uri)
+    println("{uri}")
+    println(version)
+    println("{version}")
+    println(Box { value: uri })
+    println([version])
+    let map = HashMap.new()
+    map.set("version", version)
+    println(map)
+}

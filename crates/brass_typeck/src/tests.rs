@@ -9,6 +9,7 @@ use fxhash::FxHashSet as HashSet;
 fn errs(src: &str) -> Vec<String> {
     let ast = parse(src).expect("parse");
     let (prog, lerr) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -20,6 +21,7 @@ fn errs(src: &str) -> Vec<String> {
 fn infer_errs(src: &str) -> Vec<String> {
     let ast = parse(src).expect("parse");
     let (prog, lerr) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -37,11 +39,13 @@ fn prelude_infer_errs(src: &str) -> Vec<String> {
     let main = parse(src).expect("parse main module");
     let (prog, lerr) = lower(&[
         LoadedModule {
+            source: None,
             is_prelude: true,
             path: vec!["core".into(), "error".into()],
             ast: core,
         },
         LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast: main,
@@ -58,6 +62,7 @@ fn prelude_infer_errs(src: &str) -> Vec<String> {
 fn analysis(src: &str) -> Analysis {
     let ast = parse(src).expect("parse");
     let (prog, lerr) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -70,6 +75,7 @@ fn module_errs(modules: &[(&[&str], &str)]) -> Vec<String> {
     let loaded = modules
         .iter()
         .map(|(path, src)| LoadedModule {
+            source: None,
             is_prelude: false,
             path: path.iter().map(|part| (*part).to_string()).collect(),
             ast: parse(src).expect("parse"),
@@ -87,6 +93,7 @@ fn module_program(modules: &[(&[&str], &str)]) -> Program {
     let loaded = modules
         .iter()
         .map(|(path, src)| LoadedModule {
+            source: None,
             is_prelude: false,
             path: path.iter().map(|part| (*part).to_string()).collect(),
             ast: parse(src).expect("parse"),
@@ -1105,11 +1112,13 @@ fn debug_protocol_accepts_every_type() {
         .expect("parse main module");
     let (prog, lerr) = lower(&[
         LoadedModule {
+            source: None,
             is_prelude: true,
             path: vec!["core".into(), "show".into()],
             ast: library,
         },
         LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast: main,
@@ -1904,6 +1913,7 @@ fn unknown_type_name_is_reported() {
     // diagnostic is available before the type checker starts.
     let ast = parse("fun f(x: Nope) {\n}\n").expect("parse");
     let (_, errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -2973,6 +2983,7 @@ fn implicit_nullable_result_warning_uses_signature_span_and_annotation_silences_
     };
     let signature_span = function.span;
     let (program, lower_errors) = lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,

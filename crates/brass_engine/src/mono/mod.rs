@@ -44,6 +44,7 @@ mod join;
 mod params;
 mod postpone;
 mod record_from;
+mod rendering;
 mod result;
 mod returns;
 mod rules;
@@ -106,6 +107,8 @@ pub struct MonoFunction<'m> {
     /// The specialization each reflective call site of the body
     /// ([`Callee::Keyed`]) dispatches to in this instance.
     pub keyed: HashMap<brass_parser::Span, String>,
+    /// Field sequences selected from checked observations for this instance.
+    pub fields: HashMap<brass_parser::Span, Vec<String>>,
     /// Completed instance symbols of closure values created by this body.
     pub closure_targets: HashMap<ClosureId, String>,
 }
@@ -264,6 +267,13 @@ impl<'m> MonoProgram<'m> {
         self.index.get(symbol).map(|&i| &self.functions[i])
     }
 
+    /// The concrete entry instance named by the lowered program, when typed.
+    pub fn entry_function(&self) -> Option<&MonoFunction<'m>> {
+        self.hir
+            .entry_function()
+            .and_then(|symbol| self.lookup(symbol))
+    }
+
     /// The concrete type of global `name`, if any.
     pub fn global_type(&self, name: &str) -> Option<&Type> {
         self.global_index.get(name)
@@ -362,6 +372,8 @@ struct Monomorphizer<'m, 'p> {
     /// The checker's per-instance dispatch of keyed calls
     /// ([`MirProgram::instance_dispatch`]), read like `instance_seeds`.
     instance_dispatch: &'m brass_hir::InstanceChannel<String>,
+    /// Checked alternatives used by compile-time field iteration.
+    instance_fields: &'m brass_hir::InstanceChannel<Vec<String>>,
     numeric_calls: &'m brass_hir::NumericCalls,
     active_numeric_call: Option<(brass_parser::Span, Option<brass_hir::NumericLayout>)>,
     numeric_targets: HashMap<(brass_parser::Span, Option<brass_hir::InstanceKey>), String>,
@@ -376,7 +388,7 @@ struct Monomorphizer<'m, 'p> {
     postponed: postpone::Postponed,
     /// The checker instance of each body being typed, innermost last (see
     /// [`instance`]): `None` for a body outside any instance (a module
-    /// initializer, the entry); a closure body inherits its creator's.
+    /// initializer); a closure body inherits its creator's.
     instance_stack: Vec<Option<brass_hir::InstanceKey>>,
 }
 
@@ -420,6 +432,7 @@ impl<'m, 'p> Monomorphizer<'m, 'p> {
             instance_returns: mir.instance_returns.clone(),
             instance_seeds: &mir.instance_seeds,
             instance_dispatch: &mir.instance_dispatch,
+            instance_fields: &mir.instance_fields,
             numeric_calls: &mir.numeric_calls,
             active_numeric_call: None,
             numeric_targets: HashMap::default(),
@@ -486,6 +499,7 @@ mod tests {
                    fun main() {\n  println(value(1))\n}\n";
         let ast = brass_parser::parse(src).expect("parse");
         let (program, errs) = brass_hir::lower(&[brass_hir::LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,
@@ -528,6 +542,7 @@ mod tests {
                    fun main() {\n  let r = read_text(\"12\")\n}\n";
         let ast = brass_parser::parse(src).expect("parse");
         let (program, errs) = brass_hir::lower(&[brass_hir::LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,

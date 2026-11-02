@@ -1,0 +1,24 @@
+// @backends: all
+// The same debug body is specialized independently for each concrete owner.
+type Box = {
+    value
+}
+fun Box.debug(self) -> string {
+    return "box({self.value.debug()})"
+}
+type Outer = {
+    value
+}
+type Callable = {
+    run: (int32) -> int32
+}
+fun Callable.debug(self) -> string {
+    return "callable"
+}
+fun main() {
+    println([Callable { run: (n) -> n + 1 }])
+    println(Box { value: 7 })
+    println(Box { value: "seven" })
+    println(Outer { value: Box { value: "inside" } })
+    println([Box { value: 1 }, Box { value: 2 }])
+}

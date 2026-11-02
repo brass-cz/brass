@@ -87,7 +87,8 @@ A few points:
 - A name beginning with `_` (like `_helper`) is private to its module and
   cannot be imported.
 - The embedded `core` library is an implicit prelude: `sqrt`, `println`,
-  `HashMap`, and the array/string helpers need no import. The shipped
+  and the array/string helpers need no import. Import `HashMap` with
+  `import std.collections.{ HashMap }`. The shipped
   `std/` tree is imported explicitly with the `std.` prefix, e.g.
   `import std.fs.{ read_file }`.
 - A module that declares a prelude name itself (its own `abs`, say) uses its

@@ -1,0 +1,18 @@
+// @backends: all
+type Loud = {
+    value: int32
+}
+fun Loud.debug(self) -> string {
+    println("debug {self.value}")
+    return "value({self.value})"
+}
+type Holder = {
+    value: Loud
+}
+fun main() {
+    const value = Loud { value: 7 }
+    println([value])
+    println(Holder { value })
+    println("{[value]}")
+    println([value].debug())
+}

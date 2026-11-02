@@ -232,3 +232,8 @@ fun equal(a: uint8[], b: uint8[]) -> bool {
     }
     return diff == 0
 }
+
+/** Render `Hasher { .. }`: the opaque plugin state is neither queried nor consumed. */
+fun Hasher.debug(self) -> string {
+    return "Hasher \{ .. }"
+}

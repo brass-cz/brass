@@ -1,0 +1,9 @@
+// @backends: all
+import std.collections.HashMap
+import std.package_manager.resolve.ResolvedDependencies
+
+// The imported code checks pairs() for a different HashMap value type.
+let m: HashMap { key: string, value: string } = HashMap.new()
+m.set("demo", "/tmp/demo")
+println(m)
+println("{m}")

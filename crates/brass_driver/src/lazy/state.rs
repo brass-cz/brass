@@ -13,6 +13,8 @@ use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 /// concrete argument types of the call that needs it -- that pull bodies to
 /// the front of the checking order.
 pub(super) struct LazyState {
+    /// Eligible source bodies, distinct from actual checked-body observations.
+    pub(super) selected_bodies: Option<std::sync::Arc<HashSet<Span>>>,
     /// Optional auto-policy observations; absent in the default demand-only mode.
     pub(super) completion: Option<super::policy::CompletionState>,
     pub(super) counters: trace::LazyCounters,
@@ -140,6 +142,19 @@ impl LazyState {
     pub(super) fn take(&mut self, event: brass_typeck::stream::CheckEvent) {
         use brass_typeck::stream::{BodyId, CheckEvent};
         match &event {
+            CheckEvent::SelectedBodies(spans) => {
+                debug_assert!(
+                    self.selected_bodies
+                        .as_ref()
+                        .is_none_or(|old| old.is_subset(spans))
+                );
+                if self.selected_bodies.as_ref() != Some(spans)
+                    && let Some(policy) = &mut self.completion
+                {
+                    policy.selection_changed();
+                }
+                self.selected_bodies = Some(spans.clone());
+            }
             CheckEvent::ContextChecked(symbols) => {
                 if let Some(policy) = &mut self.completion {
                     policy.observe_context(symbols);
@@ -170,7 +185,9 @@ impl LazyState {
             }
         }
         let (seal, finished) = match &event {
-            CheckEvent::StaticChecked(_) | CheckEvent::ContextChecked(_) => (None, false),
+            CheckEvent::SelectedBodies(_)
+            | CheckEvent::StaticChecked(_)
+            | CheckEvent::ContextChecked(_) => (None, false),
             CheckEvent::ContextReady(d)
             | CheckEvent::BodyChecked(_, d)
             | CheckEvent::BatchSettled(d)
@@ -218,6 +235,7 @@ impl LazyState {
             || !d.lift_errs.is_empty()
             || !d.null_props.is_empty()
             || !d.fields_loops.is_empty()
+            || !d.instance_fields.is_empty()
             || !d.sum_views.is_empty()
             || !d.type_names.is_empty()
             || !d.typeof_types.is_empty()
@@ -247,6 +265,7 @@ impl LazyState {
         d.lift_errs.iter().for_each(|span| mark(*span));
         d.null_props.iter().for_each(|span| mark(*span));
         d.fields_loops.iter().for_each(|(span, _)| mark(*span));
+        d.instance_fields.iter().for_each(|(span, _)| mark(*span));
         d.sum_views.iter().for_each(|(span, _)| mark(*span));
         d.type_names.iter().for_each(|(span, _)| mark(*span));
         d.typeof_types.iter().for_each(|(span, _)| mark(*span));
@@ -345,10 +364,10 @@ impl LazyState {
     /// the program has one) `main`. False means the checker hung up (or
     /// requested the eager fallback) before settling them; held diagnostics are the caller's
     /// judgement to make.
-    pub(super) fn wait_gate(&mut self, inits: usize, has_main: bool) -> bool {
+    pub(super) fn wait_gate(&mut self, inits: usize, entry: Option<&str>) -> bool {
         let settled = |s: &Self| {
             s.inits_checked >= inits
-                && (!has_main || s.checked_fns.contains("main"))
+                && entry.is_none_or(|symbol| s.checked_fns.contains(symbol))
                 && !s.awaiting_keyed
         };
         while !self.needs_eager && !self.closed && !settled(self) {
@@ -437,6 +456,7 @@ impl LazyState {
         call_locations: &'a HashMap<Span, (String, u32, u32)>,
     ) -> brass_mir::CheckerChannels<'a> {
         brass_mir::CheckerChannels {
+            selected_bodies: self.selected_bodies.as_deref(),
             expr_types: &self.merged.expr_types,
             receiver_types: &self.merged.receiver_types,
             receiver_owners: &self.merged.receiver_owners,
@@ -447,6 +467,7 @@ impl LazyState {
             call_locations,
             lift_errs: &self.merged.lift_errs,
             fields_loops: &self.merged.fields_loops,
+            instance_fields: &self.merged.instance_fields,
             type_names: &self.merged.type_names,
             typeof_types: &self.merged.typeof_types,
             null_props: &self.merged.null_props,

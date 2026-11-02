@@ -98,6 +98,7 @@ fn static_and_variant_methods_replay_separate_identities() {
 #[test]
 fn annotated_receiver_function_has_method_certificate() {
     let (p, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+        source: None,
         path: vec!["core".into()],
         is_prelude: true,
         ast: brass_parser::parse("fun string.copy_value(self) -> string { return self }").unwrap(),

@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // Reflective deserialization: a struct is populated field by field from a
 // name-keyed map, using `fields()` to drive the field walk and `v[field]` to
 // store into each slot. `typeof` labels errors and output with the target's
@@ -5,9 +7,9 @@
 // parsed into a name->value map.
 
 type Config = {
-    width: int64,
-    height: int64,
-    depth: int64,
+    width: int64
+    height: int64
+    depth: int64
 }
 
 // Fill an uninitialized `Config` from `source`, reading each declared field by
@@ -38,8 +40,10 @@ fun main() {
             for field in fields(value) {
                 println("  {field} = {value[field]}")
             }
-        }
-        Err { error } => { println("error: {error}") }
+        },
+        Err { error } => {
+            println("error: {error}")
+        },
     }
 
     // A missing key is reported by name.
@@ -47,7 +51,11 @@ fun main() {
     partial.set("width", 800)
     partial.set("height", 600)
     match from_map(partial) {
-        Ok { value } => { println("depth = {value.depth}") }
-        Err { error } => { println("error: {error}") }
+        Ok { value } => {
+            println("depth = {value.depth}")
+        },
+        Err { error } => {
+            println("error: {error}")
+        },
     }
 }

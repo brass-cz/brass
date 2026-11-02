@@ -1,3 +1,3 @@
 widget 7
 gadget 2
-err: [e2e_tests/reflection/sum_static_feeds_keyed_into.cz:15:16] unhandled error: negative count
+err: [e2e_tests/reflection/sum_static_feeds_keyed_into.cz:15:16] error: negative count

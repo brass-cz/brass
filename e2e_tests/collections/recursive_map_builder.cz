@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // A recursive, UNANNOTATED, fallible function that builds a witness-free
 // container and merges its own recursive result back into it: the recursive
 // call returns the same `HashMap` instance the body builds (`string` keys,

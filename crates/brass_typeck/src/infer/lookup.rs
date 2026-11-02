@@ -419,8 +419,8 @@ impl<'a> Checker<'a> {
         if defining == self.current_module.as_slice() || defining.is_empty() {
             return true;
         }
-        // Only the implicit-prelude modules are visible with no import; the
-        // core-library modules (`core.collections`, ...) follow the same
+        // Only the implicit-prelude modules are visible with no import; other
+        // library modules (`std.collections`, ...) follow the same
         // import rule as user modules.
         if self.program.prelude_modules.contains(defining) && !name.starts_with('_') {
             return true;

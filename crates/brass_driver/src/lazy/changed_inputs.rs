@@ -58,6 +58,13 @@ impl MergedChannels {
                 }
             }
         }
+        for (span, targets) in &delta.instance_fields {
+            if targets.is_empty() {
+                changes.instance_fields.remove(*span);
+            } else {
+                changes.instance_fields.change(*span);
+            }
+        }
         for (symbol, args, _) in &delta.instance_returns {
             changes.returns.change((symbol.clone(), args.clone()));
         }
@@ -79,6 +86,7 @@ impl MergedChannels {
             || !delta.sum_views.is_empty()
             || !delta.lift_errs.is_empty()
             || !delta.fields_loops.is_empty()
+            || !delta.instance_fields.is_empty()
             || !delta.type_names.is_empty()
             || !delta.typeof_types.is_empty()
             || !delta.typeof_types_removed.is_empty()
@@ -115,6 +123,7 @@ mod tests {
         // insertion order must not decide which owner receives the first id.
         let ast = brass_parser::parse("fun alpha() { let f = (x) -> x + 1\n return f(1) }\nfun zeta() { let f = (x) -> x + 2\n return f(1) }\n").unwrap();
         let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,
@@ -122,6 +131,7 @@ mod tests {
         assert!(errors.is_empty());
         let tables = brass_mir::LowerTables::new(&program);
         let channels = brass_mir::CheckerChannels {
+            selected_bodies: None,
             expr_types: &Default::default(),
             receiver_types: &Default::default(),
             receiver_owners: &Default::default(),
@@ -132,6 +142,7 @@ mod tests {
             call_locations: &Default::default(),
             lift_errs: &Default::default(),
             fields_loops: &Default::default(),
+            instance_fields: &Default::default(),
             type_names: &Default::default(),
             typeof_types: &Default::default(),
             null_props: &Default::default(),

@@ -1,11 +1,10 @@
 ---
 title: "Collections and strings"
-description: "Arrays, strings, and HashMap from the core library."
+description: "Arrays, strings, and the standard-library HashMap."
 ---
 
-The core library is an implicit prelude: its helpers are available in
-every program with no import. This chapter tours the everyday ones; the
-complete list with signatures is in the
+Arrays and strings are in the implicit core prelude. HashMap requires an
+import from `std.collections`. The complete list with signatures is in the
 [standard library reference](/references/stdlib/).
 
 ## Arrays
@@ -77,11 +76,12 @@ on byte positions, and a multibyte character counts as several bytes.
 
 ## HashMap
 
-`HashMap` lives in the core module `core.collections` and, like the rest
-of `core`, is in scope with no import. `HashMap.new()` takes no arguments;
+Import `HashMap` from `std.collections`. `HashMap.new()` takes no arguments;
 the key and value types are inferred from the first insertion:
 
 ```brass
+import std.collections.{ HashMap }
+
 let ages = HashMap.new()
 ages.set("alice", 30)
 ages.set("bob", 25)

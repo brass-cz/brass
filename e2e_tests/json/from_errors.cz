@@ -1,0 +1,47 @@
+// @backends: all
+import std.collections.{ HashMap }
+import std.data.json.{ JsonValue }
+
+type Unsupported = One | Two
+type Broken = {
+    value: int32
+}
+fun Broken.to_json(self) -> JsonValue! {
+    return error("custom conversion failed")
+}
+type Container = {
+    item: Unsupported
+}
+
+fun reject(value) {
+    match JsonValue.from(value) {
+        Ok { value } => {
+            assert(false, "unsupported value converted")
+        },
+        Err { error } => println(error.value),
+    }
+}
+
+fun main() {
+    // Reject key types even when no entry can supply a witness value.
+    let empty: HashMap { key: int32, value: string } = HashMap.new()
+    reject(empty)
+    empty.set(1, "one")
+    reject(empty)
+    reject(Unsupported.One)
+    reject((x: int32) -> x)
+    reject(float64.parse("nan")!)
+    reject(float64.parse("inf")!)
+    reject(float64.parse("-inf")!)
+    reject(float32.parse("nan")!)
+    reject(float32.parse("inf")!)
+    reject(float32.parse("-inf")!)
+    reject(Broken { value: 1 })
+
+    // A nested failure returns Err, never a partially converted container.
+    reject(Container { item: Unsupported.Two })
+    reject([1.0, float64.parse("inf")!])
+    let map = HashMap.new()
+    map.set("bad", Unsupported.One)
+    reject(map)
+}

@@ -1,0 +1,22 @@
+// @backends: all
+type Lines = {
+}
+fun Lines.debug(self) -> string {
+    return "first\nsecond\nlast"
+}
+type Inner = {
+    value: Lines
+}
+type Outer = {
+    value: Inner
+}
+type Choice = | Value { value: Lines }
+fun main() {
+    const lines = Lines { }
+    println(lines)
+    println(Outer { value: Inner { value: lines } })
+    println([lines])
+    println([[lines]])
+    println([1, lines])
+    println(Choice.Value { value: lines })
+}

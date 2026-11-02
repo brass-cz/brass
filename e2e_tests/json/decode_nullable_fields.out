@@ -4,5 +4,5 @@ Bo: no address
   no age
 Cy: no address
   no age
-err: [std/data/json.cz:147:36] unhandled error: missing field 'name'
-err: [e2e_tests/json/decode_nullable_fields.cz:37:23] unhandled error: cannot decode this value as `int64`
+err: [std/data/json.cz:154:36] error: missing field 'name'
+err: [e2e_tests/json/decode_nullable_fields.cz:37:23] error: cannot decode this value as `int64`

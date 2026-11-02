@@ -1,0 +1,22 @@
+// @backends: all
+fun main() {
+    let e = Error {
+        value: "missing key",
+        location: Location { file: "config.cz", line: 2, col: 7 },
+        frames: [
+            Frame {
+                message: "loading config",
+                location: Location { file: "main.cz", line: 8, col: 3 },
+            },
+        ],
+    }
+    println(e)
+    println("{e}")
+    println(e.display())
+    let nested = Error {
+        value: e,
+        location: Location { file: "outer.cz", line: 3, col: 4 },
+        frames: [],
+    }
+    println(nested.display())
+}

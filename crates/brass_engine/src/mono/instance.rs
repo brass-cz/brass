@@ -34,7 +34,7 @@ pub(super) fn numeric_base<'a>(
 
 impl Monomorphizer<'_, '_> {
     /// The checker instance of the body being typed: `None` for a module
-    /// initializer, the entry, or a body typed outside any instance.
+    /// initializer or a body typed outside any instance.
     pub(super) fn current_instance(&self) -> Option<&InstanceKey> {
         self.instance_stack.last()?.as_ref()
     }
@@ -78,25 +78,47 @@ impl Monomorphizer<'_, '_> {
             .flatten()
     }
 
-    /// The type a local starts from before typing, if any: a seed the
-    /// checker recorded for this instance when the instances of the body
-    /// disagree at the local's expression ([`LocalDecl::seed_site`]), else
-    /// the type lowering fixed (an annotation, or the seed every instance
-    /// shares). A per-instance span never falls back to the shared type:
-    /// another instance's seed (or a stale shared one, lowered before the
-    /// disagreement was known) would type this instance's value at the
-    /// wrong representation, while no seed only leaves the local to be
-    /// inferred from its uses.
+    /// The type a local starts from before typing. Source-fixed annotations have no
+    /// seed site and apply directly. A checker seed inside a callable requires
+    /// an observation for that exact instance, even when the span has no
+    /// per-instance entries: a shared observation from an open preparation frame
+    /// or another instance cannot type this body. Without an exact seed the
+    /// local is inferred from its own operands and uses. Shared seeds apply only
+    /// outside a callable instance (for example, a module initializer).
     pub(super) fn local_seed(&self, decl: &LocalDecl) -> Option<Type> {
         if let Some(site) = decl.seed_site {
             self.read_input(dependencies::Read::Seed(site));
-        }
-        if let Some(site) = decl.seed_site
-            && let Some(per_instance) = self.instance_seeds.get(&site)
-        {
-            return per_instance.get(self.current_instance()?).cloned();
+            if let Some(instance) = self.current_instance() {
+                return self.instance_seeds.get(&site)?.get(instance).cloned();
+            }
+            if self.instance_seeds.contains_key(&site) {
+                return None;
+            }
         }
         decl.ty.as_known().cloned()
+    }
+
+    /// Resolve field-list guards under the current checker instance. Missing entries
+    /// are kept absent: only a live loop requires a checked expansion.
+    pub(super) fn field_selections(&self, body: &MirBody) -> HashMap<Span, Vec<String>> {
+        let mut selected = HashMap::default();
+        if self.instance_fields.is_empty() {
+            return selected;
+        }
+        for block in &body.blocks {
+            for stmt in &block.stmts {
+                if let MirStmt::Assign(_, Rvalue::FieldsTest { site, .. }) = stmt {
+                    self.read_input(dependencies::Read::Fields(*site));
+                    if let Some(fields) = self
+                        .current_instance()
+                        .and_then(|key| self.instance_fields.get(site)?.get(key))
+                    {
+                        selected.insert(*site, fields.clone());
+                    }
+                }
+            }
+        }
+        selected
     }
 
     /// The specialization the reflective call at `site` (of template
@@ -159,6 +181,62 @@ impl Monomorphizer<'_, '_> {
 mod tests {
     use super::super::monomorphize;
 
+    #[test]
+    fn unobserved_instance_never_uses_a_shared_expression_seed() {
+        use super::super::Monomorphizer;
+        use brass_hir::{InstanceCallable, InstanceKey, Program, Type};
+        use brass_mir::{LocalDecl, TypeRef};
+        use brass_parser::Span;
+
+        let program = Program::empty();
+        let site = Span::new(1, 2);
+        let shared = Type::Slice(Box::new(Type::Str));
+        let local = LocalDecl {
+            ty: TypeRef::Known(shared.clone()),
+            name: None,
+            seed_site: Some(site),
+        };
+        let key = InstanceKey {
+            callable: InstanceCallable::Function("collect".into()),
+            args: vec![Type::Bool],
+            numeric_layout: None,
+        };
+        let mut mir = brass_mir::lower_program(&program);
+        // An open preparation frame can publish a shared type with no exact key.
+        let mut mono = Monomorphizer::new(&mir, &program);
+        assert_eq!(mono.local_seed(&local), Some(shared.clone()));
+        mono.instance_stack.push(Some(key.clone()));
+        assert_eq!(mono.local_seed(&local), None);
+        // A source annotation remains fixed even in an unobserved instance.
+        let annotation = LocalDecl {
+            seed_site: None,
+            ..local.clone()
+        };
+        assert_eq!(mono.local_seed(&annotation), Some(shared.clone()));
+        drop(mono);
+
+        let other = InstanceKey {
+            args: vec![Type::Str],
+            ..key.clone()
+        };
+        mir.instance_seeds
+            .entry(site)
+            .or_default()
+            .insert(other, shared);
+        let mut mono = Monomorphizer::new(&mir, &program);
+        mono.instance_stack.push(Some(key.clone()));
+        assert_eq!(mono.local_seed(&local), None);
+        drop(mono);
+        let exact = Type::Slice(Box::new(Type::Bool));
+        mir.instance_seeds
+            .entry(site)
+            .or_default()
+            .insert(key.clone(), exact.clone());
+        let mut mono = Monomorphizer::new(&mir, &program);
+        mono.instance_stack.push(Some(key));
+        assert_eq!(mono.local_seed(&local), Some(exact));
+    }
+
     /// Polymorphic recursion that reaches monomorphization (the checker
     /// rejects it; this lowers the program unchecked) stops at the nesting
     /// bound with an error instead of exhausting the stack, and quickly: the
@@ -175,6 +253,7 @@ mod tests {
             .spawn(move || {
                 let ast = brass_parser::parse(src).expect("parse");
                 let (program, errs) = brass_hir::lower(&[brass_hir::LoadedModule {
+                    source: None,
                     is_prelude: false,
                     path: vec!["main".into()],
                     ast,

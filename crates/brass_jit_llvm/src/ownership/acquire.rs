@@ -114,12 +114,14 @@ fn process_scope(
     // resolved closure-variable sites), for the scope-wide guard set.
     let mut all_cowns: BTreeSet<String> = BTreeSet::new();
     each_scope_site_shallow(stmts, stmts, &lexical, &mut |cbody, bound, visible| {
-        let (cowns, _) = classify_captures(cbody, bound, visible, fn_params, pristine_fn);
+        let (cowns, freezes) = classify_captures(cbody, bound, visible, fn_params, pristine_fn);
+        report.may_rewrite |= !cowns.is_empty() || !freezes.is_empty();
         all_cowns.extend(cowns);
     });
 
     // Locals handed to spawn-capturing call positions become cowns too.
     let summary_cowns = collect_summary_cowns(stmts, &locals, summaries);
+    report.may_rewrite |= !summary_cowns.is_empty();
     all_cowns.extend(summary_cowns.iter().cloned());
 
     let ctx = ScopeCtx {
@@ -285,7 +287,7 @@ fn transform_stmts(stmts: &mut Vec<Stmt>, ctx: &ScopeCtx, report: &mut AutoAcqui
                     classify_captures(&body, &bound, visible, ctx.fn_params, ctx.pristine_fn);
                 // The spawned body is its own execution scope; nested spawns in
                 // it are classified against its own locals.
-                if let Some(inner) = spawn_closure_body_mut(&mut stmts[i]) {
+                if let Some(inner) = spawn_closure_body_mut(&mut stmts[i], report) {
                     let mut inner_scope = visible.clone();
                     inner_scope.extend(bound.iter().cloned());
                     process_scope(
@@ -410,7 +412,7 @@ fn transform_spawned_binding(stmt: &mut Stmt, ctx: &ScopeCtx, report: &mut AutoA
     let mut inner_scope = visible.clone();
     inner_scope.extend(bound);
     process_scope(
-        closure_body_stmts_mut(body),
+        closure_body_stmts_mut(body, report),
         &inner_scope,
         ctx.fn_params,
         ctx.pristine_fn,
@@ -532,7 +534,10 @@ fn insert_summary_promotion_after_binding(
 /// The mutable statement list of a `spawn(closure)`'s body in `stmt`, if `stmt`
 /// is a spawn site whose argument is a block closure. Lets the transform recurse
 /// into a nested spawn so its captures are promoted and its body guarded.
-fn spawn_closure_body_mut(stmt: &mut Stmt) -> Option<&mut Vec<Stmt>> {
+fn spawn_closure_body_mut<'a>(
+    stmt: &'a mut Stmt,
+    report: &mut AutoAcquireReport,
+) -> Option<&'a mut Vec<Stmt>> {
     let expr = match stmt {
         Stmt::Expr(e) | Stmt::Let { value: Some(e), .. } => e,
         _ => return None,
@@ -546,15 +551,19 @@ fn spawn_closure_body_mut(stmt: &mut Stmt) -> Option<&mut Vec<Stmt>> {
     let Expr::Closure(_, body, _) = &mut args.first_mut()?.expr else {
         return None;
     };
-    Some(closure_body_stmts_mut(body))
+    Some(closure_body_stmts_mut(body, report))
 }
 
 /// Return a mutable statement view of a closure body. An expression-bodied
 /// closure returns its expression, while a block's trailing expression is only
 /// a statement, so normalization must make that return explicit before the
 /// ownership pass inserts guards or nested-spawn rewrites.
-fn closure_body_stmts_mut(body: &mut Box<Expr>) -> &mut Vec<Stmt> {
+fn closure_body_stmts_mut<'a>(
+    body: &'a mut Box<Expr>,
+    report: &mut AutoAcquireReport,
+) -> &'a mut Vec<Stmt> {
     if !matches!(body.as_ref(), Expr::Block(..)) {
+        report.may_rewrite = true;
         let span = body.span();
         let value = std::mem::replace(body.as_mut(), Expr::Null(span));
         *body.as_mut() = Expr::Block(

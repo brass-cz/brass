@@ -1,0 +1,5 @@
+// @backends: all
+import entry_library
+fun main() {
+    entry_library.main()
+}

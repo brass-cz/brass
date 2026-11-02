@@ -1,0 +1,18 @@
+Command { program: "unused", args: ["a, b", ""], env: [["GREETING", "hi, world"]], stdin: Stdio.Inherit, stdout: Stdio.Pipe, stderr: Stdio.Inherit }
+Command { program: "unused", args: ["a, b", ""], env: [["GREETING", "hi, world"]], stdin: Stdio.Inherit, stdout: Stdio.Pipe, stderr: Stdio.Inherit }
+Box {
+    value: Command { program: "unused", args: ["a, b", ""], env: [["GREETING", "hi, world"]], stdin: Stdio.Inherit, stdout: Stdio.Pipe, stderr: Stdio.Inherit },
+}
+[Command { program: "unused", args: ["a, b", ""], env: [["GREETING", "hi, world"]], stdin: Stdio.Inherit, stdout: Stdio.Pipe, stderr: Stdio.Inherit }]
+{
+    "command": Command { program: "unused", args: ["a, b", ""], env: [["GREETING", "hi, world"]], stdin: Stdio.Inherit, stdout: Stdio.Pipe, stderr: Stdio.Inherit }
+}
+Child { .. }
+Box {
+    value: Child { .. },
+}
+[Child { .. }]
+{
+    "child": Child { .. }
+}
+0

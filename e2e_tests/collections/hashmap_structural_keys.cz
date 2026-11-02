@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // @backends: all
 // HashMap keys compare with structural `==` on every back end: a record key
 // with a nullable field, tuple keys, sum keys and array keys are all found
@@ -9,9 +11,7 @@ type K = {
     tag: string?
 }
 
-type Shape =
-    | Circle { r: int64 }
-    | Empty
+type Shape = Circle { r: int64 } | Empty
 
 fun main() {
     let m = HashMap.new()

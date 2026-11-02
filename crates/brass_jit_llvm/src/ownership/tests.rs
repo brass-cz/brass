@@ -601,3 +601,34 @@ fn handles_into_a_cowned_graph_are_promoted_at_the_spawn() {
         .count();
     assert_eq!(guarded, 2, "both spawner-side accesses take `o`'s lock");
 }
+
+#[test]
+fn rewrite_certificate_covers_promotions_and_nested_scopes() {
+    // A false certificate lets selection reuse the pre-rewrite dependency graph.
+    // Exercise move-only, freeze, cown, normalization and nested spawn paths.
+    for source in [
+        "fun main() { let n = 1\nprintln(n) }",
+        "fun main() { spawn(() -> error(\"boom\")) }",
+        "fun main() { let f = () -> error(\"boom\")\nspawn(f) }",
+        "fun main() { spawn(() -> { spawn(() -> error(\"boom\")) }) }",
+        "fun main() { let a = [1]\nspawn(() -> { println(a) }) }",
+        "fun main() { let a = [1]\nspawn(() -> { println(a) })\nprintln(a) }",
+        "fun main() { let a = [1]\nspawn(() -> { a.push(2) })\nprintln(a) }",
+        "fun main() { let a = [1]\nlet f = () -> { a.push(2) }\nspawn(f)\nprintln(a) }",
+        "fun main() { spawn(() -> { let a = [1]\nspawn(() -> { a.push(2) })\nprintln(a) }) }",
+    ] {
+        let mut body = main_body(source);
+        let before = format!("{:?}", body.stmts);
+        let report = auto_acquire(
+            &mut body.stmts,
+            &HashSet::default(),
+            &SpawnSummaries::default(),
+        );
+        if !report.may_rewrite {
+            assert_eq!(before, format!("{:?}", body.stmts), "{source}");
+        }
+        if source.contains("println(a) }") {
+            assert!(report.may_rewrite, "{source}");
+        }
+    }
+}

@@ -199,6 +199,7 @@ mod tests {
     fn deferred_resolver_slot_is_scoped() {
         let ast = brass_parser::parse("fun main() {\n}\n").expect("parse");
         let (program, errs) = brass_hir::lower(&[brass_hir::LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,

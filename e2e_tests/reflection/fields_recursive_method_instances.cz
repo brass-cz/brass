@@ -1,0 +1,35 @@
+// @backends: all
+// Recursive methods select fields using both their receiver and argument.
+type Leaf = {
+    name: string
+}
+type Branch = {
+    child: Leaf
+    count: int32
+}
+type Root = {
+    branch: Branch
+    enabled: bool
+}
+type Walker = {
+}
+
+fun Walker.walk(self, value) -> string {
+    if value: anonymous {  } {
+        let out = ""
+        for field in fields(value) {
+            out = out + field + ":" + self.walk(value[field]) + ";"
+        }
+        return out
+    }
+    return "leaf"
+}
+
+println(
+    Walker { }.walk(
+        Root {
+            branch: Branch { child: Leaf { name: "Aki" }, count: 1 },
+            enabled: true,
+        },
+    ),
+)

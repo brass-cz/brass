@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // @backends: all
 // The returns of one instantiation join by value-preserving widening, and an
 // integer literal return adapts to the joined type when its value fits it --
@@ -74,7 +76,9 @@ fun main() {
     println(m.get_or("missing", 7))
     println(typeof(m.get_or("missing", 7)))
     println("{typeof(small_first(true))} {typeof(small_last(true))}")
-    println("{small_first(true)} {small_first(false)} {small_last(true)} {small_last(false)}")
+    println(
+        "{small_first(true)} {small_first(false)} {small_last(true)} {small_last(false)}",
+    )
     println("{typeof(fits_first(true))} {typeof(fits_last(true))}")
     println("{fits_first(false)} {fits_last(true)}")
 }

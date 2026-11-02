@@ -1,0 +1,16 @@
+// @backends: all
+fun filled(value) {
+    let values = []
+    values.push(value)
+    return values
+}
+fun apply(f, value) {
+    return f(value)
+}
+fun main() {
+    let ints = apply(filled, 42)
+    let strings = apply(filled, "second")
+    assert(ints[0] == 42)
+    assert(strings[0] == "second")
+    println("ok")
+}

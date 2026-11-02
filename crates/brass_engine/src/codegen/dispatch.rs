@@ -33,7 +33,7 @@ pub(super) enum CallKind<'c> {
     /// A monomorphized instance, called by its resolved symbol.
     Instance(String),
     /// A `"{v}"` segment of a nullable whose inner type renders through the
-    /// USER `display` instance named here ([`nullable_display_instance`]):
+    /// effective top-level renderer named here ([`nullable_display_instance`]):
     /// `null` when absent, the instance's result on the unwrapped value when
     /// present.
     NullableDisplay(String),
@@ -78,9 +78,8 @@ pub(super) fn classify_call<'c>(
                 .cloned()
                 .unwrap_or_else(|| instance_symbol(base, arg_types)),
         ),
-        // A `to_string` segment (`"{v}"`) routes to the USER `display`
-        // instance the monomorphizer created when the value's type declares
-        // one; everything else keeps the built-in renderer.
+        // Interpolation uses the shared Display policy: display, then debug,
+        // then builtin structure. Mono has prepared any selected user method.
         Callee::Builtin(name) if name == "to_string" => {
             let Some(ty) = arg_types.first() else {
                 return CallKind::Builtin(name);

@@ -976,9 +976,8 @@ impl Checker<'_> {
                 return;
             }
         };
-        // The field list is span-keyed and one MIR lowering serves every
-        // instantiation, so instantiations that expand different field sets
-        // are rejected (`record_fields_loop`) rather than lowered with one.
+        // Each callable instance records the exact expansion checked here.
+        // MIR can share an expansion only while every instance agrees.
         if !self.record_fields_loop(s.span(), field_names.clone()) {
             return;
         }

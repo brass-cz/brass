@@ -8,14 +8,62 @@ use brass_engine::Codegen as EngineCodegen;
 use brass_hir::Type;
 
 use super::aggregate::VariantFieldLayout;
-use super::{LlvmCodegen, helper_key, rendered_string_is_owned};
+use super::{LlvmCodegen, helper_key};
 
 impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
+    /// Effective debug returns an owned string, including quoted string leaves.
+    /// The shared resolver selects nominal methods; builtin children recurse here.
+    pub(super) fn effective_debug(
+        &mut self,
+        v: BasicValueEnum<'ctx>,
+        ty: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        if let Type::Nullable(inner) = ty {
+            let f = self.cur_fn.unwrap();
+            let some = self.ctx.append_basic_block(f, "debug_some");
+            let none = self.ctx.append_basic_block(f, "debug_none");
+            let join = self.ctx.append_basic_block(f, "debug_join");
+            let present = self
+                .builder
+                .build_is_not_null(v.into_pointer_value(), "present")
+                .unwrap();
+            self.builder
+                .build_conditional_branch(present, some, none)
+                .unwrap();
+            self.builder.position_at_end(some);
+            let value = self.nullable_unwrap(v, inner);
+            let text = self.effective_debug(value, inner);
+            let end = self.builder.get_insert_block().unwrap();
+            self.builder.build_unconditional_branch(join).unwrap();
+            self.builder.position_at_end(none);
+            let null = self.const_str("null");
+            self.builder.build_unconditional_branch(join).unwrap();
+            self.builder.position_at_end(join);
+            let phi = self
+                .builder
+                .build_phi(self.abi.ptr(), "debug_text")
+                .unwrap();
+            phi.add_incoming(&[(&text, end), (&null, none)]);
+            return phi.as_basic_value();
+        }
+        if let Some(symbol) = brass_engine::render::resolve_renderer(
+            self.program,
+            ty,
+            brass_engine::render::RenderForm::Debug,
+        ) {
+            return self.call(&symbol, &[v], &Type::Str);
+        }
+        if matches!(ty, Type::Str) {
+            return self.str_debug(v);
+        }
+        self.to_string(v, ty)
+    }
+
     /// A memoized per-type `to_string` renderer for a record or sum. A record
     /// renders as `T {\n    field: <value>,\n}` and a sum as
     /// `T.Variant {\n    field: <value>,\n}` (a field-less variant as bare
-    /// `T.Variant`), with each field rendered by [`to_string`] so nested
-    /// records/sums/scalars format recursively. Registered before its body is
+    /// `T.Variant`), with each field rendered through effective debug so nested
+    /// records/sums/scalars honor their structural or custom form. Registered before its body is
     /// emitted so a self-referential type (e.g. a field of its own type) recurses
     /// through the call rather than re-entering code generation.
     pub(super) fn get_or_emit_to_string(&mut self, ty: &Type) -> FunctionValue<'ctx> {
@@ -113,12 +161,6 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
         let mut acc = self.const_str(&format!("{header} {{\n"));
         let mut acc_owned = false;
         for (fname, fty, offset) in fields {
-            // A string-typed field value renders in its quoted, escaped debug
-            // form, so the struct output distinguishes the string "1" from the
-            // number 1 (and shows empty strings at all). A nullable string
-            // quotes only when the value is present (`null` stays bare).
-            let is_str = matches!(fty, Type::Str);
-            let is_opt_str = matches!(fty, Type::Nullable(inner) if matches!(**inner, Type::Str));
             let prefix = self.const_str(&format!("    {fname}: "));
             let next = self.str_concat2(acc, prefix);
             if acc_owned {
@@ -129,43 +171,9 @@ impl<'ctx, 'p> LlvmCodegen<'ctx, 'p> {
             let llty = self.abi.typed_basic(fty);
             let fp = self.field_ptr(obj, *offset);
             let fv = self.builder.build_load(llty, fp, "fld").unwrap();
-            // Indent the field's rendering one level so a nested record/sum
-            // (which is itself multi-line) sits under its label with deeper
-            // indentation; a string renders on one line in its debug form.
-            let (mut fs, rendered) = if is_str {
-                (self.str_debug(fv), None)
-            } else {
-                let rendered = self.to_string(fv, fty);
-                (self.str_indent(rendered), Some(rendered))
-            };
-            if is_opt_str {
-                let f = self.cur_fn.unwrap();
-                let ptrt = self.abi.ptr();
-                let slot = self.builder.build_alloca(ptrt, "optstr").unwrap();
-                self.builder.build_store(slot, fs).unwrap();
-                let quote_bb = self.ctx.append_basic_block(f, "fld_quote");
-                let done_bb = self.ctx.append_basic_block(f, "fld_done");
-                let is_null = self
-                    .builder
-                    .build_is_null(fv.into_pointer_value(), "fldnull")
-                    .unwrap();
-                self.builder
-                    .build_conditional_branch(is_null, done_bb, quote_bb)
-                    .unwrap();
-                self.builder.position_at_end(quote_bb);
-                let present = rendered.expect("a nullable string field is rendered first");
-                let quoted = self.str_debug(present);
-                self.release(fs);
-                self.builder.build_store(slot, quoted).unwrap();
-                self.builder.build_unconditional_branch(done_bb).unwrap();
-                self.builder.position_at_end(done_bb);
-                fs = self.builder.build_load(ptrt, slot, "optstr_v").unwrap();
-            }
-            if let Some(rendered) = rendered
-                && rendered_string_is_owned(fty)
-            {
-                self.release(rendered);
-            }
+            let rendered = self.effective_debug(fv, fty);
+            let fs = self.str_indent(rendered);
+            self.release(rendered);
             let next = self.str_concat2(acc, fs);
             self.release(acc);
             self.release(fs);

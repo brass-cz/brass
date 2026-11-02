@@ -194,6 +194,7 @@ mod tests {
     fn spans_of(src: &str) -> Vec<String> {
         let ast = brass_parser::parse(src).expect("parse");
         let (program, errors) = crate::lower(&[crate::LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,

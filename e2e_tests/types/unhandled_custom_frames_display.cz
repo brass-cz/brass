@@ -1,0 +1,24 @@
+// @backends: all
+type Payload = {
+    value: string
+    location: Location
+    frames: Frame[]
+}
+fun Payload.display(self) -> string {
+    return "custom trace"
+}
+fun main() {
+    let result = Result.Err {
+        error: Payload {
+            value: "custom",
+            location: Location { file: "custom", line: 1, col: 1 },
+            frames: [
+                Frame {
+                    message: "custom frame",
+                    location: Location { file: "custom", line: 2, col: 3 },
+                },
+            ],
+        },
+    }
+    result!
+}

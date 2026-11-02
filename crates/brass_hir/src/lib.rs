@@ -2,13 +2,22 @@
 //! id-assigned program model the type checker annotates and MIR lowering
 //! consumes.
 
+pub mod builtin_returns;
+pub mod diagnostics;
 pub mod expand;
 pub mod generalize;
 pub mod hir;
+pub mod identity;
 pub mod instance;
+pub use identity::{
+    ItemId, ItemKind, MethodBodyId, ModuleId, ModuleSource, PackageId, Reason, SourceOrigin,
+};
 pub mod lower;
 pub mod mutation;
 pub mod plugin;
+pub mod project;
+pub mod rendering;
+pub use project::ProjectScope;
 pub mod typed;
 pub mod typedecl;
 pub mod types;
@@ -28,7 +37,7 @@ pub use instance::{
     InstanceCallable, InstanceChannel, InstanceKey, NumericCallEntry, NumericCalls, NumericLayout,
     instance_key_type, numeric_instance_base,
 };
-pub use lower::{LowerError, lower, lower_generated_into};
+pub use lower::{LowerError, lower, lower_context, lower_generated_into};
 pub use mutation::{
     MutationInfo, ParamDecl, annotated_type_passes_by_copy, mutates_root, mutates_value,
     param_infers_pass_mode, param_is_immutable_ref, param_is_infer, param_is_mut_ref,

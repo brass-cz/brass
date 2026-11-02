@@ -1,0 +1,30 @@
+// @backends: all
+import std.collections.HashMap
+
+// Both map instances are inferred from insertion, including the nested value.
+fun main() {
+    let child = HashMap.new()
+    child.set("a", 2)
+    let m = HashMap.new()
+    m.set("child", child)
+    if let stored = m.get("child") {
+        println(stored.get("a"))
+    }
+    let replacement = HashMap.new()
+    replacement.set("a", 7)
+    replacement.set("b", 9)
+    m.set("child", replacement)
+    if let stored = m.get("child") {
+        println(stored.get("a"))
+        println(stored.get("b"))
+    }
+    println(m.size())
+    println(m.get("missing"))
+    let outer = HashMap.new()
+    outer.set("maps", m)
+    if let middle = outer.get("maps") {
+        if let inner = middle.get("child") {
+            println(inner.get("a"))
+        }
+    }
+}

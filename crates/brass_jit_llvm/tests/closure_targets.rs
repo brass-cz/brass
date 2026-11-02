@@ -45,6 +45,7 @@ fn closure_target_child() {
     };
     let ast = brass_parser::parse(&source(&case)).expect("parse fixture");
     let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,
@@ -192,6 +193,7 @@ fn later_native_batches_reuse_missing_target_helpers() {
     )
     .unwrap();
     let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,

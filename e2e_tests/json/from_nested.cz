@@ -1,0 +1,39 @@
+// @backends: all
+import std.collections.{ HashMap }
+import std.data.json.{ JsonValue }
+
+type Leaf = {
+    name: string
+}
+type Branch = {
+    leaf: Leaf
+    count: int32
+}
+type Root = {
+    branch: Branch
+    active: bool
+}
+
+fun main() {
+    // Child types are reached only through recursive conversion, never separately.
+    let value = Root {
+        branch: Branch { leaf: Leaf { name: "nested" }, count: 2 },
+        active: true,
+    }
+    let json = JsonValue.from(value)!
+    assert(
+        json.get("branch")!.get("leaf")!.get("name")!.as_string()! == "nested",
+    )
+    assert(json.get("branch")!.get("count")!.as_number()! == 2.0)
+    assert(json.get("active")!.as_bool()!)
+    println(json.pretty())
+
+    // Nested map values contain arrays of records.
+    let inner = HashMap.new()
+    inner.set("roots", [value])
+    let outer = HashMap.new()
+    outer.set("inner", inner)
+    let converted = JsonValue.from(outer)!
+    assert(converted.get("inner")!.get("roots")!.at(0)! == json)
+    println(converted.pretty())
+}

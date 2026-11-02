@@ -1,0 +1,5 @@
+// @backends: all
+println("entry initializer")
+fun main() {
+    println("entry main")
+}

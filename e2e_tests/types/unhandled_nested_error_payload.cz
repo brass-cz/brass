@@ -1,0 +1,15 @@
+// @backends: all
+fun main() {
+    let inner = Error {
+        value: "inner",
+        location: Location { file: "inner.cz", line: 1, col: 2 },
+        frames: [],
+    }
+    let outer = Error {
+        value: inner,
+        location: Location { file: "outer.cz", line: 3, col: 4 },
+        frames: [],
+    }
+    let result = Result.Err { error: outer }
+    result!
+}

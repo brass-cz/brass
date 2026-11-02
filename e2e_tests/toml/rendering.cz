@@ -1,0 +1,39 @@
+// @backends: all
+import std.data.toml.TomlValue
+import std.collections.HashMap
+
+type Box = {
+    value: TomlValue
+}
+// The content renderer preserves scalar kinds and never exposes table storage.
+fun main() {
+    let scalars = [
+        TomlValue.String { value: "line\n\"two\"" },
+        TomlValue.Integer { value: 2 },
+        TomlValue.Float { value: 2.0 },
+        TomlValue.Bool { value: true },
+        TomlValue.Datetime { value: "2026-10-31T12:34:56Z" },
+    ]
+    for value in scalars {
+        println(value)
+        println(value.debug() == value.display())
+    }
+    println(TomlValue.Array { value: [] })
+    println(TomlValue.Array { value: scalars })
+    let empty = TomlValue.parse("")!
+    println(empty)
+    println(empty.debug())
+    let doc = TomlValue.parse(
+        "title = \"demo\"\nnumbers = [1, 2]\ncreated = 2026-10-31T12:34:56Z\n[owner]\nname = \"Ada\"\n[[servers]]\nname = \"one\"\n[[servers]]\nname = \"two\"\n",
+    )!
+    println(doc)
+    println("{doc}")
+    println(doc.debug())
+    println(Box { value: doc })
+    println([doc])
+    let map = HashMap.new()
+    map.set("document", doc)
+    println(map)
+    // Arrays containing a table use one element per indented line.
+    println(TomlValue.Array { value: [empty, doc] })
+}

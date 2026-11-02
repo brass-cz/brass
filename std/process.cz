@@ -294,3 +294,21 @@ fun Child.output(self) -> Output! {
     const err = process_take_captured(self._handle, 2)!
     return Output { code, stdout: out, stderr: err }
 }
+
+/** Render program, quoted arguments, environment overrides as `[name, value]`
+ * pairs, and the three stream policies in a `Command` record. Never starts it.
+ */
+fun Command.debug(self) -> string {
+    let env: string[] = []
+    let i: int64 = 0
+    while i < len(self._env) {
+        env.push("[{self._env[i].debug()}, {self._env[i + 1].debug()}]")
+        i += 2
+    }
+    return "Command \{ program: {self._program.debug()}, args: {self._args.debug()}, env: [{env.join(", ")}], stdin: {self._stdin.debug()}, stdout: {self._stdout.debug()}, stderr: {self._stderr.debug()} }"
+}
+
+/** Render `Child { .. }` without querying the process or exposing stream caches. */
+fun Child.debug(self) -> string {
+    return "Child \{ .. }"
+}

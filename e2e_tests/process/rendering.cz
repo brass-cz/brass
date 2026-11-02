@@ -1,0 +1,30 @@
+// @backends: all
+import std.process.{ Command, Stdio }
+import std.collections.HashMap
+
+type Box = {
+    value
+}
+// A command's semantic configuration is visible; rendering does not start it.
+fun main() {
+    let command = Command
+        .new("unused")
+        .args(["a, b", ""])
+        .env("GREETING", "hi, world")
+        .stdout(Stdio.Pipe)
+    println(command)
+    println(command.debug())
+    println(Box { value: command })
+    println([command])
+    let map = HashMap.new()
+    map.set("command", command)
+    println(map)
+    let child = Command.new("true").spawn()!
+    println(child)
+    println(Box { value: child })
+    println([child])
+    let children = HashMap.new()
+    children.set("child", child)
+    println(children)
+    println(child.wait()!)
+}

@@ -4,8 +4,12 @@ description: "The type system in full: literals, conversions, parameter passing,
 ---
 
 Brass is statically typed with flexible type inference. Every function body
-is checked before it can execute; `brass check` produces the complete
-whole-program verdict. Annotations constrain types, but are never required
+is checked before it can execute. `brass check` checks the own package
+completely, including unused items; dependencies are checked only where
+reached or required for shared inference. Unreached dependency bodies are
+neither checked nor reported. Recoverable syntax errors inside those bodies
+follow the same rule; syntax errors that hide declaration boundaries remain
+errors. Annotations constrain types, but are never required
 for safety. See [Execution model](/references/execution/) for when the default
 run performs each check.
 
@@ -40,6 +44,11 @@ it) or passed as an argument. There is no character type: a character
 is a one-character `string`. Diagnostics and `typeof` may additionally
 mention `never` (the type of `null` before it meets a context, spelled
 `never?`); it is not writable in source.
+
+Float32 values print in their own shortest round-trip form: `0.1`, rather than
+`0.10000000149011612`. This also applies to interpolation, `string.from`,
+`debug`/`display` and nested values. Integral float32 values retain `.0` (such as
+`2.0`); widening a value to float64 uses float64's own representation.
 
 ## Literals
 
@@ -683,8 +692,11 @@ only the code after the loop.
 
 A narrowed module global, a `ref(T?)` or `ref(mut(T?))` parameter, or a local
 that a closure assigns is re-widened after any call, since the call could
-reassign it. Rendering a value counts as a call when its type declares a
-`display` method: `print`, `println`, and a `"{v}"` segment run that method.
+reassign it. Rendering counts as a call when it can run a user method: a
+top-level `display` or an effective `debug` at any structural depth. This
+applies to `print`, `println`, interpolation, `string.from`, and builtin
+`debug` rendering. Nested values use their own `debug`, not `display`; see
+[Rendering protocols](/references/stdlib/#coreshow) for the text forms.
 
 A narrowing made before a loop holds inside the loop only if no path through
 the loop body can end it before the next iteration (a path that runs off the
@@ -793,7 +805,9 @@ error sites of one function must reconcile to one payload type).
   raised by `error(..)`, or lifted at `!` or a forwarding `return`, matches
   as the `Error` record:
   the original value is `error.value`, and `error.display()` renders the
-  trace.
+  trace with `[file:line:col] error: <message>` on each line. Printing or
+  interpolating the Error uses the same text; an unhandled `!` retains the
+  `unhandled error` label.
 - A function that can only ever `error(...)` (no successful return) cannot be
   used where a value is required: reading its Ok payload -- a used
   `Ok { value }` binding, or `f()!` in a value position -- is a compile
@@ -911,8 +925,8 @@ type StringInts = Map { key: string, value: int64 }
   `int64`, a literal field value adapting to the pinned type as it does when
   the literal flows into a slot annotated `Box64`.
 - Annotating a binding with the alias pins the container's types up front, so
-  `let m: Counts = HashMap.new()` (with
-  `type Counts = HashMap { key: string, value: int64 }`) is a usable
+  `let m: Counts = HashMap.new()` (after importing `std.collections.{ HashMap }`,
+  with `type Counts = HashMap { key: string, value: int64 }`) is a usable
   `string -> int64` map: later stores are checked against the pinned value
   type, so a bare integer literal or an `int32` value stores as an `int64`
   (see [Literals](#literals)).

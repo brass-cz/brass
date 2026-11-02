@@ -1,0 +1,99 @@
+// @backends: all
+import std.collections.{ HashMap }
+import std.data.json.{ JsonValue }
+
+type Child = {
+    label: string
+}
+type Parent = {
+    child: Child
+    enabled: bool
+    missing: string?
+}
+type Data = {
+    to_json: string
+}
+type Custom = {
+    text: string
+}
+type Choice = First | Second
+fun Custom.to_json(self) -> JsonValue! {
+    return JsonValue.String { value: self.text }
+}
+fun Choice.to_json(self) -> JsonValue! {
+    return JsonValue.Bool { value: true }
+}
+
+fun show(value) {
+    match JsonValue.from(value) {
+        Ok { value } => println(value.stringify()),
+        Err { error } => {
+            println(error.value)
+            assert(false, "conversion failed")
+        },
+    }
+}
+
+fun main() {
+    // Scalars exercise every numeric storage class and the precision contract.
+    show(JsonValue.Null)
+    show(JsonValue.parse("[true, 2, \"text\"]")!)
+    show(false)
+    show("line\n\"quoted\"\\end")
+    show(int8.from(-8)!)
+    show(int16.from(-16)!)
+    show(32)
+    show(int64.from(64)!)
+    show(uint8.from(8)!)
+    show(uint16.from(16)!)
+    show(uint32.from(32)!)
+    show(uint64.from(64)!)
+    show(float32.parse("1.5")!)
+    show(2.5)
+    show(int64.parse("9007199254740993")!)
+    show(null)
+    let optional: int32? = null
+    show(optional)
+    optional = 7
+    show(optional)
+
+    // Different and recursively nested records share one generic conversion.
+    show(
+        Parent {
+            child: Child { label: "nested" },
+            enabled: true,
+            missing: null,
+        },
+    )
+    show(Child { label: "second shape" })
+    show({ count: 4 })
+    show(Data { to_json: "ordinary field" })
+    show(Custom { text: "hook" })
+    show(Choice.First)
+    let custom: Custom? = Custom { text: "nullable hook" }
+    show(custom)
+
+    // Arrays recurse through arbitrary element types, including nullable records.
+    show([Child { label: "a" }, Child { label: "b" }])
+    let records: Child?[] = [null, Child { label: "c" }]
+    show(records)
+    show([[1, 2], [3]])
+    const fixed = [true, false]
+    show(fixed)
+    let empty: Child[] = []
+    show(empty)
+
+    // Empty string maps, stored nulls and nested maps keep every key.
+    let empty_map: HashMap { key: string, value: Child } = HashMap.new()
+    show(empty_map)
+    let nullable: HashMap { key: string, value: int32? } = HashMap.new()
+    nullable.set("absent", null)
+    nullable.set("present", 9)
+    show(nullable)
+    let inner = HashMap.new()
+    inner.set("children", [Child { label: "map child" }])
+    let outer = HashMap.new()
+    outer.set("inner", inner)
+    show(outer)
+    assert(JsonValue.from(nullable)!.get("absent")!.is_null())
+}

@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // The standard-library HashMap declares `key`/`value` type slots, so a
 // refinement alias names a concrete instantiation. A witness-free map built with
 // `HashMap.new()` and annotated `StringInts` is pinned to `string` keys and
@@ -9,10 +11,7 @@
 // to `total` would be a genuine mismatch: an `int32`-valued map has a different
 // slot layout than an `int64`-valued one, so it is rejected rather than adapted.
 
-type StringInts = HashMap {
-    key: string,
-    value: int64,
-}
+type StringInts = HashMap { key: string, value: int64 }
 
 fun total(m: StringInts) -> int64 {
     let sum: int64 = 0

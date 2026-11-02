@@ -1,0 +1,66 @@
+// @backends: all
+// Every exit owns different managed locals. Returned locals move, borrowed
+// parameters gain a reference, and aliases in nested scopes must still be freed.
+fun choose(input: string, n: int32) -> string {
+    let first = input + " first"
+    let second = input + " second"
+    if n == 0 {
+        return input
+    }
+    if n == 1 {
+        let alias = first
+        return alias
+    }
+    return second
+}
+
+fun maybe(n: int32) -> string? {
+    if n == 0 {
+        return null
+    }
+    return "present"
+}
+
+fun nullable(n: int32) -> string? {
+    let held = ["nested", "scope"]
+    for value in held {
+        if value == "scope" {
+            let alias = held
+            let result = maybe(n)!
+            return result
+        }
+    }
+    return null
+}
+
+fun tick(n: int32) -> void! {
+    let held = ["outer", "inner"]
+    for value in held {
+        if value == "inner" {
+            let alias = held
+            if n < 0 {
+                error("nested loop")!
+            }
+            if n == 0 {
+                return
+            }
+        }
+    }
+    // Falling off a fallible void body still builds Ok after cleanup.
+}
+
+fun main() {
+    let input = "kept"
+    for n in [0, 1, 2] {
+        println(choose(input, n))
+    }
+    println(input)
+    println(nullable(0))
+    println(nullable(1))
+    for n in [-1, 0, 1] {
+        match tick(n) {
+            Ok { value } => println("ok"),
+            Err { error } => println(error.value),
+        }
+    }
+}

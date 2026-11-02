@@ -7,6 +7,7 @@ use brass_typeck::analyze;
 fn lower(src: &str) -> brass_hir::Program {
     let ast = brass_parser::parse(src).expect("parse");
     let (program, lerr) = brass_hir::lower(&[brass_hir::LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,

@@ -16,7 +16,7 @@ null
 int32?[]
 [3, null]
 [int32?, string]
-[3, a]
+[3, "a"]
 P?
 P {
     v: 3,

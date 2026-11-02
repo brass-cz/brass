@@ -62,6 +62,10 @@ struct MethodWindow {
 pub(in crate::infer) struct MethodInventory {
     /// Nested body windows receive the dependencies of their children.
     windows: Vec<MethodWindow>,
+    /// Qualified reads of a root shared-state observation, including nested hits.
+    pub(super) item_reads: Option<GlobalReadProvenance>,
+    /// Lexical bodies prevent an absence claim without capture classification.
+    pub(super) item_closure: bool,
     /// Test evidence is not retained in production runs.
     #[cfg(test)]
     pub completed: Vec<(String, MethodMemoDependencies, Vec<&'static str>)>,
@@ -94,6 +98,7 @@ impl Checker<'_> {
     /// A closure body needs lexical state that a method memo cannot replay.
     pub(in crate::infer) fn observe_method_closure(&mut self) {
         if let Some(inventory) = &mut self.method_inventory {
+            inventory.item_closure |= inventory.item_reads.is_some();
             for window in &mut inventory.windows {
                 window.frame.has_closure_bodies = true;
             }
@@ -277,6 +282,9 @@ impl Checker<'_> {
     /// Empty provenance certifies no reads; unavailable identities still reject.
     pub(in crate::infer) fn observe_method_replay(&mut self, reads: Option<&GlobalReadProvenance>) {
         if let Some(inventory) = &mut self.method_inventory {
+            if let (Some(root), Some(reads)) = (&mut inventory.item_reads, reads) {
+                root.extend(reads);
+            }
             for window in &mut inventory.windows {
                 window.nested_replay = true;
                 if let Some(reads) = reads {
@@ -302,12 +310,22 @@ impl Checker<'_> {
         if !self
             .method_inventory
             .as_ref()
-            .is_some_and(|i| !i.windows.is_empty())
+            .is_some_and(|i| !i.windows.is_empty() || i.item_reads.is_some())
         {
             return;
         }
         let identity = self.method_global_identity(name, qualified);
         let resolved = self.resolve(ty);
+        if let Some(root) = &mut self.method_inventory.as_mut().unwrap().item_reads {
+            root.extend(&GlobalReadProvenance {
+                untracked: identity.is_none(),
+                reads: identity
+                    .clone()
+                    .map(|id| (id, resolved.clone()))
+                    .into_iter()
+                    .collect(),
+            });
+        }
         for window in &mut self.method_inventory.as_mut().unwrap().windows {
             if let Some(identity) = &identity {
                 let read = (identity.clone(), resolved.clone());

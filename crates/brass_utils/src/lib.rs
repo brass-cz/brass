@@ -152,7 +152,7 @@ pub fn perf_phase(phase: &str, elapsed: std::time::Duration) {
     );
 }
 
-/// Render a float the way Brass programs observe it (string conversion,
+/// Render a float64 the way Brass programs observe it (string conversion,
 /// `print`, REPL echo): an integral finite value below 1e15 keeps a trailing
 /// `.0` (`2.0`, not `2`); everything else uses Rust's shortest round-trip
 /// form. One shared rule so every back end and the runtime print the same
@@ -162,6 +162,16 @@ pub fn float_str(v: f64) -> String {
         format!("{v:.1}")
     } else {
         format!("{v}")
+    }
+}
+
+/// Render a float32 in its own shortest round-trip form, without widening its
+/// decimal representation. Integral finite values retain a trailing `.0`.
+pub fn float32_str(v: f32) -> String {
+    if v.is_finite() && v == v.trunc() {
+        format!("{v}.0")
+    } else {
+        v.to_string()
     }
 }
 
@@ -189,4 +199,41 @@ pub fn debug_quote(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod float_rendering_tests {
+    use super::{float_str, float32_str};
+
+    #[test]
+    fn float32_uses_its_own_precision_and_retains_integral_marker() {
+        assert_eq!(float32_str(0.1), "0.1");
+        assert_eq!(float32_str(2.0), "2.0");
+        assert_eq!(float32_str(-0.0), "-0.0");
+        assert_eq!(float32_str(f32::INFINITY), "inf");
+        assert_eq!(float32_str(f32::NEG_INFINITY), "-inf");
+        assert_eq!(float32_str(f32::NAN), "NaN");
+        assert_eq!(float_str(f64::from(0.1_f32)), "0.10000000149011612");
+        assert_eq!(float_str(2.0), "2.0");
+    }
+
+    #[test]
+    fn float32_text_round_trips_across_exponents_and_signs() {
+        // Boundary bit patterns plus a deterministic sample of the full width.
+        let boundaries = [
+            0, 1, 0x007fffff, 0x00800000, 0x7f7fffff, 0x80000000, 0x80000001, 0xff7fffff,
+        ];
+        let samples = (0..20_000_u32).map(|n| n.wrapping_mul(2_654_435_761));
+        for bits in boundaries.into_iter().chain(samples) {
+            let value = f32::from_bits(bits);
+            if !value.is_finite() {
+                continue;
+            }
+            let text = float32_str(value);
+            assert_eq!(text.parse::<f32>().unwrap().to_bits(), bits, "{text}");
+            if value == value.trunc() {
+                assert!(text.ends_with(".0"), "{text}");
+            }
+        }
+    }
 }

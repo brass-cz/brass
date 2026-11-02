@@ -1,6 +1,6 @@
 true
 hi
 42.0
-{"x":1.0,"y":[2.0,3.0]}
+{"x":1,"y":[2,3]}
 Aki 30 Tokyo 100
-error: [std/data/json.cz:147:36] unhandled error: missing field 'age'
+error: [std/data/json.cz:154:36] error: missing field 'age'

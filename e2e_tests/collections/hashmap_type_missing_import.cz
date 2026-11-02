@@ -1,0 +1,6 @@
+// @backends: all
+// A map annotation requires its defining module to be imported.
+fun take(value: HashMap) {
+}
+fun main() {
+}

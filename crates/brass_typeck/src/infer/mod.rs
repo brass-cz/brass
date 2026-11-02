@@ -68,6 +68,7 @@ mod conversion;
 mod delta;
 mod driver;
 mod expr;
+mod fields;
 mod function_values;
 mod helpers;
 mod instances;
@@ -80,6 +81,7 @@ mod narrowing;
 mod numeric_calls;
 mod patterns;
 mod precompute;
+mod preparation;
 pub(crate) mod publication;
 mod resolve;
 mod returns;
@@ -308,7 +310,10 @@ pub struct Inference {
     /// Field lists of `for f in fields(x)` loops, keyed by the loop statement's
     /// span. The checker resolved `x`'s record type and checked one expanded
     /// copy per field; MIR lowering unrolls the same copies from this list.
+    /// A divergent span retains a representative here; `instance_fields` owns its selections.
     pub fields_loops: HashMap<Span, Vec<String>>,
+    /// Field lists at loops whose callable instances disagree.
+    pub instance_fields: brass_hir::InstanceChannel<Vec<String>>,
     /// Type symbols resolved for expressions, keyed by span: the type a
     /// `typeof(v).method(..)` static call names (keyed by the inner
     /// `typeof(v)`), and the declared record an anonymous record literal or a
@@ -518,7 +523,9 @@ struct Checker<'a> {
     /// leak into unrelated bodies' cached signature variables.
     co_return_links: HashMap<(String, String), Vec<(Type, Type)>>,
     /// Callables whose body is currently being re-elaborated at a call site,
-    /// keyed by `fn:<symbol>` / `method:<self type>.<name>`. Re-entering one is a
+    /// keyed by `fn:<symbol>` / `method:<self type>.<name>`, qualified by
+    /// argument types for distinct recursive instances that can reach field
+    /// reflection. Re-entering the same key is a
     /// recursive call: re-checking the body again would not terminate, so the
     /// call is typed against the return the elaboration in progress assumes
     /// (see `recursion_assumptions`, `recursion_provisional`), else the
@@ -536,6 +543,12 @@ struct Checker<'a> {
     /// (`main`) was checked by the run that produced the seed, so the per-item
     /// passes skip it and read the seeded tables instead.
     entry_only: bool,
+    /// Requested item work; context-only requests omit ordinary dedicated passes.
+    preparation: Option<Rc<crate::reachability::AnalysisView>>,
+    /// A selected return dependency reuses one immutable catalog in this analysis.
+    selection_index: Option<Rc<crate::reachability::ItemIndex<'a>>>,
+    /// Item-granular facts tied to the producing context's storage identities.
+    item_seed: Option<Rc<crate::reachability::AnalysisView>>,
     /// Elaborations in progress (keyed like `instantiating`) that a recursive
     /// call re-entered. Only those need what their recursive calls were typed
     /// against -- the instance's provisional return (see
@@ -675,6 +688,8 @@ struct Checker<'a> {
     numeric: binding_joins::numeric::NumericState,
     numeric_pure_bodies: Rc<HashSet<String>>,
     numeric_pure_spans: Rc<std::cell::OnceCell<HashSet<Span>>>,
+    /// Reachable field loops used to distinguish reflected recursive instances.
+    fields_reflection: Rc<std::cell::OnceCell<fields::recursion::Reflection>>,
     numeric_eligibility: Rc<std::cell::OnceCell<binding_joins::numeric::eligibility::Eligibility>>,
     numeric_closed_bodies: Rc<HashSet<String>>,
     /// Nested elaboration windows isolate their own observations while still
@@ -791,6 +806,8 @@ struct Checker<'a> {
     /// Field lists of checked fields-loops, keyed by loop-statement span; the
     /// channel MIR lowering unrolls from (see [`Inference::fields_loops`]).
     fields_loops: HashMap<Span, Vec<String>>,
+    /// Replayable field lists with their enclosing callable identities.
+    fields_observations: HashMap<Span, Vec<fields::FieldsObservation>>,
     /// Type symbols resolved for `typeof(v).method(..)` static calls and for
     /// record literals built as a declared record (see
     /// [`Inference::type_names`]).
@@ -905,6 +922,8 @@ struct Checker<'a> {
     /// "the type `to_bytes` accepts" -- so `expect_assignable` commits an
     /// accepted hole-to-concrete flow while this set is non-empty.
     type_test_holes: HashSet<u32>,
+    /// Pattern-only walks cannot publish a concrete record field expansion.
+    fields_probe_depth: usize,
 }
 
 /// What a checked `expr!` propagates on failure: the null of a nullable
@@ -1110,6 +1129,9 @@ impl<'a> Checker<'a> {
             co_return_links: HashMap::default(),
             instantiating: HashSet::default(),
             entry_only: false,
+            preparation: None,
+            selection_index: None,
+            item_seed: None,
             recursed: HashSet::default(),
             recursion_provisional: HashMap::default(),
             light_reads: std::cell::RefCell::new(None),
@@ -1143,8 +1165,9 @@ impl<'a> Checker<'a> {
             method_scheme_revision: 0,
             method_co_seen: HashSet::default(),
             method_inventory:
-                tracing::enabled!(target: "brass::method_inventory", tracing::Level::TRACE)
-                    .then(|| Box::new(co_replay::MethodInventory::default())),
+                (tracing::enabled!(target: "brass::method_inventory", tracing::Level::TRACE)
+                    || tracing::enabled!(target: "brass::item_inventory", tracing::Level::TRACE))
+                .then(|| Box::new(co_replay::MethodInventory::default())),
             closure_memo: HashMap::default(),
             closure_memo_disabled: std::env::var("BRASS_CLOSURE_MEMO").as_deref() == Ok("off")
                 || std::env::var("BRASS_MEMO_CHECK").as_deref() == Ok("1"),
@@ -1171,6 +1194,7 @@ impl<'a> Checker<'a> {
                 std::cell::OnceCell::new()
             }),
             numeric_zero_growth: false,
+            fields_reflection: Default::default(),
             numeric_eligibility: Default::default(),
             numeric_pure_bodies: Rc::new(numeric_pure_bodies),
             numeric_closed_bodies: Rc::new(numeric_closed_bodies),
@@ -1214,6 +1238,7 @@ impl<'a> Checker<'a> {
             lift_errs: HashSet::default(),
             sum_views: HashMap::default(),
             fields_loops: HashMap::default(),
+            fields_observations: HashMap::default(),
             type_names: HashMap::default(),
             closure_bindings: HashMap::default(),
             generalizable: Rc::new(brass_hir::generalized_closure_bindings(program)),
@@ -1229,6 +1254,7 @@ impl<'a> Checker<'a> {
             type_tests: HashMap::default(),
             type_test_poisoned: HashSet::default(),
             type_test_holes: HashSet::default(),
+            fields_probe_depth: 0,
         }
     }
 
@@ -1429,6 +1455,7 @@ impl<'a> Checker<'a> {
     /// shows its concrete type) -- and preserves the `ConstOf` wrapper, so
     /// constness is unchanged.
     fn finalize_typed(&mut self) {
+        self.report_fields_conflicts();
         self.settle_sum_views();
         let resolved: Vec<Type> = self
             .typed

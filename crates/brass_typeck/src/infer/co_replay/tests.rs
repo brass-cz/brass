@@ -15,6 +15,7 @@ mod replay;
 fn program(source: &str) -> Program {
     let ast = brass_parser::parse(source).unwrap();
     let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast,

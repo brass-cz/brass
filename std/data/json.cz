@@ -1,3 +1,5 @@
+import std.collections.{ HashMap }
+
 // JSON: a value tree, a recursive-descent parser, accessors, a serializer, and
 // a reflective decoder into typed structures. A library (pure Brass, no
 // plugin) -- import it explicitly:
@@ -11,11 +13,16 @@
 // given input, but not the source document's ordering.
 
 type _JsonObject = HashMap { key: string, value: JsonValue }
+type _StringMap = HashMap { key: string }
+type _JsonConvertible = {
+    to_json(self) -> JsonValue!
+}
 
 /**
  * A parsed JSON value, one variant per JSON kind. Obtain one with `JsonValue.parse`,
  * inspect it with the accessors (`get`, `at`, `as_*`), decode it into a typed
- * structure with `into`, and render it back to text with `stringify`.
+ * structure with `into`, or construct one from a value with `from`. Render
+ * compact text with `stringify` or indented text with `pretty` / `display`.
  */
 type JsonValue =
     | Null
@@ -157,21 +164,127 @@ fun JsonValue.into(self) -> infer! {
     }
 }
 
+// ----- conversion to JSON -----
+
+/**
+ * Convert a value to a JSON tree. JsonValue passes through unchanged; a declared
+ * `to_json(self) -> JsonValue!` supplies a custom conversion. Booleans, numbers,
+ * strings, nullables, arrays, string-keyed HashMaps and records convert
+ * recursively. Record fields become object members; map entries are inserted
+ * in map order. Object output order is unspecified.
+ *
+ * Recursive record conversion uses compile-time field reflection. The compiler
+ * permits at most eight additional active recursive instances with distinct
+ * concrete types; deeper expansion is a compile-time error at the fields loop.
+ *
+ * Numbers become float64, so integers beyond 2^53 can lose precision.
+ * Non-finite numbers and unsupported types (including non-string map keys,
+ * sums without a hook and functions) return an error without a partial tree.
+ */
+fun JsonValue.from(value) -> JsonValue! {
+    return _from(value)
+}
+
+fun _from(value) -> JsonValue! {
+    if value: JsonValue {
+        return value
+    } else if value: _JsonConvertible {
+        return value.to_json()
+    } else if value: bool {
+        return JsonValue.Bool { value }
+    } else if value: string {
+        return JsonValue.String { value }
+    } else if value: infer? {
+        if let inner = value {
+            return _from(inner)
+        }
+        return JsonValue.Null
+    } else if value: infer[] {
+        let elements: JsonValue[] = []
+        for element in value {
+            elements.push(_from(element)!)
+        }
+        return JsonValue.Array { value: elements }
+    } else if value: _StringMap {
+        let members: _JsonObject = HashMap.new()
+        for key in value.keys() {
+            // Every key is present; get's null represents a stored nullable value.
+            members.set(key, _from(value.get(key))!)
+        }
+        return JsonValue.Object { values: members }
+    } else if value: HashMap {
+        return error(
+            "cannot convert {typeof(value)} with non-string keys to JSON",
+        )
+    } else if value: anonymous {  } {
+        let members: _JsonObject = HashMap.new()
+        for field in fields(value) {
+            members.set(field, _from(value[field])!)
+        }
+        return JsonValue.Object { values: members }
+    } else if value: int8 {
+        return _number(float64.from(value))
+    } else if value: int16 {
+        return _number(float64.from(value))
+    } else if value: int32 {
+        return _number(float64.from(value))
+    } else if value: int64 {
+        return _number(float64.from(value))
+    } else if value: uint8 {
+        return _number(float64.from(value))
+    } else if value: uint16 {
+        return _number(float64.from(value))
+    } else if value: uint32 {
+        return _number(float64.from(value))
+    } else if value: uint64 {
+        return _number(float64.from(value))
+    } else if value: float32 {
+        return _number(float64.from(value))
+    } else if value: float64 {
+        return _number(float64.from(value))
+    }
+    return error("cannot convert {typeof(value)} to JSON")
+}
+
+fun _number(value: float64) -> JsonValue! {
+    if value != value || value - value != 0.0 {
+        return error("JSON number is not finite: {value}")
+    }
+    return JsonValue.Number { value }
+}
+
 // ----- serialization -----
 //
-// `stringify` is the method; `_render` is the recursion. Keeping the hot
+// The rendering methods delegate recursion to `_render`. Keeping the hot
 // recursive core a free function is a compile-time choice: a method call on a sum
 // resolves to one candidate per variant and the checker re-elaborates each, so a
 // recursive method multiplies its own work by the variant count. The public
 // surface is unaffected -- callers write `j.stringify()` either way.
 
-/** Render a `JsonValue` back to compact JSON text (no added whitespace). */
+/** Render compact JSON without added whitespace. Finite integral numbers within
+ * +/-2^53 use integer spelling, including negative zero as `0`; other numbers
+ * retain their float spelling. `pretty`, `display` and `debug` use the same rule.
+ */
 fun JsonValue.stringify(self) -> string {
-    return _render(self)
+    return _render(self, false)
+}
+
+/**
+ * Render JSON with four-space indentation and one member or element per line.
+ * Empty objects and arrays stay inline. Strings and numbers render exactly as
+ * in `stringify`; object order is unspecified.
+ */
+fun JsonValue.pretty(self) -> string {
+    return _render(self, true)
+}
+
+/** Render the same multi-line JSON text as `pretty`, including in interpolation. */
+fun JsonValue.display(self) -> string {
+    return _render(self, true)
 }
 
 // The recursive renderer. See the note above on why this is not a method.
-fun _render(value: JsonValue) -> string {
+fun _render(value: JsonValue, pretty: bool) -> string {
     match value {
         JsonValue.Null => {
             return "null"
@@ -183,36 +296,38 @@ fun _render(value: JsonValue) -> string {
             return "false"
         },
         JsonValue.Number { value } => {
+            // Within the exact-integer range the conversion and comparison are lossless.
+            if value >= -9007199254740992.0 && value <= 9007199254740992.0 {
+                if let Ok { value: integer } = int64.from(value) {
+                    if float64.from(integer) == value {
+                        return "{integer}"
+                    }
+                }
+            }
             return "{value}"
         },
         JsonValue.String { value } => {
             return _quote(value)
         },
         JsonValue.Array { value } => {
-            let out = "["
-            let first = true
+            let parts: string[] = []
             for elem in value {
-                if !first {
-                    out = out + ","
-                }
-                out = out + _render(elem)
-                first = false
+                parts.push(_render(elem, pretty))
             }
-            return out + "]"
+            return _join(parts, "[", "]", pretty)
         },
         JsonValue.Object { values } => {
-            let out = "\{"
-            let first = true
-            for k in values.keys() {
-                if !first {
-                    out = out + ","
-                }
-                if let v = values.get(k) {
-                    out = out + _quote(k) + ":" + _render(v)
-                }
-                first = false
+            let parts: string[] = []
+            let colon = ":"
+            if pretty {
+                colon = ": "
             }
-            return out + "\}"
+            for k in values.keys() {
+                if let v = values.get(k) {
+                    parts.push(_quote(k) + colon + _render(v, pretty))
+                }
+            }
+            return _join(parts, "\{", "\}", pretty)
         },
     }
 }
@@ -635,4 +750,30 @@ fun _encode_utf8(cp: int64) -> string! {
         },
     }
     return error("invalid UTF-8 encoding")
+}
+
+fun _join(
+    parts: string[],
+    opening: string,
+    closing: string,
+    pretty: bool,
+) -> string {
+    if len(parts) == 0 {
+        return opening + closing
+    }
+    if pretty {
+        return opening +
+            "\n    " +
+            parts.join(",\n").replace("\n", "\n    ") +
+            "\n" +
+            closing
+    }
+    return opening + parts.join(",") + closing
+}
+
+/** Render the `pretty` JSON text: four-space indentation, one member or element
+ * per line, and inline empty objects/arrays. Number spelling matches `stringify`.
+ */
+fun JsonValue.debug(self) -> string {
+    return _render(self, true)
 }

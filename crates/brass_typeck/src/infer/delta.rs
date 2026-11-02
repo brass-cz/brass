@@ -3,6 +3,7 @@
 use super::*;
 
 mod channels;
+mod fields;
 mod numeric;
 mod reference;
 mod verify;
@@ -130,8 +131,8 @@ fn publish(
     state.typed_seen = checker.typed.expressions.len();
     // Per-instance seeds: an observation joins the per-instance agreement once
     // both its instance's argument types and its own type are known (the
-    // same pending discipline as the span-keyed scan above), and the spans
-    // the span-keyed seeds leave out are published per instance.
+    // same pending discipline as the span-keyed scan above). Observed agreement
+    // never grants a seed to an instance the checker has not seen.
     let pending: Vec<_> = dirty_instances
         .into_iter()
         .filter(|index| state.instance_pending.remove(index))
@@ -184,11 +185,7 @@ fn publish(
             }
             _ => {}
         }
-        // Shared agreement changes can expose instance readings accumulated
-        // earlier, even when this boundary observed no new instance value.
-        let seeds = state
-            .instance_agg
-            .seeds_at(&span, state.expr_flushed.contains_key(&span));
+        let seeds = state.instance_agg.seeds_at(&span);
         state.counters.instance_maps += usize::from(seeds.is_some());
         match seeds {
             Some(seeds) if state.instance_flushed.get(&span) != Some(&seeds) => {

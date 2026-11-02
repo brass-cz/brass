@@ -127,14 +127,23 @@ fn spawn_reachable_instances(program: &MonoProgram) -> Option<Vec<String>> {
                             program.lookup(&target)?;
                             queue.push(target);
                         }
-                        // `print`/`println` of a value rendering through a
-                        // USER `display` calls that instance.
-                        CallKind::Io(_) => {
-                            if let Some(inst) = arg_types.first().and_then(|ty| {
-                                display_instance(program, ty)
-                                    .or_else(|| nullable_display_instance(program, ty))
-                            }) {
-                                queue.push(inst.symbol.clone());
+                        // Implicit nested renderers are calls too; worker threads
+                        // must not enter an unmaterialized user method through glue.
+                        CallKind::Io(_) | CallKind::Builtin("to_string") => {
+                            let form = if matches!(callee, Callee::Method(name) if name == "debug")
+                            {
+                                crate::render::RenderForm::Debug
+                            } else {
+                                crate::render::RenderForm::Display
+                            };
+                            if let Some(ty) = arg_types.first() {
+                                for (receiver, method) in
+                                    crate::render::renderer_dependencies(program.hir, ty, form)
+                                {
+                                    let target = method_symbol(method, &[receiver]);
+                                    program.lookup(&target)?;
+                                    queue.push(target);
+                                }
                             }
                         }
                         _ => {}

@@ -1,0 +1,54 @@
+HttpClient { host: "example.com", port: 80 }
+HttpClient { host: "example.com", port: 80 }
+Box {
+    value: HttpClient { host: "example.com", port: 80 },
+}
+[HttpClient { host: "example.com", port: 80 }]
+{
+    "handle": HttpClient { host: "example.com", port: 80 }
+}
+HttpClient { host: "example.com", port: 443 }
+HttpClient { host: "example.com", port: 443 }
+Box {
+    value: HttpClient { host: "example.com", port: 443 },
+}
+[HttpClient { host: "example.com", port: 443 }]
+{
+    "handle": HttpClient { host: "example.com", port: 443 }
+}
+Tcp { .. }
+Tcp { .. }
+Box {
+    value: Tcp { .. },
+}
+[Tcp { .. }]
+{
+    "handle": Tcp { .. }
+}
+TcpListener { .. }
+TcpListener { .. }
+Box {
+    value: TcpListener { .. },
+}
+[TcpListener { .. }]
+{
+    "handle": TcpListener { .. }
+}
+Udp { .. }
+Udp { .. }
+Box {
+    value: Udp { .. },
+}
+[Udp { .. }]
+{
+    "handle": Udp { .. }
+}
+TlsStream { .. }
+TlsStream { .. }
+Box {
+    value: TlsStream { .. },
+}
+[TlsStream { .. }]
+{
+    "handle": TlsStream { .. }
+}

@@ -17,7 +17,7 @@ from2=bb@2
 ll 3 5
 2026/07 and 1999/01
 X and 1999-01-02
-[a, b, c]
+["a", "b", "c"]
 a\.b\*c
 true
 false

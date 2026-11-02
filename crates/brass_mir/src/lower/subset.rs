@@ -2,8 +2,8 @@
 
 use super::*;
 
-/// A partially lowered MIR program for the lazy pipeline. Methods and module
-/// initializers are lowered up front -- the checker settles every method body
+/// A partially lowered MIR program for the lazy pipeline. Selected methods and all module
+/// initializers are lowered up front -- the checker settles selected method bodies
 /// before its first body event, and execution runs every init -- while free
 /// functions are lowered one at a time as their checks stream in
 /// ([`SubsetLowering::add_function`]). Closure ids are allocated from one
@@ -24,7 +24,7 @@ pub struct SubsetLowering {
 }
 
 impl SubsetLowering {
-    /// Lower every method body and module initializer of `program` (with the
+    /// Lower eligible method bodies and every module initializer (with the
     /// channel state current at call time); no free function is lowered yet.
     /// `tables` are the shared HIR-derived tables ([`LowerTables`]), computed
     /// once by the caller and reused across rebuilds.
@@ -52,10 +52,9 @@ impl SubsetLowering {
         }
     }
 
-    /// Adopt the per-instance channels of `channels` (the checker's state
-    /// as of now) for the next monomorphization. Lowered bodies only name
-    /// their seed sites, so revised per-instance values need no re-lowering;
-    /// they only have to be current when an instance is typed.
+    /// Adopt the checker's per-instance channels for the next monomorphization.
+    /// Seeds and dispatch targets are read through their sites. Changed field-list
+    /// alternatives require rebuilding the affected bodies before this refresh.
     pub fn refresh_instance_channels(&mut self, channels: &CheckerChannels) {
         let mut changes = crate::ChangedInputs::since(self.changed_inputs.epoch);
         changes.epoch = changes
@@ -77,6 +76,7 @@ impl SubsetLowering {
     ) {
         self.mir.instance_seeds = channels.instance_seeds.clone();
         self.mir.instance_dispatch = channels.instance_dispatch.clone();
+        self.mir.instance_fields = channels.instance_fields.clone();
         self.mir.numeric_calls = channels.numeric_calls.clone();
         let reset = self.reset_inputs || changes.base_epoch != self.changed_inputs.epoch;
         self.changed_inputs = changes;
@@ -123,6 +123,12 @@ impl SubsetLowering {
         let Some(info) = program.functions.get(symbol) else {
             return false;
         };
+        if channels
+            .selected_bodies
+            .is_some_and(|spans| !spans.contains(&info.decl.span))
+        {
+            return false;
+        }
         let ctx = subset_ctx(program, tables, channels, self.next_closure);
         lower_function_into(&ctx, &mut self.mir, info);
         self.next_closure = ctx.next_closure.get();
@@ -151,6 +157,12 @@ impl SubsetLowering {
         let Some(info) = program.functions.get(symbol) else {
             return false;
         };
+        if channels
+            .selected_bodies
+            .is_some_and(|spans| !spans.contains(&info.decl.span))
+        {
+            return false;
+        }
         let Some(index) = self
             .mir
             .functions
@@ -184,6 +196,7 @@ mod tests {
         let program = Program::empty();
         let tables = LowerTables::new(&program);
         let channels = CheckerChannels {
+            selected_bodies: None,
             expr_types: &Default::default(),
             receiver_types: &Default::default(),
             receiver_owners: &Default::default(),
@@ -194,6 +207,7 @@ mod tests {
             call_locations: &Default::default(),
             lift_errs: &Default::default(),
             fields_loops: &Default::default(),
+            instance_fields: &Default::default(),
             type_names: &Default::default(),
             typeof_types: &Default::default(),
             null_props: &Default::default(),

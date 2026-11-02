@@ -236,11 +236,40 @@ impl Monomorphizer<'_, '_> {
             MirStmt::Eval(_) => {
                 Err("unsupported statement (non-call eval) on the typed backend".into())
             }
-            // `obj.field = v` / `arr[i] = v` stores: validated, no local type.
-            MirStmt::Store(place, _) => match place.proj.as_slice() {
-                [Projection::Field(_)] | [Projection::Index(_)] => Ok(()),
-                _ => Err("nested projection stores are unsupported on the typed backend".into()),
-            },
+            MirStmt::Store(place, value) => {
+                if !matches!(
+                    place.proj.as_slice(),
+                    [Projection::Field(_)] | [Projection::Index(_)]
+                ) {
+                    return Err(
+                        "nested projection stores are unsupported on the typed backend".into(),
+                    );
+                }
+                // A record literal stored into a generic field or element is
+                // constructed at that slot's instance, including nullable fields.
+                // Existing values keep their own type; only a fresh literal adapts.
+                if let Operand::Local(local) = value
+                    && let Some(actual_ty @ Type::Record(actual)) = &local_types[local.index()]
+                    && let Some(slot) = self.rvalue_type(
+                        &Rvalue::Load(place.clone()), cur_sym, module, local_types,
+                        cur_ret, fallible, None,
+                    )?
+                    && let Type::Record(want) = unwrap_nullable(&slot)
+                    && actual.id == want.id
+                    && actual != want
+                    // Preserve a literal's more complete nested substitution.
+                    // Narrowing it to the slot would discard information its
+                    // assignment restores on the next fixpoint round.
+                    && !is_refinement_of(unwrap_nullable(&slot), actual_ty)
+                    && body.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
+                        matches!(stmt, MirStmt::Assign(dest, Rvalue::Record { .. }) if dest == local)
+                    })
+                {
+                    local_types[local.index()] = Some(Type::Record(want.clone()));
+                    *changed = true;
+                }
+                Ok(())
+            }
             // A top-level `let g = v`: record the global's concrete type (from
             // its initializer) for reads elsewhere.
             MirStmt::SetGlobal(name, op) => {

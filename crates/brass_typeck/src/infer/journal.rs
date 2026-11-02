@@ -89,7 +89,11 @@ pub(super) enum ElaborationJournalEntry {
     LiteralNominal(Span, String),
     TypeOf(Span, Type),
     TypeTest(Span, Type),
-    FieldsLoop(Span, Vec<String>),
+    FieldsLoop {
+        span: Span,
+        fields: Vec<String>,
+        instance: Option<TagRef>,
+    },
     ViewArg(Span),
     /// A reflective call at `span`: (receiver symbol, method, key), and the
     /// instance it was made in (see the `Typed` entry's `instance`).
@@ -636,6 +640,7 @@ impl Checker<'_> {
                     | ElaborationJournalEntry::TypeOf(..)
                     | ElaborationJournalEntry::TypeTest(..)
                     | ElaborationJournalEntry::KeyedCall { .. }
+                    | ElaborationJournalEntry::FieldsLoop { .. }
                     | ElaborationJournalEntry::NumericCall { .. }
                     | ElaborationJournalEntry::InstanceReturn(..)
                     | ElaborationJournalEntry::ClosureBinding(..)
@@ -644,6 +649,7 @@ impl Checker<'_> {
                 let mut observation = substitute_journal_entry(observation, &substitution);
                 if let ElaborationJournalEntry::Typed { instance, .. }
                 | ElaborationJournalEntry::KeyedCall { instance, .. }
+                | ElaborationJournalEntry::FieldsLoop { instance, .. }
                 | ElaborationJournalEntry::NumericCall { instance, .. } = &mut observation
                     && let Some(tag) = instance
                 {
@@ -759,6 +765,15 @@ impl Checker<'_> {
             ElaborationJournalEntry::TypeTest(span, ty) => {
                 ElaborationJournalEntry::TypeTest(span, self.memo_skeleton_type(&ty, skeleton))
             }
+            ElaborationJournalEntry::FieldsLoop {
+                span,
+                fields,
+                instance,
+            } => ElaborationJournalEntry::FieldsLoop {
+                span,
+                fields,
+                instance: instance.map(|tag| self.memo_skeleton_tag(&tag, skeleton)),
+            },
             ElaborationJournalEntry::KeyedCall {
                 span,
                 receiver,
@@ -836,8 +851,12 @@ impl Checker<'_> {
             }
             ElaborationJournalEntry::TypeOf(span, ty) => self.record_typeof_type(*span, ty),
             ElaborationJournalEntry::TypeTest(span, ty) => self.record_type_test(*span, ty),
-            ElaborationJournalEntry::FieldsLoop(span, fields) => {
-                self.record_fields_loop(*span, fields.clone());
+            ElaborationJournalEntry::FieldsLoop {
+                span,
+                fields,
+                instance,
+            } => {
+                self.record_fields_loop_in(*span, fields.clone(), instance.clone());
             }
             ElaborationJournalEntry::NumericCall { span, ty, instance } => {
                 self.record_numeric_call(*span, ty.clone(), instance.clone());
@@ -1020,29 +1039,7 @@ impl Checker<'_> {
         }
     }
 
-    /// Record the field list a `fields(..)` loop at `span` expands to. A
-    /// different list than an earlier instantiation's is an error, and
-    /// `false` is returned.
-    pub(super) fn record_fields_loop(&mut self, span: Span, fields: Vec<String>) -> bool {
-        self.journal_elaboration(ElaborationJournalEntry::FieldsLoop(span, fields.clone()));
-        if let Some(prev) = self.fields_loops.get(&span)
-            && prev != &fields
-        {
-            self.errors.push(TypeError {
-                message: "`fields(..)` expands different field sets across instantiations \
-                          of this generic function (annotate the operand to fix it)"
-                    .to_string(),
-                span,
-            });
-            return false;
-        }
-        self.channel_changes
-            .get_mut()
-            .mark(channel_changes::Channel::FieldsLoop, span);
-        self.fields_loops.insert(span, fields);
-        true
-    }
-
+    /// Record a call argument requiring a structural view.
     pub(super) fn record_view_arg(&mut self, span: Span) {
         self.journal_elaboration(ElaborationJournalEntry::ViewArg(span));
         self.channel_changes
@@ -1265,6 +1262,36 @@ mod tests {
         parent.extend(&child);
         parent.extend(&child);
         assert_eq!(parent.shapes.len(), 2);
+    }
+
+    #[test]
+    fn fields_memo_replays_the_nested_instance_tag() {
+        let program = Program::empty();
+        let mut checker =
+            Checker::new(&program, Rc::new(brass_typesys::RowInfo::analyze(&program)));
+        let span = Span::new(3, 4);
+        let tag = checker.intern_tag(
+            brass_hir::InstanceCallable::Function("child".into()),
+            &[Type::Str],
+        );
+        checker.begin_elaboration_journal();
+        checker.record_fields_loop_in(span, vec!["name".into()], Some(tag.clone()));
+        let frame = checker.finish_elaboration_journal();
+        let context = concrete_context();
+        let memo = checker
+            .build_elaboration_memo_entry(&Type::Bool, frame, &context)
+            .unwrap();
+        checker.fields_loops.clear();
+        checker.fields_observations.clear();
+        checker.enter_instance(
+            brass_hir::InstanceCallable::Function("parent".into()),
+            &[Type::Bool],
+        );
+        checker.replay_elaboration_memo_entry(&memo, &context);
+        checker.leave_instance();
+        // A conflicting reading belongs to child, not the parent active during replay.
+        assert!(!checker.record_fields_loop_in(span, vec!["other".into()], Some(tag)));
+        assert_eq!(checker.errors.len(), 1);
     }
 
     #[test]

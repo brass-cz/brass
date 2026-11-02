@@ -1,4 +1,4 @@
 read after close errs
-addr after close: [<plugin:std.libnet>:65:12] unhandled error: socket is closed
-accept after close: [<plugin:std.libnet>:27:12] unhandled error: socket is closed
+addr after close: [<plugin:std.libnet>:65:12] error: socket is closed
+accept after close: [<plugin:std.libnet>:27:12] error: socket is closed
 done

@@ -379,6 +379,7 @@ mod tests {
             let source = format!("fun main() {{ let f = (x) -> x; f = (x) -> x; {suffix} }}");
             let ast = brass_parser::parse(&source.replace(';', "\n")).expect("parse");
             let (program, errors) = brass_hir::lower(&[brass_hir::LoadedModule {
+                source: None,
                 is_prelude: false,
                 path: vec!["main".into()],
                 ast,
@@ -394,6 +395,7 @@ mod tests {
             brass_parser::parse("fun main() { let g = (x) -> { return 1 }\nf(1)\nf(2147483648) }")
                 .unwrap();
         let (program, _) = brass_hir::lower(&[brass_hir::LoadedModule {
+            source: None,
             is_prelude: false,
             path: vec!["main".into()],
             ast,

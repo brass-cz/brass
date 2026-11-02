@@ -1,19 +1,31 @@
 // @backends: all
+import std.collections.{ HashMap }
+
 // The built-in rendering of a record or variant shows a string field in the
 // string's own debug form: quoted and escaped exactly as `"..".debug()`
 // writes it (quotes, backslashes and control characters escaped), so a field
 // value can never be confused with the surrounding structure. A present
 // nullable string field is quoted the same way; `null` stays bare. A map's
 // display form quotes its keys and values the same way. Array elements,
-// also inside a record field, render unquoted.
-type P = { x: int32, s: string, n: string?, missing: string?, arr: string[] }
+// also inside a record field, are quoted and escaped.
+type P = {
+    x: int32
+    s: string
+    n: string?
+    missing: string?
+    arr: string[]
+}
 
-type S =
-    | A { v: string }
-    | B
+type S = A { v: string } | B
 
 fun main() {
-    const p = P { x: 1, s: "q\"t\n", n: "a\\b", missing: null, arr: ["a\"", "b"] }
+    const p = P {
+        x: 1,
+        s: "q\"t\n",
+        n: "a\\b",
+        missing: null,
+        arr: ["a\"", "b"],
+    }
     println(p)
     println("{p}")
     println(p.debug())

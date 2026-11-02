@@ -11,6 +11,10 @@ use super::*;
 /// of being re-derived, which is where a library-heavy program spends almost
 /// all of its inference time.
 ///
+/// An item-selective seed instead certifies only the work listed in `items`;
+/// its consumer completes uncovered preparation and retains ordinary body work.
+/// It never grants whole-module coverage.
+///
 /// The tables are span-free by construction (keyed by symbol or
 /// module path), so they survive the entry file changing size. Inference
 /// VARIABLE ids are not portable -- a consuming run mints its own -- so
@@ -24,6 +28,8 @@ use super::*;
 pub struct ContextTables {
     /// The seed satisfied all numeric demands without negotiation.
     pub ordinary_numeric: bool,
+    /// Explicit item/shared coverage; partial preparation never covers a module.
+    pub items: Option<crate::reachability::AnalysisView>,
     pub schemes: HashMap<String, TypeScheme>,
     pub function_returns: HashMap<String, Type>,
     pub method_returns: HashMap<(String, String), Type>,
@@ -39,7 +45,8 @@ pub struct ContextTables {
     /// The module paths these tables cover. `None` means the whole context
     /// (every module but the entry) -- the full-seed case. `Some` marks a
     /// PARTIAL seed (see [`ContextTables::retain_modules`]): only the listed
-    /// modules skip their passes; the rest re-analyze against the seed.
+    /// modules skip their passes; the rest re-analyze against the seed. An item
+    /// seed never grants this module-level coverage.
     pub covered: Option<HashSet<Vec<String>>>,
     /// The program-wide storage symbols and nominal IDs these tables were
     /// built against. Both can change when an otherwise unrelated module
@@ -72,10 +79,39 @@ impl ContextProgramIdentity {
 }
 
 impl ContextTables {
+    /// Item seeds require the same storage symbols and nominal identities in
+    /// the consuming catalog. New declarations may be appended, not renumber old ones.
+    pub(crate) fn item_identity_matches(&self, program: &Program) -> bool {
+        self.items.is_none()
+            || (self
+                .program_identity
+                .functions
+                .iter()
+                .all(|(symbol, module)| {
+                    program
+                        .functions
+                        .get(symbol)
+                        .is_some_and(|f| &f.module == module)
+                })
+                && self
+                    .program_identity
+                    .types
+                    .iter()
+                    .all(|(symbol, (module, id))| {
+                        program
+                            .types
+                            .get(symbol)
+                            .is_some_and(|t| &t.module == module && &t.id == id)
+                    }))
+    }
+
     /// Whether this seed covers `module`, whose per-item passes a seeded run
     /// then skips: every module but the entry (`main`) for a full seed, the
     /// listed ones for a partial seed.
     pub(crate) fn covers_module(&self, module: &[String]) -> bool {
+        if self.items.is_some() {
+            return false;
+        }
         match &self.covered {
             Some(covered) => covered.contains(module),
             None => !matches!(module, [name] if name == "main"),
@@ -122,6 +158,7 @@ impl ContextTables {
         let re = |t: &Type| brass_hir::substitute_vars(t, &subst);
         let out = ContextTables {
             ordinary_numeric: self.ordinary_numeric,
+            items: self.items.clone(),
             schemes: self
                 .schemes
                 .iter()
@@ -221,6 +258,9 @@ impl ContextTables {
         self.co_method_returns.retain(|(ty, _), _| ty_kept(ty));
         self.method_return_props.retain(|(ty, _)| ty_kept(ty));
         self.global_defs.retain(|module, _| keep.contains(module));
+        if let Some(items) = &mut self.items {
+            items.retain(program, &keep);
+        }
         self.covered = Some(keep);
         true
     }
@@ -233,6 +273,7 @@ impl Checker<'_> {
     pub(super) fn apply_seed(&mut self, seed: ContextTables, next_var: u32) -> AppliedSeedMetadata {
         let ContextTables {
             ordinary_numeric,
+            items,
             schemes,
             function_returns,
             method_returns,
@@ -250,6 +291,10 @@ impl Checker<'_> {
         let method_return_prop_keys = method_return_props.clone();
         let co_method_return_keys = co_method_returns.keys().cloned().collect();
         let global_def_keys = global_defs.keys().cloned().collect();
+        // Coverage belongs to the producer's storage keys as well as its source
+        // IDs. A generated method can share its template's span; projecting a
+        // source certificate onto that new key would falsely cover its return.
+        self.item_seed = items.map(Rc::new);
         self.numeric_seed_ordinary = ordinary_numeric;
         self.schemes = schemes;
         self.observe_scheme_install();
@@ -261,6 +306,7 @@ impl Checker<'_> {
         self.seeded_set = covered;
         self.next_unknown = self.next_unknown.max(next_var);
         self.entry_only = true;
+        self.assert_item_seed(self.program);
         AppliedSeedMetadata {
             next_var: table_next_var,
             bare_names,
@@ -294,6 +340,7 @@ impl Checker<'_> {
 
         ContextTables {
             ordinary_numeric: self.numeric_seed_ordinary,
+            items: self.item_seed.take().map(|v| (*v).clone()),
             schemes: std::mem::take(&mut self.schemes),
             function_returns: std::mem::take(&mut self.function_returns),
             method_returns: std::mem::take(&mut self.method_returns),
@@ -312,7 +359,7 @@ impl Checker<'_> {
     /// seed's own module list for a partial one (an incremental context
     /// rebuild -- the uncovered modules get real passes here).
     pub(super) fn seeded_module(&self, module: &[String]) -> bool {
-        if !self.entry_only {
+        if !self.entry_only || self.item_seed.is_some() {
             return false;
         }
         match &self.seeded_set {

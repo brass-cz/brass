@@ -1,0 +1,72 @@
+// @backends: all
+// Display is top-level text; every builtin child uses effective debug.
+type Token = {
+    value: int32
+}
+fun Token.display(self) -> string {
+    return "human {self.value}"
+}
+fun Token.debug(self) -> string {
+    return "token({self.value})"
+}
+type OnlyDebug = {
+    value: int32
+}
+fun OnlyDebug.debug(self) -> string {
+    return "only({self.value})"
+}
+type Holder = {
+    item: Token
+    optional: Token?
+    text: string?
+    _hidden: string
+}
+type Choice = Empty | Item { value: Token }
+fun optional(present: bool) -> Token? {
+    if present {
+        return Token { value: 5 }
+    }
+    return null
+}
+fun main() {
+    const value = Token { value: 1 }
+    println(value)
+    println("{value}")
+    println(value.debug())
+    const only = OnlyDebug { value: 2 }
+    println(only)
+    println("{only}")
+    println(string.from(only))
+    println([value])
+    const fixed: Token[2] = [value, Token { value: 3 }]
+    println(fixed)
+    println(fixed.slice(0, 2))
+    println([value, "a, b", "", true])
+    println(
+        Holder {
+            item: value,
+            optional: optional(true),
+            text: "quoted",
+            _hidden: "visible",
+        },
+    )
+    println(
+        Holder {
+            item: value,
+            optional: optional(false),
+            text: null,
+            _hidden: "visible",
+        },
+    )
+    println(Choice.Item { value })
+    println(optional(true))
+    println(optional(false))
+    println([optional(true), optional(false)])
+    println(["a, b", "c", "", "quote\"", "line\n"])
+    println([["a", "b"], ["c", "d"]])
+    const words: string[3] = ["a, b", "c", ""]
+    println(words)
+    println(words.slice(0, 3))
+    const empty: string[] = []
+    println(empty)
+}

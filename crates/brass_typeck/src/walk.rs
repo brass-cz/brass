@@ -27,7 +27,7 @@ pub(crate) fn walk_program_exprs_in(
     v: &mut impl ExprVisitor,
 ) {
     for f in program.functions.values() {
-        if !modules.checks(&f.module) {
+        if !modules.checks(&f.module) || !modules.checks_body(f.decl.span) {
             continue;
         }
         v.enter_module(&f.module);
@@ -41,6 +41,9 @@ pub(crate) fn walk_program_exprs_in(
         match &t.kind {
             TypeKind::Record { methods, .. } => {
                 for m in methods.values() {
+                    if !modules.checks_body(m.decl.span) {
+                        continue;
+                    }
                     if let Some(b) = &m.decl.body {
                         walk_block(b, v);
                     }
@@ -49,6 +52,9 @@ pub(crate) fn walk_program_exprs_in(
             TypeKind::Sum { variants } => {
                 for vi in variants {
                     for m in vi.methods.values() {
+                        if !modules.checks_body(m.decl.span) {
+                            continue;
+                        }
                         if let Some(b) = &m.decl.body {
                             walk_block(b, v);
                         }

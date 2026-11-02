@@ -66,7 +66,7 @@ pub fn monomorphize<'m>(
                 // "outside the typed subset" -- surface it in the debug trace,
                 // and keep `main`'s reason for the driver's error message.
                 tracing::debug!(root = %f.symbol, error = %e, "skipping untypeable root");
-                if f.symbol == "main" {
+                if program.entry_function() == Some(f.symbol.as_str()) {
                     main_skip = Some(e);
                 }
             }
@@ -213,15 +213,15 @@ pub(super) fn entry_roots<'m>(
         }
     }
     let mut main_skip = None;
-    if mir.functions.iter().any(|f| f.symbol == "main") || program.functions.contains_key("main") {
+    if let Some(entry) = program.entry_function() {
         let watermark = mono.missing_demands.borrow().len();
-        match mono.function_root("main", Vec::new()) {
+        match mono.function_root(entry, Vec::new()) {
             Ok(_) => mono.missing_demands.borrow_mut().truncate(watermark),
             Err(e) => {
                 // Only a miss-free failure is a genuine skip; a failure with
                 // missing bodies is retried once they land.
                 if mono.missing_demands.borrow().len() == watermark {
-                    tracing::debug!(root = "main", error = %e, "skipping untypeable entry");
+                    tracing::debug!(root = entry, error = %e, "skipping untypeable entry");
                     main_skip = Some(e);
                 }
             }

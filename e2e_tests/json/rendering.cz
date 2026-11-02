@@ -1,0 +1,31 @@
+// @backends: all
+import std.data.json.JsonValue
+import std.collections.HashMap
+
+type Box = {
+    value: JsonValue
+}
+// Debug shares pretty's layout and number spelling, including empty containers.
+fun main() {
+    for source in [
+        "null",
+        "true",
+        "2",
+        "\"two\"",
+        "[]",
+        "\{}",
+        "[1, \"two\"]",
+        "\{\"n\": 2, \"child\": \{\"ok\": true}}",
+    ] {
+        let value = JsonValue.parse(source)!
+        println(value)
+        println(value.debug())
+        println(value.debug() == value.pretty())
+    }
+    let value = JsonValue.parse("\{\"items\": [1, \"two\"]}")!
+    println(Box { value })
+    println([value])
+    let map = HashMap.new()
+    map.set("document", value)
+    println(map)
+}

@@ -74,8 +74,8 @@ pub(crate) struct InstanceTyped {
 
 impl Checker<'_> {
     /// The instance the innermost active elaboration checks, if any: `None`
-    /// in a dedicated body pass (a declaration checked at its own parameter
-    /// types) and in module initializers.
+    /// in module initializers and shared preparation. Dedicated function passes
+    /// carry their declaration frame; call-site elaborations carry their inputs.
     pub(super) fn current_instance(&self) -> Option<TagRef> {
         self.instance_stack.last().cloned()
     }

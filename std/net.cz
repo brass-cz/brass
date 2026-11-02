@@ -219,3 +219,23 @@ fun TlsStream.write(self, data: uint8[]) -> int64! {
 fun TlsStream.close(self) {
     tls_close(self._handle)!
 }
+
+/** Render `Tcp { .. }` without querying addresses or exposing native handles. */
+fun Tcp.debug(self) -> string {
+    return "Tcp \{ .. }"
+}
+
+/** Render `TcpListener { .. }` without querying addresses or exposing native handles. */
+fun TcpListener.debug(self) -> string {
+    return "TcpListener \{ .. }"
+}
+
+/** Render `Udp { .. }` without querying addresses or exposing native handles. */
+fun Udp.debug(self) -> string {
+    return "Udp \{ .. }"
+}
+
+/** Render `TlsStream { .. }` without querying addresses or exposing native handles. */
+fun TlsStream.debug(self) -> string {
+    return "TlsStream \{ .. }"
+}

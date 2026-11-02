@@ -2,6 +2,7 @@ use brass_hir::{IntKind, LoadedModule, Type, TypedExprKind};
 
 fn program(source: &str) -> brass_hir::Program {
     let (program, errors) = brass_hir::lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["main".into()],
         ast: brass_parser::parse(source).expect("parse"),
@@ -128,12 +129,8 @@ fn typed_instances_remove_a_numeric_only_shared_storage_seed() {
         .span;
     let shared = crate::stream::aggregate_result_types(&result.typed, &program);
     assert!(!shared.contains_key(&span));
-    let seeds = crate::stream::aggregate_instance_seeds(
-        &result.instance_typed,
-        &result.typed,
-        &shared,
-        &program,
-    );
+    let seeds =
+        crate::stream::aggregate_instance_seeds(&result.instance_typed, &result.typed, &program);
     let types = &seeds[&span];
     assert!(!types.keys().any(|key| key.args == [Type::Str]));
     assert!(types.values().any(|ty| *ty == Type::Int(IntKind::I64)));
@@ -357,6 +354,7 @@ fn method_seed_certificate_requires_fixed_receiver_and_parameter_types() {
     use std::rc::Rc;
 
     let (program, errors) = brass_hir::lower(&[LoadedModule {
+        source: None,
         is_prelude: false,
         path: vec!["library".into()],
         ast: brass_parser::parse("type Fixed = { value: int64 }\nfun Fixed.make(v: int64) { return Self { value: v } }\nfun Fixed.read(self, i: int64) { return self.value + i }\ntype Open = { value }\nfun Open.make(v: int64) { return Self { value: v } }\n").unwrap(),

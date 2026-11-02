@@ -1,0 +1,32 @@
+// @backends: all
+// Each instance owns its field expansion, including recursive child records.
+type Name = {
+    first: string
+    last: string
+}
+type Person = {
+    name: Name
+    age: int32
+}
+type Switch = {
+    enabled: bool
+}
+
+fun walk(value) {
+    if value: anonymous {  } {
+        for field in fields(value) {
+            println(field)
+            walk(value[field])
+        }
+    } else {
+        println(value)
+    }
+}
+
+fun main() {
+    walk(Person { name: Name { first: "Aki", last: "N" }, age: 30 })
+    walk(Switch { enabled: true })
+    // Repeat both shapes to exercise replay of the same loop observations.
+    walk(Switch { enabled: false })
+    walk(Name { first: "Bo", last: "M" })
+}

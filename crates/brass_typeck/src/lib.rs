@@ -34,6 +34,7 @@ pub mod globals;
 pub mod infer;
 pub mod interface;
 pub mod narrow;
+pub mod reachability;
 pub mod stream;
 pub mod structural;
 mod taint;
@@ -57,6 +58,17 @@ use brass_parser::ast::*;
 pub struct TypeError {
     pub message: String,
     pub span: Span,
+}
+
+impl TypeError {
+    /// Attribute a body-pass diagnostic through an explicitly constructed
+    /// ownership index. Declaration-pass errors remain catalog diagnostics.
+    pub fn body_owner(
+        &self,
+        owners: &brass_hir::diagnostics::DiagnosticOwners,
+    ) -> brass_hir::diagnostics::DiagnosticOwner {
+        owners.body_owner(self.span)
+    }
 }
 
 /// Delimits a source-offset placeholder inside a diagnostic message.
@@ -128,8 +140,8 @@ pub struct Analysis {
     pub typed: TypedProgram,
     /// The aggregate-seed observations of `typed` made while elaborating a
     /// callable instance, attributed to it: the source of the per-instance
-    /// seeds ([`stream::aggregate_instance_seeds`]) of the spans whose
-    /// instances disagree.
+    /// seeds ([`stream::aggregate_instance_seeds`]), including spans whose
+    /// observed instances agree.
     pub instance_typed: stream::InstanceObservations,
     /// Per record-type generalized scheme (inferred type parameters and the
     /// field/method signatures over them), keyed by the type's storage symbol. The
@@ -179,7 +191,10 @@ pub struct Analysis {
     /// Field lists of checker-approved `for f in fields(x)` loops, keyed by the
     /// loop statement's span; MIR lowering unrolls the same expanded copies the
     /// checker typed (see `brass_hir::expand`).
+    /// A divergent span retains a representative here; `instance_fields` owns its selections.
     pub fields_loops: fxhash::FxHashMap<Span, Vec<String>>,
+    /// Checked field lists for loops that differ between callable instances.
+    pub instance_fields: brass_hir::InstanceChannel<Vec<String>>,
     /// Type symbols resolved for expressions, keyed by span: the type a
     /// `typeof(v).method(..)` static call names (keyed by the inner
     /// `typeof(v)`), and the declared record an anonymous record literal or a
@@ -222,15 +237,24 @@ pub use infer::ContextTables;
 #[derive(Clone, Copy)]
 pub(crate) struct AnalysisModules<'a> {
     seed: Option<&'a ContextTables>,
+    view: Option<&'a reachability::AnalysisView>,
 }
 
 impl<'a> AnalysisModules<'a> {
     fn new(seed: Option<&'a ContextTables>) -> Self {
-        Self { seed }
+        Self { seed, view: None }
     }
 
     fn all() -> Self {
-        Self { seed: None }
+        Self {
+            seed: None,
+            view: None,
+        }
+    }
+
+    /// Whether this source body is requested; declarations are never pruned.
+    pub(crate) fn checks_body(self, span: Span) -> bool {
+        self.view.is_none_or(|view| view.selects_body(span))
     }
 
     /// Whether the per-item passes check `module`.
@@ -270,7 +294,7 @@ pub fn analyze(program: &Program) -> Analysis {
 /// context also defines: the collision qualifies the context's storage symbols
 /// in the combined program, detaching every seeded table key.
 pub fn analyze_with(program: &Program, seed: Option<&ContextTables>) -> Analysis {
-    analyze_impl(program, seed, None)
+    analyze_impl(program, seed, None, None)
 }
 
 /// Continue a completed analysis by checking only the methods the driver
@@ -301,6 +325,7 @@ pub fn analyze_generated(
         sum_views: infer.sum_views,
         lift_errs: infer.lift_errs,
         fields_loops: infer.fields_loops,
+        instance_fields: infer.instance_fields,
         type_names: infer.type_names,
         keyed_calls: infer.keyed_calls,
         numeric_calls: infer.numeric_calls,
@@ -327,25 +352,44 @@ pub fn analyze_streaming(
     seed: Option<&ContextTables>,
     sched: &mut dyn stream::Scheduler,
 ) -> Analysis {
-    analyze_impl(program, seed, Some(sched))
+    analyze_impl(program, seed, Some(sched), None)
 }
 
-fn analyze_impl(
+/// Stream selected body work while preserving the complete declaration catalog.
+/// Selection growth is published independently of real body checks and batch seals.
+pub fn analyze_streaming_selected(
     program: &Program,
     seed: Option<&ContextTables>,
-    sched: Option<&mut dyn stream::Scheduler>,
+    sched: &mut dyn stream::Scheduler,
+    view: &reachability::AnalysisView,
 ) -> Analysis {
-    let entry_declares =
-        |name: &str| {
-            program.functions.values().any(|f| {
-                matches!(f.module.as_slice(), [m] if m == "main") && f.signature.name == name
-            }) || program
-                .types
-                .values()
-                .any(|t| matches!(t.module.as_slice(), [m] if m == "main") && t.name == name)
-        };
-    let seed = seed.filter(|s| !s.bare_names.iter().any(|name| entry_declares(name)));
-    let modules = AnalysisModules::new(seed);
+    analyze_impl(program, seed, Some(sched), Some(view))
+}
+
+/// Prepare a selected context without claiming ordinary dedicated-body coverage.
+/// The caller projects selection from the combined catalog; entry analysis must
+/// complete uncovered preparation before running its ordinary body schedule.
+pub fn prepare_context(program: &Program, view: &reachability::AnalysisView) -> Analysis {
+    let mut view = view.clone();
+    view.preparation_only = true;
+    analyze_impl(program, None, None, Some(&view))
+}
+
+/// Check selected bodies against the complete declaration catalog. Coverage in
+/// the seed is reused per item; omitted dependencies never cover a whole module.
+pub fn analyze_selected(
+    program: &Program,
+    seed: Option<&ContextTables>,
+    view: &reachability::AnalysisView,
+) -> Analysis {
+    analyze_impl(program, seed, None, Some(view))
+}
+
+/// Run body-filtered declaration facts and the const-call sidecar together.
+fn static_checks(
+    program: &Program,
+    modules: AnalysisModules<'_>,
+) -> (Vec<TypeError>, constck::ConstCalls) {
     let mut errors = Vec::new();
     errors.extend(resolve_annotations(program, modules));
     errors.extend(check_constructions(program, modules));
@@ -357,6 +401,29 @@ fn analyze_impl(
     errors.extend(check_result_shadows(program, modules));
     let (const_errors, const_calls) = constck::check_in(program, modules);
     errors.extend(const_errors);
+    (errors, const_calls)
+}
+
+fn analyze_impl(
+    program: &Program,
+    seed: Option<&ContextTables>,
+    sched: Option<&mut dyn stream::Scheduler>,
+    view: Option<&reachability::AnalysisView>,
+) -> Analysis {
+    let entry_declares =
+        |name: &str| {
+            program.functions.values().any(|f| {
+                matches!(f.module.as_slice(), [m] if m == "main") && f.signature.name == name
+            }) || program
+                .types
+                .values()
+                .any(|t| matches!(t.module.as_slice(), [m] if m == "main") && t.name == name)
+        };
+    let seed = seed.filter(|s| {
+        s.item_identity_matches(program) && !s.bare_names.iter().any(|name| entry_declares(name))
+    });
+    let modules = AnalysisModules { seed, view };
+    let (mut errors, const_calls) = static_checks(program, modules);
     tracing::debug!(
         errors = errors.len(),
         "errors after the declaration-level passes"
@@ -371,12 +438,37 @@ fn analyze_impl(
         ctl.sched
             .emit(stream::CheckEvent::StaticChecked(errors.clone()));
     }
-    let (infer, final_delta, cleanup) =
-        infer::analyze_inner(program, seed, ctl.as_mut(), std::rc::Rc::new(const_calls));
+    let (infer, final_delta, cleanup) = infer::analyze_inner(
+        program,
+        seed,
+        ctl.as_mut(),
+        std::rc::Rc::new(const_calls),
+        view,
+    );
+    // An observed return read can extend an intentionally conservative request.
+    // Re-run static facts against that larger request before publishing a verdict;
+    // const-call facts must be available during inference, not filtered afterward.
+    if ctl.is_none()
+        && let (Some(request), Some(completed)) = (view, infer.context_tables.items.as_ref())
+        && completed
+            .selection
+            .body_roots
+            .iter()
+            .any(|id| !request.selection.body_roots.contains(id))
+    {
+        let mut expanded = request.clone();
+        expanded.set_selection(completed.selection.clone());
+        drop(cleanup);
+        return analyze_impl(program, seed, None, Some(&expanded));
+    }
     // Exhaustiveness depends on the scrutinee's inferred nominal id. Running it
     // after inference prevents a same-named variant in another sum from being
     // mistaken for the match's owner.
-    errors.extend(exhaustive::check_in(program, &infer.typed, modules));
+    let final_modules = AnalysisModules {
+        seed,
+        view: infer.context_tables.items.as_ref().or(view),
+    };
+    errors.extend(exhaustive::check_in(program, &infer.typed, final_modules));
     errors.extend(infer.errors);
     // Message is the secondary key so identical diagnostics from re-checked
     // bodies (per-instance re-elaboration, expanded fields-loop copies) land
@@ -405,6 +497,7 @@ fn analyze_impl(
         sum_views: infer.sum_views,
         lift_errs: infer.lift_errs,
         fields_loops: infer.fields_loops,
+        instance_fields: infer.instance_fields,
         type_names: infer.type_names,
         keyed_calls: infer.keyed_calls,
         numeric_calls: infer.numeric_calls,
@@ -649,7 +742,7 @@ fn resolve_annotations(program: &Program, modules: AnalysisModules<'_>) -> Vec<T
                     }
                 }
                 for m in methods.values() {
-                    collect_method(m, &mut local);
+                    collect_method(m, modules.checks_body(m.decl.span), &mut local);
                 }
             }
             TypeKind::Sum { variants } => {
@@ -660,7 +753,7 @@ fn resolve_annotations(program: &Program, modules: AnalysisModules<'_>) -> Vec<T
                         }
                     }
                     for m in v.methods.values() {
-                        collect_method(m, &mut local);
+                        collect_method(m, modules.checks_body(m.decl.span), &mut local);
                     }
                 }
             }
@@ -680,7 +773,9 @@ fn resolve_annotations(program: &Program, modules: AnalysisModules<'_>) -> Vec<T
         if let Some(r) = &f.signature.ret {
             local.push(r.clone());
         }
-        collect_block(&f.decl.body, &mut local);
+        if modules.checks_body(f.decl.span) {
+            collect_block(&f.decl.body, &mut local);
+        }
         push_decl(&f.module, local, &mut tes);
     }
     for init in &program.inits {
@@ -735,7 +830,7 @@ fn mentions_decl_only_syntax(te: &TypeExpr) -> bool {
     }
 }
 
-fn collect_method(m: &MethodInfo, out: &mut Vec<TypeExpr>) {
+fn collect_method(m: &MethodInfo, selected: bool, out: &mut Vec<TypeExpr>) {
     for p in &m.signature.params {
         if let Some(t) = &p.ty {
             out.push(t.clone());
@@ -744,7 +839,7 @@ fn collect_method(m: &MethodInfo, out: &mut Vec<TypeExpr>) {
     if let Some(r) = &m.signature.ret {
         out.push(r.clone());
     }
-    if let Some(b) = &m.decl.body {
+    if selected && let Some(b) = &m.decl.body {
         collect_block(b, out);
     }
 }

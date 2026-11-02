@@ -1,7 +1,7 @@
 // @backends: all
 // Strings inside containers render the same on every back end, present
-// nullable strings exactly like plain ones: array and tuple elements unquoted
-// (`[a, null]`, as for a `string[]`), record and variant fields quoted
+// nullable strings exactly like plain ones: array and tuple elements quoted
+// (`["a", null]`, as for a `string[]`), record and variant fields quoted
 // (`s: "q"`), with `null` for an absent value in either position.
 
 type R = {
@@ -9,8 +9,7 @@ type R = {
     xs: string?[]
 }
 
-type S =
-    | V { s: string? }
+type S = | V { s: string? }
 
 fun main() {
     let xs: string?[] = ["a", null]

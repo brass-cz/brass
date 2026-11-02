@@ -46,6 +46,7 @@ mod equality;
 mod lowering;
 mod memory;
 mod render;
+mod return_cleanup;
 mod session;
 
 /// A typed stack slot for one MIR local on the `brass_engine::Codegen` path:
@@ -173,23 +174,6 @@ fn is_traced(ty: &Type) -> bool {
     is_managed_heap(ty) || matches!(ty, Type::Nullable(_))
 }
 
-/// Whether [`LlvmCodegen::to_string`] returns a caller-owned temporary for this
-/// exact type. String identities are borrowed and opaque fallbacks are interned.
-fn rendered_string_is_owned(ty: &Type) -> bool {
-    matches!(
-        ty,
-        Type::Bool
-            | Type::Int(_)
-            | Type::Float(_)
-            | Type::Nullable(_)
-            | Type::Slice(_)
-            | Type::Array(..)
-            | Type::Tuple(_)
-            | Type::Record(_)
-            | Type::Sum(_)
-    )
-}
-
 /// The per-program and per-body state of the `brass_engine::Codegen`
 /// implementation, populated as [`LlvmCodegen`] emits each monomorphized
 /// instance.
@@ -197,6 +181,10 @@ fn rendered_string_is_owned(ty: &Type) -> bool {
 struct MirState<'ctx> {
     /// Typed storage per MIR `LocalId`; `None` for a `void` local.
     locals: Vec<Option<MirSlot<'ctx>>>,
+    /// One ordered cleanup chain and its return-site continuations, if needed.
+    return_cleanup: Option<return_cleanup::ReturnCleanup<'ctx>>,
+    /// Single-return bodies keep direct releases without an extra dispatch.
+    share_return_cleanup: bool,
     /// The LLVM block for each MIR `BlockId` of the current body.
     blocks: Vec<BasicBlock<'ctx>>,
     /// Typed module-level globals, declared in `begin_program`.
@@ -221,7 +209,8 @@ struct MirState<'ctx> {
     defined: HashMap<String, bool>,
     /// Helpers reserved by earlier batches, including units still pending in ORC.
     helpers: Rc<HashSet<String>>,
-    lazy_has_main: bool,
+    /// Concrete entry symbol selected by the lowered program.
+    entry_symbol: Option<String>,
     /// Instance symbols whose modules must be materialized before execution:
     /// code a spawned worker thread may enter. Workers cannot run the Rust
     /// materializer (it lives on the main thread), so their whole statically

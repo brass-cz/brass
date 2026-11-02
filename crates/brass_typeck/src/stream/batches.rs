@@ -49,7 +49,9 @@ impl Scheduler for Recorder {
 
 fn delta(event: &CheckEvent) -> Option<&ChannelDelta> {
     match event {
-        CheckEvent::StaticChecked(_) | CheckEvent::ContextChecked(_) => None,
+        CheckEvent::SelectedBodies(_)
+        | CheckEvent::StaticChecked(_)
+        | CheckEvent::ContextChecked(_) => None,
         CheckEvent::ContextReady(d)
         | CheckEvent::BodyChecked(_, d)
         | CheckEvent::BatchSettled(d)

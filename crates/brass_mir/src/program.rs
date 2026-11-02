@@ -91,8 +91,8 @@ pub struct MirProgram {
     /// types). Monomorphization types a call into an instance still being
     /// typed (mutual recursion without annotations) against it.
     pub instance_returns: fxhash::FxHashMap<(String, Vec<brass_hir::Type>), brass_hir::Type>,
-    /// The checker's per-instance aggregate seeds, for the spans whose
-    /// instances disagree (see [`brass_hir::InstanceChannel`]):
+    /// The checker's exact-instance aggregate seeds, including spans whose
+    /// observed instances agree (see [`brass_hir::InstanceChannel`]):
     /// monomorphization seeds a local whose [`crate::LocalDecl::seed_site`]
     /// is such a span from the entry of the instance it is typing, never
     /// from the span-shared seed.
@@ -101,6 +101,8 @@ pub struct MirProgram {
     /// dispatches to, for the calls whose instances key them differently
     /// (lowered as [`crate::Callee::Keyed`]).
     pub instance_dispatch: brass_hir::InstanceChannel<String>,
+    /// Checked per-instance field lists for divergent reflection loops.
+    pub instance_fields: brass_hir::InstanceChannel<Vec<String>>,
     /// Settled return-origin contracts, keyed by call and enclosing instance.
     pub numeric_calls: brass_hir::NumericCalls,
 }

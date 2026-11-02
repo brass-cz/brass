@@ -200,7 +200,7 @@ impl ConstChecker<'_> {
         // Bodies see only the globals their defining module can resolve.
         let global_defs = self.global_bindings();
         for f in self.program.functions.values() {
-            if !modules.checks(&f.module) {
+            if !modules.checks(&f.module) || !modules.checks_body(f.decl.span) {
                 continue;
             }
             // Parameters shadow any like-named global const. Each binds
@@ -224,6 +224,9 @@ impl ConstChecker<'_> {
                 }
             };
             for m in methods {
+                if !modules.checks_body(m.decl.span) {
+                    continue;
+                }
                 if brass_hir::keyed_return(m.decl.ret.as_ref()) {
                     continue;
                 }

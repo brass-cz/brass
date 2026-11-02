@@ -65,6 +65,7 @@ struct MonoFacts {
     is_closure: bool,
     fallible: bool,
     keyed: HashMap<brass_parser::Span, String>,
+    fields: HashMap<brass_parser::Span, Vec<String>>,
     closure_targets: HashMap<ClosureId, String>,
 }
 
@@ -81,6 +82,7 @@ impl MonoFacts {
             is_closure: self.is_closure,
             fallible: self.fallible,
             keyed: self.keyed.clone(),
+            fields: self.fields.clone(),
             closure_targets: self.closure_targets.clone(),
         }
     }
@@ -334,6 +336,7 @@ impl<'m> Monomorphizer<'m, '_> {
                     is_closure: instance.is_closure,
                     fallible: instance.fallible,
                     keyed: instance.keyed.clone(),
+                    fields: instance.fields.clone(),
                     closure_targets: instance.closure_targets.clone(),
                 }
             })
